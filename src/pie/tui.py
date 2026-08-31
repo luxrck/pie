@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +19,10 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.message import Message
 from textual.strip import Strip
-from textual.widgets import Footer, Header, RichLog, Static, TextArea
+from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
 
 from .chat import Session
 
@@ -38,19 +42,13 @@ ROLE_BORDERS: dict[str, str] = {
     "error": "#f38ba8",       # 出错
     "system": "#585b70",      # 命令反馈 / 系统提示（低调灰）
 }
-# 兼容别名
-BORDER_USER = ROLE_BORDERS["user"]
-BORDER_ANSWER = ROLE_BORDERS["assistant"]
-BORDER_TOOL_CALL = ROLE_BORDERS["tool_call"]
-BORDER_TOOL_RESULT = ROLE_BORDERS["tool_result"]
-BORDER_ERROR = ROLE_BORDERS["error"]
-BORDER_DIM = ROLE_BORDERS["system"]
 SELECTION_STYLE = Style(bgcolor="#89b4fa", color="#06121f")  # 鼠标框选高亮
 
 # 命令补全候选：(命令, 说明)
 PALETTE_COMMANDS: list[tuple[str, str]] = [
     ("/help", "显示帮助"),
-    ("/stat", "查看 token 用量"),
+    ("/status", "查看 token 用量"),
+    ("/stop", "取消当前正在执行的模型请求/工具"),
     ("/compact", "工具级 + 轮次级压缩"),
     ("/compact tools", "只做工具级压缩"),
     ("/compact turns", "只做轮次级压缩"),
@@ -329,10 +327,14 @@ class PieApp(App):
         color: #a6adc8;
         padding: 0 1;
     }}
+    #input-bar {{
+        height: auto;
+    }}
     #input {{
+        width: 1fr;
         height: auto;
         min-height: 5;
-        max-height: 9;
+        max-height: 5;
         background: {SCREEN_BG};
         color: {BODY_TEXT};
         border: round #45475a;
@@ -343,6 +345,29 @@ class PieApp(App):
     #input.shell-mode, #input.shell-mode:focus {{
         border: round #9c4916;
     }}
+    #send-btn {{
+        min-width: 0;
+        padding: 1;
+        text-align: center;
+        background: transparent;
+        border: round #45475a;
+        color: #a6adc8;
+    }}
+    #send-btn:hover {{
+        background: transparent;
+        border: round #89b4fa;
+        color: #cdd6f4;
+    }}
+    #send-btn.busy {{
+        background: transparent;
+        border: round #f38ba8;
+        color: #f38ba8;
+    }}
+    #send-btn.busy:hover {{
+        background: transparent;
+        border: round #ffb4c8;
+        color: #ffb4c8;
+    }}
     Header {{ background: {SCREEN_BG}; color: {BODY_TEXT}; }}
     Footer {{ background: {SCREEN_BG}; color: {BODY_TEXT}; }}
     """
@@ -352,18 +377,21 @@ class PieApp(App):
         self.session = session
         self.initial_prompt = initial_prompt
         self._worker: threading.Thread | None = None
+        self._cancel_event: threading.Event | None = None
         self._palette_index = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield SelectableRichLog(highlight=True, markup=True, wrap=True, id="log")
         yield CommandPalette("", id="palette")
-        yield PieTextArea(
-            placeholder="输入消息（! 开头直接执行 shell，/ 显示命令补全，Shift+Enter 换行）",
-            id="input",
-            tab_behavior="focus",
-            highlight_cursor_line=False,
-        )
+        with Horizontal(id="input-bar"):
+            yield PieTextArea(
+                placeholder="输入消息（! 开头直接执行 shell，/stop 取消当前任务，/ 显示命令补全，Shift+Enter 换行）",
+                id="input",
+                tab_behavior="focus",
+                highlight_cursor_line=False,
+            )
+            yield Button("▶", id="send-btn", variant="default")
         yield Static("", id="meta")
         yield Static("", id="status")
         yield Footer()
@@ -379,6 +407,9 @@ class PieApp(App):
             f"  |  归档: {len(self.session.fs)}"
         )
         self.query_one("#input", PieTextArea).focus()
+        send_btn = self.query_one("#send-btn", Button)
+        send_btn.can_focus = False  # 右侧按钮不抢焦点，避免干扰输入
+        self._update_send_button()
         self._update_status()
         if self.initial_prompt:
             self._submit(self.initial_prompt)
@@ -488,6 +519,30 @@ class PieApp(App):
             pass  # 组件正在卸载时忽略
         self._update_input_border()
 
+    def _update_send_button(self) -> None:
+        """右侧按钮两用：空闲=发送，处理中（busy）=停止（等价 /stop）。"""
+        try:
+            btn = self.query_one("#send-btn", Button)
+        except Exception:
+            return
+        if self._busy():
+            btn.label = "■"
+            btn.add_class("busy")
+        else:
+            btn.label = "▶"
+            btn.remove_class("busy")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "send-btn":
+            return
+        if self._busy():
+            self._command("/stop")
+        else:
+            inp = self.query_one("#input", PieTextArea)
+            text = inp.text
+            if text.strip():
+                self.on_message_submitted(MessageSubmitted(text))
+
     def _update_input_border(self) -> None:
         """输入以 ! 开头时切换 shell 模式边框（tool_call 橙色），否则恢复正常。"""
         inp = self.query_one("#input", PieTextArea)
@@ -542,18 +597,50 @@ class PieApp(App):
         elif text.startswith("!"):
             self._run_shell(text[1:].strip())
         else:
+            if self._busy():
+                if self._cancelling():
+                    # 正在取消收尾：等它结束（cancel 路径很快），避免新旧回合并发写历史
+                    self._worker.join(timeout=2)
+                    if self._busy():
+                        self.query_one("#log", RichLog).write(
+                            _box("正在取消中，请稍候…", role="system")
+                        )
+                        return
+                else:
+                    self.query_one("#log", RichLog).write(
+                        _box("正在处理中，输入 /stop 可取消", role="system")
+                    )
+                    return
             self._submit(text)
+
+    def _busy(self) -> bool:
+        """是否有 worker 线程正在跑（模型请求 / 工具执行 / shell）。"""
+        return self._worker is not None and self._worker.is_alive()
+
+    def _cancelling(self) -> bool:
+        """正在取消收尾：worker 还活着但已请求取消。"""
+        return self._cancel_event is not None and self._cancel_event.is_set()
 
     def _command(self, text: str) -> None:
         log = self.query_one("#log", RichLog)
         cmd, _, arg = text.partition(" ")
         if cmd in ("/exit", "/quit"):
             self.exit()
+        elif cmd == "/stop":
+            if self._busy():
+                if self._cancel_event is not None:
+                    self._cancel_event.set()
+                    log.write(_box("已请求取消，正在终止…", role="system"))
+                else:
+                    log.write(_box("正在执行 shell，等待其结束", role="system"))
+            else:
+                log.write(_box("当前没有正在执行的任务", role="system"))
         elif cmd == "/help":
-            log.write(_box("/exit /quit 退出 | /reset 清空历史 | /clear 归档并开新窗口 | "
+            log.write(_box("/exit /quit 退出 | /stop 取消当前模型请求/工具执行（等待期间可继续输入） | "
+                           "/reset 清空历史 | /clear 归档并开新窗口 | "
                            "/compact [tools|turns] 手动压缩 | /save [文件] 保存 | "
-                           "/stat 用量 | /help 帮助 | 鼠标拖动日志可复制文本\n"
-                           "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式）"))
+                           "/status 用量 | /help 帮助 | 鼠标拖动日志可复制文本\n"
+                           "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，/stop 可终止）"))
         elif cmd == "/reset":
             self.session.reset()
             log.write(_box("已清空历史（保留 system prompt 与记忆）"))
@@ -581,7 +668,7 @@ class PieApp(App):
         elif cmd == "/save":
             self.session.save(arg.strip() or None)
             log.write(_box(f"会话已保存: {self.session.file}"))
-        elif cmd == "/stat":
+        elif cmd == "/status":
             log.write(_box(self.session.usage_report()))
         else:
             log.write(_box(f"未知命令: {cmd}（/help 查看）", role="error"))
@@ -601,27 +688,61 @@ class PieApp(App):
         self.query_one("#log", RichLog).write(
             _box(f"$ {cmd}", title="shell", role="tool_call", icon="⚙")
         )
-        self.query_one("#input", PieTextArea).disabled = True
-        self._worker = threading.Thread(target=self._exec_shell, args=(cmd,), daemon=True)
+        self._cancel_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._exec_shell, args=(cmd, self._cancel_event), daemon=True
+        )
         self._worker.start()
+        self._update_send_button()
 
-    def _exec_shell(self, cmd: str) -> None:
+    def _exec_shell(self, cmd: str, cancel_event: threading.Event) -> None:
+        """Popen 轮询执行：/stop 时 kill 整个进程组并返回“用户手动终止”；保留 120s 超时。"""
         try:
-            proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=120
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,  # 独立进程组，取消时可 killpg 连子进程一起杀
             )
-            out = (proc.stdout or "") + (proc.stderr or "")
-            code: Any = proc.returncode
-        except subprocess.TimeoutExpired:
-            out = ""
-            code = "timeout(120s)"
+            start = time.monotonic()
+            while proc.poll() is None:
+                if cancel_event.is_set():
+                    self._kill_proc(proc)
+                    out, _ = proc.communicate()
+                    code = "cancelled"
+                    self.call_from_thread(self._show_shell_result, cmd, out, code)
+                    return
+                if time.monotonic() - start > 120:
+                    self._kill_proc(proc)
+                    out, _ = proc.communicate()
+                    code = "timeout(120s)"
+                    self.call_from_thread(self._show_shell_result, cmd, out, code)
+                    return
+                time.sleep(0.05)
+            out, _ = proc.communicate()
+            code = proc.returncode
         except Exception as e:  # 兜底：异常显示为红色盒子
             out = f"{type(e).__name__}: {e}"
             code = "error"
         self.call_from_thread(self._show_shell_result, cmd, out, code)
 
+    @staticmethod
+    def _kill_proc(proc: subprocess.Popen) -> None:
+        """杀整个进程组（含 shell 的子命令），失败时退回杀 shell 本身。"""
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
     def _show_shell_result(self, cmd: str, out: str, code: Any) -> None:
         log = self.query_one("#log", RichLog)
+        if code == "cancelled":
+            out = (out.rstrip() + "\n[用户手动终止]").strip()
         lines = out.splitlines()
         if len(lines) > 200:
             preview = "\n".join(lines[:100] + ["...[输出过长，已截断]..."] + lines[-50:])
@@ -631,23 +752,29 @@ class PieApp(App):
             body = out
             title = f"shell [{code}]" if out else f"shell [{code}]（无输出）"
         log.write(_box(body or "(无输出)", title=title, role="tool_result", icon="↳"))
-        self.query_one("#input", PieTextArea).disabled = False
+        self._cancel_event = None
+        self._worker = None
         self.query_one("#input", PieTextArea).focus()
+        self._update_send_button()
 
     def _submit(self, text: str) -> None:
         self.query_one("#log", RichLog).write(
             _box(text, title="你", role="user", icon="▎")
         )
-        self.query_one("#input", PieTextArea).disabled = True
+        # 输入框保持可用：等待期间用户仍可输入 /stop 取消当前回合
+        self._cancel_event = threading.Event()
         self._worker = threading.Thread(target=self._run_turn, args=(text,), daemon=True)
         self._worker.start()
+        self._update_send_button()
 
     def _run_turn(self, text: str) -> None:
         def on_event(ev: dict[str, Any]) -> None:
             self.call_from_thread(self._append_event, ev)
 
         try:
-            answer = self.session.turn(text, on_event=on_event)
+            answer = self.session.turn(
+                text, on_event=on_event, cancel_event=self._cancel_event
+            )
         except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
             self.call_from_thread(self._fail_turn, e)
             return
@@ -676,15 +803,18 @@ class PieApp(App):
     def _fail_turn(self, exc: Exception) -> None:
         log = self.query_one("#log", RichLog)
         log.write(_box(f"{type(exc).__name__}: {exc}", title="出错", role="error", icon="✗"))
-        self.query_one("#input", PieTextArea).disabled = False
+        self._cancel_event = None
+        self._worker = None
         self.query_one("#input", PieTextArea).focus()
         self._update_status()
+        self._update_send_button()
 
     def _finish_turn(self, answer: str) -> None:
-        self.query_one("#input", PieTextArea).disabled = False
-        self.query_one("#input", PieTextArea).focus()
+        self._cancel_event = None
+        self._worker = None
         self._safe_save()
         self._update_status()
+        self._update_send_button()
 
     def on_unmount(self) -> None:
         if self._worker and self._worker.is_alive():

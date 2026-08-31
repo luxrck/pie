@@ -1,6 +1,6 @@
 [project]
 name = "pie"
-version = "0.0.3"
+version = "0.0.4"
 description = "极简 agent harness：内置 read / edit / write / shell 四个工具，YOLO 模式"
 requires-python = ">=3.11"
 dependencies = [
