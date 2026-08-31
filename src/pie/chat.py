@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,6 @@ from .context import (
     build_window_summary,
     content_hash,
     flatten_messages,
-    maybe_compact as _maybe_compact,
     summarize_turns,
     write_manifest,
 )
@@ -205,6 +205,7 @@ class Session:
         self,
         user_input: str,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         self.messages.add(UserMessage(user_input))
         self.turn_count += 1
@@ -219,15 +220,7 @@ class Session:
             user_turn=self.turn_count,
             usage=self.usage,
             on_event=on_event,
-        )
-
-    def to_messages(self) -> list[dict]:
-        """转成 OpenAI 兼容的消息 dict（纯转换，不做压缩）。"""
-        return self.messages.to_api()
-
-    def maybe_compact(self) -> dict:
-        return _maybe_compact(
-            self.messages, self.config, self.messages.tokens(), self.manifest, fs=self.fs
+            cancel_event=cancel_event,
         )
 
     def _window_summaries(self) -> list[SystemMessage]:
@@ -366,41 +359,6 @@ class Session:
             return []
         with self.manifest.open(encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
-
-    def verify_context(self) -> list[str]:
-        """校验被引用文件是否存在：消息字段 raw_path + fs 块 + 旧 manifest 条目。"""
-        from .context import message_raw_path
-
-        missing: list[str] = []
-        for m in flatten_messages(self.messages.messages):
-            p = message_raw_path(m)
-            if p is not None and not p.exists():
-                missing.append(str(p))
-        missing.extend(str(p) for p in self.fs if not p.exists())
-        for entry in self.compression_history():
-            raw_path = entry.get("raw_path")
-            if raw_path and not Path(raw_path).exists():
-                missing.append(raw_path)
-        return list(dict.fromkeys(missing))
-
-    def raw_history(self) -> list[dict]:
-        out = []
-        for entry in self.compression_history():
-            raw_path = entry.get("raw_path")
-            content = (
-                Path(raw_path).read_text(encoding="utf-8")
-                if raw_path and Path(raw_path).exists()
-                else ""
-            )
-            out.append(
-                {
-                    "kind": entry.get("kind"),
-                    "level": entry.get("level"),
-                    "raw_path": raw_path,
-                    "content": content,
-                }
-            )
-        return out
 
     def full_history(self) -> list[dict]:
         """完整转录：按消息顺序展开压缩指针（工具级还原全文、轮次/会话级还原原始消息序列）。"""

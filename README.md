@@ -66,7 +66,8 @@ pie --session 20260831-103224   # 恢复指定会话（id / 文件名 / 路径�
 直接输入消息即可，每条消息都会走完整的工具循环（read / edit / write / shell），历史上下文在会话内持续保留。
 每轮对话自动保存到 `~/.pie/sessions/<时间戳>.jsonl`，所以 `pie resume` 能恢复最近会话。
 真实终端下使用 **Textual TUI**（pi / tau 风格：消息流、工具调用日志、状态栏、底部输入）；非 TTY（管道/脚本）自动回退 readline。
-对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 fs 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/stat` 查看 token 使用情况与当前会话文件、`/help` 查看帮助。
+对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 fs 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/status` 查看 token 使用情况与当前会话文件、`/stop` 取消当前正在执行的模型请求 / 工具、`/help` 查看帮助。
+TUI 下发出消息后输入框**不会禁用**：模型请求 / 工具执行期间可以继续输入，输入 `/stop` 即手动取消——模型请求被中断时返回“用户手动终止”，工具执行被中断时工具结果同样填充“用户手动终止”（未执行的工具调用也补该文本，保证会话序列合法）；`!cmd` 的 shell 模式同样可用 `/stop` 终止（会 kill 子进程）。
 输入使用 prompt_toolkit 做 Unicode 安全行编辑：中文退格按字符删除，不会出现半个字符导致的 UTF-8 错误；管道/脚本输入时自动回退 `input()`。
 
 ## 一次性执行（子 agent / 摘要）
@@ -160,7 +161,7 @@ tail = 2
 
 触发：软阈值 `context_soft_ratio × max_seq_len`，压缩到 `context_target_ratio` 水位（迟滞防抖）；token 计数优先使用 API 返回的 `usage.prompt_tokens`，无上报时用字符估算。单条消息的压缩级别只升不降（0=原始 → 2=轮次级/step → 3=会话级；旧文件的 1=工具级 仍兼容）。
 
-每次压缩事件都会记录统计（节省 token、各级数量）并写入会话的压缩索引：`~/.pie/context/<session>-manifest.jsonl`，包含时间戳、级别、类型（tool/turn/session）、是否滚动、原文文件路径与 hash、摘要。程序可通过 `Session.compression_history()` / `verify_context()` / `raw_history()` 读取与校验。
+每次压缩事件都会记录统计（节省 token、各级数量）并写入会话的压缩索引：`~/.pie/context/<session>-manifest.jsonl`，包含时间戳、级别、类型（tool/turn/session）、是否滚动、原文文件路径与 hash、摘要。程序可通过 `Session.compression_history()` 读取压缩历史，`Session.full_history()` 重建完整转录。
 
 压缩维护命令：
 
