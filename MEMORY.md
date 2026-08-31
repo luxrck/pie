@@ -78,6 +78,7 @@ echo "还原完成: $SRC"
 - 2026-08-31：重构——摘要只保留规则式；移除子 agent 摘要器（_make_subagent_summarizer）与 LLM 摘要模式（parse_summary_output / remember_facts / 滚式 / compress_summarizer / subagent_timeout / remember_facts / subagent_config_file / ensure_subagent_config）。
 - 2026-08-29：/usage 显示当前上下文占用（估算+百分比）、压缩次数与落盘原文量、API 上报与累计；UsageTracker 经会话文件 __meta__ 跨 resume 恢复。
 - 2026-08-31：/usage 改名 /stat；usage_report 新增“会话文件：<path>”行（仅当会话文件已保存存在时显示），TUI 状态栏过滤该行保持首/尾摘要。
+- 2026-08-31：/stat 改名 /status（命令字符串、帮助文本、补全候选、README 同步更新）。
 - 2026-08-29：DeepSeek thinking 400 真根因 = 会话级压缩在轮次进行中 pair 提取，产生 user→纯文本 assistant→tool_calls→tool 非法序列；修复：进行中轮次不 pair 提取（turn_in_progress）、pair 仅当轮次以 assistant 结尾时提取、Session.load 自动修复已损坏序列。
 - 2026-08-29：tool_call 参数膨胀（write 大 content + thinking reasoning 大）是上下文主要消耗源，决策：留给自动压缩处理，不单独改工具。
 - 2026-08-29：新增 keep_last_steps（当前轮次内必须完整保留的最近 step 批次数，默认 3）与 compress_current_turn（默认 true）：进行中的轮次超限时压缩较早 step 批次（整批落盘 + manifest kind=step），解决长工具循环单轮撑爆上下文的问题。
@@ -93,6 +94,16 @@ echo "还原完成: $SRC"
 - 2026-08-31：移除 use_memory 配置——SYSTEM.md / AGENTS.md / MEMORY.md 存在即加载，不再有跳过开关。
 - 2026-08-31：修复 /save 自定义路径的 manifest 关联——__meta__ 记录 manifest 路径，load 优先使用；新增 Session.full_history() 按 manifest 展开压缩内容重建完整转录（压缩视图 vs 完整历史的差异是设计，原始数据始终在 step/turn/session-*.txt）。
 - 2026-08-31：TUI 新增 shell 模式——输入以 `!` 开头时输入框边框变 tool_call 橙色（#9c4916，CSS 类 shell-mode 切换），提交后 `!` 后内容直接 subprocess 执行（shell=True，120s 超时，超 200 行截断显示前 100 后 50），结果输出到 log 但不经过 LLM、不进会话上下文（不写 messages、不 save）。
+- 2026-09-01：清理第一类死代码——删除 cli.py 的 chat_main/resume_main/once_main 兼容入口（main() 已用 argv[0] 分发 + _run 替代）与 --new-session 死参数；删除 Session.to_messages / maybe_compact / verify_context / raw_history（无调用方，被 messages.to_api() / context.maybe_compact / referenced_raw_paths() / full_history() 取代）；删除 tui.py 的 BORDER_* 兼容别名（_box 直接用 ROLE_BORDERS）；README 同步去掉 verify_context/raw_history 引用。
+- 2026-09-01：新增手动取消（TUI `/stop`）——发出消息后输入框不再 disabled（等待期间可继续输入）；loop 层 `complete_turn` / `Session.turn` 新增 `cancel_event`（threading.Event）参数，`_run_cancellable` 在子线程跑阻塞调用并 poll 取消标志（50ms 粒度）；模型请求被取消 → 回合终止、历史写 AssistantMessage("用户手动终止")；工具执行被取消 → 该工具（及未执行工具）结果填充 ToolMessage("用户手动终止")，再写 AssistantMessage("用户手动终止")，保证 tool_call_id 一一对应（API 序列合法）；TUI shell 模式（!）改 Popen 轮询，/stop kill 子进程；处理中提交普通消息提示“正在处理中，输入 /stop 可取消”，取消收尾时 join 等待避免新旧回合并发写历史。
+- 2026-09-01：TUI 输入框右侧按钮（`#send-btn`）两用：空闲“▶ 发送”点击提交输入框内容（等价回车），处理中变“■ 停止”点击等价 `/stop`；实现 = `#input-bar` Horizontal 布局（输入框 `width: 1fr` + 按钮 `width: 8; height: 100%` 等高），按钮 `min-width: 0; padding: 0 1` 收窄，`can_focus=False` 不抢焦点；状态在 `_submit/_run_shell`（进入 busy）与 `_finish_turn/_fail_turn/_show_shell_result`（退出）切换。
+- 2026-09-01（修订）：按钮从右下角悬浮改为输入框右侧等高——用户嫌悬浮覆盖丑；`layers/overlay/dock/offset-y` 全部移除，`_place_send_button` 删除；Textual `pilot.click` 的 offset 是像素偏移（非百分比），headless 测试需等布局稳定或显式传中心 offset。
+- 2026-09-01（再修订）：用户最终决定**移除 send-btn**——输入框恢复为直接 yield（去掉 Horizontal 容器），`_update_send_button` / `on_button_pressed` / CSS 规则全部删除，功能回退到纯 `/stop` 文本命令 + 回车提交。
+- 2026-09-01（最终）：用户决定**恢复 send-btn**（加回来）——恢复为输入框右侧按钮：`Horizontal(id="input-bar")` 容器 + `Button("▶")`，label 纯符号（空闲 `▶` / busy `■`），CSS 用 `min-width: 0; padding: 1; text-align: center`（用户此前手动改窄过），`can_focus=False`。
+- 2026-09-01（再修订）：send-btn 样式改为**透明背景、只以 border 为边界**——Textual 默认 background 覆盖整个 widget 区域（含 border 之下），border 字符其实是画在背景色块上的前景描边，视觉上“border 在 background 内部”；改 `background: transparent` 后 border 即按钮唯一边界，内部露出下层背景；hover/busy 改用边框颜色区分：空闲 border `#45475a` / hover `#89b4fa`，busy border `#f38ba8` / busy:hover `#ffb4c8`（文字颜色同步）。
+- 2026-09-01（再再修订）：**busy 时恢复暗红背景**（用户明确要求，允许 busy 状态下 border 在背景内部）——空闲仍透明背景+border 边界；busy 未 hover 背景 `#3a1d1d` + 边框 `#f38ba8`，busy:hover 背景 `#5a2d2d` + 边框 `#ffb4c8`，文字 `#f38ba8`。
+- 2026-09-01（再再再修订）：**取消 busy 暗红背景，暗红挪到 border**——所有状态背景统一透明（border 即边界）；busy 边框 `#3a1d1d`（暗红，即原背景色）/ busy:hover 边框 `#5a2d2d`（提亮暗红），文字 `#f38ba8`；注意 `#3a1d1d` 与屏幕背景 `#1a1a24` 对比度低，边框偏暗（如需可见可调亮）。
+- 2026-09-01（再再再再修订）：**busy 边框提亮为亮红**——用户反馈暗红边框不醒目；busy 边框 `#f38ba8`（error 色）/ busy:hover 边框 `#ffb4c8`（更亮），文字同步，背景仍透明。
 - 2026-08-31：修正工具级/step 级语义——工具级压缩只压缩 tool 返回文本（内容落盘成指针，消息保留，绝不删除）；当前轮 step 压缩改为内容级（spill_turn_tool_results），整批删除的 compress_step_batches 已移除；stats 字段 spilled 改名为 tools。
 - 2026-08-31：压缩指针写入消息自身字段（Message.raw_path / raw_hash）——消息自描述，full_history() 按消息顺序精确重建；referenced_raw_paths() 同时扫 manifest 与会话消息字段，GC/verify 不再依赖文件名 stem 关联。
 

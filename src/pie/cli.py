@@ -55,7 +55,7 @@ CHAT_HELP = """\
   /clear         当前窗口写入 fs 归档，开新窗口
   /compact       手动压缩：/compact tools（工具级）、/compact turns（轮次级）、/compact（两者）
   /save [文件]   保存会话（不带参数则保存到当前会话文件）
-  /stat          查看当前 token 使用情况
+  /status        查看当前 token 使用情况
   /help          显示本帮助
 """
 
@@ -144,7 +144,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
     parser.add_argument("-r", "--resume", action="store_true", help="恢复最近的会话")
     parser.add_argument("--session", metavar="ID", help="恢复指定会话（id / 文件名 / 路径）")
-    parser.add_argument("--new-session", action="store_true", help="开新会话（默认）")
     parser.add_argument("--session-id", metavar="ID", help="为新会话指定精确 id（print 模式会保存到该文件）")
     parser.add_argument("--cwd", metavar="PATH", help="内置工具的工作目录（默认当前目录）")
     parser.add_argument(
@@ -332,7 +331,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
                     _safe_save(session)
                     if session.file is not None:
                         print(f"会话已保存: {session.file}")
-                elif cmd == "/stat":
+                elif cmd == "/status":
                     print(session.usage_report())
                 else:
                     print(f"未知命令: {cmd}（/help 查看）")
@@ -476,54 +475,6 @@ def context_main(argv: list[str]) -> int:
             p.unlink(missing_ok=True)
         print(f"已删除 {len(garbage)} 个文件")
     return 0
-
-
-def chat_main(resume: bool, config_file: str | None = None, initial_prompt: str | None = None) -> int:
-    """兼容入口：新对话 / 恢复会话（TUI 或 readline）。"""
-    cfg = ensure_config(config_file=config_file)
-    try:
-        session = Session.resume(config=cfg) if resume else Session.new(config=cfg)
-    except FileNotFoundError as e:
-        print(f"恢复失败: {e}", file=sys.stderr)
-        return 1
-    return _interactive_main(session, initial_prompt, resumed=resume)
-
-
-def resume_main(argv: list[str]) -> int:
-    """兼容入口：pie resume（等价 pie -r）。"""
-    parser = argparse.ArgumentParser(prog="pie resume", description="恢复最近的对话会话")
-    parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
-    args = parser.parse_args(argv)
-    return chat_main(resume=True, config_file=args.config)
-
-
-def once_main(argv: list[str]) -> int:
-    """兼容入口：pie [PROMPT] 一次性执行（子 agent 模式）。"""
-    parser = argparse.ArgumentParser(prog="pie", description="一次性执行任务（子 agent 模式）")
-    parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
-    parser.add_argument("prompt", nargs="?", help="任务描述；省略时从 stdin 读取")
-    args = parser.parse_args(argv)
-    return _run(
-        argparse.Namespace(
-            prompt=args.prompt,
-            print=True,
-            mode="text",
-            model=None,
-            thinking=None,
-            config=args.config,
-            resume=False,
-            session=None,
-            new_session=False,
-            session_id=None,
-            cwd=None,
-            system_prompt=None,
-            append_system_prompt=[],
-            auto_compact_threshold=None,
-            timeout_seconds=None,
-            max_retries=None,
-            max_retry_delay_seconds=None,
-        )
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
