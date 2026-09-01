@@ -526,7 +526,7 @@ class PieApp(App):
         except Exception:
             return
         if self._busy():
-            btn.label = "■"
+            btn.label = "■" # ⏹
             btn.add_class("busy")
         else:
             btn.label = "▶"
@@ -823,4 +823,5 @@ class PieApp(App):
 
 def run_tui(session: Session, initial_prompt: str | None = None) -> None:
     PieApp(session, initial_prompt).run()
+
 

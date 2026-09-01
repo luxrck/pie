@@ -80,7 +80,7 @@ def run_agent(
     )
 
     messages = AgentMessage(
-        [SystemMessage(build_system_prompt(config)), UserMessage(task)],
+        [SystemMessage(build_system_prompt(cfg)), UserMessage(task)],
         keep_last_steps=cfg.keep_last_steps,
     )
     return complete_turn(messages, cfg, registry, backend, user_turn=1)
@@ -244,4 +244,5 @@ def _cancel_tool(
         if call is cancelled_call and on_event is not None:
             on_event({"type": "tool_result", "name": call.name, "text": CANCEL_TEXT})
     return _cancel_turn(messages, on_event)
+
 
