@@ -90,7 +90,8 @@ def load_raw_messages(path: Path) -> list["Message"]:
 
 
 def summarize_turns(dicts: list[dict[str, Any]], head: int, tail: int) -> str:
-    """规则式会话摘要：保留开头 head 轮 + 末尾 tail 轮，每轮只留 <user_q, 模型最终回复>。"""
+    """规则式会话摘要：保留开头 head 轮 + 末尾 tail 轮，每轮只留 <user_q, 模型最终回复>；
+    中间被省略的轮次显式标注（对齐工具级压缩的省略提示），编号保留原始轮次序号。"""
     turns: list[tuple[str, str]] = []
     q: str | None = None
     final: str | None = None
@@ -108,16 +109,34 @@ def summarize_turns(dicts: list[dict[str, Any]], head: int, tail: int) -> str:
         turns.append((q, final or ""))
     head = max(0, int(head or 0))
     tail = max(0, int(tail or 0))
-    keep = turns[:head] + turns[-tail:] if tail else turns[:head]
-    deduped: list[tuple[str, str]] = []
-    for t in keep:
-        if not deduped or deduped[-1] != t:
-            deduped.append(t)
+    total = len(turns)
+    if total == 0:
+        return ""
+    omitted = 0
+    if tail and head + tail < total:
+        parts: list[tuple[list[tuple[str, str]], int]] = [
+            (turns[:head], 1),
+            (turns[-tail:], total - tail + 1),
+        ]
+        omitted = total - head - tail
+    else:
+        parts = [(turns, 1)]
     lines: list[str] = []
-    for i, (q_, a_) in enumerate(deduped, 1):
-        lines.append(f"{i}. 用户: {q_}")
-        if a_:
-            lines.append(f"   pie: {a_}")
+    for i, (part, base) in enumerate(parts):
+        prev: tuple[str, str] | None = None
+        idx = base
+        for t in part:
+            if prev == t:  # 相邻重复合并，序号仍推进（表示原始位置）
+                idx += 1
+                continue
+            prev = t
+            q_, a_ = t
+            lines.append(f"{idx}. 用户: {q_}")
+            if a_:
+                lines.append(f"   pie: {a_}")
+            idx += 1
+        if omitted and i == 0:
+            lines.append(f"...[中间省略 {omitted} 轮]...")
     return "\n".join(lines)
 
 
@@ -277,12 +296,13 @@ class ToolMessage(Message):
             **kwargs,
         )
 
-    def compact(self, cfg: Any = None, manifest: Path | None = None, **kwargs: Any) -> int:
-        """工具级压缩：行数 > head+tail 时全文落盘，消息保留。"""
-        if self.compress_level >= 1 or not self.content or cfg is None:
+    def compact(self, tool_cfg: Any = None, manifest: Path | None = None, **kwargs: Any) -> int:
+        """工具级压缩：行数 > head+tail 时全文落盘，消息保留。
+        tool_cfg 为 None（工具压缩关闭）时不做任何事。"""
+        if self.compress_level >= 1 or not self.content or tool_cfg is None:
             return 0
-        head = max(0, int(cfg.compaction.tool.head))
-        tail = max(0, int(cfg.compaction.tool.tail))
+        head = max(0, int(tool_cfg.head))
+        tail = max(0, int(tool_cfg.tail))
         content = self.content
         lines = content.splitlines()
         if len(lines) <= head + tail:
@@ -344,18 +364,49 @@ class ModelMessage:
         *,
         tools: bool = False,
         turns: bool = False,
-        session: bool = False,
-        cfg: Any = None,
+        tool_cfg: Any = None,
+        turn_cfg: Any = None,
         manifest: Path | None = None,
     ) -> Any:
         if tools:
             for m in self.messages:
                 if isinstance(m, ToolMessage):
-                    m.compact(cfg=cfg, manifest=manifest)
+                    m.compact(tool_cfg=tool_cfg, manifest=manifest)
             return self
         if turns:
-            return _compress_turn(self, cfg, manifest)
+            return self._compact_turn(turn_cfg, manifest)
         return self
+
+    def _compact_turn(self, turn_cfg: Any, manifest: Path | None) -> AssistantMessage:
+        """轮次级（规则式）：整轮压成摘要 assistant（user 保留在 AgentMessage 中）+ 指针；
+        保留 head/tail 消息概览，中间省略部分显式标注（对齐工具级压缩）。"""
+        raw = json.dumps([m.to_dict() for m in self.messages], ensure_ascii=False, indent=1)
+        path = write_raw(raw, "turn")
+        total = len(self.messages)
+        head = max(0, int(turn_cfg.head))
+        tail = max(0, int(turn_cfg.tail))
+        if tail and head + tail < total:
+            preview = [_turn_preview(m) for m in self.messages[:head]]
+            preview.append(f"...[中间省略 {total - head - tail} 条消息]...")
+            preview += [_turn_preview(m) for m in self.messages[-tail:]]
+        else:
+            preview = [_turn_preview(m) for m in self.messages]
+        body = "\n".join(preview) if preview else "[该轮次无最终文本，原文已保存]"
+        if manifest is not None:
+            write_manifest(
+                manifest,
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "level": 2,
+                    "kind": "turn",
+                    "raw_path": str(path),
+                    "raw_hash": content_hash(raw),
+                    "summary": body[:200],
+                },
+            )
+        msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n{body}", compress_level=2)
+        msg._set_raw(path, raw)
+        return msg
 
 
 class AgentMessage:
@@ -433,39 +484,39 @@ class AgentMessage:
         tools: bool = False,
         turns: bool = False,
         session: bool = False,
-        cfg: Any = None,
+        tool_cfg: Any = None,
+        turn_cfg: Any = None,
+        session_cfg: Any = None,
         target: int | None = None,
         manifest: Path | None = None,
         fs: list[Path] | None = None,
     ) -> Any:
         if tools:
-            return self._compact_tools(cfg, manifest)
+            return self._compact_tools(tool_cfg, manifest)
         if turns:
-            return self._compact_turns(cfg, target, manifest)
+            return self._compact_turns(turn_cfg, target, manifest)
         if session:
-            return self._compact_session(cfg, manifest, fs)
+            return self._compact_session(session_cfg, manifest, fs)
         return self
 
-    def _compact_tools(self, cfg: Any, manifest: Path | None) -> "AgentMessage":
-        """当前轮（最后一个 ModelMessage）最近 keep_last_steps 条之外的工具文本落盘。"""
+    def _compact_tools(self, tool_cfg: Any, manifest: Path | None) -> "AgentMessage":
+        """工具级压缩：保护最近 keep_last_steps 个 step 批次（跨轮次滚动，
+        每批 = 一次 assistant(tool_calls) + 其后的 tool 结果），窗口外的
+        未压缩 ToolMessage（从最老开始）全文落盘成指针。"""
+        flat = flatten_messages(self.messages)
+        protected = _protected_step_tool_indices(flat, self.keep_last_steps)
         n = 0
-        if self.messages and isinstance(self.messages[-1], ModelMessage):
-            tail = self.messages[-1]
-            prefix = tail[:-self.keep_last_steps] if len(tail) > self.keep_last_steps else ModelMessage()
-            before = sum(
-                1 for m in prefix.messages if isinstance(m, ToolMessage) and m.compress_level == 0
-            )
-            prefix.compact(tools=True, cfg=cfg, manifest=manifest)
-            n = before - sum(
-                1 for m in prefix.messages if isinstance(m, ToolMessage) and m.compress_level == 0
-            )
+        for i, m in enumerate(flat):
+            if isinstance(m, ToolMessage) and m.compress_level == 0 and i not in protected:
+                m.compact(tool_cfg=tool_cfg, manifest=manifest)
+                n += 1
         self.compact_counts["tools"] = n
         if n:
             self.compacted_since_api = True
         return self
 
     def _compact_turns(
-        self, cfg: Any, target: int | None, manifest: Path | None
+        self, turn_cfg: Any, target: int | None, manifest: Path | None
     ) -> "AgentMessage":
         """从最老开始压缩已完成的 ModelMessage（最后一个为进行中，不压），直到低于目标。"""
         count = 0
@@ -475,7 +526,7 @@ class AgentMessage:
                 break
             e = self.messages[idx]
             if isinstance(e, ModelMessage) and idx != len(self.messages) - 1:
-                self.messages[idx] = e.compact(turns=True, cfg=cfg, manifest=manifest)
+                self.messages[idx] = e.compact(turns=True, turn_cfg=turn_cfg, manifest=manifest)
                 count += 1
             idx += 1
         self.compact_counts["turns"] = count
@@ -484,7 +535,7 @@ class AgentMessage:
         return self
 
     def _compact_session(
-        self, cfg: Any, manifest: Path | None, fs: list[Path] | None
+        self, session_cfg: Any, manifest: Path | None, fs: list[Path] | None
     ) -> "AgentMessage":
         """当前轮之前的历史整段落盘成新窗口，保留所有既有窗口摘要，
         插入新窗口的“摘要 + 指针”SystemMessage；新窗口块追加进 fs。"""
@@ -515,7 +566,7 @@ class AgentMessage:
         path = write_raw(raw, "session")
         if fs is not None:
             fs.append(path)
-        sc = cfg.compaction.session
+        sc = session_cfg
         summary = build_window_summary(path, sc.head, sc.tail)
         if manifest is not None:
             write_manifest(
@@ -548,27 +599,48 @@ def flatten_messages(elements: Iterable[Any]) -> list[Message]:
     return out
 
 
-def _compress_turn(model: ModelMessage, cfg: Any, manifest: Path | None) -> AssistantMessage:
-    """轮次级（规则式）：整轮压成 user（保留在 AgentMessage 中）+ 摘要 assistant + 指针。"""
-    raw = json.dumps([m.to_dict() for m in model.messages], ensure_ascii=False, indent=1)
-    path = write_raw(raw, "turn")
-    finals = [m.content for m in model.messages if isinstance(m, AssistantMessage) and m.content]
-    summary = finals[-1] if finals else "[该轮次无最终文本，原文已保存]"
-    if manifest is not None:
-        write_manifest(
-            manifest,
-            {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "level": 2,
-                "kind": "turn",
-                "raw_path": str(path),
-                "raw_hash": content_hash(raw),
-                "summary": summary[:200],
-            },
-        )
-    msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n{summary}", compress_level=2)
-    msg._set_raw(path, raw)
-    return msg
+def _step_batches(flat: list[Message]) -> list[tuple[int, int]]:
+    """把扁平消息序列切成 step 批次（半开区间 [start, end)）：
+    每批 = 一次 assistant(tool_calls) + 其后的连续 tool 结果。"""
+    batches: list[tuple[int, int]] = []
+    i, n = 0, len(flat)
+    while i < n:
+        m = flat[i]
+        if isinstance(m, AssistantMessage) and m.tool_calls:
+            j = i + 1
+            while j < n and isinstance(flat[j], ToolMessage):
+                j += 1
+            batches.append((i, j))
+            i = j
+        else:
+            i += 1
+    return batches
+
+
+def _protected_step_tool_indices(flat: list[Message], keep: int) -> set[int]:
+    """返回最近 keep 个 step 批次内 ToolMessage 的索引集合（跨轮次滚动保护）。"""
+    protected: set[int] = set()
+    for start, end in _step_batches(flat)[-max(1, int(keep)):]:
+        for i in range(start, end):
+            if isinstance(flat[i], ToolMessage):
+                protected.add(i)
+    return protected
+
+
+def _turn_preview(m: Message, max_chars: int = 120) -> str:
+    """单条消息的概览行（轮次级摘要用）：tool 显示工具名+内容，assistant 显示文本或工具调用。"""
+    if isinstance(m, ToolMessage):
+        name = m.tool_name or "tool"
+        text = (m.content or "").replace("\n", " ").strip()
+        return f"tool({name}): {text[:max_chars]}"
+    if isinstance(m, AssistantMessage):
+        if m.content:
+            return f"assistant: {m.content.replace(chr(10), ' ').strip()[:max_chars]}"
+        calls = m.tool_calls or []
+        names = [c.get("function", {}).get("name", "?") for c in calls]
+        return f"assistant: 调用工具 {', '.join(names)}"
+    text = (m.content or "").replace("\n", " ").strip()
+    return f"{m.role}: {text[:max_chars]}"
 
 
 def message_raw_path(m: Message) -> Path | None:
@@ -591,7 +663,7 @@ def maybe_compact(
     manifest: Path | None = None,
     fs: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """按需压缩：软阈值触发，tools → turns → session（session 受 compaction.session 门控）。"""
+    """按需压缩：软阈值触发，tools → turns → session（各级受对应子配置 None 门控）。"""
     stats: dict[str, Any] = {
         "saved_tokens": 0,
         "turns": 0,
@@ -599,7 +671,7 @@ def maybe_compact(
         "session": False,
     }
     limit = cfg.max_seq_len
-    if limit <= 0 or not cfg.compaction.enabled:
+    if limit <= 0 or cfg.compaction is None:  # compaction 未配置 = 不做任何压缩
         return stats
     tokens = current_tokens if current_tokens is not None else agent.tokens()
     soft = cfg.soft_limit()
@@ -608,11 +680,15 @@ def maybe_compact(
     target = cfg.target_limit()
     before = agent.tokens()
     agent.compact_counts = {"turns": 0, "tools": 0, "session": False}
-    agent.compact(tools=True, cfg=cfg, manifest=manifest)
-    if agent.tokens() > target:
-        agent.compact(turns=True, cfg=cfg, target=target, manifest=manifest)
-    if cfg.compaction.session.enabled and agent.tokens() > target:
-        agent.compact(session=True, cfg=cfg, manifest=manifest, fs=fs)
+    tool_cfg = cfg.compaction.tool
+    turn_cfg = cfg.compaction.turn
+    session_cfg = cfg.compaction.session
+    if tool_cfg is not None:
+        agent.compact(tools=True, tool_cfg=tool_cfg, manifest=manifest)
+    if turn_cfg is not None and agent.tokens() > target:
+        agent.compact(turns=True, turn_cfg=turn_cfg, target=target, manifest=manifest)
+    if session_cfg is not None and agent.tokens() > target:
+        agent.compact(session=True, session_cfg=session_cfg, manifest=manifest, fs=fs)
     stats["tools"] = agent.compact_counts["tools"]
     stats["turns"] = agent.compact_counts["turns"]
     stats["session"] = agent.compact_counts["session"]
@@ -670,4 +746,5 @@ def collect_context_garbage() -> list[Path]:
     """返回 context/ 下未被任何会话引用的文件（可安全删除）。fs 窗口块在 windows/ 下，不受影响。"""
     referenced = referenced_raw_paths()
     return sorted(f for f in CONTEXT_DIR.glob("*.txt") if f.resolve() not in referenced)
+
 

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import PIE_DIR, Config, build_system_prompt, resolve_config
+from .config import PIE_DIR, Config, SessionCompaction, build_system_prompt, resolve_config
 from .context import (
     CONTEXT_DIR,
     WINDOWS_DIR,
@@ -146,8 +146,8 @@ class Session:
         head: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(session.config)}
         ]
-        sc = session.config.compaction.session
-        if sc.enabled:
+        sc = session.config.compaction.session if session.config.compaction else None
+        if sc is not None:
             for block in session.fs:
                 if not block.exists():
                     continue
@@ -224,10 +224,11 @@ class Session:
         )
 
     def _window_summaries(self) -> list[SystemMessage]:
-        """为 fs 里所有历史窗口块生成“摘要 + 指针”SystemMessage（保持 fs 顺序）。"""
-        sc = self.config.compaction.session
+        """为 fs 里所有历史窗口块生成“摘要 + 指针”SystemMessage（保持 fs 顺序）。
+        会话级压缩关闭（session 为 None）时不生成摘要。"""
+        sc = self.config.compaction.session if self.config.compaction else None
         summaries: list[SystemMessage] = []
-        if not sc.enabled:
+        if sc is None:
             return summaries
         for block in self.fs:
             if not block.exists():
@@ -263,8 +264,11 @@ class Session:
                     raw += line
                     f.write(line)
             self.fs.append(block)
-            sc = self.config.compaction.session
             if self.manifest is not None:
+                sc = self.config.compaction.session if self.config.compaction else None
+                head, tail = (
+                    (sc.head, sc.tail) if sc is not None else (SessionCompaction.head, SessionCompaction.tail)
+                )
                 write_manifest(
                     self.manifest,
                     {
@@ -275,8 +279,8 @@ class Session:
                         "raw_hash": content_hash(raw),
                         "summary": summarize_turns(
                             [json.loads(l) for l in raw.splitlines() if l.strip()],
-                            sc.head,
-                            sc.tail,
+                            head,
+                            tail,
                         )[:200],
                     },
                 )
@@ -294,15 +298,17 @@ class Session:
             "tools": 0,
             "session": False,
         }
-        if not cfg.compaction.enabled:
-            stats["skipped"] = "compaction.enabled = false"
+        if cfg.compaction is None:
+            stats["skipped"] = "compaction disabled (未配置 [compaction])"
             return stats
         before = self.messages.tokens()
         self.messages.compact_counts = {"turns": 0, "tools": 0, "session": False}
-        if mode in ("auto", "tools"):
-            self.messages.compact(tools=True, cfg=cfg, manifest=self.manifest)
-        if mode in ("auto", "turns"):
-            self.messages.compact(turns=True, cfg=cfg, target=None, manifest=self.manifest)
+        tool_cfg = cfg.compaction.tool
+        turn_cfg = cfg.compaction.turn
+        if mode in ("auto", "tools") and tool_cfg is not None:
+            self.messages.compact(tools=True, tool_cfg=tool_cfg, manifest=self.manifest)
+        if mode in ("auto", "turns") and turn_cfg is not None:
+            self.messages.compact(turns=True, turn_cfg=turn_cfg, target=None, manifest=self.manifest)
         stats["tools"] = self.messages.compact_counts["tools"]
         stats["turns"] = self.messages.compact_counts["turns"]
         stats["saved_tokens"] = max(0, before - self.messages.tokens())
@@ -439,4 +445,5 @@ def _backfill_title(path: Path, title: str) -> None:
             lines[i] = json.dumps(data, ensure_ascii=False)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
+
 
