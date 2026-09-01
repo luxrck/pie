@@ -289,3 +289,4 @@ def register_builtins(registry: ToolRegistry) -> ToolRegistry:
 def default_tools() -> ToolRegistry:
     return register_builtins(ToolRegistry())
 
+
