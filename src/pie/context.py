@@ -669,7 +669,10 @@ def message_raw_path(m: Message) -> Path | None:
     if m.raw_path:
         return Path(m.raw_path)
     if m.content:
-        mm = _POINTER_RE.search(m.content)
+        # content 可能是 str（普通消息）或 list（多模态 parts，如 ImageMessage）；
+        # 统一经 content_text 归一后再找压缩指针，避免对 list 调 re.search 崩溃。
+        text = content_text(m.content)
+        mm = _POINTER_RE.search(text) if text else None
         if mm:
             return Path(mm.group(1))
     return None
