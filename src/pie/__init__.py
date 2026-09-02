@@ -5,6 +5,7 @@
 
 from .config import (
     CONFIG_FILE,
+    DEFAULT_MODEL,
     GLOBAL_MEMORY_FILE,
     PIE_DIR,
     SYSTEM_PROMPT,
@@ -15,15 +16,15 @@ from .config import (
 from .context import (
     AgentMessage,
     AssistantMessage,
+    ImageMessage,
     Message,
-    ModelMessage,
     SystemMessage,
     ToolMessage,
     UserMessage,
 )
 from .chat import Session
-from .llm import DEFAULT_MODEL, LLM, LLMResult, OpenAILLM, ToolCall, UsageTracker
-from .loop import run_agent
+from .llm import LLM, LLMResult, OpenAILLM, StreamChunk, ToolCall, UsageTracker
+from .loop import acomplete_turn, run_agent
 from .tools import (
     MAX_TOOL_OUTPUT,
     Tool,
@@ -41,15 +42,16 @@ __all__ = [
     "Config",
     "DEFAULT_MODEL",
     "GLOBAL_MEMORY_FILE",
+    "ImageMessage",
     "LLM",
     "LLMResult",
     "MAX_TOOL_OUTPUT",
     "Message",
-    "ModelMessage",
     "OpenAILLM",
     "PIE_DIR",
     "SYSTEM_PROMPT",
     "Session",
+    "StreamChunk",
     "SystemMessage",
     "Tool",
     "ToolCall",
@@ -58,6 +60,7 @@ __all__ = [
     "ToolMessage",
     "UsageTracker",
     "UserMessage",
+    "acomplete_turn",
     "build_system_prompt",
     "default_tools",
     "register_builtins",

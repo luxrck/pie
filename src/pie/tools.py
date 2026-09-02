@@ -8,16 +8,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
-import subprocess
+import re
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Union, get_args, get_origin, get_type_hints
+from typing import Any, Awaitable, Callable, Union, get_args, get_origin, get_type_hints
 
-from .context import write_raw
 
 MAX_TOOL_OUTPUT = 20_000  # 单个工具返回给模型的最大字符数
+READ_IMAGE_MAX_BYTES = 12 * 1024 * 1024  # read 内联图片的字节上限（data URI 请求体保护）
 
 
 class ToolError(Exception):
@@ -60,7 +61,7 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, Any]
-    handler: Callable[..., str]
+    handler: Callable[..., str | Awaitable[str]]  # 支持 async 函数（异步工具）
 
     def definition(self) -> dict[str, Any]:
         """生成 OpenAI 接口要求的工具定义。"""
@@ -93,8 +94,8 @@ def tool(
         props: dict[str, Any] = {}
         required: list[str] = []
         for pname, param in sig.parameters.items():
-            if pname in ("self", "cls"):
-                continue
+            if pname in ("self", "cls") or pname.startswith("_"):
+                continue  # 下划线开头的参数（如 _on_progress）是注入项，不进 schema
             if parameters and pname in parameters:
                 schema = parameters[pname]
             else:
@@ -130,23 +131,174 @@ class ToolRegistry:
         self._tools[t.name] = t
         return t
 
-    def unregister(self, name: str) -> None:
-        self._tools.pop(name, None)
-
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
-
-    def names(self) -> list[str]:
-        return list(self._tools)
 
     def definitions(self) -> list[dict[str, Any]]:
         return [t.definition() for t in self._tools.values()]
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
+        """同步分发（须在无事件循环的线程调用）：async 工具用 asyncio.run 包装。"""
         t = self._tools.get(name)
         if t is None:
             raise ToolError(f"未知工具: {name}（可用: {', '.join(self._tools)}）")
-        return t.handler(**args)
+        handler = t.handler
+        if inspect.iscoroutinefunction(handler):
+            return asyncio.run(handler(**args))
+        return handler(**args)
+
+    async def adispatch(
+        self,
+        name: str,
+        args: dict[str, Any],
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        """异步分发：async 工具直接 await；同步工具丢线程池（不阻塞事件循环）。
+
+        on_event 非 None 时注入给接受 `_on_progress` 参数的异步工具（如 shell
+        的实时输出回调）；同步工具无法实时，忽略该参数。
+        """
+        t = self._tools.get(name)
+        if t is None:
+            raise ToolError(f"未知工具: {name}（可用: {', '.join(self._tools)}）")
+        handler = t.handler
+        if inspect.iscoroutinefunction(handler):
+            if on_event is not None and "_on_progress" in inspect.signature(handler).parameters:
+                return await handler(**args, _on_progress=on_event)
+            return await handler(**args)
+        return await asyncio.to_thread(handler, **args)
+
+
+# ---------------------------------------------------------------- 图片支持（read）
+
+
+@dataclass
+class ImageRef:
+    """read 读取的图片引用：由返回文本的机器可读标记解析而来。"""
+
+    path: str
+    mime: str
+    size: int  # 原始字节数
+    width: int | None = None
+    height: int | None = None
+
+
+# 魔数嗅探：扩展名不可信，图片识别以文件头为准
+_IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),  # RIFF....WEBP 需二次校验
+    (b"BM", "image/bmp"),
+)
+_READ_HEAD_BYTES = 65_536  # 读文件头用于嗅探 + 尺寸解析（JPEG 的 SOF 段可能较靠后）
+
+# read 返回文本中的机器可读图片标记（人类可读，loop 用 parse_image_marker 解析）
+_IMAGE_MARKER_RE = re.compile(
+    r"\[图片已读取: path=(?P<path>[^,\]]+), mime=(?P<mime>[^,\]]+), "
+    r"size=(?P<size>\d+)(?:, dim=(?P<width>\d+)x(?P<height>\d+))?\]"
+)
+
+
+def _sniff_mime(head: bytes) -> str | None:
+    """按魔数识别图片格式，非图片返回 None。"""
+    for sig, mime in _IMAGE_SIGNATURES:
+        if head.startswith(sig):
+            if mime == "image/webp" and head[8:12] != b"WEBP":
+                continue  # RIFF 但非 WEBP（如 WAV/AVI）
+            return mime
+    return None
+
+
+def _image_size(mime: str, head: bytes) -> tuple[int, int] | None:
+    """从文件头解析图片宽高；识别失败返回 None（绝不抛异常，尺寸仅供描述）。"""
+    try:
+        if mime == "image/png" and len(head) >= 24:
+            return (
+                int.from_bytes(head[16:20], "big"),
+                int.from_bytes(head[20:24], "big"),
+            )
+        if mime == "image/gif" and len(head) >= 10:
+            return (
+                int.from_bytes(head[6:8], "little"),
+                int.from_bytes(head[8:10], "little"),
+            )
+        if mime == "image/bmp" and len(head) >= 26:
+            w = int.from_bytes(head[18:22], "little")
+            h = int.from_bytes(head[22:26], "little")
+            return (w, abs(h)) if w else None
+        if mime == "image/jpeg":  # 扫 marker 找 SOFn 段（宽高 BE 各 2 字节）
+            sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+            i, n = 2, len(head)
+            while i + 9 < n:
+                if head[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = head[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:  # 无长度段
+                    i += 2
+                    continue
+                seg_len = int.from_bytes(head[i + 2 : i + 4], "big")
+                if marker in sof:
+                    return (
+                        int.from_bytes(head[i + 7 : i + 9], "big"),
+                        int.from_bytes(head[i + 5 : i + 7], "big"),
+                    )
+                i += 2 + seg_len
+            return None
+        if mime == "image/webp" and len(head) >= 30:
+            fourcc = head[12:16]
+            if fourcc == b"VP8X":  # canvas 尺寸 24bit LE，实际值 = 存储值 + 1
+                return (
+                    int.from_bytes(head[24:27], "little") + 1,
+                    int.from_bytes(head[27:30], "little") + 1,
+                )
+            if fourcc == b"VP8 " and len(head) >= 30:  # lossy 关键帧头 14bit LE
+                return (
+                    int.from_bytes(head[26:28], "little") & 0x3FFF,
+                    int.from_bytes(head[28:30], "little") & 0x3FFF,
+                )
+            if fourcc == b"VP8L" and len(head) >= 25:  # lossless
+                b = head[20:25]
+                w = 1 + (b[1] | ((b[2] & 0x3F) << 8))
+                h = 1 + (((b[2] & 0xC0) >> 6) | (b[3] << 2) | ((b[4] & 0x0F) << 10))
+                return (w, h)
+    except Exception:
+        pass
+    return None
+
+
+def _read_image(p: Path, mime: str, head: bytes) -> str:
+    """图片分支：返回机器可读标记（图片本体由 harness 读文件后按多模态消息注入）。
+    offset/limit 是文本分页概念，对图片无意义，直接忽略。"""
+    size = p.stat().st_size
+    if size > READ_IMAGE_MAX_BYTES:
+        raise ToolError(
+            f"图片过大（{size:,} 字节 > {READ_IMAGE_MAX_BYTES:,} 上限），无法内联发送给模型；"
+            "请先压缩/裁剪该图片再读取"
+        )
+    dim = _image_size(mime, head)
+    dim_txt = f", dim={dim[0]}x{dim[1]}" if dim else ""
+    return (
+        f"[图片已读取: path={p}, mime={mime}, size={size}{dim_txt}]\n"
+        #"图像内容已作为多模态消息附加到本轮对话（offset/limit 不适用于图片）。"
+    )
+
+
+def parse_image_marker(text: str) -> ImageRef | None:
+    """从 read 返回文本解析图片标记；非图片读取结果返回 None。"""
+    m = _IMAGE_MARKER_RE.search(text or "")
+    if m is None:
+        return None
+    w, h = m.group("width"), m.group("height")
+    return ImageRef(
+        path=m.group("path"),
+        mime=m.group("mime"),
+        size=int(m.group("size")),
+        width=int(w) if w else None,
+        height=int(h) if h else None,
+    )
 
 
 # ---------------------------------------------------------------- 内置工具
@@ -155,15 +307,32 @@ class ToolRegistry:
 @tool(
     parameters={
         "path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
-        "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)"},
-        "limit": {"type": "integer", "description": "Maximum number of lines to read"},
+        "offset": {
+            "type": "integer",
+            "description": "Line number to start reading from (1-indexed); text files only, ignored for images",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Maximum number of lines to read; text files only, ignored for images",
+        },
     }
 )
 def read(path: str, offset: int | None = None, limit: int | None = None) -> str:
-    """读取文件内容（不截断）；大文件用 offset（1 起）/ limit 分页读取。"""
+    """读取文件内容（不截断）：文本按 UTF-8 全文或 offset（1 起）/ limit 分页读取；
+    图片（PNG/JPEG/GIF/WebP/BMP）返回图像引用，图像内容会随多模态请求发送给模型，
+    此时 offset/limit 不适用。"""
     p = Path(path)
     if not p.exists():
         raise ToolError(f"文件不存在: {path}")
+    # 图片：先嗅探魔数（避免把大图按 UTF-8 全量解码），命中即走图片分支
+    try:
+        with p.open("rb") as f:
+            head = f.read(_READ_HEAD_BYTES)
+    except OSError as e:
+        raise ToolError(f"无法读取 {path}: {e}")
+    mime = _sniff_mime(head)
+    if mime is not None:
+        return _read_image(p, mime, head)
     try:
         content = p.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -252,7 +421,12 @@ def edit(path: str, edits: list[dict[str, str]]) -> str:
     return f"已替换 {len(edits)} 处: {path}"
 
 
-@tool()
+@tool(
+    parameters={
+        "path": {"type": "string", "description": "Path to the file to write (relative or absolute)"},
+        "content": {"type": "string", "description": "Content to write to the file"},
+    }
+)
 def write(path: str, content: str) -> str:
     """把 content 写入 path，覆盖已有内容并自动创建父目录。"""
     p = Path(path)
@@ -261,23 +435,57 @@ def write(path: str, content: str) -> str:
     return f"已写入 {p}（{len(content)} 字符，{content.count(chr(10)) + 1} 行）"
 
 
-@tool()
-def shell(cmd: str, timeout: int = 120, cwd: str | None = None, limit: int = 200) -> str:
-    """执行 shell 命令，返回 stdout/stderr 与退出码；输出超过 limit 行时全文落盘，只返回指针 + 最后 limit 行（YOLO，无权限确认）。"""
-    if limit <= 0:
-        raise ToolError("limit 必须为正整数")
-    try:
-        r = subprocess.run(
-            cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
+@tool(
+    parameters={
+        "command": {"type": "string", "description": "Shell command to execute"},
+        "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (optional, no default timeout)",
+        },
+    }
+)
+async def shell(
+    command: str,
+    timeout: int | None = None,
+    _on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> str:
+    """执行 shell 命令，返回 stdout/stderr 与退出码（YOLO，无权限确认）。
+
+    async 实现：stdout/stderr 合并逐行读取，每行通过 _on_progress 实时推送
+    （供 TUI 边执行边显示）；被取消（asyncio.CancelledError / 超时）时 kill 子进程。
+    超长输出不做内部截断，交回 harness 由工具级压缩（head+tail 落盘指针）处理。
+    """
+
+    async def _run() -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,  # 合并，保证输出顺序稳定
         )
-    except subprocess.TimeoutExpired:
-        return f"[shell] 命令超过 {timeout}s 超时，可能仍在后台运行：{cmd}"
-    out = (r.stdout or "") + (r.stderr or "")
-    lines = out.splitlines()
-    if len(lines) > limit:
-        path = write_raw(out, "shell")  # 全文落盘（内容 hash 寻址），上下文只留指针 + 最后 limit 行
-        return f"[exit={r.returncode}]\n[shell 输出全文已保存: {path}]\n" + "\n".join(lines[-limit:])
-    return f"[exit={r.returncode}]\n{out}"
+        lines: list[str] = []
+        try:
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace")
+                lines.append(line)
+                if _on_progress is not None:
+                    _on_progress(
+                        {"type": "tool_progress", "name": "shell", "text": line.rstrip()}
+                    )
+            rc = await proc.wait()
+        finally:
+            if proc.returncode is None:  # 异常 / 取消 / 超时时 kill，避免僵尸进程
+                proc.kill()
+                await proc.wait()
+        return rc, "".join(lines)
+
+    try:
+        rc, out = await asyncio.wait_for(_run(), timeout)
+    except asyncio.TimeoutError:
+        return f"[shell] 命令超过 {timeout}s 超时，可能仍在后台运行：{command}"
+    return f"[exit={rc}]\n{out}"
 
 
 def register_builtins(registry: ToolRegistry) -> ToolRegistry:
@@ -288,5 +496,82 @@ def register_builtins(registry: ToolRegistry) -> ToolRegistry:
 
 def default_tools() -> ToolRegistry:
     return register_builtins(ToolRegistry())
+
+
+BUILTIN_TOOLS = ("read", "edit", "write", "shell")
+
+
+def _restricted_shell_tool(allow_cmds: list[str], base: Tool) -> Tool:
+    """受限 shell 工具：command 首词必须命中白名单，否则 ToolError 回给模型修正。
+
+    schema/参数与原 shell 一致（parameters 复用，只读）；description 追加白名单，
+    让模型事先知道边界、少试错；handler 包装校验后转发原实现（含 _on_progress）。
+    """
+    allowed = ", ".join(allow_cmds)
+
+    async def handler(
+        command: str,
+        timeout: int | None = None,
+        _on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        stripped = command.strip()
+        first = stripped.split(None, 1)[0] if stripped else ""
+        if first not in allow_cmds:
+            raise ToolError(
+                f"[shell] 本次仅允许以这些命令开头: {allowed}（收到: {first or '(空命令)'}）"
+            )
+        return await base.handler(command, timeout=timeout, _on_progress=_on_progress)
+
+    return Tool(
+        name="shell",
+        description=base.description + f"\n本次运行仅允许以这些命令开头: {allowed}",
+        parameters=base.parameters,
+        handler=handler,
+    )
+
+
+def tools_from_spec(spec: str | None) -> ToolRegistry:
+    """按 --tools 说明构建可用工具集（无 spec / 空串 → 默认全量）。
+
+    解析优先级：内置工具名 > shell 子命令。
+      - 名字 ∈ 内置（read/edit/write/shell）→ 启用该工具；
+      - 其他名字 → 收集为 shell 允许的子命令白名单，并隐式启用 shell 工具；
+      - 只要出现非内置名，shell 即受限（command 首词须命中白名单）；
+      - 未显式列 shell 且无任何非内置名 → shell 工具禁用。
+
+    示例:
+      "read"                → 仅 read（shell 禁用）
+      "read,shell"          → read + shell（不限子命令）
+      "read,ls,grep,wc"     → read + shell（仅允许 ls/grep/wc）
+      "ls,grep"             → 仅 shell（仅允许 ls/grep）
+    """
+    if not spec or not spec.strip():
+        return default_tools()
+    tokens = [t.strip() for t in spec.split(",") if t.strip()]
+    enabled: set[str] = set()
+    allow_cmds: list[str] = []
+    for t in tokens:
+        if t in BUILTIN_TOOLS:
+            enabled.add(t)
+        elif t not in allow_cmds:
+            allow_cmds.append(t)
+    if not enabled and not allow_cmds:
+        return default_tools()
+    # 全内置且无子命令白名单 = 默认全量
+    if not allow_cmds and enabled == set(BUILTIN_TOOLS):
+        return default_tools()
+
+    names = set(enabled)
+    if allow_cmds:
+        names.add("shell")  # 有子命令白名单 → 隐式启用受限 shell
+    registry = ToolRegistry()
+    for t in (read, edit, write, shell):
+        if t.name not in names:
+            continue
+        if t.name == "shell" and allow_cmds:
+            registry.register(_restricted_shell_tool(allow_cmds, t))
+        else:
+            registry.register(t)
+    return registry
 
 

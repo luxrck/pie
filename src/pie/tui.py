@@ -1,12 +1,16 @@
-"""Textual TUI：pi / tau 风格的聊天界面。非 TTY 或 Textual 缺失时回退 readline。"""
+"""Textual TUI：pi / tau 风格的聊天界面。非 TTY 或 Textual 缺失时回退 readline。
+
+异步架构：回合在 Textual worker（同一事件循环）里 await session.aturn()，
+流式增量（模型 reasoning/content、shell 逐行输出）经 on_event 实时渲染到
+消息流下方的 #stream 区；/stop 通过 asyncio.Event 优雅取消当前回合。
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
-import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -23,14 +27,22 @@ from textual.containers import Horizontal
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
+from textual.worker import Worker
 
 from .chat import Session
+from .config import REASONING_LEVELS, REASONING_NONE
+from .context import content_text
 
 # catppuccin mocha 配色
 # SCREEN_BG = "#1e1e2e"
 # LOG_BG = "#181828"
-SCREEN_BG = "#1a1a24"
-LOG_BG = "#1b1b1b"
+# SCREEN_BG = "#1a1a24"
+# LOG_BG = "#1b1b1b"
+# 背景透明：SCREEN_BG/LOG_BG 用 transparent，配合 on_mount 里的 ansi-dark 主题
+# （ansi-dark 的 background=ansi_default 且 ansi=True → 输出 49 终端默认背景，露出终端窗口色）。
+# 若想用不透明背景，改回 hex 值并去掉 ansi-dark 主题设置即可。
+SCREEN_BG = "transparent"
+LOG_BG = "transparent"
 BODY_TEXT = "#cdd6f4"
 
 # role → 边框颜色（不同 role 用不同颜色区分）
@@ -42,7 +54,10 @@ ROLE_BORDERS: dict[str, str] = {
     "error": "#f38ba8",       # 出错
     "system": "#585b70",      # 命令反馈 / 系统提示（低调灰）
 }
-SELECTION_STYLE = Style(bgcolor="#89b4fa", color="#06121f")  # 鼠标框选高亮
+# 框选/文字选中高亮（#log 鼠标框选与 #input 文字选中共用同一配色）
+SELECTION_BG = "#89b4fa"  # 猫猫蓝背景
+SELECTION_FG = "#06121f"  # 深蓝黑文字
+SELECTION_STYLE = Style(bgcolor=SELECTION_BG, color=SELECTION_FG)
 
 # 命令补全候选：(命令, 说明)
 PALETTE_COMMANDS: list[tuple[str, str]] = [
@@ -54,10 +69,17 @@ PALETTE_COMMANDS: list[tuple[str, str]] = [
     ("/compact turns", "只做轮次级压缩"),
     ("/clear", "归档当前窗口，开新窗口"),
     ("/save", "保存会话（可带文件路径）"),
+    ("/reasoning none", "思考深度: 关闭"),
+    ("/reasoning low", "思考深度: low"),
+    ("/reasoning high", "思考深度: high（默认）"),
+    ("/reasoning max", "思考深度: max"),
     ("/reset", "清空对话历史"),
     ("/exit", "退出"),
     ("/quit", "退出"),
 ]
+
+
+STREAM_MAX_LINES = 8  # #stream 区最多显示的行数（!shell 实时输出）
 
 
 def _box(
@@ -78,7 +100,56 @@ def _box(
     )
 
 
+def _tool_failed_role(text: str) -> str:
+    """工具结果边框 role：执行失败染成 error 红框，其余保持 tool_result。
+
+    判定：shell 返回以 [exit=N] 开头且 N ≠ 0（命令执行失败）；或以工具调用层
+    失败前缀开头（超时 [shell] / [工具错误] / [工具异常] / [参数解析失败]）。
+    """
+    if text.startswith("[exit="):
+        rc = text[6:].split("]", 1)[0]
+        if rc.lstrip("-").isdigit() and rc != "0":
+            return "error"
+    elif text.startswith(("[工具错误]", "[工具异常]", "[参数解析失败]", "[shell] ")):
+        return "error"
+    return "tool_result"
+
+
+def _split_shell_exit(text: str) -> tuple[str | None, str]:
+    """shell 工具返回文本：解析首行 [exit=N] → (code, 去掉首行后的正文)。
+
+    非 shell 文本（read/edit/write 结果、[工具错误] 等失败前缀、取消文本）原样
+    返回 (None, text)，由调用方按普通工具结果渲染。
+    """
+    if text.startswith("[exit="):
+        code = text[6:].split("]", 1)[0]
+        rest = text.split("\n", 1)[1] if "\n" in text else ""
+        return code, rest
+    return None, text
+
+
+def _shell_result_box(body: str, code: Any) -> tuple[str, str, str]:
+    """按 !shell 结果（_show_shell_result）的样式生成 (title, body, role)：
+    exit code 进标题 `shell [{code}]`，正文不带 [exit=] 头；超长 (>200 行) head/tail
+    截断。agent 回合里 shell 工具的结果与用户直接 !cmd 执行保持同一套视觉。"""
+    lines = body.splitlines()
+    if len(lines) > 200:
+        preview = "\n".join(lines[:100] + ["...[输出过长，已截断]..."] + lines[-50:])
+        title = f"shell [{code}]（共 {len(lines)} 行，显示前 100 后 50）"
+    else:
+        preview = body
+        title = f"shell [{code}]" if body else f"shell [{code}]（无输出）"
+    if str(code) == "0":
+        role = "tool_result"
+    elif code == "cancelled":
+        role = "system"  # 用户主动 /stop，非错误，低调灰
+    else:  # 非 0 退出码 / 超时 / 异常 → 红框
+        role = "error"
+    return title, preview or "(无输出)", role
+
+
 class CommandPalette(Static):
+    # background: #1e1e2e;
     """/ 命令补全候选面板：输入以 / 开头时显示，位于输入框上方。"""
 
     DEFAULT_CSS = """
@@ -86,7 +157,7 @@ class CommandPalette(Static):
         height: auto;
         max-height: 10;
         border: round #45475a;
-        background: #1e1e2e;
+        background: transparent;
         color: #cdd6f4;
         padding: 0 1;
         display: none;
@@ -311,7 +382,7 @@ class SelectableRichLog(RichLog):
 
 
 class PieApp(App):
-    """聊天主界面：Header + 消息流 + 状态栏 + 补全面板 + 底部输入。"""
+    """聊天主界面：Header + 消息流 + 流式区 + 状态栏 + 补全面板 + 底部输入。"""
 
     TITLE = "pie"
     CSS = f"""
@@ -321,6 +392,25 @@ class PieApp(App):
         border: round #313244;
         padding: 0 1;
         background: {LOG_BG};
+        /* 滚动条：窄（1 cell）+ 半透明灰轨道 + 亮灰滑块，替换默认的 2 cell 黑底蓝条 */
+        scrollbar-size: 0 1;
+        /* 轨道：带 alpha 的灰。ScrollBar 渲染时若背景 alpha<1 会与父级背景（沿 transparent
+           链最终是终端默认背景色）alpha 混合 → 半透明灰透出终端底色。
+           不要用 {{LOG_BG}}（transparent=全透明，轨道会隐形）。 */
+        scrollbar-background: rgba(108, 112, 134, 0.35);
+        scrollbar-background-hover: rgba(108, 112, 134, 0.5);
+        scrollbar-background-active: rgba(108, 112, 134, 0.5);
+        scrollbar-color: #a6adc8;
+        scrollbar-color-hover: #cdd6f4;
+        scrollbar-color-active: #cdd6f4;
+    }}
+    #stream {{
+        height: auto;
+        max-height: 12;
+        color: #a6adc8;
+        padding: 0 1;
+        display: none;
+        border: none;
     }}
     #meta, #status {{
         height: auto;
@@ -338,6 +428,16 @@ class PieApp(App):
         background: {SCREEN_BG};
         color: {BODY_TEXT};
         border: round #45475a;
+        & .text-area--placeholder {{
+            color: #585b70;
+        }}
+        /* 选中高亮与 #log 鼠标框选统一：覆盖 TextArea 内置的
+           .text-area--selection（ansi 下默认 background: transparent + reverse，
+           与 #log 的 SELECTION_STYLE 不一致）。#input 是 ID 选择器，优先级更高。 */
+        & .text-area--selection {{
+            background: {SELECTION_BG};
+            color: {SELECTION_FG};
+        }}
     }}
     #input:focus {{
         border: round #89b4fa;
@@ -376,13 +476,22 @@ class PieApp(App):
         super().__init__()
         self.session = session
         self.initial_prompt = initial_prompt
-        self._worker: threading.Thread | None = None
-        self._cancel_event: threading.Event | None = None
+        self._turn_worker: Worker | None = None
+        self._shell_worker: Worker | None = None
+        self._cancel_event: asyncio.Event | None = None
         self._palette_index = 0
+        # 流式区状态（当前回合进行中的增量）
+        # 模型 thinking 只维护尾部窗口：Static 不滚动、内容 top 对齐，若把完整
+        # reasoning 塞进去，超过 max-height 的新行全部落在可视区外 → 表现成
+        # “输出几行后就不更新了”。改成增量维护尾部窗口行，与 !shell 一致。
+        self._reasoning_lines: list[str] = []  # 已完成行（尾部窗口，≤ STREAM_MAX_LINES）
+        self._reasoning_tail = ""  # 尚未换行的累积片段（跨 chunk 拼接）
+        self._stream_tool: list[str] = []  # 仅 !shell 模式的逐行实时输出
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        # yield Header()
         yield SelectableRichLog(highlight=True, markup=True, wrap=True, id="log")
+        yield Static("", id="stream")
         yield CommandPalette("", id="palette")
         with Horizontal(id="input-bar"):
             yield PieTextArea(
@@ -394,31 +503,68 @@ class PieApp(App):
             yield Button("▶", id="send-btn", variant="default")
         yield Static("", id="meta")
         yield Static("", id="status")
-        yield Footer()
+        # yield Footer()
 
     def on_mount(self) -> None:
+        # 用 ansi-dark 主题：background=ansi_default + ansi=True（native ANSI），
+        # 背景输出 `49`（终端默认背景）→ 透明，露出终端窗口背景色；
+        # 默认主题 ansi=False 会经 ANSIToTruecolor 把 default 背景映射成主题色（不透明）。
+        self.theme = "ansi-dark"
         log = self.query_one("#log", RichLog)
         if self.session.fs:
             log.write(_box(f"已归档 {len(self.session.fs)} 个历史窗口块（~/.pie/windows/）"))
         self._render_history()
-        self.query_one("#meta", Static).update(
-            f"模型: {self.session.config.model}"
-            f"  |  目录: {Path.cwd()}"
-            f"  |  归档: {len(self.session.fs)}"
-        )
+        self._update_meta()
         self.query_one("#input", PieTextArea).focus()
         send_btn = self.query_one("#send-btn", Button)
         send_btn.can_focus = False  # 右侧按钮不抢焦点，避免干扰输入
         self._update_send_button()
         self._update_status()
+        # 启动预热：后台发一次极小请求（max_tokens=1），把 openai client + HTTPS 连接
+        # 在启动阶段建好，避免首次真实发送阻塞事件循环数秒（WSL 首次建连慢）。
+        self.run_worker(
+            self._prewarm(), group="prewarm", exclusive=False, exit_on_error=False
+        )
         if self.initial_prompt:
             self._submit(self.initial_prompt)
+
+    async def _prewarm(self) -> None:
+        """预热模型连接：极小请求（~几 token，成本可忽略），静默失败不影响后续。
+
+        OpenAILLM 懒创建 AsyncOpenAI/httpx 连接池，首次真实请求在事件循环里
+        同步完成 TLS 握手 + 建连，WSL 下可达 ~6s → UI 冻结。预热后连接池
+        keep-alive 复用，首次发送不再卡。非 OpenAILLM 后端（无 _client）跳过。
+        """
+        llm = getattr(self.session, "llm", None)
+        make_client = getattr(llm, "_client", None)
+        if make_client is None:
+            return
+        try:
+            client = make_client()
+            await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=llm.model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                ),
+                timeout=8,
+            )
+        except Exception:
+            pass  # 预热失败静默：真实请求自带重试，不受影响
+
+    def _update_meta(self) -> None:
+        """顶栏元信息：模型 / 思考深度 / 目录 / 归档窗口数（/reasoning 切换后刷新）。"""
+        self.query_one("#meta", Static).update(
+            f"{self.session.config.model} {self.session.config.reasoning_effort}"
+            f" · {Path.cwd()}"
+            f" | 归档: {len(self.session.fs)}"
+        )
 
     def _update_status(self) -> None:
         rep = self.session.usage_report().splitlines()
         # 跳过“会话文件”行（路径长，不适合状态栏），仍取首/尾两行摘要
         lines = [ln for ln in rep if not ln.startswith("会话文件")]
-        self.query_one("#status", Static).update(f"{lines[0]}\n{lines[-1]}")
+        self.query_one("#status", Static).update(f"{lines[0].split("：", 1)[-1].strip()} | {lines[-1].split("：", 1)[-1].strip()}")
 
     # ---- 历史渲染 ----
 
@@ -433,7 +579,7 @@ class PieApp(App):
             role = d.get("role")
             if role == "system":
                 continue
-            content = d.get("content") or ""
+            content = content_text(d.get("content"))
             if role == "user":
                 log.write(_box(content, title="你", role="user", icon="▎"))
             elif role == "assistant":
@@ -460,22 +606,23 @@ class PieApp(App):
         log.write(_box(arg_txt, title=name, role="tool_call", icon="⚙"))
 
     def _write_tool_result(self, log: RichLog, d: dict) -> None:
-        """渲染一条历史工具结果；超长（>200 行）截断显示 head/tail，避免 resume 一次性撑爆 TUI。"""
+        """渲染一条历史工具结果；超长（>200 行）截断显示 head/tail，避免 resume 一次性撑爆 TUI。
+
+        shell 工具结果（以 [exit=N] 开头）解析 exit code 进标题、正文去掉 [exit=] 头，
+        与 !shell 的 _show_shell_result 展示一致；其余工具原样显示。"""
         content = d.get("content") or ""
         name = d.get("tool_name") or "工具"
-        lines = content.splitlines()
-        if len(lines) > 200:
-            preview = "\n".join(lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:])
-            log.write(
-                _box(
-                    preview,
-                    title=f"{name}（共 {len(lines)} 行，显示前后 50 行）",
-                    role="tool_result",
-                    icon="↳",
-                )
-            )
+        code, body = _split_shell_exit(content)
+        if code is not None:  # shell：标题带 exit code，正文不带 [exit=] 头
+            title, body, role = _shell_result_box(body, code)
         else:
-            log.write(_box(content, title=name, role="tool_result", icon="↳"))
+            title = name
+            role = _tool_failed_role(content)
+            lines = body.splitlines()
+            if len(lines) > 200:
+                body = "\n".join(lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:])
+                title = f"{name}（共 {len(lines)} 行，显示前后 50 行）"
+        log.write(_box(body, title=title, role=role, icon="↳"))
 
     # ---- 命令补全 ----
 
@@ -532,7 +679,7 @@ class PieApp(App):
             btn.label = "▶"
             btn.remove_class("busy")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "send-btn":
             return
         if self._busy():
@@ -541,7 +688,7 @@ class PieApp(App):
             inp = self.query_one("#input", PieTextArea)
             text = inp.text
             if text.strip():
-                self.on_message_submitted(MessageSubmitted(text))
+                await self.on_message_submitted(MessageSubmitted(text))
 
     def _update_input_border(self) -> None:
         """输入以 ! 开头时切换 shell 模式边框（tool_call 橙色），否则恢复正常。"""
@@ -586,7 +733,7 @@ class PieApp(App):
 
     # ---- 消息 ----
 
-    def on_message_submitted(self, event: MessageSubmitted) -> None:
+    async def on_message_submitted(self, event: MessageSubmitted) -> None:
         text = event.text.strip()
         self.query_one("#input", PieTextArea).text = ""
         self._update_input_border()
@@ -600,7 +747,7 @@ class PieApp(App):
             if self._busy():
                 if self._cancelling():
                     # 正在取消收尾：等它结束（cancel 路径很快），避免新旧回合并发写历史
-                    self._worker.join(timeout=2)
+                    await self._turn_worker.wait()  # type: ignore[union-attr]
                     if self._busy():
                         self.query_one("#log", RichLog).write(
                             _box("正在取消中，请稍候…", role="system")
@@ -614,8 +761,11 @@ class PieApp(App):
             self._submit(text)
 
     def _busy(self) -> bool:
-        """是否有 worker 线程正在跑（模型请求 / 工具执行 / shell）。"""
-        return self._worker is not None and self._worker.is_alive()
+        """是否有 worker 正在跑（回合 / shell）。"""
+        for w in (self._turn_worker, self._shell_worker):
+            if w is not None and w.is_running:
+                return True
+        return False
 
     def _cancelling(self) -> bool:
         """正在取消收尾：worker 还活着但已请求取消。"""
@@ -632,13 +782,14 @@ class PieApp(App):
                     self._cancel_event.set()
                     log.write(_box("已请求取消，正在终止…", role="system"))
                 else:
-                    log.write(_box("正在执行 shell，等待其结束", role="system"))
+                    log.write(_box("当前没有正在执行的任务", role="system"))
             else:
                 log.write(_box("当前没有正在执行的任务", role="system"))
         elif cmd == "/help":
             log.write(_box("/exit /quit 退出 | /stop 取消当前模型请求/工具执行（等待期间可继续输入） | "
                            "/reset 清空历史 | /clear 归档并开新窗口 | "
                            "/compact [tools|turns] 手动压缩 | /save [文件] 保存 | "
+                           "/reasoning <none|low|high|max> 思考深度 | "
                            "/status 用量 | /help 帮助 | 鼠标拖动日志可复制文本\n"
                            "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，/stop 可终止）"))
         elif cmd == "/reset":
@@ -670,6 +821,29 @@ class PieApp(App):
             log.write(_box(f"会话已保存: {self.session.file}"))
         elif cmd == "/status":
             log.write(_box(self.session.usage_report()))
+        elif cmd == "/reasoning":
+            level = arg.strip().lower()
+            if level not in REASONING_LEVELS:
+                log.write(
+                    _box(
+                        f"未知思考级别: {level or '(空)'}（可选: {' / '.join(REASONING_LEVELS)}）",
+                        role="error",
+                    )
+                )
+            else:
+                cfg = self.session.config
+                cfg.reasoning_effort = level
+                # 当前 llm 实例立即生效（后续请求即用新深度，无需重启）
+                llm = getattr(self.session, "llm", None)
+                if llm is not None and hasattr(llm, "reasoning_effort"):
+                    llm.reasoning_effort = None if level == REASONING_NONE else level
+                try:
+                    cfg.save(getattr(cfg, "config_file", None))  # 持久化，重启后仍生效
+                    note = "已写入配置"
+                except OSError as e:
+                    note = f"配置写入失败: {e}（仅本次会话生效）"
+                log.write(_box(f"思考深度: {level}（{note}）", role="system"))
+                self._update_meta()
         else:
             log.write(_box(f"未知命令: {cmd}（/help 查看）", role="error"))
         self._update_status()
@@ -680,6 +854,48 @@ class PieApp(App):
         except OSError:
             pass
 
+    # ---- 流式区（#stream）：模型生成中 / 工具执行中的实时输出 ----
+
+    def _render_stream(self) -> None:
+        """#stream：模型回合只流式显示 reasoning；!shell 模式显示逐行输出。
+        reasoning / shell 行都是外部文本，用 Text 按字面渲染（不走 markup 解析，
+        避免 `[xxx=...]` 片段触发 MarkupError）。正文与 agent 工具输出不进 stream。
+        """
+        stream = self.query_one("#stream", Static)
+        if self._reasoning_lines or self._reasoning_tail:
+            shown = list(self._reasoning_lines)
+            if self._reasoning_tail:
+                shown.append(self._reasoning_tail)
+            stream.update(Text("\n".join(shown), style="dim"))
+            stream.display = True
+        elif self._shell_worker is not None and self._stream_tool:
+            shown = self._stream_tool[-STREAM_MAX_LINES:]
+            stream.update(Text("\n".join(shown)))
+            stream.display = True
+        else:
+            stream.update("")
+            stream.display = False
+
+    def _push_reasoning(self, delta: str) -> None:
+        """增量维护 reasoning 尾部行窗口：跨 chunk 拼接未换行的片段，
+        只保留最后 STREAM_MAX_LINES 行供 #stream 渲染（避免超大 Text 全量重绘）。"""
+        if not delta:
+            return
+        text = (self._reasoning_tail + delta).replace("\r", "")
+        lines = text.split("\n")
+        self._reasoning_tail = lines.pop()  # 无换行结尾的片段留到下一个 chunk
+        if lines:
+            self._reasoning_lines.extend(lines)
+            over = len(self._reasoning_lines) - STREAM_MAX_LINES
+            if over > 0:
+                del self._reasoning_lines[:over]
+
+    def _clear_stream(self) -> None:
+        self._reasoning_lines.clear()
+        self._reasoning_tail = ""
+        self._stream_tool.clear()
+        self._render_stream()
+
     # ---- shell 模式（! 前缀）：直接执行，不经过 LLM、不进会话上下文 ----
 
     def _run_shell(self, cmd: str) -> None:
@@ -688,48 +904,57 @@ class PieApp(App):
         self.query_one("#log", RichLog).write(
             _box(f"$ {cmd}", title="shell", role="tool_call", icon="⚙")
         )
-        self._cancel_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._exec_shell, args=(cmd, self._cancel_event), daemon=True
+        self._cancel_event = asyncio.Event()
+        self._shell_worker = self.run_worker(
+            self._exec_shell_async(cmd), group="shell", exclusive=True, exit_on_error=False
         )
-        self._worker.start()
         self._update_send_button()
 
-    def _exec_shell(self, cmd: str, cancel_event: threading.Event) -> None:
-        """Popen 轮询执行：/stop 时 kill 整个进程组并返回“用户手动终止”；保留 120s 超时。"""
+    async def _exec_shell_async(self, cmd: str) -> None:
+        """asyncio 子进程逐行执行：/stop 时 kill 整个进程组；保留 120s 超时。
+        每行输出经 tool_progress 实时显示到 #stream。"""
+        lines: list[str] = []
+        code: Any = 0
         try:
-            proc = subprocess.Popen(
+            proc = await asyncio.create_subprocess_shell(
                 cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,  # 独立进程组，取消时可 killpg 连子进程一起杀
             )
-            start = time.monotonic()
-            while proc.poll() is None:
-                if cancel_event.is_set():
+            started = time.monotonic()
+            timed_out = False
+            cancelled = False
+            while True:
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    cancelled = True
                     self._kill_proc(proc)
-                    out, _ = proc.communicate()
-                    code = "cancelled"
-                    self.call_from_thread(self._show_shell_result, cmd, out, code)
-                    return
-                if time.monotonic() - start > 120:
+                    break
+                if time.monotonic() - started > 120:
+                    timed_out = True
                     self._kill_proc(proc)
-                    out, _ = proc.communicate()
-                    code = "timeout(120s)"
-                    self.call_from_thread(self._show_shell_result, cmd, out, code)
-                    return
-                time.sleep(0.05)
-            out, _ = proc.communicate()
-            code = proc.returncode
-        except Exception as e:  # 兜底：异常显示为红色盒子
+                    break
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), 0.2)
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    break
+                line = line.decode("utf-8", errors="replace")
+                lines.append(line)
+                self._append_event(
+                    {"type": "tool_progress", "name": "shell", "text": line.rstrip()}
+                )
+            rc = await proc.wait()
+            code = "cancelled" if cancelled else ("timeout(120s)" if timed_out else rc)
+            out = "".join(lines)
+        except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
             out = f"{type(e).__name__}: {e}"
             code = "error"
-        self.call_from_thread(self._show_shell_result, cmd, out, code)
+        self._show_shell_result(cmd, out, code)
 
     @staticmethod
-    def _kill_proc(proc: subprocess.Popen) -> None:
+    def _kill_proc(proc: asyncio.subprocess.Process) -> None:
         """杀整个进程组（含 shell 的子命令），失败时退回杀 shell 本身。"""
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -743,47 +968,54 @@ class PieApp(App):
         log = self.query_one("#log", RichLog)
         if code == "cancelled":
             out = (out.rstrip() + "\n[用户手动终止]").strip()
-        lines = out.splitlines()
-        if len(lines) > 200:
-            preview = "\n".join(lines[:100] + ["...[输出过长，已截断]..."] + lines[-50:])
-            body = preview
-            title = f"shell [{code}]（共 {len(lines)} 行，显示前 100 后 50）"
-        else:
-            body = out
-            title = f"shell [{code}]" if out else f"shell [{code}]（无输出）"
-        log.write(_box(body or "(无输出)", title=title, role="tool_result", icon="↳"))
+        title, body, result_role = _shell_result_box(out, code)
+        log.write(_box(body, title=title, role=result_role, icon="↳"))
         self._cancel_event = None
-        self._worker = None
+        self._shell_worker = None
+        self._clear_stream()
         self.query_one("#input", PieTextArea).focus()
         self._update_send_button()
+
+    # ---- 回合（Textual worker 内 await session.aturn） ----
 
     def _submit(self, text: str) -> None:
         self.query_one("#log", RichLog).write(
             _box(text, title="你", role="user", icon="▎")
         )
         # 输入框保持可用：等待期间用户仍可输入 /stop 取消当前回合
-        self._cancel_event = threading.Event()
-        self._worker = threading.Thread(target=self._run_turn, args=(text,), daemon=True)
-        self._worker.start()
+        self._cancel_event = asyncio.Event()
+        self._clear_stream()
+        self._turn_worker = self.run_worker(
+            self._run_turn(text), group="turn", exclusive=True, exit_on_error=False
+        )
         self._update_send_button()
 
-    def _run_turn(self, text: str) -> None:
-        def on_event(ev: dict[str, Any]) -> None:
-            self.call_from_thread(self._append_event, ev)
-
+    async def _run_turn(self, text: str) -> None:
         try:
-            answer = self.session.turn(
-                text, on_event=on_event, cancel_event=self._cancel_event
+            answer = await self.session.aturn(
+                text, on_event=self._append_event, cancel_event=self._cancel_event
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
-            self.call_from_thread(self._fail_turn, e)
+            self._fail_turn(e)
             return
-        self.call_from_thread(self._finish_turn, answer)
+        self._finish_turn(answer)
 
     def _append_event(self, ev: dict[str, Any]) -> None:
+        """回合事件回调：worker 与 UI 同事件循环，直接更新组件（无需跨线程）。"""
         log = self.query_one("#log", RichLog)
         ev_type = ev.get("type")
-        if ev_type == "tool_call":
+        if ev_type == "reasoning_delta":
+            self._push_reasoning(ev.get("text", ""))
+            self._render_stream()
+        elif ev_type == "content_delta":
+            pass  # 正文不进 #stream（回合结束由 answer 盒子一次性固化）
+        elif ev_type == "tool_progress":
+            self._stream_tool.append(ev.get("text", ""))
+            if self._shell_worker is not None:  # 仅 !shell 模式实时显示（模型回合不用）
+                self._render_stream()
+        elif ev_type == "tool_call":
             args = ev.get("arguments", {})
             try:
                 arg_txt = json.dumps(args, ensure_ascii=False) if args else "(无参数)"
@@ -793,35 +1025,44 @@ class PieApp(App):
                 _box(arg_txt, title=ev.get("name", "工具"), role="tool_call", icon="⚙")
             )
         elif ev_type == "tool_result":
-            log.write(
-                _box(ev.get("text", ""), title=ev.get("name", "工具"), role="tool_result", icon="↳")
-            )
+            text = ev.get("text", "")
+            code, body = _split_shell_exit(text)
+            if code is not None:  # shell 结果：样式与 !shell（_show_shell_result）一致
+                title, body, role = _shell_result_box(body, code)
+            else:
+                title = ev.get("name", "工具")
+                role = _tool_failed_role(text)
+            log.write(_box(body, title=title, role=role, icon="↳"))
+            self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
-            log.write(_box(ev.get("text", ""), title="pie", role="assistant", icon="▎"))
+            text = ev.get("text", "")
+            # 正文不在 #stream 实时显示：直接固化最终内容为 log 盒子
+            log.write(_box(text, title="pie", role="assistant", icon="▎"))
+            self._clear_stream()
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:
         log = self.query_one("#log", RichLog)
         log.write(_box(f"{type(exc).__name__}: {exc}", title="出错", role="error", icon="✗"))
         self._cancel_event = None
-        self._worker = None
+        self._turn_worker = None
+        self._clear_stream()
         self.query_one("#input", PieTextArea).focus()
         self._update_status()
         self._update_send_button()
 
     def _finish_turn(self, answer: str) -> None:
         self._cancel_event = None
-        self._worker = None
+        self._turn_worker = None
         self._safe_save()
         self._update_status()
         self._update_send_button()
 
     def on_unmount(self) -> None:
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=5)
+        for w in (self._turn_worker, self._shell_worker):
+            if w is not None and w.is_running:
+                w.cancel()
 
 
 def run_tui(session: Session, initial_prompt: str | None = None) -> None:
     PieApp(session, initial_prompt).run()
-
-

@@ -1,12 +1,13 @@
-"""上下文管理：AgentMessage/ModelMessage 容器 + 分级压缩 + 全文落盘。
+"""上下文管理：AgentMessage 容器（扁平叶子列表）+ 分级压缩 + 全文落盘。
 
 信息不删除只换表示：压缩时全文写入 ~/.pie/context/<前缀>-<hash>.txt，
 消息自描述（raw_path/raw_hash/raw_len/raw_tokens）。压缩级别只升不降：
   0=原始 1=工具级（文本落盘） 2=轮次级（整轮摘要） 3=会话级（旧区指针）
 
 容器：
-  AgentMessage  整场对话：[SystemMessage, UserMessage, ModelMessage, ...]
-  ModelMessage  一轮内系统（LLM、工具）返回的所有消息
+  AgentMessage  整场对话：扁平叶子列表 [SystemMessage, UserMessage, ...]，
+                轮次边界由 UserMessage 隐式表达（一个 User 及其后的
+                assistant/tool 叶子构成一轮）
 叶子：SystemMessage / UserMessage / AssistantMessage / ToolMessage
 """
 
@@ -29,6 +30,52 @@ WINDOWS_DIR = PIE_DIR / "windows"  # fs 历史窗口块（在 context/ 外，GC 
 _SHELL_SPILL_RE = re.compile(r"\[shell 输出全文已保存: ([^\]]+)\]")
 _POINTER_RE = re.compile(r"\[(?:会话原文|轮次原文|工具输出全文)已保存: ([^\]]+)\]")
 WINDOW_SUMMARY_MARKER = "[历史窗口:"
+
+
+def content_text(content: Any) -> str:
+    """把消息 content 归一为可读文本：纯文本原样；多模态 parts（list）拼 text 片段、
+    图片 part 用占位符表示（供摘要/标题/TUI 显示，data URI 不进人读文本）。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "text":
+                parts.append(str(part.get("text") or ""))
+            elif t == "image_url":
+                parts.append("[图片]")
+        return "\n".join(x for x in parts if x)
+    return ""
+
+
+def _image_token_estimate(url: str) -> int:
+    """图片 part 的 token 估算：data URI 按 base64 负载量粗略估计（普通图 ~1-4K），
+    封顶防失真；外部 URL 无法估算取常见中间值。真实值以 provider 上报为准。"""
+    if url.startswith("data:"):
+        return min(12000, 800 + len(url) // 256)
+    return 2000
+
+
+def _content_tokens(content: Any) -> int:
+    """content 的 token 估算：str 按字符/4；多模态 parts 逐段算（text 按字符，image 按图像估算）。"""
+    if isinstance(content, str):
+        return len(content) // 4
+    if isinstance(content, list):
+        n = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "image_url":
+                url = (part.get("image_url") or {}).get("url") or ""
+                n += _image_token_estimate(url)
+            elif t == "text":
+                n += len(str(part.get("text") or "")) // 4
+        return n
+    return 0
 
 
 # ---------------------------------------------------------------- 落盘与工具函数
@@ -97,14 +144,14 @@ def summarize_turns(dicts: list[dict[str, Any]], head: int, tail: int) -> str:
     final: str | None = None
     for d in dicts:
         role = d.get("role")
-        if role == "user":
+        if role == "user" and not d.get("synthetic"):  # 图片消息（synthetic）不是轮次
             if q is not None:
                 turns.append((q, final or ""))
-            q = d.get("content") or ""
+            q = content_text(d.get("content") or "") or "[图片输入]"
             final = None
         elif role == "assistant" and q is not None and not d.get("tool_calls"):
             if d.get("content"):
-                final = d["content"]
+                final = content_text(d["content"])
     if q is not None:
         turns.append((q, final or ""))
     head = max(0, int(head or 0))
@@ -152,10 +199,10 @@ def build_window_summary(path: Path, head: int, tail: int) -> str:
 
 @dataclass
 class Message:
-    """叶子消息：System/User/Assistant/Tool 的公共基类。"""
+    """叶子消息：System/User/Assistant/Tool/Image 的公共基类。"""
 
     role: str
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     compress_level: int = 0  # 0=原始 1=工具级 2=轮次级 3=会话级（只升不降）
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -165,9 +212,11 @@ class Message:
     raw_hash: str | None = None
     raw_len: int | None = None  # 原始文本长度（压缩前），tokens() 比例估算用
     raw_tokens: int | None = None  # 原始 token 估算（压缩时 raw_len//4）
+    synthetic: bool = False  # 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数
 
     def to_api(self) -> dict[str, Any]:
-        """转成 OpenAI 兼容的消息 dict（去掉内部压缩元数据）。"""
+        """转成 OpenAI 兼容的消息 dict（去掉内部压缩元数据）。
+        content 为多模态 parts（list）时原样透传（如 ImageMessage 的图片 user 消息）。"""
         if self.role == "tool":
             return {
                 "role": "tool",
@@ -194,6 +243,7 @@ class Message:
             "role": self.role,
             "content": self.content,
             "compress_level": self.compress_level,
+            "cls": type(self).__name__,
         }
         for key in (
             "tool_call_id",
@@ -208,18 +258,22 @@ class Message:
             value = getattr(self, key)
             if value is not None:
                 d[key] = value
+        if self.synthetic:  # 只在 True 时写出（False 默认省略，保持旧文件干净）
+            d["synthetic"] = True
         return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Message":
-        """按 role 还原子类；兼容无子类字段的纯 API dict。"""
-        ctor = {
+        """按 cls（新格式）/ role（旧格式兼容）还原子类。"""
+        ctor = _MESSAGE_CLASSES.get(d.get("cls")) or {
             "system": SystemMessage,
             "user": UserMessage,
             "assistant": AssistantMessage,
             "tool": ToolMessage,
         }.get(d.get("role", "assistant"), AssistantMessage)
         kwargs = {f.name: d.get(f.name) for f in fields(Message) if f.name != "role"}
+        if kwargs.get("synthetic") is None:  # 旧文件无该字段 → 默认 False
+            kwargs["synthetic"] = False
         return ctor(**kwargs)
 
     def compact(self, **kwargs: Any) -> Any:
@@ -227,16 +281,25 @@ class Message:
         return 0
 
     def tokens(self) -> int:
-        """token 估算：压缩过的消息用（当前长度/原始长度 × 原始 tokens）比例。"""
+        """token 估算：压缩过的消息用（当前长度/原始长度 × 原始 tokens）比例；
+        多模态 parts 按 text 字符 + 图片估算分别计。"""
         if self.raw_len and self.raw_tokens is not None and self.compress_level >= 1:
-            cur = len(self.content or "")
+            cur = _content_tokens(self.content)
             return max(1, round(cur / max(1, self.raw_len) * self.raw_tokens))
-        n = len(self.content or "") // 4 + 12
+        n = _content_tokens(self.content) + 12
         if self.tool_calls:
             n += len(json.dumps(self.tool_calls, ensure_ascii=False)) // 4
         if self.reasoning_content:
             n += len(self.reasoning_content) // 4
         return n
+
+    def __str__(self) -> str:
+        """日志/显示用：content 为多模态 parts 时输出可读文本，避免 data URI 淹没。"""
+        if self.role == "tool":
+            return f"<Tool {self.tool_name} {self.tool_call_id}>"
+        if self.tool_calls:
+            return f"<Assistant tool_calls={[tc.get('function', {}).get('name') for tc in self.tool_calls]}>"
+        return f"<{type(self).__name__} {content_text(self.content)[:80]}>"
 
     def _set_raw(self, path: Path, blob: str) -> None:
         self.raw_path = str(path)
@@ -253,9 +316,24 @@ class SystemMessage(Message):
 
 
 class UserMessage(Message):
-    """用户消息，不可压缩。"""
+    """用户消息，不可压缩；真实轮次边界（role=user）。"""
 
     def __init__(self, content: str | None = None, **kwargs: Any) -> None:
+        super().__init__(role="user", content=content, **kwargs)
+
+
+class ImageMessage(Message):
+    """图片消息：把工具读取的图片作为多模态 user 内容注入（模型“看”图的载体，synthetic）。
+
+    不是 UserMessage 子类 → 不构成轮次边界，不影响轮次级/会话级压缩的轮次认定、
+    轮数统计与标题提取；可随所在轮次/窗口一起被压缩落盘（原始 data URI 保留在
+    raw 文件里，full_history 可恢复）。role 为 user：OpenAI 兼容 API 要求图片只能
+    出现在 user 消息的 content parts。
+    content = [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {"url": "data:..."}}]
+    """
+
+    def __init__(self, content: list[dict[str, Any]] | None = None, **kwargs: Any) -> None:
+        kwargs.setdefault("synthetic", True)  # 图片恒为注入消息（from_dict 还原时用存档值）
         super().__init__(role="user", content=content, **kwargs)
 
 
@@ -330,94 +408,25 @@ class ToolMessage(Message):
 # ---------------------------------------------------------------- 容器
 
 
-class ModelMessage:
-    """一轮内系统（LLM、工具）返回的所有消息容器，可压缩。"""
-
-    def __init__(self, messages: Iterable[Message] | None = None) -> None:
-        self.messages: list[Message] = list(messages or [])
-
-    def __len__(self) -> int:
-        return len(self.messages)
-
-    def __iter__(self) -> Iterable[Message]:
-        return iter(self.messages)
-
-    def __getitem__(self, i: int | slice) -> Any:
-        if isinstance(i, slice):
-            return ModelMessage(self.messages[i])
-        return self.messages[i]
-
-    def __add__(self, other: Any) -> "ModelMessage":
-        return ModelMessage(self.messages + list(other))
-
-    def append(self, m: Message) -> None:
-        self.messages.append(m)
-
-    def tokens(self) -> int:
-        return sum(m.tokens() for m in self.messages)
-
-    def to_api(self) -> list[dict[str, Any]]:
-        return [m.to_api() for m in self.messages]
-
-    def compact(
-        self,
-        *,
-        tools: bool = False,
-        turns: bool = False,
-        tool_cfg: Any = None,
-        turn_cfg: Any = None,
-        manifest: Path | None = None,
-    ) -> Any:
-        if tools:
-            for m in self.messages:
-                if isinstance(m, ToolMessage):
-                    m.compact(tool_cfg=tool_cfg, manifest=manifest)
-            return self
-        if turns:
-            return self._compact_turn(turn_cfg, manifest)
-        return self
-
-    def _compact_turn(self, turn_cfg: Any, manifest: Path | None) -> AssistantMessage:
-        """轮次级（规则式）：整轮压成摘要 assistant（user 保留在 AgentMessage 中）+ 指针；
-        保留 head/tail 消息概览，中间省略部分显式标注（对齐工具级压缩）。"""
-        raw = json.dumps([m.to_dict() for m in self.messages], ensure_ascii=False, indent=1)
-        path = write_raw(raw, "turn")
-        total = len(self.messages)
-        head = max(0, int(turn_cfg.head))
-        tail = max(0, int(turn_cfg.tail))
-        if tail and head + tail < total:
-            preview = [_turn_preview(m) for m in self.messages[:head]]
-            preview.append(f"...[中间省略 {total - head - tail} 条消息]...")
-            preview += [_turn_preview(m) for m in self.messages[-tail:]]
-        else:
-            preview = [_turn_preview(m) for m in self.messages]
-        body = "\n".join(preview) if preview else "[该轮次无最终文本，原文已保存]"
-        if manifest is not None:
-            write_manifest(
-                manifest,
-                {
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                    "level": 2,
-                    "kind": "turn",
-                    "raw_path": str(path),
-                    "raw_hash": content_hash(raw),
-                    "summary": body[:200],
-                },
-            )
-        msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n{body}", compress_level=2)
-        msg._set_raw(path, raw)
-        return msg
+_MESSAGE_CLASSES: dict[str, type] = {
+    "SystemMessage": SystemMessage,
+    "UserMessage": UserMessage,
+    "ImageMessage": ImageMessage,
+    "AssistantMessage": AssistantMessage,
+    "ToolMessage": ToolMessage,
+}
 
 
 class AgentMessage:
-    """整场对话容器：[SystemMessage, UserMessage, ModelMessage, ...]"""
+    """整场对话容器：扁平叶子列表 [SystemMessage, UserMessage, AssistantMessage, ToolMessage, ...]，
+    轮次边界由 UserMessage 隐式表达（一个 User 及其后的 assistant/tool 叶子构成一轮）。"""
 
     def __init__(
         self,
-        messages: Iterable[Any] | None = None,
+        messages: Iterable[Message] | None = None,
         keep_last_steps: int = 5,
     ) -> None:
-        self.messages: list[Any] = list(messages or [])
+        self.messages: list[Message] = list(messages or [])
         self.keep_last_steps = max(1, int(keep_last_steps))
         self.compact_counts: dict[str, Any] = {"turns": 0, "tools": 0, "session": False}
         self.last_api_tokens: int | None = None  # provider 上报的最近一次 prompt_tokens
@@ -427,7 +436,7 @@ class AgentMessage:
     def __len__(self) -> int:
         return len(self.messages)
 
-    def __iter__(self) -> Iterable[Any]:
+    def __iter__(self) -> Iterable[Message]:
         return iter(self.messages)
 
     def __getitem__(self, i: int | slice) -> Any:
@@ -442,27 +451,15 @@ class AgentMessage:
 
     @staticmethod
     def from_flat(dicts: list[dict[str, Any]], keep_last_steps: int = 5) -> "AgentMessage":
-        """从扁平消息 dict 列表重建容器：assistant/tool 归入 ModelMessage。"""
-        agent = AgentMessage(keep_last_steps=keep_last_steps)
-        for d in dicts:
-            m = Message.from_dict(d)
-            if isinstance(m, (AssistantMessage, ToolMessage)):
-                if not agent.messages or not isinstance(agent.messages[-1], ModelMessage):
-                    agent.messages.append(ModelMessage())
-                agent.messages[-1].append(m)
-            else:
-                agent.messages.append(m)
-        return agent
+        """从扁平消息 dict 列表重建容器：叶子直存，轮次由 UserMessage 隐式表达。"""
+        return AgentMessage(
+            [Message.from_dict(d) for d in dicts], keep_last_steps=keep_last_steps
+        )
 
     def add(self, m: Message) -> None:
-        """追加消息：assistant/tool 进当前 ModelMessage（无则新建），user/system 直接追加。"""
+        """追加叶子消息（assistant/tool/user/system 一律直存）。"""
         self.dirty = True
-        if isinstance(m, (AssistantMessage, ToolMessage)):
-            if not self.messages or not isinstance(self.messages[-1], ModelMessage):
-                self.messages.append(ModelMessage())
-            self.messages[-1].append(m)
-        else:
-            self.messages.append(m)
+        self.messages.append(m)
 
     def tokens(self) -> int:
         if self.last_api_tokens is not None and not self.compacted_since_api and not self.dirty:
@@ -470,13 +467,7 @@ class AgentMessage:
         return sum(e.tokens() for e in self.messages)
 
     def to_api(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for e in self.messages:
-            if isinstance(e, ModelMessage):
-                out.extend(e.to_api())
-            else:
-                out.append(e.to_api())
-        return out
+        return [m.to_api() for m in self.messages]
 
     def compact(
         self,
@@ -503,7 +494,7 @@ class AgentMessage:
         """工具级压缩：保护最近 keep_last_steps 个 step 批次（跨轮次滚动，
         每批 = 一次 assistant(tool_calls) + 其后的 tool 结果），窗口外的
         未压缩 ToolMessage（从最老开始）全文落盘成指针。"""
-        flat = flatten_messages(self.messages)
+        flat = self.messages
         protected = _protected_step_tool_indices(flat, self.keep_last_steps)
         n = 0
         for i, m in enumerate(flat):
@@ -518,21 +509,80 @@ class AgentMessage:
     def _compact_turns(
         self, turn_cfg: Any, target: int | None, manifest: Path | None
     ) -> "AgentMessage":
-        """从最老开始压缩已完成的 ModelMessage（最后一个为进行中，不压），直到低于目标。"""
+        """从最老开始压缩已完成的轮次（最后一个 UserMessage 之后为进行中，不压），
+        直到低于目标或无可压缩。每轮 = [UserMessage, assistant/tool 叶子...]，
+        user 保留、其后的叶子替换为摘要 assistant。
+        循环上限 = 已完成轮次数 + 1：每次迭代要么压掉一个轮次（压缩过的轮不再
+        可压），要么 break，结构上保证不会死循环。"""
+        completed = max(
+            0,
+            sum(1 for e in self.messages if isinstance(e, UserMessage)) - 1,
+        )
         count = 0
-        idx = 0
-        while idx < len(self.messages):
+        for _ in range(completed + 1):
             if target is not None and self.tokens() <= target:
                 break
-            e = self.messages[idx]
-            if isinstance(e, ModelMessage) and idx != len(self.messages) - 1:
-                self.messages[idx] = e.compact(turns=True, turn_cfg=turn_cfg, manifest=manifest)
-                count += 1
-            idx += 1
+            # 每次重扫索引：切片替换会漂移后续元素位置，预计算索引会误压进行中轮次
+            user_idxs = [i for i, e in enumerate(self.messages) if isinstance(e, UserMessage)]
+            victim: tuple[int, int] | None = None
+            for k in range(len(user_idxs) - 1):  # 最后一个 user 之后 = 进行中，不压
+                u, end = user_idxs[k], user_idxs[k + 1]
+                span = self.messages[u + 1:end]
+                if not span:  # 连续 user，无内容
+                    continue
+                if all(
+                    isinstance(m, AssistantMessage) and m.compress_level >= 2 for m in span
+                ):  # 已轮次级压缩过 → 跳过
+                    continue
+                victim = (u, end)
+                break
+            if victim is None:  # 无可压缩轮次
+                break
+            u, end = victim
+            span = self.messages[u + 1:end]
+            self.messages[u + 1:end] = [
+                self._compact_turn_span(span, manifest)
+            ]
+            count += 1
         self.compact_counts["turns"] = count
         if count:
             self.compacted_since_api = True
         return self
+
+    def _compact_turn_span(
+        self,
+        span: list[Message],
+        manifest: Path | None,
+    ) -> AssistantMessage:
+        """轮次级（规则式）：把一轮的 assistant/tool 叶子压成摘要 assistant
+        （user 保留在 AgentMessage 中，不重复写入摘要）+ 指针；摘要只保留
+        该轮次的模型最终输出（pie: ...），中间过程被省略时显式标注。"""
+        raw = json.dumps([m.to_dict() for m in span], ensure_ascii=False, indent=1)
+        path = write_raw(raw, "turn")
+        final = ""  # 模型最终输出 = 最后一个有文本的 assistant 回复
+        for m in span:
+            if isinstance(m, AssistantMessage) and m.content:
+                final = m.content
+        lines: list[str] = []
+        if len(span) > 1:  # 存在中间过程（工具调用等）→ 显式省略标注
+            lines.append("...[中间过程省略]...")
+        lines.append(f"{final}" if final else "[该轮次无最终文本，原文已保存]")
+        body = "\n".join(lines)
+        if manifest is not None:
+            write_manifest(
+                manifest,
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "level": 2,
+                    "kind": "turn",
+                    "raw_path": str(path),
+                    "raw_hash": content_hash(raw),
+                    "summary": body[:200],
+                },
+            )
+        msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n{body}", compress_level=2)
+        msg._set_raw(path, raw)
+        return msg
 
     def _compact_session(
         self, session_cfg: Any, manifest: Path | None, fs: list[Path] | None
@@ -561,8 +611,7 @@ class AgentMessage:
         if not old:
             self.compact_counts["session"] = False
             return self
-        flat = flatten_messages(old)
-        raw = json.dumps([m.to_dict() for m in flat], ensure_ascii=False, indent=1)
+        raw = json.dumps([m.to_dict() for m in old], ensure_ascii=False, indent=1)
         path = write_raw(raw, "session")
         if fs is not None:
             fs.append(path)
@@ -586,17 +635,6 @@ class AgentMessage:
         self.compacted_since_api = True
         self.compact_counts["session"] = True
         return self
-
-
-def flatten_messages(elements: Iterable[Any]) -> list[Message]:
-    """把容器元素（Message / ModelMessage）展平成叶子消息列表。"""
-    out: list[Message] = []
-    for e in elements:
-        if isinstance(e, ModelMessage):
-            out.extend(e.messages)
-        else:
-            out.append(e)
-    return out
 
 
 def _step_batches(flat: list[Message]) -> list[tuple[int, int]]:
@@ -625,22 +663,6 @@ def _protected_step_tool_indices(flat: list[Message], keep: int) -> set[int]:
             if isinstance(flat[i], ToolMessage):
                 protected.add(i)
     return protected
-
-
-def _turn_preview(m: Message, max_chars: int = 120) -> str:
-    """单条消息的概览行（轮次级摘要用）：tool 显示工具名+内容，assistant 显示文本或工具调用。"""
-    if isinstance(m, ToolMessage):
-        name = m.tool_name or "tool"
-        text = (m.content or "").replace("\n", " ").strip()
-        return f"tool({name}): {text[:max_chars]}"
-    if isinstance(m, AssistantMessage):
-        if m.content:
-            return f"assistant: {m.content.replace(chr(10), ' ').strip()[:max_chars]}"
-        calls = m.tool_calls or []
-        names = [c.get("function", {}).get("name", "?") for c in calls]
-        return f"assistant: 调用工具 {', '.join(names)}"
-    text = (m.content or "").replace("\n", " ").strip()
-    return f"{m.role}: {text[:max_chars]}"
 
 
 def message_raw_path(m: Message) -> Path | None:
@@ -685,7 +707,7 @@ def maybe_compact(
     session_cfg = cfg.compaction.session
     if tool_cfg is not None:
         agent.compact(tools=True, tool_cfg=tool_cfg, manifest=manifest)
-    if turn_cfg is not None and agent.tokens() > target:
+    if turn_cfg and agent.tokens() > target:
         agent.compact(turns=True, turn_cfg=turn_cfg, target=target, manifest=manifest)
     if session_cfg is not None and agent.tokens() > target:
         agent.compact(session=True, session_cfg=session_cfg, manifest=manifest, fs=fs)
