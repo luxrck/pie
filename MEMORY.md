@@ -106,6 +106,8 @@ echo "还原完成: $SRC"
 - 2026-09-01（再再再再修订）：**busy 边框提亮为亮红**——用户反馈暗红边框不醒目；busy 边框 `#f38ba8`（error 色）/ busy:hover 边框 `#ffb4c8`（更亮），文字同步，背景仍透明。
 - 2026-08-31：修正工具级/step 级语义——工具级压缩只压缩 tool 返回文本（内容落盘成指针，消息保留，绝不删除）；当前轮 step 压缩改为内容级（spill_turn_tool_results），整批删除的 compress_step_batches 已移除；stats 字段 spilled 改名为 tools。
 - 2026-08-31：压缩指针写入消息自身字段（Message.raw_path / raw_hash）——消息自描述，full_history() 按消息顺序精确重建；referenced_raw_paths() 同时扫 manifest 与会话消息字段，GC/verify 不再依赖文件名 stem 关联。
+- 2026-09-02：TUI 样式整理成 theme——新增 src/pie/theme.py（Theme 纯数据 + THEMES 注册表 + get_theme），Config 新增 theme 键（默认 catppuccin-mocha）持久化到 config.toml；PieApp 实例持有 self.palette=get_theme(config.theme)，CSS 经 build_css(palette) 在 __init__ 注入实例属性 self.CSS（Textual load 阶段读实例属性，可按主题动态生成）；tui.py 不再有硬编码颜色常量，_box/选中高亮/补全面板均走 palette。注意：RichLog 已有只读 property selection_style，选中样式需用私有名 self._selection_style；选中的高亮样式需在 compose 里传给 SelectableRichLog(selection_style=Style(...))。
+- 2026-09-02：resume 含图片消息的会话时 TUI 崩溃（on_mount → full_history）——message_raw_path() 对多模态 content（list，如 ImageMessage）直接 re.search 抛 TypeError；修复为统一先经 content_text() 归一（图片 part 不参与指针匹配）再扫压缩指针。教训：扫描消息 content 的代码必须兼容 str / list 两种形态。
 
 ## 项目演进总结（优化改进一览）
 
@@ -165,4 +167,3 @@ echo "还原完成: $SRC"
 
 - 当前上下文估算用 chars/4 对中文严重低估（实例：估算 1,792 vs provider 上报 30,609）→ /usage 应优先展示 provider 上报值（last_prompt_tokens 已采集，主行待改）。
 - write(content=全文) 参数 + thinking reasoning 体积大是上下文主要消耗源，且不在 spill 统计口径内；决策：留给自动压缩处理。
-

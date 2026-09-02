@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .input import read_input
+from .theme import DEFAULT_THEME_NAME
 
 # 可通过 PIE_DIR 环境变量重定向（测试/多环境），默认 ~/.pie
 PIE_DIR = Path(os.environ.get("PIE_DIR") or Path.home() / ".pie")
@@ -167,6 +168,7 @@ class Config:
     max_retries: int = 2  # 请求重试次数
     max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
     verbose: bool = True
+    theme: str = DEFAULT_THEME_NAME  # TUI 主题名（见 theme.py 的 THEMES）
 
     def __post_init__(self) -> None:
         # 归一化旧 bool 写法（compaction = true / false），保证下游只见到

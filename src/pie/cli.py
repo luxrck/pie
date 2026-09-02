@@ -301,8 +301,11 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
 
             run_tui(session, initial_prompt)
             return 0
-        except Exception:
-            pass  # Textual 初始化失败等 → 回退
+        except Exception as exc:  # Textual 初始化失败等 → 回退
+            print(
+                f"[warn] TUI 启动失败，已回退 readline 模式: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     print(
         f"pie：{'恢复会话 ' + str(session.file) if resumed else '新对话'}"
