@@ -152,7 +152,7 @@ Screen {{ layout: vertical; background: {palette.screen_bg}; }}
 }}
 #stream {{
     height: auto;
-    max-height: 12;
+    max-height: 3;
     color: {palette.muted};
     padding: 0 1;
     display: none;
@@ -168,7 +168,7 @@ Screen {{ layout: vertical; background: {palette.screen_bg}; }}
 }}
 CommandPalette {{
     height: auto;
-    max-height: 10;
+    max-height: 6;
     border: round {palette.border};
     background: transparent;
     color: {palette.body_text};
@@ -926,10 +926,10 @@ class PieApp(App):
                     cancelled = True
                     self._kill_proc(proc)
                     break
-                if time.monotonic() - started > 120:
-                    timed_out = True
-                    self._kill_proc(proc)
-                    break
+                # if time.monotonic() - started > 120:
+                #     timed_out = True
+                #     self._kill_proc(proc)
+                #     break
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), 0.2)
                 except asyncio.TimeoutError:
