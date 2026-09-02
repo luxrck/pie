@@ -24,7 +24,7 @@ from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
@@ -157,6 +157,23 @@ Screen {{ layout: vertical; background: {palette.screen_bg}; }}
     padding: 0 1;
     display: none;
     border: none;
+}}
+#assistant-stream {{
+    height: auto;
+    max-height: 14;
+    display: none;
+    border: none;
+    padding: 0 1;
+    scrollbar-size: 0 1;
+    scrollbar-background: {palette.scrollbar_track};
+    scrollbar-background-hover: {palette.scrollbar_track_hover};
+    scrollbar-background-active: {palette.scrollbar_track_hover};
+    scrollbar-color: {palette.muted};
+    scrollbar-color-hover: {palette.body_text};
+    scrollbar-color-active: {palette.body_text};
+}}
+#assistant-panel {{
+    width: 100%;
 }}
 #meta, #status {{
     height: auto;
@@ -475,6 +492,9 @@ class PieApp(App):
         self._reasoning_lines: list[str] = []  # 已完成行（尾部窗口，≤ STREAM_MAX_LINES）
         self._reasoning_tail = ""  # 尚未换行的累积片段（跨 chunk 拼接）
         self._stream_tool: list[str] = []  # 仅 !shell 模式的逐行实时输出
+        self._assistant_text = ""  # 当前回合 assistant 正文增量（content_delta 累积），
+        # 用于 #assistant-stream 实时渲染，answer 固化后清空
+        self._content_streaming = False  # 当前回合是否已进入 content 阶段（首次时清 reasoning）
 
     def compose(self) -> ComposeResult:
         # yield Header()
@@ -485,6 +505,8 @@ class PieApp(App):
             wrap=True,
             id="log",
         )
+        with VerticalScroll(id="assistant-stream"):
+            yield Static("", id="assistant-panel")
         yield Static("", id="stream")
         yield CommandPalette("", id="palette")
         with Horizontal(id="input-bar"):
@@ -579,6 +601,10 @@ class PieApp(App):
             elif role == "assistant":
                 tool_calls = d.get("tool_calls")
                 if tool_calls:
+                    if content:  # content+tool_call 并存：先固化正文再写工具调用框
+                        log.write(
+                            _box(self.palette, content, title="pie", role="assistant", icon="▎")
+                        )
                     for tc in tool_calls:
                         self._write_tool_call(log, tc)
                 else:
@@ -890,7 +916,31 @@ class PieApp(App):
         self._reasoning_lines.clear()
         self._reasoning_tail = ""
         self._stream_tool.clear()
+        self._content_streaming = False
         self._render_stream()
+
+    def _render_assistant_stream(self) -> None:
+        """把当前回合的 assistant 正文增量渲染进 #assistant-stream（VerticalScroll+Static+Panel）。
+
+        正文用 Text 而非 _box 的 Markdown：流式中半截 Markdown 易解析错乱，
+        故流式态用纯文本，完成时由 answer 分支用 Markdown 固化到 #log。
+        """
+        box = self.query_one("#assistant-stream", VerticalScroll)
+        panel = self.query_one("#assistant-panel", Static)
+        if self._assistant_text:
+            panel.update(
+                Panel(
+                    Text(self._assistant_text, style=self.palette.body_text),
+                    title="▎ pie",
+                    title_align="left",
+                    border_style=self.palette.role_border("assistant"),
+                    padding=(0, 1),
+                )
+            )
+            box.display = True
+            box.scroll_end(animate=False, immediate=True)
+        else:
+            box.display = False
 
     # ---- shell 模式（! 前缀）：直接执行，不经过 LLM、不进会话上下文 ----
 
@@ -1006,12 +1056,27 @@ class PieApp(App):
             self._push_reasoning(ev.get("text", ""))
             self._render_stream()
         elif ev_type == "content_delta":
-            pass  # 正文不进 #stream（回合结束由 answer 盒子一次性固化）
+            # 正文逐 chunk 实时渲染到 #assistant-stream（VerticalScroll+Static+Panel），
+            # 回合结束由 answer 盒子一次性固化到 #log。
+            if not self._content_streaming:
+                # content 开始 → 清掉仍显示的 reasoning（#stream 只在 reasoning 阶段用）
+                self._clear_stream()
+                self._content_streaming = True
+            self._assistant_text += ev.get("text", "")
+            self._render_assistant_stream()
         elif ev_type == "tool_progress":
             self._stream_tool.append(ev.get("text", ""))
             if self._shell_worker is not None:  # 仅 !shell 模式实时显示（模型回合不用）
                 self._render_stream()
         elif ev_type == "tool_call":
+            # 修复 content+tool_call 并存：先把已累积的正文固化到 #log，再写工具调用框
+            if self._assistant_text:
+                log.write(
+                    _box(self.palette, self._assistant_text, title="pie", role="assistant", icon="▎")
+                )
+                self._assistant_text = ""
+                self._content_streaming = False  # 下一轮模型输出时重新清 reasoning
+                self._render_assistant_stream()
             args = ev.get("arguments", {})
             try:
                 arg_txt = json.dumps(args, ensure_ascii=False) if args else "(无参数)"
@@ -1032,9 +1097,12 @@ class PieApp(App):
             self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
             text = ev.get("text", "")
-            # 正文不在 #stream 实时显示：直接固化最终内容为 log 盒子
+            # 正文流式显示已在 #assistant-stream 完成：此处直接把最终内容固化
+            # 为 #log 的 assistant 盒子，并清掉流式框（与最终文本以 answer 为准）。
             log.write(_box(self.palette, text, title="pie", role="assistant", icon="▎"))
             self._clear_stream()
+            self._assistant_text = ""
+            self._render_assistant_stream()
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:
