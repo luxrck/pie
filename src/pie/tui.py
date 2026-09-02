@@ -20,6 +20,7 @@ from rich.cells import cell_len
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
+from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -32,32 +33,7 @@ from textual.worker import Worker
 from .chat import Session
 from .config import REASONING_LEVELS, REASONING_NONE
 from .context import content_text
-
-# catppuccin mocha 配色
-# SCREEN_BG = "#1e1e2e"
-# LOG_BG = "#181828"
-# SCREEN_BG = "#1a1a24"
-# LOG_BG = "#1b1b1b"
-# 背景透明：SCREEN_BG/LOG_BG 用 transparent，配合 on_mount 里的 ansi-dark 主题
-# （ansi-dark 的 background=ansi_default 且 ansi=True → 输出 49 终端默认背景，露出终端窗口色）。
-# 若想用不透明背景，改回 hex 值并去掉 ansi-dark 主题设置即可。
-SCREEN_BG = "transparent"
-LOG_BG = "transparent"
-BODY_TEXT = "#cdd6f4"
-
-# role → 边框颜色（不同 role 用不同颜色区分）
-ROLE_BORDERS: dict[str, str] = {
-    "user": "#5b78a6", #"#89b4fa",        # 你
-    "assistant": "#0f766e", #"#7f9cf5",   # pie 回复
-    "tool_call": "#9c4916", #"#fab387",   # 工具调用
-    "tool_result": "#805b45", #"#94e2d5", # 工具结果
-    "error": "#f38ba8",       # 出错
-    "system": "#585b70",      # 命令反馈 / 系统提示（低调灰）
-}
-# 框选/文字选中高亮（#log 鼠标框选与 #input 文字选中共用同一配色）
-SELECTION_BG = "#89b4fa"  # 猫猫蓝背景
-SELECTION_FG = "#06121f"  # 深蓝黑文字
-SELECTION_STYLE = Style(bgcolor=SELECTION_BG, color=SELECTION_FG)
+from .theme import Theme, get_theme
 
 # 命令补全候选：(命令, 说明)
 PALETTE_COMMANDS: list[tuple[str, str]] = [
@@ -83,19 +59,20 @@ STREAM_MAX_LINES = 8  # #stream 区最多显示的行数（!shell 实时输出�
 
 
 def _box(
+    palette: Theme,
     body: str,
     *,
     title: str = "",
     role: str = "system",
     icon: str = "",
 ) -> Panel:
-    """把一条输出装进带边框的盒子；边框颜色按 role 区分（ROLE_BORDERS）。"""
-    color = ROLE_BORDERS.get(role, ROLE_BORDERS["system"])
+    """把一条输出装进带边框的盒子；边框颜色按 role 区分（palette.role_border）。"""
+    cls = Markdown if role == "assistant" else Text
     return Panel(
-        Text(body or "(空回复)", style=BODY_TEXT),
+        cls(body or "(空回复)", style=palette.body_text),
         title=f"{icon} {title}".strip() or None,
         title_align="left",
-        border_style=color,
+        border_style=palette.role_border(role),
         padding=(0, 1),
     )
 
@@ -148,21 +125,111 @@ def _shell_result_box(body: str, code: Any) -> tuple[str, str, str]:
     return title, preview or "(无输出)", role
 
 
-class CommandPalette(Static):
-    # background: #1e1e2e;
-    """/ 命令补全候选面板：输入以 / 开头时显示，位于输入框上方。"""
+def build_css(palette: Theme) -> str:
+    """由主题（palette）生成 PieApp 的 Textual CSS：布局 + 配色，无硬编码颜色。
 
-    DEFAULT_CSS = """
-    CommandPalette {
-        height: auto;
-        max-height: 10;
-        border: round #45475a;
-        background: transparent;
-        color: #cdd6f4;
-        padding: 0 1;
-        display: none;
-    }
+    颜色全部来自 Theme；布局/滚动条配置固定。运行时在 __init__ 注入到 self.CSS，
+    Textual 在 load 阶段读取的是实例属性 self.CSS（而非类级 CSS），因此可按所选主题动态生成。
     """
+    return f"""
+Screen {{ layout: vertical; background: {palette.screen_bg}; }}
+#log {{
+    height: 1fr;
+    border: round {palette.border_dim};
+    padding: 0 1;
+    background: {palette.log_bg};
+    /* 滚动条：窄（1 cell）+ 半透明灰轨道 + 亮灰滑块，替换默认的 2 cell 黑底蓝条 */
+    scrollbar-size: 0 1;
+    /* 轨道：带 alpha 的灰。ScrollBar 渲染时若背景 alpha<1 会与父级背景（沿 transparent
+       链最终是终端默认背景色）alpha 混合 → 半透明灰透出终端底色。
+       不要用 transparent（纯透明轨道会隐形）。 */
+    scrollbar-background: {palette.scrollbar_track};
+    scrollbar-background-hover: {palette.scrollbar_track_hover};
+    scrollbar-background-active: {palette.scrollbar_track_hover};
+    scrollbar-color: {palette.muted};
+    scrollbar-color-hover: {palette.body_text};
+    scrollbar-color-active: {palette.body_text};
+}}
+#stream {{
+    height: auto;
+    max-height: 12;
+    color: {palette.muted};
+    padding: 0 1;
+    display: none;
+    border: none;
+}}
+#meta, #status {{
+    height: auto;
+    color: {palette.muted};
+    padding: 0 1;
+}}
+#input-bar {{
+    height: auto;
+}}
+CommandPalette {{
+    height: auto;
+    max-height: 10;
+    border: round {palette.border};
+    background: transparent;
+    color: {palette.body_text};
+    padding: 0 1;
+    display: none;
+}}
+#input {{
+    width: 1fr;
+    height: auto;
+    min-height: 5;
+    max-height: 5;
+    background: {palette.screen_bg};
+    color: {palette.body_text};
+    border: round {palette.border};
+    & .text-area--placeholder {{
+        color: {palette.faint};
+    }}
+    /* 选中高亮与 #log 鼠标框选统一：覆盖 TextArea 内置的
+       .text-area--selection（ansi 下默认 background: transparent + reverse，
+       与 #log 的选中高亮不一致）。#input 是 ID 选择器，优先级更高。 */
+    & .text-area--selection {{
+        background: {palette.accent};
+        color: {palette.accent_text};
+    }}
+}}
+#input:focus {{
+    border: round {palette.accent};
+}}
+#input.shell-mode, #input.shell-mode:focus {{
+    border: round {palette.role_tool_call};
+}}
+#send-btn {{
+    min-width: 0;
+    padding: 1;
+    text-align: center;
+    background: transparent;
+    border: round {palette.border};
+    color: {palette.muted};
+}}
+#send-btn:hover {{
+    background: transparent;
+    border: round {palette.accent};
+    color: {palette.body_text};
+}}
+#send-btn.busy {{
+    background: transparent;
+    border: round {palette.busy_border};
+    color: {palette.busy_text};
+}}
+#send-btn.busy:hover {{
+    background: transparent;
+    border: round {palette.busy_border_hover};
+    color: {palette.busy_border_hover};
+}}
+Header {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
+Footer {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
+"""
+
+
+class CommandPalette(Static):
+    """/ 命令补全候选面板：输入以 / 开头时显示，位于输入框上方。"""
 
 
 class MessageSubmitted(Message):
@@ -227,8 +294,14 @@ class PieTextArea(TextArea):
 class SelectableRichLog(RichLog):
     """RichLog + 鼠标框选复制：按住左键拖动选择，松开自动复制到剪贴板。"""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        selection_style: Style | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self._selection_style = selection_style or Style()
         self._selecting = False
         self._sel_start: tuple[int, int] | None = None
         self._sel_end: tuple[int, int] | None = None
@@ -335,8 +408,7 @@ class SelectableRichLog(RichLog):
         end = c2 if row == r2 else strip.cell_length
         return self._apply_selection(strip, start, end)
 
-    @staticmethod
-    def _apply_selection(strip: Strip, start: int, end: int) -> Strip:
+    def _apply_selection(self, strip: Strip, start: int, end: int) -> Strip:
         """给 [start, end) 单元格区间叠加高亮。
 
         按字符边界切分而非按单格切开：宽字符（中文/emoji）整体保留，
@@ -371,9 +443,9 @@ class SelectableRichLog(RichLog):
                 segs.append(Segment(before, seg.style, seg.control))
             if selected:
                 sel_style = (
-                    (seg.style + SELECTION_STYLE)
+                    (seg.style + self._selection_style)
                     if seg.style is not None
-                    else SELECTION_STYLE
+                    else self._selection_style
                 )
                 segs.append(Segment(selected, sel_style, seg.control))
             if after:
@@ -385,97 +457,13 @@ class PieApp(App):
     """聊天主界面：Header + 消息流 + 流式区 + 状态栏 + 补全面板 + 底部输入。"""
 
     TITLE = "pie"
-    CSS = f"""
-    Screen {{ layout: vertical; background: {SCREEN_BG}; }}
-    #log {{
-        height: 1fr;
-        border: round #313244;
-        padding: 0 1;
-        background: {LOG_BG};
-        /* 滚动条：窄（1 cell）+ 半透明灰轨道 + 亮灰滑块，替换默认的 2 cell 黑底蓝条 */
-        scrollbar-size: 0 1;
-        /* 轨道：带 alpha 的灰。ScrollBar 渲染时若背景 alpha<1 会与父级背景（沿 transparent
-           链最终是终端默认背景色）alpha 混合 → 半透明灰透出终端底色。
-           不要用 {{LOG_BG}}（transparent=全透明，轨道会隐形）。 */
-        scrollbar-background: rgba(108, 112, 134, 0.35);
-        scrollbar-background-hover: rgba(108, 112, 134, 0.5);
-        scrollbar-background-active: rgba(108, 112, 134, 0.5);
-        scrollbar-color: #a6adc8;
-        scrollbar-color-hover: #cdd6f4;
-        scrollbar-color-active: #cdd6f4;
-    }}
-    #stream {{
-        height: auto;
-        max-height: 12;
-        color: #a6adc8;
-        padding: 0 1;
-        display: none;
-        border: none;
-    }}
-    #meta, #status {{
-        height: auto;
-        color: #a6adc8;
-        padding: 0 1;
-    }}
-    #input-bar {{
-        height: auto;
-    }}
-    #input {{
-        width: 1fr;
-        height: auto;
-        min-height: 5;
-        max-height: 5;
-        background: {SCREEN_BG};
-        color: {BODY_TEXT};
-        border: round #45475a;
-        & .text-area--placeholder {{
-            color: #585b70;
-        }}
-        /* 选中高亮与 #log 鼠标框选统一：覆盖 TextArea 内置的
-           .text-area--selection（ansi 下默认 background: transparent + reverse，
-           与 #log 的 SELECTION_STYLE 不一致）。#input 是 ID 选择器，优先级更高。 */
-        & .text-area--selection {{
-            background: {SELECTION_BG};
-            color: {SELECTION_FG};
-        }}
-    }}
-    #input:focus {{
-        border: round #89b4fa;
-    }}
-    #input.shell-mode, #input.shell-mode:focus {{
-        border: round #9c4916;
-    }}
-    #send-btn {{
-        min-width: 0;
-        padding: 1;
-        text-align: center;
-        background: transparent;
-        border: round #45475a;
-        color: #a6adc8;
-    }}
-    #send-btn:hover {{
-        background: transparent;
-        border: round #89b4fa;
-        color: #cdd6f4;
-    }}
-    #send-btn.busy {{
-        background: transparent;
-        border: round #f38ba8;
-        color: #f38ba8;
-    }}
-    #send-btn.busy:hover {{
-        background: transparent;
-        border: round #ffb4c8;
-        color: #ffb4c8;
-    }}
-    Header {{ background: {SCREEN_BG}; color: {BODY_TEXT}; }}
-    Footer {{ background: {SCREEN_BG}; color: {BODY_TEXT}; }}
-    """
 
     def __init__(self, session: Session, initial_prompt: str | None = None) -> None:
         super().__init__()
         self.session = session
         self.initial_prompt = initial_prompt
+        self.palette = get_theme(session.config.theme)
+        self.CSS = build_css(self.palette)
         self._turn_worker: Worker | None = None
         self._shell_worker: Worker | None = None
         self._cancel_event: asyncio.Event | None = None
@@ -490,7 +478,13 @@ class PieApp(App):
 
     def compose(self) -> ComposeResult:
         # yield Header()
-        yield SelectableRichLog(highlight=True, markup=True, wrap=True, id="log")
+        yield SelectableRichLog(
+            selection_style=Style(bgcolor=self.palette.accent, color=self.palette.accent_text),
+            highlight=True,
+            markup=True,
+            wrap=True,
+            id="log",
+        )
         yield Static("", id="stream")
         yield CommandPalette("", id="palette")
         with Horizontal(id="input-bar"):
@@ -512,7 +506,7 @@ class PieApp(App):
         self.theme = "ansi-dark"
         log = self.query_one("#log", RichLog)
         if self.session.fs:
-            log.write(_box(f"已归档 {len(self.session.fs)} 个历史窗口块（~/.pie/windows/）"))
+            log.write(_box(self.palette, f"已归档 {len(self.session.fs)} 个历史窗口块（~/.pie/windows/）"))
         self._render_history()
         self._update_meta()
         self.query_one("#input", PieTextArea).focus()
@@ -581,18 +575,18 @@ class PieApp(App):
                 continue
             content = content_text(d.get("content"))
             if role == "user":
-                log.write(_box(content, title="你", role="user", icon="▎"))
+                log.write(_box(self.palette, content, title="你", role="user", icon="▎"))
             elif role == "assistant":
                 tool_calls = d.get("tool_calls")
                 if tool_calls:
                     for tc in tool_calls:
                         self._write_tool_call(log, tc)
                 else:
-                    log.write(_box(content, title="pie", role="assistant", icon="▎"))
+                    log.write(_box(self.palette, content, title="pie", role="assistant", icon="▎"))
             elif role == "tool":
                 self._write_tool_result(log, d)
             else:
-                log.write(_box(content, role="system"))
+                log.write(_box(self.palette, content, role="system"))
 
     def _write_tool_call(self, log: RichLog, tc: dict) -> None:
         """渲染一条历史 tool_call（OpenAI 格式：function.arguments 是 JSON 字符串）。"""
@@ -603,7 +597,7 @@ class PieApp(App):
             arg_txt = json.dumps(json.loads(args), ensure_ascii=False) if args else "(无参数)"
         except (ValueError, TypeError):
             arg_txt = args or "(无参数)"
-        log.write(_box(arg_txt, title=name, role="tool_call", icon="⚙"))
+        log.write(_box(self.palette, arg_txt, title=name, role="tool_call", icon="⚙"))
 
     def _write_tool_result(self, log: RichLog, d: dict) -> None:
         """渲染一条历史工具结果；超长（>200 行）截断显示 head/tail，避免 resume 一次性撑爆 TUI。
@@ -622,7 +616,7 @@ class PieApp(App):
             if len(lines) > 200:
                 body = "\n".join(lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:])
                 title = f"{name}（共 {len(lines)} 行，显示前后 50 行）"
-        log.write(_box(body, title=title, role=role, icon="↳"))
+        log.write(_box(self.palette, body, title=title, role=role, icon="↳"))
 
     # ---- 命令补全 ----
 
@@ -644,7 +638,7 @@ class PieApp(App):
         lines = []
         for i, (cmd, desc) in enumerate(shown):
             if i == self._palette_index:
-                lines.append(f"[bold #06121f on #89b4fa] {cmd} [/][dim] — {desc}[/]")
+                lines.append(f"[bold {self.palette.accent_text} on {self.palette.accent}] {cmd} [/][dim] — {desc}[/]")
             else:
                 lines.append(f" {cmd} [dim]— {desc}[/]")
         if len(matches) > len(shown):
@@ -750,12 +744,12 @@ class PieApp(App):
                     await self._turn_worker.wait()  # type: ignore[union-attr]
                     if self._busy():
                         self.query_one("#log", RichLog).write(
-                            _box("正在取消中，请稍候…", role="system")
+                            _box(self.palette, "正在取消中，请稍候…", role="system")
                         )
                         return
                 else:
                     self.query_one("#log", RichLog).write(
-                        _box("正在处理中，输入 /stop 可取消", role="system")
+                        _box(self.palette, "正在处理中，输入 /stop 可取消", role="system")
                     )
                     return
             self._submit(text)
@@ -780,13 +774,13 @@ class PieApp(App):
             if self._busy():
                 if self._cancel_event is not None:
                     self._cancel_event.set()
-                    log.write(_box("已请求取消，正在终止…", role="system"))
+                    log.write(_box(self.palette, "已请求取消，正在终止…", role="system"))
                 else:
-                    log.write(_box("当前没有正在执行的任务", role="system"))
+                    log.write(_box(self.palette, "当前没有正在执行的任务", role="system"))
             else:
-                log.write(_box("当前没有正在执行的任务", role="system"))
+                log.write(_box(self.palette, "当前没有正在执行的任务", role="system"))
         elif cmd == "/help":
-            log.write(_box("/exit /quit 退出 | /stop 取消当前模型请求/工具执行（等待期间可继续输入） | "
+            log.write(_box(self.palette, "/exit /quit 退出 | /stop 取消当前模型请求/工具执行（等待期间可继续输入） | "
                            "/reset 清空历史 | /clear 归档并开新窗口 | "
                            "/compact [tools|turns] 手动压缩 | /save [文件] 保存 | "
                            "/reasoning <none|low|high|max> 思考深度 | "
@@ -794,23 +788,24 @@ class PieApp(App):
                            "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，/stop 可终止）"))
         elif cmd == "/reset":
             self.session.reset()
-            log.write(_box("已清空历史（保留 system prompt 与记忆）"))
+            log.write(_box(self.palette, "已清空历史（保留 system prompt 与记忆）"))
             self._safe_save()
         elif cmd == "/clear":
             self.session.clear_window()
-            log.write(_box(f"已切换新窗口（归档 {len(self.session.fs)} 个，fs 在 ~/.pie/windows/）"))
+            log.write(_box(self.palette, f"已切换新窗口（归档 {len(self.session.fs)} 个，fs 在 ~/.pie/windows/）"))
             self._safe_save()
         elif cmd == "/compact":
             mode = arg.strip() or "auto"
             if mode not in ("auto", "tools", "turns"):
-                log.write(_box(f"未知压缩模式: {mode}（/compact [tools|turns]）", role="error"))
+                log.write(_box(self.palette, f"未知压缩模式: {mode}（/compact [tools|turns]）", role="error"))
             else:
                 stats = self.session.compact(mode=mode)
                 if stats.get("skipped"):
-                    log.write(_box(f"未压缩：{stats['skipped']}"))
+                    log.write(_box(self.palette, f"未压缩：{stats['skipped']}"))
                 else:
                     log.write(
                         _box(
+                            self.palette,
                             f"压缩完成：节省约 {stats['saved_tokens']:,} tokens"
                             f"（tools={stats['tools']}，turns={stats['turns']}）"
                         )
@@ -818,14 +813,15 @@ class PieApp(App):
                 self._safe_save()
         elif cmd == "/save":
             self.session.save(arg.strip() or None)
-            log.write(_box(f"会话已保存: {self.session.file}"))
+            log.write(_box(self.palette, f"会话已保存: {self.session.file}"))
         elif cmd == "/status":
-            log.write(_box(self.session.usage_report()))
+            log.write(_box(self.palette, self.session.usage_report()))
         elif cmd == "/reasoning":
             level = arg.strip().lower()
             if level not in REASONING_LEVELS:
                 log.write(
                     _box(
+                        self.palette,
                         f"未知思考级别: {level or '(空)'}（可选: {' / '.join(REASONING_LEVELS)}）",
                         role="error",
                     )
@@ -842,10 +838,10 @@ class PieApp(App):
                     note = "已写入配置"
                 except OSError as e:
                     note = f"配置写入失败: {e}（仅本次会话生效）"
-                log.write(_box(f"思考深度: {level}（{note}）", role="system"))
+                log.write(_box(self.palette, f"思考深度: {level}（{note}）", role="system"))
                 self._update_meta()
         else:
-            log.write(_box(f"未知命令: {cmd}（/help 查看）", role="error"))
+            log.write(_box(self.palette, f"未知命令: {cmd}（/help 查看）", role="error"))
         self._update_status()
 
     def _safe_save(self) -> None:
@@ -902,7 +898,7 @@ class PieApp(App):
         if not cmd:
             return
         self.query_one("#log", RichLog).write(
-            _box(f"$ {cmd}", title="shell", role="tool_call", icon="⚙")
+            _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", icon="⚙")
         )
         self._cancel_event = asyncio.Event()
         self._shell_worker = self.run_worker(
@@ -969,7 +965,7 @@ class PieApp(App):
         if code == "cancelled":
             out = (out.rstrip() + "\n[用户手动终止]").strip()
         title, body, result_role = _shell_result_box(out, code)
-        log.write(_box(body, title=title, role=result_role, icon="↳"))
+        log.write(_box(self.palette, body, title=title, role=result_role, icon="↳"))
         self._cancel_event = None
         self._shell_worker = None
         self._clear_stream()
@@ -980,7 +976,7 @@ class PieApp(App):
 
     def _submit(self, text: str) -> None:
         self.query_one("#log", RichLog).write(
-            _box(text, title="你", role="user", icon="▎")
+            _box(self.palette, text, title="你", role="user", icon="▎")
         )
         # 输入框保持可用：等待期间用户仍可输入 /stop 取消当前回合
         self._cancel_event = asyncio.Event()
@@ -1022,7 +1018,7 @@ class PieApp(App):
             except TypeError:
                 arg_txt = str(args) or "(无参数)"
             log.write(
-                _box(arg_txt, title=ev.get("name", "工具"), role="tool_call", icon="⚙")
+                _box(self.palette, arg_txt, title=ev.get("name", "工具"), role="tool_call", icon="⚙")
             )
         elif ev_type == "tool_result":
             text = ev.get("text", "")
@@ -1032,18 +1028,18 @@ class PieApp(App):
             else:
                 title = ev.get("name", "工具")
                 role = _tool_failed_role(text)
-            log.write(_box(body, title=title, role=role, icon="↳"))
+            log.write(_box(self.palette, body, title=title, role=role, icon="↳"))
             self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
             text = ev.get("text", "")
             # 正文不在 #stream 实时显示：直接固化最终内容为 log 盒子
-            log.write(_box(text, title="pie", role="assistant", icon="▎"))
+            log.write(_box(self.palette, text, title="pie", role="assistant", icon="▎"))
             self._clear_stream()
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:
         log = self.query_one("#log", RichLog)
-        log.write(_box(f"{type(exc).__name__}: {exc}", title="出错", role="error", icon="✗"))
+        log.write(_box(self.palette, f"{type(exc).__name__}: {exc}", title="出错", role="error", icon="✗"))
         self._cancel_event = None
         self._turn_worker = None
         self._clear_stream()
