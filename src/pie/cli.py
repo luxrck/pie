@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -25,7 +26,7 @@ from .chat import Session
 from .config import CONFIG_FILE, PIE_DIR, Config, _prompt, build_system_prompt, ensure_config
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
 from .input import read_input
-from .tools import default_tools
+from .tools import default_tools, parse_image_marker, tools_from_spec
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -46,6 +47,8 @@ MAIN_EPILOG = """\
   pie -r -p "继续刚才的任务"       在最近会话上非交互执行一条消息
   pie --session 20260831-103224    恢复指定会话
   pie -m deepseek-v4-flash "..."  本次运行指定模型（不持久化）
+  pie --tools read,ls,grep "..."   限制工具：read + shell（仅 ls/grep）
+  pie --tools read "..."           仅 read 工具（shell 禁用）
 """
 
 CHAT_HELP = """\
@@ -69,10 +72,24 @@ def self_check() -> None:
         print(reg.dispatch("read", {"path": str(p)}))
         print(reg.dispatch("edit", {"path": str(p), "edits": [{"oldText": "hello", "newText": "hi"}]}))
         print(reg.dispatch("read", {"path": str(p)}))
-        print(reg.dispatch("shell", {"cmd": f"echo yolo && wc -c {p}"}))
+        print(reg.dispatch("shell", {"command": f"echo yolo && wc -c {p}"}))
+        # read 图片：1x1 PNG → 返回机器可读图片标记，parse_image_marker 可解析
+        img = Path(d) / "pixel.png"
+        img.write_bytes(base64.b64decode(_PNG_1X1_B64))
+        img_out = reg.dispatch("read", {"path": str(img)})
+        print(img_out)
+        ref = parse_image_marker(img_out)
+        print(f"图片标记解析: path={ref.path} mime={ref.mime} size={ref.size} dim={ref.width}x{ref.height}")
     print("\n自动生成的工具定义（read 示例）:")
     print(json.dumps(reg.definitions()[0], ensure_ascii=False, indent=2))
     print("self-check OK")
+
+
+# 1x1 透明 PNG（read 图片分支的 self_check 用例）
+_PNG_1X1_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+    "60e6kgAAAABJRU5ErkJggg=="
+)
 
 
 def _safe_save(session: Session) -> None:
@@ -143,9 +160,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
     parser.add_argument("-r", "--resume", action="store_true", help="恢复最近的会话")
+    parser.add_argument("--cwd", metavar="PATH", help="内置工具的工作目录（默认当前目录）")
     parser.add_argument("--session", metavar="ID", help="恢复指定会话（id / 文件名 / 路径）")
     parser.add_argument("--session-id", metavar="ID", help="为新会话指定精确 id（print 模式会保存到该文件）")
-    parser.add_argument("--cwd", metavar="PATH", help="内置工具的工作目录（默认当前目录）")
+    parser.add_argument(
+        "--tools",
+        metavar="SPEC",
+        help=(
+            "限制可用工具（仅本次运行）。内置工具名 read/edit/write/shell 直接启用；"
+            "非内置名视为 shell 允许的子命令白名单（并隐式启用受限 shell）。"
+            "例：--tools read,ls,grep（read + shell 仅 ls/grep）；--tools read（仅 read）。"
+            "默认启用全部工具。"
+        ),
+    )
     parser.add_argument(
         "--system-prompt",
         metavar="TEXT_OR_PATH",
@@ -201,13 +228,14 @@ def _run(args: argparse.Namespace) -> int:
     appends = [_read_cli_text(t) for t in args.append_system_prompt]
 
     resume_requested = bool(args.resume or args.session)
+    registry = tools_from_spec(args.tools)
     try:
         if args.session:
-            session = Session.load(_resolve_session(args.session), config=cfg)
+            session = Session.load(_resolve_session(args.session), config=cfg, tools=registry)
         elif resume_requested:
-            session = Session.resume(config=cfg)
+            session = Session.resume(config=cfg, tools=registry)
         else:
-            session = Session.new(config=cfg, session_id=args.session_id)
+            session = Session.new(config=cfg, tools=registry, session_id=args.session_id)
     except FileNotFoundError as e:
         print(f"恢复失败: {e}", file=sys.stderr)
         return 1
@@ -378,10 +406,10 @@ def sessions_main(argv: list[str]) -> int:
                 if d.get("__meta__"):
                     api_calls = d.get("usage", {}).get("calls", 0)
                     first_query = d.get("title") or first_query
-                elif d.get("role") == "user":
+                elif d.get("role") == "user" and not d.get("synthetic"):  # 图片消息不算用户轮
                     turns += 1
-                    if not first_query:
-                        first_query = (d.get("content") or "").strip()
+                    if not first_query and isinstance(d.get("content"), str):
+                        first_query = d["content"].strip()
         except (OSError, json.JSONDecodeError):
             pass
         rows.append(
