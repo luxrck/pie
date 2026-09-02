@@ -13,7 +13,7 @@ pie/
 ├── src/pie/
 │   ├── __init__.py    # 公开 API
 │   ├── __main__.py    # python -m pie 入口
-│   ├── chat.py        # 会话层：Session 多轮对话 + JSONL 持久化
+│   ├── session.py     # 会话层：Session 多轮对话 + JSONL 持久化
 │   ├── config.py        # 配置持久化（~/.pie/config.toml）+ system prompt 组装
 │   ├── context.py     # 上下文管理：三级压缩 + 全文落盘 + 摘要指针
 │   ├── tools.py       # 工具层：@tool 装饰器 + ToolRegistry + 内置工具

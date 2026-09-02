@@ -22,7 +22,7 @@ from .context import (
     ToolMessage,
     UserMessage,
 )
-from .chat import Session
+from .session import Session
 from .llm import LLM, LLMResult, OpenAILLM, StreamChunk, ToolCall, UsageTracker
 from .loop import acomplete_turn, run_agent
 from .tools import (
