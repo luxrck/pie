@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,12 +19,11 @@ from .context import (
     UserMessage,
     build_window_summary,
     content_hash,
-    flatten_messages,
     summarize_turns,
     write_manifest,
 )
 from .llm import LLM, OpenAILLM, UsageTracker
-from .loop import complete_turn
+from .loop import acomplete_turn
 from .tools import ToolRegistry, default_tools
 
 
@@ -172,12 +171,14 @@ class Session:
         session.file = Path(path)
         session.manifest = CONTEXT_DIR / f"{Path(path).stem}.manifest.jsonl"
         session.turn_count = sum(
-            1 for m in flatten_messages(session.messages.messages) if m.role == "user"
+            1 for m in session.messages.messages if isinstance(m, UserMessage)
         )
-        # title：meta 缺失（旧格式）时从首个 user 消息提取，并立即写回 meta
+        # title：meta 缺失（旧格式）时从首个真实 user 消息提取，并立即写回 meta
         if session.title is None:
             for d in dicts:
-                if d.get("role") == "user" and d.get("content"):
+                if d.get("role") == "user" and not d.get("synthetic") and isinstance(
+                    d.get("content"), str
+                ):
                     session.title = str(d["content"]).strip().splitlines()[0]
                     break
             if session.title:
@@ -205,13 +206,23 @@ class Session:
         self,
         user_input: str,
         on_event: Callable[[dict[str, Any]], None] | None = None,
-        cancel_event: threading.Event | None = None,
     ) -> str:
+        """同步入口（内部 asyncio.run；须在无事件循环的线程调用，如 CLI readline/print）。
+        TUI / 其他 async 环境请用 aturn()。"""
+        return asyncio.run(self.aturn(user_input, on_event=on_event))
+
+    async def aturn(
+        self,
+        user_input: str,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> str:
+        """异步主路径：追加用户消息后跑完整工具循环。cancel_event 可手动取消当前回合。"""
         self.messages.add(UserMessage(user_input))
         self.turn_count += 1
         if self.title is None:
             self.title = (user_input.strip().splitlines() or [""])[0]
-        return complete_turn(
+        return await acomplete_turn(
             self.messages,
             self.config,
             self.tools,
@@ -259,7 +270,7 @@ class Session:
             block.parent.mkdir(parents=True, exist_ok=True)
             raw = ""
             with block.open("w", encoding="utf-8") as f:
-                for m in flatten_messages(old):
+                for m in old:
                     line = json.dumps(m.to_dict(), ensure_ascii=False) + "\n"
                     raw += line
                     f.write(line)
@@ -307,7 +318,7 @@ class Session:
         turn_cfg = cfg.compaction.turn
         if mode in ("auto", "tools") and tool_cfg is not None:
             self.messages.compact(tools=True, tool_cfg=tool_cfg, manifest=self.manifest)
-        if mode in ("auto", "turns") and turn_cfg is not None:
+        if mode in ("auto", "turns") and turn_cfg:
             self.messages.compact(turns=True, turn_cfg=turn_cfg, target=None, manifest=self.manifest)
         stats["tools"] = self.messages.compact_counts["tools"]
         stats["turns"] = self.messages.compact_counts["turns"]
@@ -321,14 +332,14 @@ class Session:
         target = self.config.target_limit()
         pct = total * 100 / limit
         roles: dict[str, int] = {}
-        for m in flatten_messages(self.messages.messages):
+        for m in self.messages.messages:
             roles[m.role] = roles.get(m.role, 0) + m.tokens()
         parts = []
         if self.file is not None and self.file.exists():
             parts.append(f"会话文件：{self.file}")
         parts += [
-            f"当前上下文占用（估算）：{total:,} / {limit:,} tokens（{pct:.1f}%）",
-            f"软阈值 {soft:,}（{self.config.context_soft_ratio:.0%}）| 目标水位 {target:,}（{self.config.context_target_ratio:.0%}）",
+            f"当前上下文占用（估算）：{total:,} / {limit:,} tokens ({pct:.1f}%)",
+            f"软阈值 {soft:,} ({self.config.context_soft_ratio:.0%}) | 目标水位 {target:,} ({self.config.context_target_ratio:.0%})",
             "各角色（估算）："
             + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
         ]
@@ -343,8 +354,8 @@ class Session:
                     except OSError:
                         pass
             parts.append(
-                f"本会话已压缩 {len(comp_events)} 次（当前为压缩视图）；"
-                f"落盘原文约 {evicted:,} tokens（可经指针恢复）"
+                f"本会话已压缩 {len(comp_events)} 次 (当前为压缩视图)，"
+                f"落盘原文约 {evicted:,} tokens (可经指针恢复)"
             )
         if self.usage.last_prompt_tokens is not None:
             parts.append(
@@ -356,7 +367,7 @@ class Session:
             "会话累计 API 用量："
             f"prompt {self.usage.prompt_tokens:,}"
             f" | completion {self.usage.completion_tokens:,}"
-            f"（{self.usage.calls} 次调用）"
+            f" ({self.usage.calls} 次调用)"
         )
         return "\n".join(parts)
 
@@ -372,7 +383,7 @@ class Session:
 
         out: list[Message] = []
         expanded: set[str] = set()
-        for m in flatten_messages(self.messages.messages):
+        for m in self.messages.messages:
             p = message_raw_path(m)
             if p is not None and p.exists():
                 expanded.add(str(p.resolve()))
@@ -425,7 +436,7 @@ class Session:
             meta["title"] = self.title
         with target.open("w", encoding="utf-8") as f:
             f.write(json.dumps(meta, ensure_ascii=False) + "\n")
-            for m in flatten_messages(self.messages.messages):
+            for m in self.messages.messages:
                 f.write(json.dumps(m.to_dict(), ensure_ascii=False) + "\n")
         self.file = target
         return target

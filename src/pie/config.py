@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
 
-from .llm import DEFAULT_MODEL
 from .input import read_input
 
 # 可通过 PIE_DIR 环境变量重定向（测试/多环境），默认 ~/.pie
@@ -22,9 +21,14 @@ CONFIG_FILE = PIE_DIR / "config.toml"
 LEGACY_CONFIG_FILE = PIE_DIR / "config.json"
 GLOBAL_MEMORY_FILE = PIE_DIR / "memory.md"
 
+DEFAULT_MODEL = "deepseek-v4-flash-vision-exp"
 DEFAULT_BASE_URL = "https://api.deepseek.com/"
 DEFAULT_API_KEY = "<API_KEY>"
 DEFAULT_REASONING_EFFORT = "high"
+
+# 思考深度（/reasoning 命令与配置 reasoning_effort 的合法值）
+REASONING_LEVELS = ("none", "low", "high", "max")
+REASONING_NONE = REASONING_LEVELS[0]  # none = 关闭思考：请求时不发 reasoning_effort
 
 # 上下文压缩默认值
 DEFAULT_MAX_SEQ_LEN = 128_000
@@ -44,7 +48,7 @@ SYSTEM_PROMPT = """\
 
 长对话中，pie 会把旧内容压缩成「文件指针 + 摘要」，信息不会删除，只是换了一种表示。具体如下：
 - 工具输出截断：`[工具输出全文已保存: 路径]`（或 `[shell 输出全文已保存: 路径]`）后只附首尾若干行，中间被省略。
-- 轮次压缩：`[轮次原文已保存: 路径]` 代表一轮完整的「用户 → 思考 → 工具调用 → 结果 → 回复」，摘要保留开头/末尾消息概览，被省略的中间部分用 `...[中间省略 N 条消息]...` 显式标注。
+- 轮次压缩：`[轮次原文已保存: 路径]` 代表一轮完整的「用户 → 思考 → 工具调用 → 结果 → 回复」，摘要只保留该轮次的模型最终输出，中间过程被省略时用 `...[中间过程省略]...` 显式标注（无中间过程则不标注）。
 - 历史窗口摘要：`[历史窗口: 路径]` 后是规则式摘要，只保留最早 N 轮和最晚 M 轮的“用户提问 + 最终回复”，中间被省略的轮次用 `...[中间省略 N 轮]...` 显式标注；其中的 `pie:` 行是当时的最终回答，不是工具结果。
 
 ## 核心原则
@@ -58,10 +62,10 @@ SYSTEM_PROMPT = """\
 
 ## 可用工具
 
-- `read(path, offset=None, limit=None)`：读取文件内容（UTF-8，不截断；二进制返回大小提示）。offset 为 1 起的起始行，limit 为最大读取行数，用于大文件分页读取。
-- `edit(path, edits)`：一次做多个精确替换。每个 edits 项的 oldText 在原文中必须唯一且互不重叠，按原文一次性应用，相邻改动请合并成一个 edit。
-- `write(path, content)`：写入文件，自动创建父目录，覆盖已有内容。
-- `shell(cmd, timeout=120, cwd=None, limit=200)`：执行 shell 命令，返回 stdout/stderr 和退出码。输出超过 limit 行时全文落盘，只返回文件指针 + 最后 limit 行。
+- `read`：读取文件内容（UTF-8，不截断；二进制返回大小提示）。offset 为 1 起的起始行，limit 为最大读取行数，用于大文件分页读取。读取图片（PNG/JPEG/GIF/WebP/BMP）时返回图像引用，图片内容会作为多模态图像消息随对话发送给模型，offset/limit 不适用。
+- `edit`：一次做多个精确替换。每个 edits 项的 oldText 在原文中必须唯一且互不重叠，按原文一次性应用，相邻改动请合并成一个 edit。
+- `write`：写入文件，自动创建父目录，覆盖已有内容。
+- `shell`：执行 shell 命令，返回 stdout/stderr 和退出码。超长输出不做内部截断，交回 harness 由工具级压缩（head+tail 落盘指针）处理。
 
 ## 工作流程
 
@@ -113,17 +117,8 @@ GLOBAL_MEMORY_TEMPLATE = """\
 class ToolCompaction:
     """工具级（level 1）压缩保留的行数。"""
 
-    head: int = 50
-    tail: int = 30
-
-
-@dataclass
-class TurnCompaction:
-    """轮次级（level 2）压缩摘要：保留开头 head 条消息 + 末尾 tail 条消息的概览，
-    中间省略部分显式标注（对齐工具级 head/tail 预览）。"""
-
-    head: int = 5
-    tail: int = 3
+    head: int = 30
+    tail: int = 20
 
 
 @dataclass
@@ -143,7 +138,7 @@ class CompactionConfig:
     整个 compaction 为 None（不写 [compaction]）表示不做任何压缩。"""
 
     tool: ToolCompaction | None = field(default_factory=ToolCompaction)
-    turn: TurnCompaction | None = field(default_factory=TurnCompaction)
+    turn: bool | None = True  # 轮次级（level 2）：摘要只保留用户输入 + 模型最终输出，中间过程显式省略标注
     session: SessionCompaction | None = field(default_factory=SessionCompaction)
 
 
@@ -165,13 +160,21 @@ class Config:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN
     keep_last_steps: int = DEFAULT_KEEP_LAST_STEPS  # 工具级压缩保护窗口：最近 N 个 step 批次（跨轮次滚动）
-    compaction: CompactionConfig | bool | None = True  # None = 不做任何上下文压缩
+    compaction: CompactionConfig | bool | None = field(default_factory=CompactionConfig)  # None = 不做任何上下文压缩
     context_soft_ratio: float = DEFAULT_CONTEXT_SOFT_RATIO
     context_target_ratio: float = DEFAULT_CONTEXT_TARGET_RATIO
     timeout_seconds: float = 60.0  # HTTP 超时（OpenAI 兼容客户端）
     max_retries: int = 2  # 请求重试次数
     max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
     verbose: bool = True
+
+    def __post_init__(self) -> None:
+        # 归一化旧 bool 写法（compaction = true / false），保证下游只见到
+        # CompactionConfig（开启）或 None（关闭），避免 bool.session 崩溃。
+        if self.compaction is True:
+            self.compaction = CompactionConfig()
+        elif self.compaction is False:
+            self.compaction = None
 
     def soft_limit(self) -> int:
         """软阈值：触发自动压缩的 token 水位；--auto-compact-threshold 覆盖。"""
@@ -215,13 +218,10 @@ class Config:
                     elif tool is False:  # 显式关闭工具级
                         cfg.compaction.tool = None
                     turn = cd.get("turn")
-                    if isinstance(turn, dict):
-                        cfg.compaction.turn = TurnCompaction(
-                            head=int(turn.get("head", TurnCompaction.head)),
-                            tail=int(turn.get("tail", TurnCompaction.tail)),
-                        )
-                    elif turn is False:  # 显式关闭轮次级
-                        cfg.compaction.turn = None
+                    if isinstance(turn, bool):  # 新版 bool：true 开启 / false 关闭（旧 dict 写法视为开启）
+                        cfg.compaction.turn = turn
+                    elif turn is False:  # 显式关闭轮次级（未写 turn / 旧 dict 写法保持默认开启）
+                        cfg.compaction.turn = False
                     sd = cd.get("session")
                     if isinstance(sd, dict):
                         cfg.compaction.session = SessionCompaction(
@@ -235,7 +235,7 @@ class Config:
                     cfg.compaction = (
                         CompactionConfig(
                             tool=ToolCompaction(),
-                            turn=TurnCompaction(),
+                            turn=True,
                             session=SessionCompaction(),
                         )
                         if cd
@@ -248,7 +248,7 @@ class Config:
             k in data for k in ("compress_tools", "compress_turns", "compress_session")
         ):
             tool = ToolCompaction() if data.get("compress_tools", True) else None
-            turn = TurnCompaction() if data.get("compress_turns", True) else None
+            turn = bool(data.get("compress_turns", True))
             session = SessionCompaction() if data.get("compress_session", True) else None
             cfg.compaction = (
                 CompactionConfig(tool=tool, turn=turn, session=session)
@@ -386,6 +386,7 @@ def build_system_prompt(
     parts: list[str] = [
         base or SYSTEM_PROMPT,
         f"当前模型最大上下文长度：{config.max_seq_len}",
+        f"当前工作目录：{os.getcwd()}",
     ]
 
     agents = _read_text(_resolve_prompt_file(AGENTS_FILE))
