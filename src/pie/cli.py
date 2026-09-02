@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .chat import Session
+from .session import Session
 from .config import CONFIG_FILE, PIE_DIR, Config, _prompt, build_system_prompt, ensure_config
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
 from .input import read_input

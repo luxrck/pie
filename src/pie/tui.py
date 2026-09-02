@@ -30,7 +30,7 @@ from textual.strip import Strip
 from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
 from textual.worker import Worker
 
-from .chat import Session
+from .session import Session
 from .config import REASONING_LEVELS, REASONING_NONE
 from .context import content_text
 from .theme import Theme, get_theme

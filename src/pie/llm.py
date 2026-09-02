@@ -4,7 +4,7 @@
 vLLM、Ollama 等 OpenAI 兼容端点直接用 OpenAILLM）。
 
 异步为唯一主路径：complete() / stream() 都是 async。同步调用方用
-asyncio.run() 包装（见 chat.Session.turn）。
+asyncio.run() 包装（见 session.Session.turn）。
 """
 
 from __future__ import annotations
