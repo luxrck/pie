@@ -117,3 +117,4 @@ def get_theme(name: str | None) -> Theme:
         if theme_name.lower() == lower:
             return theme
     return CATPPUCCIN_MOCHA
+

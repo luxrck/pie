@@ -27,7 +27,7 @@ from .config import PIE_DIR
 CONTEXT_DIR = PIE_DIR / "context"
 WINDOWS_DIR = PIE_DIR / "windows"  # fs 历史窗口块（在 context/ 外，GC 不碰）
 
-_SHELL_SPILL_RE = re.compile(r"\[shell 输出全文已保存: ([^\]]+)\]")
+_SPILL_RE = re.compile(r"\[(?:shell 输出|工具输出)?全文已保存: ([^\]]+)\]")
 _POINTER_RE = re.compile(r"\[(?:会话原文|轮次原文|工具输出全文)已保存: ([^\]]+)\]")
 WINDOW_SUMMARY_MARKER = "[历史窗口:"
 
@@ -101,7 +101,7 @@ def write_manifest(manifest: Path, entry: dict[str, Any]) -> None:
 
 
 def extract_spill_path(text: str) -> Path | None:
-    m = _SHELL_SPILL_RE.search(text or "")
+    m = _SPILL_RE.search(text or "")
     return Path(m.group(1)) if m else None
 
 
@@ -771,5 +771,6 @@ def collect_context_garbage() -> list[Path]:
     """返回 context/ 下未被任何会话引用的文件（可安全删除）。fs 窗口块在 windows/ 下，不受影响。"""
     referenced = referenced_raw_paths()
     return sorted(f for f in CONTEXT_DIR.glob("*.txt") if f.resolve() not in referenced)
+
 
 

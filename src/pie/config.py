@@ -77,40 +77,37 @@ SYSTEM_PROMPT = """\
 
 ## 记忆管理
 
-你有两层记忆文件：
+你有两层记忆文件，用 `edit`/`write` 更新，只记跨会话有效的长期事实：
 - **全局记忆**：`~/.pie/memory.md` — 跨项目的用户偏好、通用编码风格、工具链路径、个人习惯。
 - **项目记忆**：`<项目根>/MEMORY.md` — 当前项目的架构决策、业务逻辑、技术选型、待办事项。
 
 **当记忆冲突时，以项目记忆优先**，若冲突则在回答开头提醒：`⚠️ 记忆冲突：全局 X，项目 Y，我将遵循 Y`。
 
-### 记忆更新
-
-学到跨会话仍然有效的经验、用户偏好或项目决策时，用 `edit` 或 `write` 更新对应记忆文件。不要记录临时状态（如临时文件路径），只记长期事实。
-
 | 写入内容 | 目标文件 | 触发条件 |
 |---------|---------|---------|
-| 跨项目的通用经验（编码风格、工具习惯、个人设置等） | `~/.pie/memory.md` | 用户显式要求记住；或从多次修正反馈中提炼出的新习惯 |
+| 跨项目通用经验（编码风格、工具习惯、个人设置等） | `~/.pie/memory.md` | 用户显式要求；或从多次修正反馈提炼出的新习惯 |
 | 项目专属决策经验（架构选型、业务规则、技术栈版本等） | `<项目根>/MEMORY.md` | 完成重大功能、修复复杂 Bug、重构后；或用户说“记住这个决策” |
 | 待办事项 / 路线图 | `<项目根>/MEMORY.md` | 规划新阶段、完成里程碑后更新进度 |
-
-### 禁止写入
-
-- 临时性报错堆栈、中间输出、调试日志
-- 明文密钥或敏感凭证（应使用 `.env`）
-- 已被项目记忆或全局记忆覆盖的临时性偏好
 """
 
 GLOBAL_MEMORY_TEMPLATE = """\
 # 全局记忆（~/.pie/memory.md）
 
-本文件是 pie 的全局持久记忆：记录跨项目仍然有效的用户偏好、关键决策和踩过的坑。agent 在每次会话开始时读取，并可在运行中用 edit/write 更新。
+跨项目的持久记忆：用户偏好、关键约定、踩过的坑。每次会话自动注入 system prompt，保持简洁。
 
-保持简洁：只记跨会话仍然有效的事实，不要记临时状态（如临时文件路径）。
+只记跨会话仍然有效的事实。不记临时状态（临时文件路径、报错堆栈、调试日志）；密钥放 `.env`；项目专属内容写到项目根 `MEMORY.md`。
 
-## 使用方式
+## 写入时机
 
-- 学到跨会话仍然有效的经验、用户偏好或项目决策时，用 edit/write 更新记忆文件：跨项目通用的写到这里，项目专属的写到该项目根目录的 MEMORY.md。
-- 不要删除本文件的说明段落；保持结构简单。
+- 用户显式要求记住；或从多次修正反馈中提炼出的新习惯。
+- 完成重大功能、修复复杂 Bug、重构后沉淀的关键决策。
+
+## 内容分类
+
+- **编码风格／工具链**：跨项目的代码风格、命名习惯、工具路径、个人设置。
+- **关键约定与踩坑**：容易再踩的规则，如「xxx 必须先 yyy，否则报 zzz」。
+
+说明段落不要删除，追加内容写到对应分类下。
 """
 
 
@@ -169,6 +166,8 @@ class Config:
     max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
     verbose: bool = True
     theme: str = DEFAULT_THEME_NAME  # TUI 主题名（见 theme.py 的 THEMES）
+    # 按工具名设置默认私有参数（下划线开头，不进 schema）：如 read: {_max_lines, _max_bytes, _max_image_bytes}
+    tools: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # 归一化旧 bool 写法（compaction = true / false），保证下游只见到
@@ -290,7 +289,7 @@ def _toml_dump(data: dict[str, Any]) -> str:
         # 先输出本层标量，再输出子表，避免后续标量被误归入已开始的 [表]。
         # None 表示“未配置/关闭”，TOML 无 null，直接跳过。
         scalars = {k: v for k, v in d.items() if not isinstance(v, dict) and v is not None}
-        tables = {k: v for k, v in d.items() if isinstance(v, dict)}
+        tables = {k: v for k, v in d.items() if isinstance(v, dict) and v}
         for key, value in scalars.items():
             lines.append(f"{key} = {fmt(value)}")
         for key, value in tables.items():
@@ -407,5 +406,6 @@ def build_system_prompt(
         parts.append(block)
     parts.extend(str(p) for p in append_prompts if p)
     return "\n\n".join(parts)
+
 
 

@@ -24,7 +24,7 @@ from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import VerticalGroup, Horizontal, VerticalScroll
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
@@ -152,17 +152,17 @@ Screen {{ layout: vertical; background: {palette.screen_bg}; }}
 }}
 #stream {{
     height: auto;
-    max-height: 3;
+    max-height: 4;
     color: {palette.muted};
     padding: 0 1;
     display: none;
-    border: none;
+    border: round {palette.border_dim};
 }}
 #assistant-stream {{
     height: auto;
-    max-height: 14;
+    max-height: 12;
     display: none;
-    border: none;
+    border: round {palette.border_dim};
     padding: 0 1;
     scrollbar-size: 0 1;
     scrollbar-background: {palette.scrollbar_track};
@@ -868,6 +868,7 @@ class PieApp(App):
                 self._update_meta()
         else:
             log.write(_box(self.palette, f"未知命令: {cmd}（/help 查看）", role="error"))
+        log.scroll_end(animate=False, force=True)
         self._update_status()
 
     def _safe_save(self) -> None:
@@ -1130,3 +1131,4 @@ class PieApp(App):
 
 def run_tui(session: Session, initial_prompt: str | None = None) -> None:
     PieApp(session, initial_prompt).run()
+
