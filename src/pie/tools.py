@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Union, get_args, get_origin, get_type_hints
 
+from .context import write_raw
+
 
 MAX_TOOL_OUTPUT = 20_000  # 单个工具返回给模型的最大字符数
-READ_IMAGE_MAX_BYTES = 12 * 1024 * 1024  # read 内联图片的字节上限（data URI 请求体保护）
+DEFAULT_MAX_IMAGE_BYTES = 32 * 1024 * 1024  # read 内联图片的默认字节上限（可由配置注入 _max_image_bytes 覆盖）
 
 
 class ToolError(Exception):
@@ -119,6 +121,35 @@ def tool(
     return decorate
 
 
+def _inject_tool_defaults(
+    name: str,
+    args: dict[str, Any],
+    handler: Callable[..., Any],
+    tool_defaults: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """把 config.tools[name] 里的配置合并进私有参数（下划线开头）。只注入：
+      - handler 签名里存在的参数；
+      - args 未显式提供的（不覆盖显式传参）；
+      - 默认值里有的键。
+    运行时注入项（_on_progress）由 adispatch 的 on_event 接管，不在此列。"""
+    if not tool_defaults:
+        return args
+    defaults = tool_defaults.get(name)
+    if not isinstance(defaults, dict):
+        return args
+    injected = dict(args)
+    for pname in inspect.signature(handler).parameters:
+        if not pname.startswith("_"):
+            continue
+        if pname == "_on_progress":
+            continue
+        if pname in injected:
+            continue
+        if pname in defaults:
+            injected[pname] = defaults[pname]
+    return injected
+
+
 class ToolRegistry:
     """按名字管理工具：注册、生成 OpenAI 定义、按名字调用。"""
 
@@ -137,12 +168,18 @@ class ToolRegistry:
     def definitions(self) -> list[dict[str, Any]]:
         return [t.definition() for t in self._tools.values()]
 
-    def dispatch(self, name: str, args: dict[str, Any]) -> str:
+    def dispatch(
+        self,
+        name: str,
+        args: dict[str, Any],
+        tool_defaults: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
         """同步分发（须在无事件循环的线程调用）：async 工具用 asyncio.run 包装。"""
         t = self._tools.get(name)
         if t is None:
             raise ToolError(f"未知工具: {name}（可用: {', '.join(self._tools)}）")
         handler = t.handler
+        args = _inject_tool_defaults(name, args, handler, tool_defaults)
         if inspect.iscoroutinefunction(handler):
             return asyncio.run(handler(**args))
         return handler(**args)
@@ -152,6 +189,7 @@ class ToolRegistry:
         name: str,
         args: dict[str, Any],
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        tool_defaults: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         """异步分发：async 工具直接 await；同步工具丢线程池（不阻塞事件循环）。
 
@@ -162,6 +200,7 @@ class ToolRegistry:
         if t is None:
             raise ToolError(f"未知工具: {name}（可用: {', '.join(self._tools)}）")
         handler = t.handler
+        args = _inject_tool_defaults(name, args, handler, tool_defaults)
         if inspect.iscoroutinefunction(handler):
             if on_event is not None and "_on_progress" in inspect.signature(handler).parameters:
                 return await handler(**args, _on_progress=on_event)
@@ -269,21 +308,19 @@ def _image_size(mime: str, head: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _read_image(p: Path, mime: str, head: bytes) -> str:
+def _read_image(p: Path, mime: str, head: bytes, max_bytes: int) -> str:
     """图片分支：返回机器可读标记（图片本体由 harness 读文件后按多模态消息注入）。
-    offset/limit 是文本分页概念，对图片无意义，直接忽略。"""
+    offset/limit/_max_lines/_max_bytes 是文本分页概念，对图片无意义，直接忽略；
+    图片只看 max_bytes（默认 DEFAULT_MAX_IMAGE_BYTES，可由配置注入 _max_image_bytes 覆盖）。"""
     size = p.stat().st_size
-    if size > READ_IMAGE_MAX_BYTES:
+    if max_bytes is not None and size > max_bytes:
         raise ToolError(
-            f"图片过大（{size:,} 字节 > {READ_IMAGE_MAX_BYTES:,} 上限），无法内联发送给模型；"
+            f"图片过大（{size:,} 字节 > {max_bytes:,} 上限），无法内联发送给模型；"
             "请先压缩/裁剪该图片再读取"
         )
     dim = _image_size(mime, head)
     dim_txt = f", dim={dim[0]}x{dim[1]}" if dim else ""
-    return (
-        f"[图片已读取: path={p}, mime={mime}, size={size}{dim_txt}]\n"
-        #"图像内容已作为多模态消息附加到本轮对话（offset/limit 不适用于图片）。"
-    )
+    return f"[图片已读取: path={p}, mime={mime}, size={size}{dim_txt}]"
 
 
 def parse_image_marker(text: str) -> ImageRef | None:
@@ -304,6 +341,54 @@ def parse_image_marker(text: str) -> ImageRef | None:
 # ---------------------------------------------------------------- 内置工具
 
 
+def _lines_by_bytes(lines: list[str], start: int, max_bytes: int) -> int:
+    """从 start 起累计行字节（UTF-8，含换行近似 +1）不超过 max_bytes，返回可读行数；
+    至少取 1 行（文件非空时），保证单行超长也能读到内容（此时会略微超出字节预算）。"""
+    n = 0
+    sz = 0
+    for line in lines[start:]:
+        b = len(line.encode("utf-8")) + 1
+        if sz + b > max_bytes and n > 0:
+            break
+        sz += b
+        n += 1
+    return n
+
+
+def _tail_output(text: str, max_lines: int | None, max_bytes: int | None) -> str:
+    """按行 / 字节预算截取尾部连续段（shell 超限只保留尾部）；未超限返回原文。"""
+    if max_lines is None and max_bytes is None:
+        return text
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    cap = total
+    if max_lines is not None:
+        cap = min(cap, max_lines)
+    if max_bytes is not None:
+        sz = 0
+        cnt = 0
+        for line in reversed(lines):
+            b = len(line.encode("utf-8"))
+            if sz + b > max_bytes and cnt > 0:
+                break
+            sz += b
+            cnt += 1
+        cap = min(cap, cnt)
+    if cap >= total:
+        return text
+    return "".join(lines[-cap:])
+
+
+def _format_output(headers: list[str], body: str | None = None) -> str:
+    """按「Headers\\n\\nBody」统一工具返回：headers 为一行一个 `[...]` 方括号行；
+    body 非空（truthy）时用空行分隔；body 为空 / 无 body 则省略空行，只返回 headers。
+    Header 值内不要含 `]`。"""
+    head = "\n".join(headers)
+    if body:
+        return head + "\n\n" + body
+    return head
+
+
 @tool(
     parameters={
         "path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
@@ -317,10 +402,20 @@ def parse_image_marker(text: str) -> ImageRef | None:
         },
     }
 )
-def read(path: str, offset: int | None = None, limit: int | None = None) -> str:
-    """读取文件内容（不截断）：文本按 UTF-8 全文或 offset（1 起）/ limit 分页读取；
-    图片（PNG/JPEG/GIF/WebP/BMP）返回图像引用，图像内容会随多模态请求发送给模型，
-    此时 offset/limit 不适用。"""
+def read(
+    path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    _max_lines: int | None = None,
+    _max_bytes: int | None = None,
+    _max_image_bytes: int | None = DEFAULT_MAX_IMAGE_BYTES,
+) -> str:
+    """读取文件内容：文本按 UTF-8 全文或 offset（1 起）/ limit 分页读取。
+    _max_lines / _max_bytes 为私有容量上限（默认由配置 tools.read 注入，未提供则不设行数/字节限制）：
+    从 offset 起点向后取连续段，行数 ≤ min(limit, _max_lines, 字节预算行数)，字节预算行数 =
+    使所选行累计字节尽可能接近 _max_bytes（不超，至少 1 行）。
+    图片（PNG/JPEG/GIF/WebP/BMP）返回图像引用，图像内容随多模态请求发送给模型，
+    文本容量上限（offset/limit/_max_lines/_max_bytes）对图片不适用，图片只看 _max_image_bytes。"""
     p = Path(path)
     if not p.exists():
         raise ToolError(f"文件不存在: {path}")
@@ -332,22 +427,36 @@ def read(path: str, offset: int | None = None, limit: int | None = None) -> str:
         raise ToolError(f"无法读取 {path}: {e}")
     mime = _sniff_mime(head)
     if mime is not None:
-        return _read_image(p, mime, head)
+        return _read_image(p, mime, head, _max_image_bytes)
     try:
         content = p.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return f"[二进制文件，大小 {p.stat().st_size} 字节，无法按文本读取]"
-    if offset is not None or limit is not None:
-        lines = content.splitlines()
-        total = len(lines)
-        if offset is not None and (offset < 1 or offset > total):
-            raise ToolError(f"offset 无效: {offset}（文件共 {total} 行）")
-        if limit is not None and limit <= 0:
-            raise ToolError(f"limit 无效: {limit}（必须为正整数）")
-        start = max(0, (offset or 1) - 1)
-        picked = lines[start : start + limit] if limit is not None else lines[start:]
-        return f"[行 {start + 1}-{start + len(picked)}，共 {total} 行]\n" + "\n".join(picked)
-    return content
+    lines = content.splitlines()
+    total = len(lines)
+    if offset is not None and (offset < 1 or offset > total):
+        raise ToolError(f"offset 无效: {offset}（文件共 {total} 行）")
+    if limit is not None and limit <= 0:
+        raise ToolError(f"limit 无效: {limit}（必须为正整数）")
+    for label, v in (("_max_lines", _max_lines), ("_max_bytes", _max_bytes)):
+        if v is not None and v <= 0:
+            raise ToolError(f"{label} 无效: {v}（必须为正整数或 None）")
+    start = max(0, (offset or 1) - 1)
+    want = total - start
+    if limit is not None:
+        want = min(want, limit)
+    cap = want
+    if _max_lines is not None:
+        cap = min(cap, _max_lines)
+    if _max_bytes is not None:
+        cap = min(cap, _lines_by_bytes(lines, start, _max_bytes))
+    picked = lines[start : start + cap]
+    omitted = want - len(picked)  # 仅容量上限导致的省略（limit 是模型显式分页，不算截断）
+    body = "\n".join(picked)
+    headers = [f"[行 {start + 1}-{start + len(picked)}，共 {total} 行]"]
+    if omitted > 0:
+        headers.append(f"[工具输出全文已保存: {write_raw(content, 'tool')}]")
+    return _format_output(headers, body)
 
 
 @tool(
@@ -418,7 +527,7 @@ def edit(path: str, edits: list[dict[str, str]]) -> str:
         pos = end
     parts.append(content[pos:])
     p.write_text("".join(parts), encoding="utf-8")
-    return f"已替换 {len(edits)} 处: {path}"
+    return _format_output([f"[已替换 {len(edits)} 处: {path}]"])
 
 
 @tool(
@@ -432,7 +541,7 @@ def write(path: str, content: str) -> str:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return f"已写入 {p}（{len(content)} 字符，{content.count(chr(10)) + 1} 行）"
+    return _format_output([f"[已写入 {p}（{len(content)} 字符，{content.count(chr(10)) + 1} 行）]"])
 
 
 @tool(
@@ -447,13 +556,17 @@ def write(path: str, content: str) -> str:
 async def shell(
     command: str,
     timeout: int | None = None,
+    _max_lines: int | None = None,
+    _max_bytes: int | None = None,
     _on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """执行 shell 命令，返回 stdout/stderr 与退出码（YOLO，无权限确认）。
 
     async 实现：stdout/stderr 合并逐行读取，每行通过 _on_progress 实时推送
     （供 TUI 边执行边显示）；被取消（asyncio.CancelledError / 超时）时 kill 子进程。
-    超长输出不做内部截断，交回 harness 由工具级压缩（head+tail 落盘指针）处理。
+    _max_lines / _max_bytes 为私有容量上限（默认由配置 tools.shell 注入，未提供则不限制）：
+    超出时只保留输出尾部（行数 ≤ min(_max_lines, 字节预算行数)），并全文落盘指针，
+    信息不丢；_on_progress 实时推送不受截断影响（TUI 可见全量）。
     """
 
     async def _run() -> tuple[int, str]:
@@ -485,7 +598,11 @@ async def shell(
         rc, out = await asyncio.wait_for(_run(), timeout)
     except asyncio.TimeoutError:
         return f"[shell] 命令超过 {timeout}s 超时，可能仍在后台运行：{command}"
-    return f"[exit={rc}]\n{out}"
+    tail = _tail_output(out, _max_lines, _max_bytes)
+    if tail == out:
+        return _format_output([f"[exit={rc}]"], tail)
+    spill = write_raw(out, "shell")
+    return _format_output([f"[exit={rc}]", f"[工具输出全文已保存: {spill}]"], tail)
 
 
 def register_builtins(registry: ToolRegistry) -> ToolRegistry:
@@ -512,6 +629,8 @@ def _restricted_shell_tool(allow_cmds: list[str], base: Tool) -> Tool:
     async def handler(
         command: str,
         timeout: int | None = None,
+        _max_lines: int | None = None,
+        _max_bytes: int | None = None,
         _on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         stripped = command.strip()
@@ -520,7 +639,13 @@ def _restricted_shell_tool(allow_cmds: list[str], base: Tool) -> Tool:
             raise ToolError(
                 f"[shell] 本次仅允许以这些命令开头: {allowed}（收到: {first or '(空命令)'}）"
             )
-        return await base.handler(command, timeout=timeout, _on_progress=_on_progress)
+        return await base.handler(
+            command,
+            timeout=timeout,
+            _max_lines=_max_lines,
+            _max_bytes=_max_bytes,
+            _on_progress=_on_progress,
+        )
 
     return Tool(
         name="shell",
@@ -573,5 +698,6 @@ def tools_from_spec(spec: str | None) -> ToolRegistry:
         else:
             registry.register(t)
     return registry
+
 
 
