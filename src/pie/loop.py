@@ -108,11 +108,15 @@ async def _tool_call(
     args: dict[str, Any],
     cancel_event: asyncio.Event | None,
     on_event: Callable[[dict[str, Any]], None] | None,
+    tool_defaults: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
     """执行工具；被取消时返回 None（工具内部已做清理）。"""
     if cancel_event is None:
-        return await registry.adispatch(name, args, on_event=on_event)
-    return await _wait_cancellable(registry.adispatch(name, args, on_event=on_event), cancel_event)
+        return await registry.adispatch(name, args, on_event=on_event, tool_defaults=tool_defaults)
+    return await _wait_cancellable(
+        registry.adispatch(name, args, on_event=on_event, tool_defaults=tool_defaults),
+        cancel_event,
+    )
 
 
 async def _run_tool_call(
@@ -141,7 +145,9 @@ async def _run_tool_call(
             file=sys.stderr,
         )
     try:
-        text = await _tool_call(registry, call.name, args, cancel_event, on_event)
+        text = await _tool_call(
+            registry, call.name, args, cancel_event, on_event, tool_defaults=cfg.tools
+        )
     except ToolError as e:
         text = f"[工具错误] {e}"
     except asyncio.CancelledError:
@@ -164,8 +170,8 @@ def _finalize_tool_message(
 ) -> ToolMessage:
     """按 call 构造 ToolMessage；shell 自带落盘的结果把 spill 指针同步进 manifest。"""
     tool_msg = ToolMessage(content=text, tool_call_id=call.id, tool_name=call.name)
-    if call.name == "shell" and manifest is not None:
-        path = extract_spill_path(text)  # shell 自带 limit 落盘，记录指针进 manifest
+    if manifest is not None:
+        path = extract_spill_path(text)  # 工具内截断落盘的结果，记录指针进 manifest
         if path is not None:
             tool_msg.compress_level = 1
             tool_msg.raw_path = str(path)
@@ -176,7 +182,7 @@ def _finalize_tool_message(
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "level": 1,
                     "kind": "tool",
-                    "tool": "shell",
+                    "tool": call.name,
                     "raw_path": str(path),
                     "raw_hash": path.stem.split("-")[-1],
                 },
@@ -380,4 +386,5 @@ def _cancel_tools(
             on_event({"type": "tool_result", "name": call.name, "text": CANCEL_TEXT})
         messages.add(_finalize_tool_message(call, content, manifest))
     return _cancel_turn(messages, on_event)
+
 
