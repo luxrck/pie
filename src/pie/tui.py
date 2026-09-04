@@ -100,7 +100,7 @@ def _split_shell_exit(text: str) -> tuple[str | None, str]:
     """
     if text.startswith("[exit="):
         code = text[6:].split("]", 1)[0]
-        rest = text.split("\n", 1)[1] if "\n" in text else ""
+        rest = text.split("\n\n", 1)[1].lstrip() if "\n" in text else ""
         return code, rest
     return None, text
 
@@ -573,14 +573,15 @@ class PieApp(App):
         self.query_one("#meta", Static).update(
             f"{self.session.config.model} {self.session.config.reasoning_effort}"
             f" · {Path.cwd()}"
-            f" | 归档: {len(self.session.fs)}"
+            f" · [{len(self.session.fs)}]"
         )
 
     def _update_status(self) -> None:
         rep = self.session.usage_report().splitlines()
         # 跳过“会话文件”行（路径长，不适合状态栏），仍取首/尾两行摘要
         lines = [ln for ln in rep if not ln.startswith("会话文件")]
-        self.query_one("#status", Static).update(f"{lines[0].split("：", 1)[-1].strip()} | {lines[-1].split("：", 1)[-1].strip()}")
+        compact = lines[3].split("：", 1)[-1].strip().split("(")[0].strip()
+        self.query_one("#status", Static).update(f"{lines[0].split("：", 1)[-1].strip()} · {lines[-1].split("：", 1)[-1].strip()} · [{compact}]")
 
     # ---- 历史渲染 ----
 
@@ -868,7 +869,6 @@ class PieApp(App):
                 self._update_meta()
         else:
             log.write(_box(self.palette, f"未知命令: {cmd}（/help 查看）", role="error"))
-        log.scroll_end(animate=False, force=True)
         self._update_status()
 
     def _safe_save(self) -> None:
@@ -1104,6 +1104,7 @@ class PieApp(App):
             self._clear_stream()
             self._assistant_text = ""
             self._render_assistant_stream()
+        log.scroll_end(animate=False, force=True)
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:

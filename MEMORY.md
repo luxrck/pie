@@ -145,6 +145,7 @@ echo "还原完成: $SRC"
 
 ### 上下文压缩
 
+- 2026-09-03：工具级压缩误报修复——`_finalize_tool_message` 先前对所有工具结果调用 `extract_spill_path` 全局搜 `[...全文已保存: ...]`；而 `read` 读取源码时输出常含该格式字面量（如 `[工具输出全文已保存: {path}]`、`{spill}`、`{write_raw(content, 'tool')}`），被 `_SPILL_RE` 误匹配 → 伪造 raw_path/raw_hash、compress_level=1 并写假 level=1 manifest，导致离软阈值很远时也报“工具压缩”。修复：① 仅 `call.name=='shell'` 时提取（该机制本就为 shell 落盘设计，read/edit/write 落盘指针在 content 里自描述、`message_raw_path` 可恢复）；② `extract_spill_path` 加路径存在校验（真 spill 指针必指向刚落盘的文件）。
 - keep_last_steps=0（旧键 keep_last_turns/keep_last_k_turns 已移除）：user_idx[m] 越界 IndexError（compress_session 必崩、maybe_compact 触发时崩），轮次级还会把进行中的当前轮压掉 → 统一 clamp max(1, keep)，0 等价 1（当前轮必须保留）。
 - 会话级压缩在轮次进行中 pair 提取“最终输出”，产生 user→纯文本 assistant→assistant(tool_calls)→tool 非法序列，被 DeepSeek 400 拒绝（reasoning_content 缺失/空串都不是根因）→ 进行中轮次不 pair 提取、pair 仅当轮次以 assistant 结尾时提取、Session.load 自动修复。
 - shell 工具内部 clip_output 截断后丢弃全文（信息丢失）→ 工具返回全文，落盘统一在 harness 边界做（eager spill）。

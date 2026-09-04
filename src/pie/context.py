@@ -102,7 +102,12 @@ def write_manifest(manifest: Path, entry: dict[str, Any]) -> None:
 
 def extract_spill_path(text: str) -> Path | None:
     m = _SPILL_RE.search(text or "")
-    return Path(m.group(1)) if m else None
+    if not m:
+        return None
+    p = Path(m.group(1))
+    # 双保险：spill 指针必然指向刚落盘的真实文件；若文本里恰好含该格式字符串
+    # （如读取的源码中的字面量），文件不存在则视为假指针，避免误判成压缩事件。
+    return p if p.exists() else None
 
 
 def load_window_dicts(path: Path) -> list[dict[str, Any]]:
@@ -191,7 +196,7 @@ def build_window_summary(path: Path, head: int, tail: int) -> str:
     """历史窗口的摘要文本：文件指针 + 规则式 <user_q, 模型最终回复> 对。"""
     body = summarize_turns(load_window_dicts(path), head, tail)
     pointer = f"{WINDOW_SUMMARY_MARKER} {path}]"
-    return f"{pointer}\n{body}" if body else f"{pointer}（无可摘要内容）"
+    return f"{pointer}\n\n{body}" if body else f"{pointer}\n\n（无可摘要内容）"
 
 
 # ---------------------------------------------------------------- 消息模型
@@ -387,7 +392,7 @@ class ToolMessage(Message):
             return 0
         path = write_raw(content, self.tool_name or "tool")
         preview = lines[:head] + ["...[中间省略]..."] + (lines[-tail:] if tail else [])
-        self.content = f"[工具输出全文已保存: {path}]\n" + "\n".join(preview)
+        self.content = f"[工具输出全文已保存: {path}]\n\n" + "\n".join(preview)
         self.compress_level = 1
         self._set_raw(path, content)  # raw 记录原始文本
         if manifest is not None:
@@ -580,7 +585,7 @@ class AgentMessage:
                     "summary": body[:200],
                 },
             )
-        msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n{body}", compress_level=2)
+        msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n\n{body}", compress_level=2)
         msg._set_raw(path, raw)
         return msg
 
