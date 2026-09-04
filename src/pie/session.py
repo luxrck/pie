@@ -340,13 +340,16 @@ class Session:
         parts += [
             f"当前上下文占用（估算）：{total:,} / {limit:,} tokens ({pct:.1f}%)",
             f"软阈值 {soft:,} ({self.config.context_soft_ratio:.0%}) | 目标水位 {target:,} ({self.config.context_target_ratio:.0%})",
-            "各角色（估算）："
-            + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
+            "各角色（估算）：" + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
         ]
         comp_events = self.compression_history()
         if comp_events:
             evicted = 0
+            level_counts = {1: 0, 2: 0, 3: 0}
             for e in comp_events:
+                lvl = e.get("level")
+                if lvl in level_counts:
+                    level_counts[lvl] += 1
                 raw_path = e.get("raw_path")
                 if raw_path and Path(raw_path).exists():
                     try:
@@ -354,9 +357,25 @@ class Session:
                     except OSError:
                         pass
             parts.append(
+                "上下文压缩："
+                f"{level_counts[1]} / {level_counts[2]} / {level_counts[3]}"
+                " (工具级 / 轮次级 / 会话级)"
+            )
+            parts.append(
                 f"本会话已压缩 {len(comp_events)} 次 (当前为压缩视图)，"
                 f"落盘原文约 {evicted:,} tokens (可经指针恢复)"
             )
+        else:
+            parts.append(
+                "上下文压缩："
+                "0 / 0 / 0"
+                " (工具级 / 轮次级 / 会话级)"
+            )
+            parts.append(
+                f"本会话已压缩 0 次 (当前为压缩视图)，"
+                f"落盘原文约 0 tokens (可经指针恢复)"
+            )
+
         if self.usage.last_prompt_tokens is not None:
             parts.append(
                 "最近一次 API 上报："

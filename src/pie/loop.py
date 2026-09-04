@@ -170,8 +170,11 @@ def _finalize_tool_message(
 ) -> ToolMessage:
     """按 call 构造 ToolMessage；shell 自带落盘的结果把 spill 指针同步进 manifest。"""
     tool_msg = ToolMessage(content=text, tool_call_id=call.id, tool_name=call.name)
-    if manifest is not None:
-        path = extract_spill_path(text)  # 工具内截断落盘的结果，记录指针进 manifest
+    # 仅 shell 会在 loop 层落盘（超 _max_lines/_max_bytes 时写“全文已保存”指针）。
+    # read/edit/write 的结果文本里可能恰好含该格式字符串（如读取的源码中的字面量），
+    # 若对所有工具全局搜索会误判成 spill 指针、产生假的压缩事件 → 按工具名 gate。
+    if manifest is not None and call.name == "shell":
+        path = extract_spill_path(text)
         if path is not None:
             tool_msg.compress_level = 1
             tool_msg.raw_path = str(path)
