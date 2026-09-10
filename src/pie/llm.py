@@ -33,6 +33,10 @@ class LLMResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     prompt_tokens: int | None = None  # 本次请求的上下文 token 数（provider 上报）
     completion_tokens: int | None = None  # 本次请求的输出 token 数（provider 上报）
+    total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+    reasoning_tokens: int | None = None  # 思考 token（completion_tokens_details.reasoning_tokens）
     reasoning_content: str | None = None  # thinking 模式的思考内容，必须原样回传
 
 
@@ -58,21 +62,33 @@ class StreamChunk:
 
 @dataclass
 class UsageTracker:
-    """会话级 token 用量累计（provider 上报值）。"""
+    """最近一次 API 上报的 token 用量（字段与 DeepSeek usage 对齐，**不累计求和**；calls 除外）。"""
 
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+    reasoning_tokens: int | None = None
     calls: int = 0
-    last_prompt_tokens: int | None = None
-    last_completion_tokens: int | None = None
 
-    def record(self, prompt: int, completion: int | None = None) -> None:
-        self.prompt_tokens += prompt
-        if completion:
-            self.completion_tokens += completion
+    def record(
+        self,
+        prompt: int,
+        completion: int | None = None,
+        *,
+        total: int | None = None,
+        cache_hit: int | None = None,
+        cache_miss: int | None = None,
+        reasoning: int | None = None,
+    ) -> None:
+        self.prompt_tokens = prompt
+        self.completion_tokens = completion
+        self.total_tokens = total
+        self.prompt_cache_hit_tokens = cache_hit
+        self.prompt_cache_miss_tokens = cache_miss
+        self.reasoning_tokens = reasoning
         self.calls += 1
-        self.last_prompt_tokens = prompt
-        self.last_completion_tokens = completion
 
 
 class LLM(Protocol):
@@ -109,13 +125,19 @@ def _diagnose(messages: list[dict[str, Any]]) -> None:
     )
 
 
-def _usage_tokens(usage: Any) -> tuple[int | None, int | None]:
+def _usage_fields(usage: Any) -> dict[str, int | None]:
+    """按 DeepSeek create-chat-completion 的 usage 结构提取字段。"""
     if usage is None:
-        return None, None
-    return (
-        getattr(usage, "prompt_tokens", None),
-        getattr(usage, "completion_tokens", None),
-    )
+        return {}
+    details = getattr(usage, "completion_tokens_details", None)
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+        "prompt_cache_hit_tokens": getattr(usage, "prompt_cache_hit_tokens", None),
+        "prompt_cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", None),
+        "reasoning_tokens": getattr(details, "reasoning_tokens", None) if details else None,
+    }
 
 
 class OpenAILLM:
@@ -164,6 +186,16 @@ class OpenAILLM:
             self._clients[loop] = client
         return client
 
+    async def list_models(self) -> list[str]:
+        """拉取端点可用模型 id 列表（OpenAI 兼容 GET /models，DeepSeek 亦支持）。
+
+        返回按 id 排序的列表；网络/鉴权失败时抛原异常（由调用方决定降级——
+        交互启动拉取失败只提示、不阻塞，/model 仍可手动指定任意 id）。
+        """
+        client = self._client()
+        resp = await client.models.list()
+        return sorted(str(m.id) for m in (resp.data or []))
+
     def _request_kwargs(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str | None
     ) -> dict[str, Any]:
@@ -203,12 +235,16 @@ class OpenAILLM:
             ToolCall(id=c.id, name=c.function.name, arguments=c.function.arguments)
             for c in (msg.tool_calls or [])
         ]
-        prompt_tokens, completion_tokens = _usage_tokens(getattr(resp, "usage", None))
+        u = _usage_fields(getattr(resp, "usage", None))
         return LLMResult(
             content=msg.content,
             tool_calls=calls,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            prompt_tokens=u.get("prompt_tokens"),
+            completion_tokens=u.get("completion_tokens"),
+            total_tokens=u.get("total_tokens"),
+            prompt_cache_hit_tokens=u.get("prompt_cache_hit_tokens"),
+            prompt_cache_miss_tokens=u.get("prompt_cache_miss_tokens"),
+            reasoning_tokens=u.get("reasoning_tokens"),
             reasoning_content=reasoning_content,
         )
 
@@ -294,16 +330,21 @@ class OpenAILLM:
             ToolCall(id=s["id"], name=s["name"], arguments=s["arguments"])
             for _, s in sorted(tool_calls.items())
         ]
-        prompt_tokens, completion_tokens = _usage_tokens(usage)
+        u = _usage_fields(usage)
         yield StreamChunk(
             type="done",
             result=LLMResult(
                 content="".join(content_parts) or None,
                 tool_calls=calls,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                prompt_tokens=u.get("prompt_tokens"),
+                completion_tokens=u.get("completion_tokens"),
+                total_tokens=u.get("total_tokens"),
+                prompt_cache_hit_tokens=u.get("prompt_cache_hit_tokens"),
+                prompt_cache_miss_tokens=u.get("prompt_cache_miss_tokens"),
+                reasoning_tokens=u.get("reasoning_tokens"),
                 reasoning_content="".join(reasoning_parts) or None,
             ),
         )
+
 
 

@@ -40,6 +40,8 @@ from .tools import (
 
 MAX_LOG_OUTPUT = 300  # 控制台日志中展示的结果长度
 
+CANCEL_GRACE = 3.0  # /stop 后等待工具清理的宽限秒数：超时则让清理在后台继续，先终止回合
+
 CANCEL_TEXT = "用户手动终止"  # /stop 手动取消后写入历史 / 返回给 UI 的固定文本
 
 
@@ -61,7 +63,14 @@ async def _wait_cancellable(
     )
     if cancel_task in done:  # 用户取消优先（即使任务同时完成）
         task.cancel()
-        await asyncio.gather(task, cancel_task, return_exceptions=True)
+        # 等工具清理结束（asyncio.wait 不打断清理）；但有限度——个别工具
+        # 清理可能真卡（如进程不可中断 D-state），不能无限等，否则 /stop 本身不返回
+        await asyncio.wait({task}, timeout=CANCEL_GRACE)
+        if task.done() and not task.cancelled():
+            try:
+                task.exception()  # 消费异常，避免 "never retrieved" 警告
+            except Exception:
+                pass
         return None
     cancel_task.cancel()
     return task.result()
@@ -272,7 +281,13 @@ async def acomplete_turn(
         if llm_out is None:  # 用户 /stop 取消了模型请求
             return _cancel_turn(messages, on_event)
         if usage is not None and llm_out.prompt_tokens is not None:
-            usage.record(llm_out.prompt_tokens, llm_out.completion_tokens)
+            usage.record(
+                llm_out.prompt_tokens, llm_out.completion_tokens,
+                total=llm_out.total_tokens,
+                reasoning=llm_out.reasoning_tokens,
+                cache_hit=llm_out.prompt_cache_hit_tokens,
+                cache_miss=llm_out.prompt_cache_miss_tokens,
+            )
         if llm_out.prompt_tokens is not None:
             messages.last_api_tokens = llm_out.prompt_tokens
             messages.dirty = False
@@ -389,5 +404,6 @@ def _cancel_tools(
             on_event({"type": "tool_result", "name": call.name, "text": CANCEL_TEXT})
         messages.add(_finalize_tool_message(call, content, manifest))
     return _cancel_turn(messages, on_event)
+
 
 

@@ -22,7 +22,7 @@ CONFIG_FILE = PIE_DIR / "config.toml"
 LEGACY_CONFIG_FILE = PIE_DIR / "config.json"
 GLOBAL_MEMORY_FILE = PIE_DIR / "memory.md"
 
-DEFAULT_MODEL = "deepseek-v4-flash-vision-exp"
+DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com/"
 DEFAULT_API_KEY = "sk-469cb4875eac409bb8e4c1419c03d0bf"
 DEFAULT_REASONING_EFFORT = "high"
@@ -116,7 +116,7 @@ class ToolCompaction:
     """工具级（level 1）压缩保留的行数。"""
 
     head: int = 30
-    tail: int = 20
+    tail: int = 50
 
 
 @dataclass
@@ -125,8 +125,8 @@ class SessionCompaction:
     每个轮次只保留 <user_q, model_last_response>（规则式，后续可换 LLM 摘要）。
     为 None 表示关闭会话级压缩。"""
 
-    head: int = 5
-    tail: int = 3
+    head: int = 3
+    tail: int = 5
 
 
 @dataclass
@@ -406,6 +406,7 @@ def build_system_prompt(
         parts.append(block)
     parts.extend(str(p) for p in append_prompts if p)
     return "\n\n".join(parts)
+
 
 
 
