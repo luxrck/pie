@@ -2,7 +2,7 @@
 
   pie [OPTIONS] [PROMPT]          交互 TUI（PROMPT 作为首条消息）或 print 一次性执行
   pie -p [PROMPT]                 非交互一次性执行（子 agent / 管道）
-  pie -r | pie resume             恢复最近会话
+  pie -r | pie resume             恢复当前目录下最近的会话
   pie --session <id> [PROMPT]     恢复指定会话
   pie sessions                    列出历史会话
   pie setup                       交互式配置模型与网络参数
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -23,7 +24,15 @@ from pathlib import Path
 from typing import Any
 
 from .session import Session
-from .config import CONFIG_FILE, PIE_DIR, Config, _prompt, build_system_prompt, ensure_config
+from .config import (
+    CONFIG_FILE,
+    PIE_DIR,
+    REASONING_LEVELS,
+    Config,
+    _prompt,
+    build_system_prompt,
+    ensure_config,
+)
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
 from .input import read_input
 from .tools import default_tools, parse_image_marker, tools_from_spec
@@ -58,6 +67,8 @@ CHAT_HELP = """\
   /clear         当前窗口写入 fs 归档，开新窗口
   /compact       手动压缩：/compact tools（工具级）、/compact turns（轮次级）、/compact（两者）
   /save [文件]   保存会话（不带参数则保存到当前会话文件）
+  /thinking      查看思考深度（/thinking <none|low|high|max> 切换）
+  /model         查看当前模型与可用列表（/model <id> 切换，重启仍生效）
   /status        查看当前 token 使用情况
   /help          显示本帮助
 """
@@ -159,7 +170,7 @@ def _parser() -> argparse.ArgumentParser:
         help="本次思考强度（off/minimal/low/medium/high/xhigh/max，覆盖配置，不持久化）",
     )
     parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
-    parser.add_argument("-r", "--resume", action="store_true", help="恢复最近的会话")
+    parser.add_argument("-r", "--resume", action="store_true", help="恢复当前目录下最近的会话")
     parser.add_argument("--cwd", metavar="PATH", help="内置工具的工作目录（默认当前目录）")
     parser.add_argument("--session", metavar="ID", help="恢复指定会话（id / 文件名 / 路径）")
     parser.add_argument("--session-id", metavar="ID", help="为新会话指定精确 id（print 模式会保存到该文件）")
@@ -312,6 +323,12 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
         "（/help 查看命令，/exit 退出，Ctrl-D 也可）",
         file=sys.stderr,
     )
+    # readline 回退模式（非 TTY / TUI 启动失败）：启动时同步拉取可用模型列表
+    # （/model 查看与切换用）；TTY 走 TUI 时由 PieApp.on_mount 后台拉取，不在此阻塞。
+    try:
+        asyncio.run(session.fetch_models(timeout=8))
+    except Exception as e:
+        print(f"[warn] 获取可用模型列表失败: {e}（/model <id> 仍可直接切换）", file=sys.stderr)
     if initial_prompt:
         try:
             answer = session.turn(initial_prompt)
@@ -364,6 +381,40 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
                         print(f"会话已保存: {session.file}")
                 elif cmd == "/status":
                     print(session.usage_report())
+                elif cmd == "/thinking":
+                    level = arg.strip().lower()
+                    if not level:
+                        print(
+                            f"当前思考深度: {session.config.reasoning_effort}"
+                            f"（可选: {' / '.join(REASONING_LEVELS)}）"
+                        )
+                    elif level not in REASONING_LEVELS:
+                        print(f"未知思考级别: {level}（可选: {' / '.join(REASONING_LEVELS)}）")
+                    else:
+                        note = session.set_reasoning_effort(level)
+                        print(f"思考深度: {level}（{note}，重启后仍生效）")
+                elif cmd == "/model":
+                    name = arg.strip()
+                    avail = session.available_models
+                    if not name:
+                        cur = session.config.model
+                        print(f"当前: {cur}")
+                        if avail:
+                            for m in avail:
+                                print(f"  {m}  ←" if m == cur else f"  {m}")
+                        else:
+                            print("（可用模型列表未获取到：/model <id> 直接切换，或 /model refresh 重新拉取）")
+                    elif name == "refresh":
+                        try:
+                            models = asyncio.run(session.fetch_models(timeout=8))
+                            print(f"已获取可用模型 {len(models)} 个（/model 查看）")
+                        except Exception as e:
+                            print(f"获取失败: {e}")
+                    elif avail and name not in avail:  # avail 为空（=列表未获取到）时不拦，允许手动指定
+                        print(f"未知模型: {name}（/model 查看可用 {len(avail)} 个；/model refresh 重新拉取）")
+                    else:
+                        note = session.set_model(name)
+                        print(f"模型已切换: {name}（{note}），下个请求生效")
                 else:
                     print(f"未知命令: {cmd}（/help 查看）")
                 continue
@@ -519,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     elif argv and argv[0] == "context":
         return context_main(argv[1:])
     return _run(_parser().parse_args(argv))
+
 
 
 

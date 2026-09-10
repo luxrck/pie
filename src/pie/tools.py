@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
+import signal
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -574,6 +576,7 @@ async def shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,  # 合并，保证输出顺序稳定
+            start_new_session=True,  # 独立进程组：取消/超时时 killpg 连子孙进程一起杀
         )
         lines: list[str] = []
         try:
@@ -589,9 +592,15 @@ async def shell(
                     )
             rc = await proc.wait()
         finally:
-            if proc.returncode is None:  # 异常 / 取消 / 超时时 kill，避免僵尸进程
-                proc.kill()
-                await proc.wait()
+            if proc.returncode is None:  # 异常 / 取消 / 超时：杀整个进程组，避免僵尸 + 子孙残留
+                _terminate_proc_group(proc)
+                # wait 限时：正常 killpg 后 <10ms 即返回；进程若处于不可中断内核态
+                # (D-state，如 NFS 卡 IO) SIGKILL 会排队暂不生效——不能无限等，
+                # 否则取消/超时路径本身会被卡住
+                try:
+                    await asyncio.wait_for(proc.wait(), 3)
+                except asyncio.TimeoutError:
+                    pass
         return rc, "".join(lines)
 
     try:
@@ -603,6 +612,21 @@ async def shell(
         return _format_output([f"[exit={rc}]"], tail)
     spill = write_raw(out, "shell")
     return _format_output([f"[exit={rc}]", f"[工具输出全文已保存: {spill}]"], tail)
+
+
+def _terminate_proc_group(proc: Any) -> None:
+    """杀整个进程组（create_subprocess_shell 配 start_new_session → 组 id = pid）。
+
+    只 kill shell 本体杀不掉它的子孙进程（真正干活的那个，且持有 stdout 管道写端）；
+    asyncio 的 wait() 要等管道 EOF 才返回，子孙残留会导致取消/超时路径卡到它自然退出。
+    killpg 连组一起杀，pipe 立即 EOF。"""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def register_builtins(registry: ToolRegistry) -> ToolRegistry:
@@ -698,6 +722,7 @@ def tools_from_spec(spec: str | None) -> ToolRegistry:
         else:
             registry.register(t)
     return registry
+
 
 
 

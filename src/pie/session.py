@@ -9,7 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import PIE_DIR, Config, SessionCompaction, build_system_prompt, resolve_config
+from .config import (
+    PIE_DIR,
+    REASONING_NONE,
+    Config,
+    SessionCompaction,
+    build_system_prompt,
+    resolve_config,
+)
 from .context import (
     CONTEXT_DIR,
     WINDOWS_DIR,
@@ -41,6 +48,50 @@ class Session:
     turn_count: int = 0
     usage: UsageTracker = field(default_factory=UsageTracker)
     title: str | None = None  # 会话标题 = 首个用户 query（写入 __meta__）
+    available_models: list[str] | None = None  # 启动时拉取的可用模型 id（/model 切换/补全用，不持久化）
+
+    async def fetch_models(self, timeout: float = 10.0) -> list[str]:
+        """拉取端点可用模型 id 并缓存到 available_models；失败抛原异常（保留旧缓存）。
+
+        启动时由交互界面（TUI worker / readline 入口）调用；后端不支持
+        list_models 时抛 NotImplementedError。"""
+        fetch = getattr(self.llm, "list_models", None)
+        if fetch is None:
+            raise NotImplementedError("当前模型后端不支持列出可用模型")
+        models = await asyncio.wait_for(fetch(), timeout)
+        self.available_models = models
+        return models
+
+    def set_model(self, name: str) -> str:
+        """切换模型（/model <id>）：更新 config + llm 实例并持久化，返回提示 note。
+
+        实际请求每轮从 config.model 读取（loop._model_call 传 model=cfg.model），
+        llm.model 只是构造/预热的默认值——同步它保持顶栏与预热语义一致；
+        下次模型请求即用新模型。"""
+        cfg = self.config
+        cfg.model = name
+        llm = getattr(self, "llm", None)
+        if llm is not None and hasattr(llm, "model"):
+            llm.model = name
+        return self._persist_note(cfg)
+
+    def set_reasoning_effort(self, level: str) -> str:
+        """切换思考深度（/thinking <none|low|high|max>）：更新 config + llm 实例并持久化。"""
+        cfg = self.config
+        cfg.reasoning_effort = level
+        llm = getattr(self, "llm", None)
+        if llm is not None and hasattr(llm, "reasoning_effort"):
+            llm.reasoning_effort = None if level == REASONING_NONE else level
+        return self._persist_note(cfg)
+
+    @staticmethod
+    def _persist_note(cfg: Config) -> str:
+        """持久化当前 config 到来源文件；失败时返回提示（仅本次会话生效）。"""
+        try:
+            cfg.save(getattr(cfg, "config_file", None))
+            return "已写入配置"
+        except OSError as e:
+            return f"配置写入失败: {e}（仅本次会话生效）"
 
     @classmethod
     def new(
@@ -105,9 +156,11 @@ class Session:
                         for k in (
                             "prompt_tokens",
                             "completion_tokens",
+                            "total_tokens",
+                            "prompt_cache_hit_tokens",
+                            "prompt_cache_miss_tokens",
+                            "reasoning_tokens",
                             "calls",
-                            "last_prompt_tokens",
-                            "last_completion_tokens",
                         )
                         if k in data.get("usage", {})
                     }
@@ -200,6 +253,11 @@ class Session:
         )
         if not files:
             raise FileNotFoundError(f"{sessions_dir} 中没有历史会话")
+        # 优先「当前工作目录」下最新的会话；没有匹配（含无 cwd 的旧会话）则回退全局最新
+        cwd = str(Path.cwd())
+        for f in files:
+            if _session_cwd(f) == cwd:
+                return cls.load(f, config=config, llm=llm, tools=tools)
         return cls.load(files[0], config=config, llm=llm, tools=tools)
 
     def turn(
@@ -326,7 +384,13 @@ class Session:
         return stats
 
     def usage_report(self) -> str:
-        total = self.messages.tokens()
+        reported = self.usage.prompt_tokens
+        if reported is not None:
+            total = reported
+            label = "当前上下文占用（API 上报）："
+        else:
+            total = self.messages.tokens()
+            label = "当前上下文占用（估算）："
         limit = max(1, self.config.max_seq_len)
         soft = self.config.soft_limit()
         target = self.config.target_limit()
@@ -338,9 +402,9 @@ class Session:
         if self.file is not None and self.file.exists():
             parts.append(f"会话文件：{self.file}")
         parts += [
-            f"当前上下文占用（估算）：{total:,} / {limit:,} tokens ({pct:.1f}%)",
+            f"{label}{total:,} / {limit:,} tokens ({pct:.1f}%)",
             f"软阈值 {soft:,} ({self.config.context_soft_ratio:.0%}) | 目标水位 {target:,} ({self.config.context_target_ratio:.0%})",
-            "各角色（估算）：" + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
+            "各角色占用（估算）：" + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
         ]
         comp_events = self.compression_history()
         if comp_events:
@@ -376,18 +440,7 @@ class Session:
                 f"落盘原文约 0 tokens (可经指针恢复)"
             )
 
-        if self.usage.last_prompt_tokens is not None:
-            parts.append(
-                "最近一次 API 上报："
-                f"prompt {self.usage.last_prompt_tokens:,}"
-                f" | completion {self.usage.last_completion_tokens or 0:,}"
-            )
-        parts.append(
-            "会话累计 API 用量："
-            f"prompt {self.usage.prompt_tokens:,}"
-            f" | completion {self.usage.completion_tokens:,}"
-            f" ({self.usage.calls} 次调用)"
-        )
+        parts.append("API 用量：\n" + json.dumps(asdict(self.usage), ensure_ascii=False, indent=2))
         return "\n".join(parts)
 
     def compression_history(self) -> list[dict]:
@@ -450,6 +503,7 @@ class Session:
             "__meta__": True,
             "usage": asdict(self.usage),
             "fs": [str(p) for p in self.fs],
+            "cwd": str(Path.cwd()),
         }
         if self.title:
             meta["title"] = self.title
@@ -459,6 +513,21 @@ class Session:
                 f.write(json.dumps(m.to_dict(), ensure_ascii=False) + "\n")
         self.file = target
         return target
+
+
+def _session_cwd(path: Path) -> str | None:
+    """读会话文件 meta 行里的 cwd（旧会话可能没有，返回 None）。"""
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    data = json.loads(line)
+                    if data.get("__meta__"):
+                        return data.get("cwd")
+                    return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
 
 
 def _backfill_title(path: Path, title: str) -> None:
@@ -475,6 +544,7 @@ def _backfill_title(path: Path, title: str) -> None:
             lines[i] = json.dumps(data, ensure_ascii=False)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
+
 
 
 

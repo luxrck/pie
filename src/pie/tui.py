@@ -1,8 +1,12 @@
 """Textual TUI：pi / tau 风格的聊天界面。非 TTY 或 Textual 缺失时回退 readline。
 
+本模块包含：应用编排与控件（布局 / 命令 / 回合 worker / 流式渲染）、日志区控件与框选复制
+（SelectableRichLog，见文件内分区注释）。显示层文本处理（CJK 断行 / 转义清洗）在 textkit.py，
+配色与 CSS 在 theme.py。
+
 异步架构：回合在 Textual worker（同一事件循环）里 await session.aturn()，
 流式增量（模型 reasoning/content、shell 逐行输出）经 on_event 实时渲染到
-消息流下方的 #stream 区；/stop 通过 asyncio.Event 优雅取消当前回合。
+消息流下方的 #stream 区；/stop（或 Esc）通过 asyncio.Event 优雅取消当前回合。
 """
 
 from __future__ import annotations
@@ -12,9 +16,11 @@ import json
 import os
 import signal
 import time
+from bisect import bisect_right
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+from rich.console import Console
 from rich.panel import Panel
 from rich.cells import cell_len
 from rich.segment import Segment
@@ -24,31 +30,32 @@ from rich.markdown import Markdown
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalGroup, Horizontal, VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.strip import Strip
-from textual.widgets import Button, Footer, Header, RichLog, Static, TextArea
+from textual.widgets import Button, RichLog, Static, TextArea
 from textual.worker import Worker
 
 from .session import Session
-from .config import REASONING_LEVELS, REASONING_NONE
+from .config import REASONING_LEVELS
 from .context import content_text
-from .theme import Theme, get_theme
+from .textkit import install_cjk_wrap, rich_text, strip_escapes
+from .theme import Theme, build_css, get_theme
+
+install_cjk_wrap()  # 显示层断行改成 CJK 友好（替换 rich.text.divide_line）
 
 # 命令补全候选：(命令, 说明)
 PALETTE_COMMANDS: list[tuple[str, str]] = [
     ("/help", "显示帮助"),
     ("/status", "查看 token 用量"),
-    ("/stop", "取消当前正在执行的模型请求/工具"),
+    ("/stop", "取消当前正在执行的模型请求/工具（等价 Esc）"),
+    ("/thinking", "查看/切换思考深度（/thinking <level>，Tab 补全）"),
+    ("/model", "查看模型列表 / 切换模型（/model <id>，Tab 补全）"),
     ("/compact", "工具级 + 轮次级压缩"),
     ("/compact tools", "只做工具级压缩"),
     ("/compact turns", "只做轮次级压缩"),
     ("/clear", "归档当前窗口，开新窗口"),
     ("/save", "保存会话（可带文件路径）"),
-    ("/reasoning none", "思考深度: 关闭"),
-    ("/reasoning low", "思考深度: low"),
-    ("/reasoning high", "思考深度: high（默认）"),
-    ("/reasoning max", "思考深度: max"),
     ("/reset", "清空对话历史"),
     ("/exit", "退出"),
     ("/quit", "退出"),
@@ -64,16 +71,45 @@ def _box(
     *,
     title: str = "",
     role: str = "system",
-    icon: str = "",
+    icon: str | None = None,
+    tool: str = "",
 ) -> Panel:
-    """把一条输出装进带边框的盒子；边框颜色按 role 区分（palette.role_border）。"""
-    cls = Markdown if role == "assistant" else Text
+    """把一条输出装进带边框的盒子；边框颜色与标题图标都取自 palette。
+
+    图标优先级：显式 icon > 工具名（palette.tool_icon(tool)）> role 默认
+    （palette.role_icon(role)）。icon="" 可强制去掉图标；tool 为空/未配置则走 role 默认。
+    边框色始终按 role（palette.role_border）。
+
+    正文先做转义清洗：assistant 走 Markdown（样式由 Markdown 决定，SGR 一并剔除），
+    其余走 Text（SGR 解成样式）。否则转义字节会把盒子边框撑歪。
+    """
+    body = body or "(空回复)"
+    content: Text | Markdown = (
+        Markdown(strip_escapes(body, keep_sgr=False))
+        if role == "assistant"
+        else rich_text(body, palette.body_text)
+    )
+    if icon is None:
+        icon = palette.tool_icon(tool) if tool else palette.role_icon(role)
     return Panel(
-        cls(body or "(空回复)", style=palette.body_text),
+        content,
         title=f"{icon} {title}".strip() or None,
         title_align="left",
         border_style=palette.role_border(role),
         padding=(0, 1),
+    )
+
+
+def _tool_result_box(
+    palette: Theme, body: str, *, title: str, role: str, tool: str = ""
+) -> Panel:
+    """工具结果盒子：边框色按 role（失败染红），图标用该工具的**结果**图标。
+
+    工具结果的「是结果」与「成功/失败」是两回事：失败时 role="error" 把框染红，
+    但图标仍是结果图标（主题未配同名工具时回退 tool_result 默认 ↳，而非 ✗）。
+    """
+    return _box(
+        palette, body, title=title, role=role, icon=palette.tool_icon(tool, result=True)
     )
 
 
@@ -125,124 +161,35 @@ def _shell_result_box(body: str, code: Any) -> tuple[str, str, str]:
     return title, preview or "(无输出)", role
 
 
-def build_css(palette: Theme) -> str:
-    """由主题（palette）生成 PieApp 的 Textual CSS：布局 + 配色，无硬编码颜色。
+def _format_tool_args(args: Any) -> str:
+    """工具调用参数 → 展示文本（实时事件与历史回放共用）。
 
-    颜色全部来自 Theme；布局/滚动条配置固定。运行时在 __init__ 注入到 self.CSS，
-    Textual 在 load 阶段读取的是实例属性 self.CSS（而非类级 CSS），因此可按所选主题动态生成。
+    实时事件给 dict、历史回放给 JSON 字符串（function.arguments），两者归一：
+    空参 → "(无参数)"，解析不了（截断 / 手写）就原样显示。
     """
-    return f"""
-Screen {{ layout: vertical; background: {palette.screen_bg}; }}
-#log {{
-    height: 1fr;
-    border: round {palette.border_dim};
-    padding: 0 1;
-    background: {palette.log_bg};
-    /* 滚动条：窄（1 cell）+ 半透明灰轨道 + 亮灰滑块，替换默认的 2 cell 黑底蓝条 */
-    scrollbar-size: 0 1;
-    /* 轨道：带 alpha 的灰。ScrollBar 渲染时若背景 alpha<1 会与父级背景（沿 transparent
-       链最终是终端默认背景色）alpha 混合 → 半透明灰透出终端底色。
-       不要用 transparent（纯透明轨道会隐形）。 */
-    scrollbar-background: {palette.scrollbar_track};
-    scrollbar-background-hover: {palette.scrollbar_track_hover};
-    scrollbar-background-active: {palette.scrollbar_track_hover};
-    scrollbar-color: {palette.muted};
-    scrollbar-color-hover: {palette.body_text};
-    scrollbar-color-active: {palette.body_text};
-}}
-#stream {{
-    height: auto;
-    max-height: 4;
-    color: {palette.muted};
-    padding: 0 1;
-    display: none;
-    border: round {palette.border_dim};
-}}
-#assistant-stream {{
-    height: auto;
-    max-height: 12;
-    display: none;
-    border: round {palette.border_dim};
-    padding: 0 1;
-    scrollbar-size: 0 1;
-    scrollbar-background: {palette.scrollbar_track};
-    scrollbar-background-hover: {palette.scrollbar_track_hover};
-    scrollbar-background-active: {palette.scrollbar_track_hover};
-    scrollbar-color: {palette.muted};
-    scrollbar-color-hover: {palette.body_text};
-    scrollbar-color-active: {palette.body_text};
-}}
-#assistant-panel {{
-    width: 100%;
-}}
-#meta, #status {{
-    height: auto;
-    color: {palette.muted};
-    padding: 0 1;
-}}
-#input-bar {{
-    height: auto;
-}}
-CommandPalette {{
-    height: auto;
-    max-height: 6;
-    border: round {palette.border};
-    background: transparent;
-    color: {palette.body_text};
-    padding: 0 1;
-    display: none;
-}}
-#input {{
-    width: 1fr;
-    height: auto;
-    min-height: 5;
-    max-height: 5;
-    background: {palette.screen_bg};
-    color: {palette.body_text};
-    border: round {palette.border};
-    & .text-area--placeholder {{
-        color: {palette.faint};
-    }}
-    /* 选中高亮与 #log 鼠标框选统一：覆盖 TextArea 内置的
-       .text-area--selection（ansi 下默认 background: transparent + reverse，
-       与 #log 的选中高亮不一致）。#input 是 ID 选择器，优先级更高。 */
-    & .text-area--selection {{
-        background: {palette.accent};
-        color: {palette.accent_text};
-    }}
-}}
-#input:focus {{
-    border: round {palette.accent};
-}}
-#input.shell-mode, #input.shell-mode:focus {{
-    border: round {palette.role_tool_call};
-}}
-#send-btn {{
-    min-width: 0;
-    padding: 1;
-    text-align: center;
-    background: transparent;
-    border: round {palette.border};
-    color: {palette.muted};
-}}
-#send-btn:hover {{
-    background: transparent;
-    border: round {palette.accent};
-    color: {palette.body_text};
-}}
-#send-btn.busy {{
-    background: transparent;
-    border: round {palette.busy_border};
-    color: {palette.busy_text};
-}}
-#send-btn.busy:hover {{
-    background: transparent;
-    border: round {palette.busy_border_hover};
-    color: {palette.busy_border_hover};
-}}
-Header {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
-Footer {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
-"""
+    if isinstance(args, str):
+        raw = args.strip()
+        if not raw:
+            return "(无参数)"
+        try:
+            args = json.loads(raw)
+        except ValueError:
+            return args
+    try:
+        return json.dumps(args, ensure_ascii=False) if args else "(无参数)"
+    except TypeError:
+        return str(args) or "(无参数)"
+
+
+def _help_text() -> str:
+    """由 PALETTE_COMMANDS 生成 /help 文案：补全候选是唯一事实来源，避免两处漂移。"""
+    rows = " | ".join(f"{cmd} {desc}" for cmd, desc in PALETTE_COMMANDS if " " not in cmd)
+    return (
+        f"{rows}\n"
+        "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，"
+        "/stop 或 Esc 可终止）\n"
+        "鼠标拖动日志可复制文本（按源文本复制，长行不会断行）"
+    )
 
 
 class CommandPalette(Static):
@@ -259,12 +206,13 @@ class MessageSubmitted(Message):
 
 class PieTextArea(TextArea):
     """多行消息输入框：Enter 提交，Shift+Enter 换行（支持多行粘贴）；
-    Tab 接受命令补全，↑/↓ 切换候选，Esc 隐藏面板。"""
+    Tab 接受命令补全，↑/↓ 切换候选，Esc 隐藏面板 / 取消当前任务。"""
 
     BINDINGS = [
         *TextArea.BINDINGS,
         Binding("tab", "palette_accept", "接受命令补全", show=False),
-        Binding("escape", "palette_hide", "隐藏补全", show=False),
+        # Esc：补全面板开着先收起，否则等价 /stop（取消当前回合 / !shell）
+        Binding("escape", "palette_hide", "隐藏补全 / 取消当前任务", show=False),
     ]
 
     async def _on_key(self, event: events.Key) -> None:
@@ -293,7 +241,7 @@ class PieTextArea(TextArea):
             app.action_focus_next()
 
     def action_palette_hide(self) -> None:
-        self.app.palette_hide()
+        self.app.action_escape()
 
     def action_cursor_up(self, select: bool = False) -> None:
         if self.app.palette_displayed():
@@ -308,8 +256,164 @@ class PieTextArea(TextArea):
             super().action_cursor_down(select)
 
 
+# ---- 日志区控件：RichLog + 鼠标框选复制 ----
+#
+# 复制取「源文本」而不是显示行：显示行是 Rich 软换行的产物（长行断成多行、换行点空格还会被
+# 吃掉），按显示行拼接会把一行复制成多行。SelectableRichLog 每次 write 记下源文本与
+# 「显示行 → 源文本字符区间」的对齐关系，复制时按字符区间切源文本（见其类 docstring）。
+# 对齐/切片本身是纯函数，测试见 tests/test_tui.py。
+
+
+class _CopyRow(NamedTuple):
+    """一条显示行拆出的可复制内容：kind=content 时 text 是去掉盒边框/填充后的正文，
+    x0 是正文在该显示行里的起始单元格（单元格 → 字符换算用）。"""
+
+    kind: str  # "content" | "border"
+    text: str
+    x0: int
+
+
+class _CopyEntry(NamedTuple):
+    """一次 log.write 的复制记录：源文本 + 每行内容在源文本里的字符区间。
+
+    spans 与显示行一一对应（边框行为 None），每项为 (start, end, off)：
+    行内容在 src 中的 [start, end)，off 是该行开头被忽略的显示装饰字符数
+    （如引用的 “▌ ” 续行装饰）；整体为 None 表示对不上源文本，
+    复制时该次写入回退成「按显示行拼接」。"""
+
+    row: int  # 起始显示行（RichLog.lines 下标）
+    count: int  # 占用的显示行数
+    src: str
+    spans: list[tuple[int, int, int] | None] | None
+
+
+# 「复制源」宽渲染宽度：足够宽 → 不软换行，拿到每条逻辑行的完整文本
+_COPY_RENDER_WIDTH = 4096
+_COPY_CONSOLE = Console(width=_COPY_RENDER_WIDTH, force_terminal=False)
+
+
+def _wide_text(renderable: Any) -> str | None:
+    """宽渲染一个 renderable，取它的纯文本逻辑行（不软换行）。失败返回 None。"""
+    options = _COPY_CONSOLE.options.update_width(_COPY_RENDER_WIDTH)
+    try:
+        segments = _COPY_CONSOLE.render(renderable, options)
+    except Exception:
+        return None
+    rows = ["".join(seg.text for seg in line) for line in Segment.split_lines(segments)]
+    return "\n".join(row.rstrip() for row in rows)
+
+
+def _copy_source(content: Any) -> str | None:
+    """取写入内容对应的可复制源文本：[Panel → 盒内正文，Text → .plain，Markdown → 渲染后纯文本]。
+
+    Markdown 不走 .markup：渲染会重排（去围栏、加缩进、合并段落），源文本与显示行对不上；
+    改用宽渲染纯文本——既是屏幕上看到的文字，每条逻辑行又保持完整（长行复制不会断行）。
+    拿不到（其它渲染对象）返回 None → 该次写入不记录，复制回退按显示行拼接。"""
+    obj = content.renderable if isinstance(content, Panel) else content
+    if isinstance(obj, Text):
+        # 显示时 Rich 会把 tab 展开成空格（tab_size=8）；源文本跟着展开才与显示行对得上
+        plain = obj.copy()
+        plain.expand_tabs()
+        return plain.plain
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, Markdown):
+        return _wide_text(obj)
+    return None
+
+
+def _split_log_row(strip: Strip) -> _CopyRow:
+    """显示行 → 可复制内容：剥掉 Panel 左右边框与行首空白，上下边框行归为 border。
+
+    行首空白（Panel padding=(0,1) + Rich 渲染产生的悬挂缩进/居中填充）一律不算内容：
+    复制按源文本切，缩进以源文本为准；它只计入 x0，供单元格 → 字符换算。"""
+    text = strip.text
+    x0 = 0
+    if text.startswith("│"):
+        text = text[1:]
+        x0 += 1
+    if text.endswith("│"):
+        text = text[:-1]
+    text = text.rstrip()
+    if text.startswith(("╭", "╰")) and text.endswith(("╮", "╯")):
+        return _CopyRow("border", "", 0)
+    if not text.strip():
+        return _CopyRow("content", "", x0)
+    body = text.lstrip()
+    return _CopyRow("content", body, x0 + cell_len(text) - cell_len(body))
+
+
+# 显示装饰：Rich 渲染 Markdown 引用时，每条显示行开头都会重复一个 “▌”
+# （源文本里只有首个逻辑行有）——匹配时允许忽略它，见 _align_spans
+_ROW_DECOR = "▌"
+
+
+def _match_row(src: str, text: str, pos: int) -> tuple[int, int] | None:
+    """从 src 的 pos 起（允许跳过剩下的空白）匹配 text → (start, end)；对不上返回 None。"""
+    if not text:
+        return (pos, pos)
+    p = pos
+    while not src.startswith(text, p):
+        if p >= len(src) or src[p] not in " \t\n":
+            return None
+        p += 1
+    return (p, p + len(text))
+
+
+def _align_spans(src: str, rows: list[_CopyRow]) -> list[tuple[int, int, int] | None] | None:
+    """把显示行内容对齐回源文本，得到每行内容在 src 里的字符区间 (start, end, off)。
+
+    逐行在 src 里顺序匹配（允许跳过 Rich 在换行点吃掉/回填的空白）；若整行匹配不上，
+    再试去掉行首显示装饰（引用续行的 “▌ ”）；还不行就返回 None
+    （该次写入复制回退按显示行拼接），要求所有行都对上、且 src 尾部只剩空白。
+
+    为什么要对齐：显示行是软换行的产物，Rich 在盒内换行点会直接吃掉那个空格
+    （实测 'aaaaaa bbbb cccc' + 'dddd…'），按显示行拼接既多出换行又丢空格；
+    按字符区间切 src 才能连同被吃掉的空格一起复原。
+    """
+    spans: list[tuple[int, int, int] | None] = []
+    pos = 0
+    for row in rows:
+        if row.kind != "content":
+            spans.append(None)
+            continue
+        if not row.text:
+            spans.append((pos, pos, 0))
+            continue
+        text, off = row.text, 0
+        hit = _match_row(src, text, pos)
+        if hit is None and text.startswith(_ROW_DECOR):
+            text = text.lstrip(_ROW_DECOR).lstrip()
+            off = len(row.text) - len(text)
+            hit = _match_row(src, text, pos)
+        if hit is None:
+            return None
+        spans.append((hit[0], hit[1], off))
+        pos = hit[1]
+    if src[pos:].strip():
+        return None
+    return spans
+
+
+def _cell_to_char(text: str, cell: int) -> int:
+    """内容文本里第 cell 个单元格之前的字符数（宽字符按占位算）。"""
+    if cell <= 0:
+        return 0
+    used = 0
+    for i, ch in enumerate(text):
+        used += cell_len(ch)
+        if used >= cell:
+            return i + 1
+    return len(text)
+
+
 class SelectableRichLog(RichLog):
-    """RichLog + 鼠标框选复制：按住左键拖动选择，松开自动复制到剪贴板。"""
+    """RichLog + 鼠标框选复制：按住左键拖动选择，松开自动复制到剪贴板。
+
+    复制取「源文本」而非显示行：长行在盒内会软换行成多行、换行点空格还会被吃掉，
+    按显示行拼接会把一行复制成多行（且丢空格）。所以每次 write 记下源文本与
+    「显示行 → 源文本字符区间」的对齐关系，复制时按字符区间切源文本。
+    """
 
     def __init__(
         self,
@@ -322,6 +426,30 @@ class SelectableRichLog(RichLog):
         self._selecting = False
         self._sel_start: tuple[int, int] | None = None
         self._sel_end: tuple[int, int] | None = None
+        self._entries: list[_CopyEntry] = []
+
+    # ---- 写入：记录复制映射 ----
+
+    def write(self, content: Any, *args: Any, **kwargs: Any) -> Any:
+        """写入一条内容，并记录它的「源文本 + 显示行对齐」。"""
+        before = len(self.lines)
+        result = super().write(content, *args, **kwargs)
+        if len(self.lines) == before:
+            # 尺寸未知时 RichLog 会延迟渲染（on_resize 时再 write 一遍）→ 此处不记录
+            return result
+        src = _copy_source(content)
+        if src is None:
+            return result
+        rows = [_split_log_row(self.lines[i]) for i in range(before, len(self.lines))]
+        self._entries.append(
+            _CopyEntry(before, len(self.lines) - before, src, _align_spans(src, rows))
+        )
+        return result
+
+    def clear(self) -> Any:
+        result = super().clear()
+        self._entries.clear()
+        return result
 
     # ---- 鼠标事件 ----
 
@@ -361,31 +489,76 @@ class SelectableRichLog(RichLog):
         row = max(0, int(event.screen_y or 0) - region.y) + self.scroll_offset.y
         return row, col
 
-    def _selected_text(self) -> str:
-        if self._sel_start is None or self._sel_end is None:
+    def _entry_at(self, row: int) -> _CopyEntry | None:
+        i = bisect_right(self._entries, row, key=lambda e: e.row) - 1
+        if i < 0:
+            return None
+        entry = self._entries[i]
+        return entry if row < entry.row + entry.count else None
+
+    def _slice_of_row(self, row: int, a: int, b: int | None) -> tuple[str, int, int] | None:
+        """显示行 [a, b) 单元格对应的源文本切片（src, start, end）。
+        无映射（未记录 / 边框行 / 对齐失败）返回 None，由调用方回退按显示行拼接。"""
+        entry = self._entry_at(row)
+        if entry is None or entry.spans is None:
+            return None
+        span = entry.spans[row - entry.row]
+        if span is None:
+            return None
+        start, _end, off = span
+        info = _split_log_row(self.lines[row])
+        text = info.text[off:]  # off：被忽略的显示装饰字符数（“▌ ” 等）
+        x0 = info.x0 + cell_len(info.text[:off])
+        begin = start + _cell_to_char(text, a - x0)
+        end = start + (len(text) if b is None else _cell_to_char(text, b - x0))
+        return (entry.src, begin, max(begin, end))
+
+    def _row_fragment(self, row: int, a: int, b: int | None) -> str:
+        """回退路径：按显示行裁剪 + 清洗（无映射时的老行为）。
+        整行是盒边框（哪怕只选到半截）→ 空串，避免把 `╰───` 这类残留复制进去。"""
+        if row < 0 or row >= len(self.lines):
             return ""
-        r1, c1 = self._sel_start
-        r2, c2 = self._sel_end
-        if (r1, c1) > (r2, c2):
-            r1, c1, r2, c2 = r2, c2, r1, c1
-        out: list[str] = []
-        for r in range(r1, r2 + 1):
-            if r < 0 or r >= len(self.lines):
+        if _split_log_row(self.lines[row]).kind == "border":
+            return ""
+        end = self.lines[row].cell_length if b is None else min(b, self.lines[row].cell_length)
+        if end <= a:
+            return ""
+        return self._clean_copied_line(self.lines[row].crop(a, end).text)
+
+    def _selected_text(self) -> str:
+        selection = self._sel_range()
+        if selection is None:
+            return ""
+        r1, c1, r2, c2 = selection
+        pieces: list[str] = []
+        acc: tuple[str, int, int] | None = None  # 正在累积的同一次写入的源文本切片
+
+        def flush() -> None:
+            nonlocal acc
+            if acc is not None:
+                pieces.append(acc[0][acc[1] : acc[2]])
+                acc = None
+
+        for row in range(r1, r2 + 1):
+            a = c1 if row == r1 else 0
+            b = c2 if row == r2 else None
+            part = self._slice_of_row(row, a, b)
+            if part is None:
+                flush()
+                fragment = self._row_fragment(row, a, b)
+                if fragment:
+                    pieces.append(fragment)
                 continue
-            width = self.lines[r].cell_length
-            a = c1 if r == r1 else 0
-            b = c2 if r == r2 else width
-            if b <= a:
-                out.append("")
-                continue
-            cropped = self.lines[r].crop(a, min(b, width))
-            out.append(self._clean_copied_line(cropped.text))
+            # 同一次写入的相邻显示行合并成一个切片：源文本本来就连续，合并后
+            # 连被软换行吃掉的空格/换行一起还原（这正是长行复制不断行的关键）
+            if acc is not None and acc[0] is part[0] and part[1] >= acc[2]:
+                acc = (acc[0], acc[1], max(acc[2], part[2]))
+            else:
+                flush()
+                acc = part
+        flush()
         # 去掉首尾空行（Panel 顶/底边框与填充产生的空行）
-        while out and out[0] == "":
-            out.pop(0)
-        while out and out[-1] == "":
-            out.pop()
-        return "\n".join(out)
+        return "\n".join(pieces).strip("\n")
 
     @staticmethod
     def _clean_copied_line(text: str) -> str:
@@ -410,14 +583,22 @@ class SelectableRichLog(RichLog):
 
     # ---- 渲染：选中区间叠加高亮 ----
 
-    def render_line(self, y: int) -> Strip:
-        strip = super().render_line(y)
+    def _sel_range(self) -> tuple[int, int, int, int] | None:
+        """规范化的选中区间 (r1, c1, r2, c2)（按行/列排序，含端点）；无选中返回 None。"""
         if self._sel_start is None or self._sel_end is None:
-            return strip
+            return None
         r1, c1 = self._sel_start
         r2, c2 = self._sel_end
         if (r1, c1) > (r2, c2):
-            r1, c1, r2, c2 = r2, c2, r1, c1
+            return (r2, c2, r1, c1)
+        return (r1, c1, r2, c2)
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        selection = self._sel_range()
+        if selection is None:
+            return strip
+        r1, c1, r2, c2 = selection
         row = self.scroll_offset.y + y
         if row < r1 or row > r2:
             return strip
@@ -475,6 +656,13 @@ class PieApp(App):
 
     TITLE = "pie"
 
+    BINDINGS = [
+        *App.BINDINGS,  # ctrl+q 退出 / ctrl+c help_quit 等
+        # Esc 焦点在输入框时由 PieTextArea 的绑定处理（同一动作），
+        # 焦点在别处（如日志区）时由这里兜底。
+        Binding("escape", "escape", "取消当前任务", show=False),
+    ]
+
     def __init__(self, session: Session, initial_prompt: str | None = None) -> None:
         super().__init__()
         self.session = session
@@ -511,14 +699,15 @@ class PieApp(App):
         yield CommandPalette("", id="palette")
         with Horizontal(id="input-bar"):
             yield PieTextArea(
-                placeholder="输入消息（! 开头直接执行 shell，/stop 取消当前任务，/ 显示命令补全，Shift+Enter 换行）",
+                placeholder="输入消息（! 开头直接执行 shell，/stop 或 Esc 取消当前任务，/ 显示命令补全，Shift+Enter 换行）",
                 id="input",
                 tab_behavior="focus",
                 highlight_cursor_line=False,
             )
             yield Button("▶", id="send-btn", variant="default")
-        yield Static("", id="meta")
-        yield Static("", id="status")
+        with Horizontal(id="foot-bar"):
+            yield Static("", id="meta")
+            yield Static("", id="status")
         # yield Footer()
 
     def on_mount(self) -> None:
@@ -526,9 +715,8 @@ class PieApp(App):
         # 背景输出 `49`（终端默认背景）→ 透明，露出终端窗口背景色；
         # 默认主题 ansi=False 会经 ANSIToTruecolor 把 default 背景映射成主题色（不透明）。
         self.theme = "ansi-dark"
-        log = self.query_one("#log", RichLog)
         if self.session.fs:
-            log.write(_box(self.palette, f"已归档 {len(self.session.fs)} 个历史窗口块（~/.pie/windows/）"))
+            self._notify(f"已归档 {len(self.session.fs)} 个历史窗口块（~/.pie/windows/）")
         self._render_history()
         self._update_meta()
         self.query_one("#input", PieTextArea).focus()
@@ -541,8 +729,35 @@ class PieApp(App):
         self.run_worker(
             self._prewarm(), group="prewarm", exclusive=False, exit_on_error=False
         )
+        # 启动拉取可用模型列表（供 /model 切换/补全）：后台异步，不阻塞 UI；
+        # 静默（notify=False）——不打扰启动界面，/model 查看、/model refresh 可主动触发
+        self.run_worker(
+            self._fetch_models(), group="prewarm", exclusive=False, exit_on_error=False
+        )
         if self.initial_prompt:
             self._submit(self.initial_prompt)
+
+    async def _fetch_models(self, notify: bool = False) -> None:
+        """拉取可用模型列表到 session.available_models（后台 worker，失败不打断）。
+
+        notify=True（/model refresh 主动触发）时才在消息流里报告结果；启动时静默。
+        """
+        try:
+            models = await self.session.fetch_models()
+        except NotImplementedError:
+            pass  # 后端不支持列出模型（自定义 LLM）→ 静默，/model 走手动指定
+        except Exception as e:
+            if notify:
+                self._notify(
+                    f"获取可用模型列表失败: {e}（/model refresh 重试，或 /model <id> 直接切换）"
+                )
+        else:
+            if notify:
+                cur = self.session.config.model
+                hit = "" if cur in models else "（不在列表中）"
+                self._notify(
+                    f"可用模型 {len(models)} 个，当前: {cur}{hit}；/model 查看，/model <id> 切换"
+                )
 
     async def _prewarm(self) -> None:
         """预热模型连接：极小请求（~几 token，成本可忽略），静默失败不影响后续。
@@ -569,27 +784,76 @@ class PieApp(App):
             pass  # 预热失败静默：真实请求自带重试，不受影响
 
     def _update_meta(self) -> None:
-        """顶栏元信息：模型 / 思考深度 / 目录 / 归档窗口数（/reasoning 切换后刷新）。"""
+        """顶栏元信息：模型 / 思考深度 / 目录 / 归档窗口数（/thinking / /model 切换后刷新）。"""
         self.query_one("#meta", Static).update(
             f"{self.session.config.model} {self.session.config.reasoning_effort}"
             f" · {Path.cwd()}"
-            f" · [{len(self.session.fs)}]"
+            # f" · [{len(self.session.fs)}]"
         )
 
     def _update_status(self) -> None:
         rep = self.session.usage_report().splitlines()
         # 跳过“会话文件”行（路径长，不适合状态栏），仍取首/尾两行摘要
         lines = [ln for ln in rep if not ln.startswith("会话文件")]
-        compact = lines[3].split("：", 1)[-1].strip().split("(")[0].strip()
-        self.query_one("#status", Static).update(f"{lines[0].split("：", 1)[-1].strip()} · {lines[-1].split("：", 1)[-1].strip()} · [{compact}]")
+        context = lines[0].split("：", 1)[-1].strip()
+        # compact = lines[3].split("：", 1)[-1].strip().split("(")[0].strip()
+        self.query_one("#status", Static).update(f"{context}")
 
-    # ---- 历史渲染 ----
+    # ---- 渲染：盒子（resume 历史与实时事件共用同一套） ----
+
+    def _notify(self, text: str, role: str = "system", **kwargs: Any) -> None:
+        """往消息流写一条提示盒（命令反馈、状态说明等）。"""
+        self.query_one("#log", RichLog).write(_box(self.palette, text, role=role, **kwargs))
+
+    def _render_tool_call(self, log: RichLog, name: str, args: Any) -> None:
+        """渲染一条工具调用（历史传 JSON 字符串，实时事件传 dict）。"""
+        log.write(
+            _box(
+                self.palette,
+                _format_tool_args(args),
+                title=name,
+                role="tool_call",
+                tool=name,
+            )
+        )
+
+    def _render_tool_result(
+        self, log: RichLog, name: str, content: str, *, truncate: bool = False
+    ) -> None:
+        """渲染一条工具结果（实时事件与 resume 历史共用）。
+
+        shell 结果（以 `[exit=N]` 开头）解析 exit code 进标题、正文去掉头部，失败染红框；
+        truncate=True（历史回放）时超长结果截断显示 head/tail，避免 resume 一次性撑爆 TUI。
+        """
+        code, body = _split_shell_exit(content)
+        if code is not None:  # shell：标题带 exit code，正文不带 [exit=] 头
+            title, body, role = _shell_result_box(body, code)
+        else:
+            title, role = name, _tool_failed_role(content)
+            if truncate:
+                lines = body.splitlines()
+                if len(lines) > 200:
+                    body = "\n".join(
+                        lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:]
+                    )
+                    title = f"{name}（共 {len(lines)} 行，显示前后 50 行）"
+        log.write(_tool_result_box(self.palette, body, title=title, role=role, tool=name))
+
+    def _flush_assistant_text(self, log: RichLog) -> None:
+        """把流式累积的正文固化成 #log 盒子（content 与 tool_call 并存时先固化）。"""
+        if not self._assistant_text:
+            return
+        log.write(_box(self.palette, self._assistant_text, title="pie", role="assistant"))
+        self._assistant_text = ""
+        self._content_streaming = False  # 下一轮模型输出时重新清 reasoning
+        self._render_assistant_stream()
 
     def _render_history(self) -> None:
         """resume 时把已有对话历史渲染进消息流（压缩指针展开为完整转录）。
 
         与实时事件渲染保持一致的盒子样式：user → "你"，assistant → "pie"，
         tool_calls → ⚙，tool → ↳；system（system prompt / 窗口摘要）不显示。
+        标题与图标都由角色决定，见 Theme.role_icon。
         """
         log = self.query_one("#log", RichLog)
         for d in self.session.full_history():
@@ -598,52 +862,23 @@ class PieApp(App):
                 continue
             content = content_text(d.get("content"))
             if role == "user":
-                log.write(_box(self.palette, content, title="你", role="user", icon="▎"))
+                log.write(_box(self.palette, content, title="你", role="user"))
             elif role == "assistant":
                 tool_calls = d.get("tool_calls")
                 if tool_calls:
                     if content:  # content+tool_call 并存：先固化正文再写工具调用框
-                        log.write(
-                            _box(self.palette, content, title="pie", role="assistant", icon="▎")
-                        )
+                        log.write(_box(self.palette, content, title="pie", role="assistant"))
                     for tc in tool_calls:
-                        self._write_tool_call(log, tc)
+                        fn = tc.get("function") or {}
+                        self._render_tool_call(log, fn.get("name") or "工具", fn.get("arguments") or "")
                 else:
-                    log.write(_box(self.palette, content, title="pie", role="assistant", icon="▎"))
+                    log.write(_box(self.palette, content, title="pie", role="assistant"))
             elif role == "tool":
-                self._write_tool_result(log, d)
+                self._render_tool_result(
+                    log, d.get("tool_name") or "工具", d.get("content") or "", truncate=True
+                )
             else:
                 log.write(_box(self.palette, content, role="system"))
-
-    def _write_tool_call(self, log: RichLog, tc: dict) -> None:
-        """渲染一条历史 tool_call（OpenAI 格式：function.arguments 是 JSON 字符串）。"""
-        fn = tc.get("function") or {}
-        name = fn.get("name") or "工具"
-        args = fn.get("arguments") or ""
-        try:
-            arg_txt = json.dumps(json.loads(args), ensure_ascii=False) if args else "(无参数)"
-        except (ValueError, TypeError):
-            arg_txt = args or "(无参数)"
-        log.write(_box(self.palette, arg_txt, title=name, role="tool_call", icon="⚙"))
-
-    def _write_tool_result(self, log: RichLog, d: dict) -> None:
-        """渲染一条历史工具结果；超长（>200 行）截断显示 head/tail，避免 resume 一次性撑爆 TUI。
-
-        shell 工具结果（以 [exit=N] 开头）解析 exit code 进标题、正文去掉 [exit=] 头，
-        与 !shell 的 _show_shell_result 展示一致；其余工具原样显示。"""
-        content = d.get("content") or ""
-        name = d.get("tool_name") or "工具"
-        code, body = _split_shell_exit(content)
-        if code is not None:  # shell：标题带 exit code，正文不带 [exit=] 头
-            title, body, role = _shell_result_box(body, code)
-        else:
-            title = name
-            role = _tool_failed_role(content)
-            lines = body.splitlines()
-            if len(lines) > 200:
-                body = "\n".join(lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:])
-                title = f"{name}（共 {len(lines)} 行，显示前后 50 行）"
-        log.write(_box(self.palette, body, title=title, role=role, icon="↳"))
 
     # ---- 命令补全 ----
 
@@ -651,6 +886,22 @@ class PieApp(App):
         value = self.query_one("#input", PieTextArea).text
         if not value.startswith("/"):
             return []
+        if value.startswith("/model "):  # 已带前缀 → 展开可用模型候选（Tab/上下键补全）
+            prefix = value[len("/model "):]
+            cur = self.session.config.model
+            return [
+                (f"/model {m}", "← 当前" if m == cur else "切换模型")
+                for m in (self.session.available_models or [])
+                if m.startswith(prefix)
+            ]
+        if value.startswith("/thinking "):  # 同 /model：前缀补全思考级别，当前级标注 ←
+            prefix = value[len("/thinking "):]
+            cur = self.session.config.reasoning_effort
+            return [
+                (f"/thinking {lv}", "← 当前" if lv == cur else "切换思考深度")
+                for lv in REASONING_LEVELS
+                if lv.startswith(prefix)
+            ]
         return [c for c in PALETTE_COMMANDS if c[0].startswith(value)]
 
     def _render_palette(self) -> None:
@@ -660,8 +911,8 @@ class PieApp(App):
             self._palette_index = 0
             palette.display = False
             return
-        self._palette_index = min(self._palette_index, len(matches) - 1)
-        shown = matches[:9]
+        shown = matches[:7]
+        self._palette_index = min(self._palette_index, len(shown) - 1)
         lines = []
         for i, (cmd, desc) in enumerate(shown):
             if i == self._palette_index:
@@ -752,6 +1003,13 @@ class PieApp(App):
     def palette_hide(self) -> None:
         self.query_one("#palette", CommandPalette).display = False
 
+    def action_escape(self) -> None:
+        """Esc：补全面板开着就先收起；否则若有任务在跑，等价 /stop 取消。"""
+        if self.palette_displayed():
+            self.palette_hide()
+        elif self._busy():
+            self._stop()
+
     # ---- 消息 ----
 
     async def on_message_submitted(self, event: MessageSubmitted) -> None:
@@ -770,14 +1028,10 @@ class PieApp(App):
                     # 正在取消收尾：等它结束（cancel 路径很快），避免新旧回合并发写历史
                     await self._turn_worker.wait()  # type: ignore[union-attr]
                     if self._busy():
-                        self.query_one("#log", RichLog).write(
-                            _box(self.palette, "正在取消中，请稍候…", role="system")
-                        )
+                        self._notify("正在取消中，请稍候…")
                         return
                 else:
-                    self.query_one("#log", RichLog).write(
-                        _box(self.palette, "正在处理中，输入 /stop 可取消", role="system")
-                    )
+                    self._notify("正在处理中，输入 /stop 或按 Esc 可取消")
                     return
             self._submit(text)
 
@@ -792,83 +1046,101 @@ class PieApp(App):
         """正在取消收尾：worker 还活着但已请求取消。"""
         return self._cancel_event is not None and self._cancel_event.is_set()
 
+    def _stop(self) -> None:
+        """取消当前正在执行的回合 / !shell（/stop 与 Esc 共用；已在取消中则忽略重复触发）。"""
+        if not self._busy() or self._cancel_event is None:
+            self._notify("当前没有正在执行的任务")
+            return
+        if self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        self._notify("已请求取消，正在终止…")
+
     def _command(self, text: str) -> None:
-        log = self.query_one("#log", RichLog)
         cmd, _, arg = text.partition(" ")
         if cmd in ("/exit", "/quit"):
             self.exit()
         elif cmd == "/stop":
-            if self._busy():
-                if self._cancel_event is not None:
-                    self._cancel_event.set()
-                    log.write(_box(self.palette, "已请求取消，正在终止…", role="system"))
-                else:
-                    log.write(_box(self.palette, "当前没有正在执行的任务", role="system"))
-            else:
-                log.write(_box(self.palette, "当前没有正在执行的任务", role="system"))
+            self._stop()
         elif cmd == "/help":
-            log.write(_box(self.palette, "/exit /quit 退出 | /stop 取消当前模型请求/工具执行（等待期间可继续输入） | "
-                           "/reset 清空历史 | /clear 归档并开新窗口 | "
-                           "/compact [tools|turns] 手动压缩 | /save [文件] 保存 | "
-                           "/reasoning <none|low|high|max> 思考深度 | "
-                           "/status 用量 | /help 帮助 | 鼠标拖动日志可复制文本\n"
-                           "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，/stop 可终止）"))
+            self._notify(_help_text())
         elif cmd == "/reset":
             self.session.reset()
-            log.write(_box(self.palette, "已清空历史（保留 system prompt 与记忆）"))
+            self._notify("已清空历史（保留 system prompt 与记忆）")
             self._safe_save()
+            self._update_status()
         elif cmd == "/clear":
             self.session.clear_window()
-            log.write(_box(self.palette, f"已切换新窗口（归档 {len(self.session.fs)} 个，fs 在 ~/.pie/windows/）"))
+            self._notify(f"已切换新窗口（归档 {len(self.session.fs)} 个，fs 在 ~/.pie/windows/）")
             self._safe_save()
+            self._update_status()
         elif cmd == "/compact":
             mode = arg.strip() or "auto"
             if mode not in ("auto", "tools", "turns"):
-                log.write(_box(self.palette, f"未知压缩模式: {mode}（/compact [tools|turns]）", role="error"))
+                self._notify(f"未知压缩模式: {mode}（/compact [tools|turns]）", role="error")
             else:
                 stats = self.session.compact(mode=mode)
                 if stats.get("skipped"):
-                    log.write(_box(self.palette, f"未压缩：{stats['skipped']}"))
+                    self._notify(f"未压缩：{stats['skipped']}")
                 else:
-                    log.write(
-                        _box(
-                            self.palette,
-                            f"压缩完成：节省约 {stats['saved_tokens']:,} tokens"
-                            f"（tools={stats['tools']}，turns={stats['turns']}）"
-                        )
+                    self._notify(
+                        f"压缩完成：节省约 {stats['saved_tokens']:,} tokens"
+                        f"（tools={stats['tools']}，turns={stats['turns']}）"
                     )
                 self._safe_save()
         elif cmd == "/save":
             self.session.save(arg.strip() or None)
-            log.write(_box(self.palette, f"会话已保存: {self.session.file}"))
+            self._notify(f"会话已保存: {self.session.file}")
         elif cmd == "/status":
-            log.write(_box(self.palette, self.session.usage_report()))
-        elif cmd == "/reasoning":
+            self._notify(self.session.usage_report())
+        elif cmd == "/thinking":
             level = arg.strip().lower()
-            if level not in REASONING_LEVELS:
-                log.write(
-                    _box(
-                        self.palette,
-                        f"未知思考级别: {level or '(空)'}（可选: {' / '.join(REASONING_LEVELS)}）",
-                        role="error",
-                    )
+            if not level:  # 无参数 → 查看当前深度
+                self._notify(
+                    f"当前思考深度: {self.session.config.reasoning_effort}"
+                    f"（可选: {' / '.join(REASONING_LEVELS)}）"
+                )
+            elif level not in REASONING_LEVELS:
+                self._notify(
+                    f"未知思考级别: {level}（可选: {' / '.join(REASONING_LEVELS)}）", role="error"
                 )
             else:
-                cfg = self.session.config
-                cfg.reasoning_effort = level
-                # 当前 llm 实例立即生效（后续请求即用新深度，无需重启）
-                llm = getattr(self.session, "llm", None)
-                if llm is not None and hasattr(llm, "reasoning_effort"):
-                    llm.reasoning_effort = None if level == REASONING_NONE else level
-                try:
-                    cfg.save(getattr(cfg, "config_file", None))  # 持久化，重启后仍生效
-                    note = "已写入配置"
-                except OSError as e:
-                    note = f"配置写入失败: {e}（仅本次会话生效）"
-                log.write(_box(self.palette, f"思考深度: {level}（{note}）", role="system"))
+                note = self.session.set_reasoning_effort(level)
+                self._notify(f"思考深度: {level}（{note}，重启后仍生效）")
+                self._update_meta()
+        elif cmd == "/model":
+            name = arg.strip()
+            avail = self.session.available_models
+            if not name:  # 无参数 → 查看当前模型 + 可用列表
+                cur = self.session.config.model
+                if avail:
+                    lines = [f"当前: {cur}"] + [
+                        f"  {m}  ←" if m == cur else f"  {m}" for m in avail
+                    ]
+                else:
+                    lines = [
+                        f"当前: {cur}",
+                        "（可用模型列表未获取到：输入 /model <id> 直接切换，或 /model refresh 重新拉取）",
+                    ]
+                self._notify("\n".join(lines), title="可用模型")
+            elif name == "refresh":  # 重新拉取模型列表（异步 worker，不阻塞 UI）
+                self._notify("正在重新拉取可用模型列表…")
+                # notify=True：用户主动触发，成功/失败都要给反馈
+                self.run_worker(
+                    self._fetch_models(notify=True), group="prewarm", exclusive=False,
+                    exit_on_error=False,
+                )
+            elif avail and name not in avail:  # avail 为空（=列表未获取到）时不拦，允许手动指定
+                self._notify(
+                    f"未知模型: {name}（/model 查看可用 {len(avail)} 个；输入 /model refresh 重新拉取）",
+                    role="error",
+                )
+            else:
+                note = self.session.set_model(name)
+                self._notify(f"模型已切换: {name}（{note}），下个请求生效")
                 self._update_meta()
         else:
-            log.write(_box(self.palette, f"未知命令: {cmd}（/help 查看）", role="error"))
+            self._notify(f"未知命令: {cmd}（/help 查看）", role="error")
         self._update_status()
 
     def _safe_save(self) -> None:
@@ -889,11 +1161,11 @@ class PieApp(App):
             shown = list(self._reasoning_lines)
             if self._reasoning_tail:
                 shown.append(self._reasoning_tail)
-            stream.update(Text("\n".join(shown), style="dim"))
+            stream.update(rich_text("\n".join(shown), "dim"))
             stream.display = True
         elif self._shell_worker is not None and self._stream_tool:
             shown = self._stream_tool[-STREAM_MAX_LINES:]
-            stream.update(Text("\n".join(shown)))
+            stream.update(rich_text("\n".join(shown)))
             stream.display = True
         else:
             stream.update("")
@@ -931,8 +1203,8 @@ class PieApp(App):
         if self._assistant_text:
             panel.update(
                 Panel(
-                    Text(self._assistant_text, style=self.palette.body_text),
-                    title="▎ pie",
+                    rich_text(self._assistant_text, self.palette.body_text),
+                    title=f"{self.palette.role_icon('assistant')} pie".strip(),
                     title_align="left",
                     border_style=self.palette.role_border("assistant"),
                     padding=(0, 1),
@@ -949,7 +1221,7 @@ class PieApp(App):
         if not cmd:
             return
         self.query_one("#log", RichLog).write(
-            _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", icon="⚙")
+            _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", tool="shell")
         )
         self._cancel_event = asyncio.Event()
         self._shell_worker = self.run_worker(
@@ -958,7 +1230,7 @@ class PieApp(App):
         self._update_send_button()
 
     async def _exec_shell_async(self, cmd: str) -> None:
-        """asyncio 子进程逐行执行：/stop 时 kill 整个进程组；保留 120s 超时。
+        """asyncio 子进程逐行执行：/stop（或 Esc）时 kill 整个进程组；保留 120s 超时。
         每行输出经 tool_progress 实时显示到 #stream。"""
         lines: list[str] = []
         code: Any = 0
@@ -992,7 +1264,10 @@ class PieApp(App):
                 self._append_event(
                     {"type": "tool_progress", "name": "shell", "text": line.rstrip()}
                 )
-            rc = await proc.wait()
+            try:
+                rc = await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                rc = "uninterruptible"  # 进程组内仍有不可中断(D-state)进程，SIGKILL 排队；不再阻塞 UI
             code = "cancelled" if cancelled else ("timeout(120s)" if timed_out else rc)
             out = "".join(lines)
         except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
@@ -1016,7 +1291,7 @@ class PieApp(App):
         if code == "cancelled":
             out = (out.rstrip() + "\n[用户手动终止]").strip()
         title, body, result_role = _shell_result_box(out, code)
-        log.write(_box(self.palette, body, title=title, role=result_role, icon="↳"))
+        log.write(_tool_result_box(self.palette, body, title=title, role=result_role, tool="shell"))
         self._cancel_event = None
         self._shell_worker = None
         self._clear_stream()
@@ -1027,9 +1302,9 @@ class PieApp(App):
 
     def _submit(self, text: str) -> None:
         self.query_one("#log", RichLog).write(
-            _box(self.palette, text, title="你", role="user", icon="▎")
+            _box(self.palette, text, title="你", role="user")
         )
-        # 输入框保持可用：等待期间用户仍可输入 /stop 取消当前回合
+        # 输入框保持可用：等待期间用户仍可输入 /stop 或按 Esc 取消当前回合
         self._cancel_event = asyncio.Event()
         self._clear_stream()
         self._turn_worker = self.run_worker(
@@ -1071,45 +1346,22 @@ class PieApp(App):
                 self._render_stream()
         elif ev_type == "tool_call":
             # 修复 content+tool_call 并存：先把已累积的正文固化到 #log，再写工具调用框
-            if self._assistant_text:
-                log.write(
-                    _box(self.palette, self._assistant_text, title="pie", role="assistant", icon="▎")
-                )
-                self._assistant_text = ""
-                self._content_streaming = False  # 下一轮模型输出时重新清 reasoning
-                self._render_assistant_stream()
-            args = ev.get("arguments", {})
-            try:
-                arg_txt = json.dumps(args, ensure_ascii=False) if args else "(无参数)"
-            except TypeError:
-                arg_txt = str(args) or "(无参数)"
-            log.write(
-                _box(self.palette, arg_txt, title=ev.get("name", "工具"), role="tool_call", icon="⚙")
-            )
+            self._flush_assistant_text(log)
+            self._render_tool_call(log, ev.get("name", "工具"), ev.get("arguments", {}))
         elif ev_type == "tool_result":
-            text = ev.get("text", "")
-            code, body = _split_shell_exit(text)
-            if code is not None:  # shell 结果：样式与 !shell（_show_shell_result）一致
-                title, body, role = _shell_result_box(body, code)
-            else:
-                title = ev.get("name", "工具")
-                role = _tool_failed_role(text)
-            log.write(_box(self.palette, body, title=title, role=role, icon="↳"))
+            self._render_tool_result(log, ev.get("name", "工具"), ev.get("text", ""))
             self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
-            text = ev.get("text", "")
-            # 正文流式显示已在 #assistant-stream 完成：此处直接把最终内容固化
-            # 为 #log 的 assistant 盒子，并清掉流式框（与最终文本以 answer 为准）。
-            log.write(_box(self.palette, text, title="pie", role="assistant", icon="▎"))
+            # 正文流式显示已在 #assistant-stream 完成：此处把最终内容（以 answer 为准）
+            # 固化为 #log 的 assistant 盒子，并清掉流式框。
+            self._assistant_text = ev.get("text", "")
+            self._flush_assistant_text(log)
             self._clear_stream()
-            self._assistant_text = ""
-            self._render_assistant_stream()
         log.scroll_end(animate=False, force=True)
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:
-        log = self.query_one("#log", RichLog)
-        log.write(_box(self.palette, f"{type(exc).__name__}: {exc}", title="出错", role="error", icon="✗"))
+        self._notify(f"{type(exc).__name__}: {exc}", role="error", title="出错")
         self._cancel_event = None
         self._turn_worker = None
         self._clear_stream()
@@ -1132,4 +1384,3 @@ class PieApp(App):
 
 def run_tui(session: Session, initial_prompt: str | None = None) -> None:
     PieApp(session, initial_prompt).run()
-
