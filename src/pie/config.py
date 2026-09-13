@@ -159,6 +159,17 @@ class SessionCompaction:
 
 
 @dataclass
+class TuiConfig:
+    """TUI 渲染配置（[tui]）：lean = true 时用简洁模式渲染。
+
+    简洁模式只给 user / assistant 消息套盒子，工具调用与工具结果压成单行
+    （`icon 工具名 摘要`，结果行尾带 ✅/❌，失败时下方缩进输出错误正文）。
+    """
+
+    lean: bool = False
+
+
+@dataclass
 class CompactionConfig:
     """压缩总配置：写了 [compaction] 即开启，默认三级全开；
     某级为 None（显式 tool/turn/session = false）表示关闭该级；
@@ -198,6 +209,7 @@ class Config:
     theme: str = DEFAULT_THEME_NAME  # TUI 主题名（见 theme.py 的 THEMES）
     # 按工具名设置默认私有参数（下划线开头，不进 schema）：如 read: {_max_lines, _max_bytes, _max_image_bytes}
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tui: TuiConfig = field(default_factory=TuiConfig)  # TUI 渲染（[tui] lean = true → 简洁模式）
 
     def __post_init__(self) -> None:
         # 归一化旧 bool 写法（compaction = true / false），保证下游只见到
@@ -233,7 +245,11 @@ class Config:
         for f in fields(cls):
             if f.name not in data:
                 continue
-            if f.name == "compaction":
+            if f.name == "tui":
+                td = data["tui"]
+                if isinstance(td, dict):
+                    cfg.tui = TuiConfig(lean=bool(td.get("lean", TuiConfig.lean)))
+            elif f.name == "compaction":
                 cd = data["compaction"]
                 if isinstance(cd, dict):
                     if cd.get("enabled") is False:  # 旧键显式关闭 → 整体 None

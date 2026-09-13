@@ -22,7 +22,8 @@ from typing import Any, NamedTuple
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.cells import cell_len
+from rich.cells import cell_len, set_cell_size
+from rich.measure import Measurement
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
@@ -36,9 +37,10 @@ from textual.strip import Strip
 from textual.widgets import Button, RichLog, Static, TextArea
 from textual.worker import Worker
 
-from .session import Session
 from .config import REASONING_LEVELS
 from .context import content_text
+from .loop import CANCEL_TEXT
+from .session import Session
 from .textkit import install_cjk_wrap, rich_text, strip_escapes
 from .theme import Theme, build_css, get_theme
 
@@ -179,6 +181,223 @@ def _format_tool_args(args: Any) -> str:
         return json.dumps(args, ensure_ascii=False) if args else "(无参数)"
     except TypeError:
         return str(args) or "(无参数)"
+
+
+# ---- 简洁模式（Config.tui.lean）：工具活动不套盒子，压成单行 ----
+#
+# 只有 user / assistant 消息保留盒子，工具调用与工具结果一律单行：
+#   调用  ❯ shell ls src
+#   成功  ↳ shell ls src ✅
+#   失败  ↳ edit src/a.py ❌
+#           → 错误正文（缩进续行，超长取首尾）
+# 单行摘要：read / write / edit 取文件 path，shell 取 command，其余退回参数 JSON。
+LEAN_OK = "✅"
+LEAN_FAIL = "❌"
+LEAN_CANCELLED = "⏹"  # 用户 /stop 终止：既不算成功也不算失败
+LEAN_RIGHT_MARGIN = 1  # 需要截断的行在行尾留 1 列：日志区最右一列会被 1 列宽的垂直滚动条盖住
+LEAN_DETAIL_HEAD = 12  # 工具错误正文最多显示的开头行数（超出时中间省略）
+LEAN_DETAIL_TAIL = 7   # ...以及结尾行数
+LEAN_SHELL_HEAD = 50   # !cmd 的输出是用户主动要看的，给更宽的额度
+LEAN_SHELL_TAIL = 20
+
+# 单行摘要取哪个参数（未列出的工具退回完整参数 JSON）
+LEAN_SUMMARY_KEYS = {"read": "path", "write": "path", "edit": "path", "shell": "command"}
+
+# C0 控制字符（含 \x7f）：单行摘要里不允许出现
+_CONTROL_CHARS = frozenset(map(chr, range(0x20))) | {"\x7f"}
+
+
+def _single_line(text: str) -> str:
+    """把摘要压成**单行可打印文本**（_LeanLine 承诺恒为一行，摘要里混进换行会把一行撑成多行）。
+
+    - 换行 / 回车 → 字面 `\\n` 两个字符（与参数 JSON 的写法一致，一眼看出原来换过行）；
+    - tab → 一个空格（Rich 渲染时会把 tab 按制表位展开成变宽空格，会让宽度计算
+      与标记位置失准）；
+    - 其余控制字符直接丢掉（终端转义字节等不该出现在工具行里）。
+    """
+    if not text:
+        return text
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    text = text.replace("\n", "\\n")
+    return "".join(ch for ch in text if ch not in _CONTROL_CHARS)
+
+
+def _tool_summary(name: str, args: Any) -> str:
+    """简洁模式的工具摘要：read/write/edit 取 path、shell 取 command，
+    其余工具或参数缺失时退回完整参数（_format_tool_args）。
+    实时事件给 dict、历史回放给 JSON 字符串，两种形态都接受。"""
+    data = args
+    if isinstance(data, str):
+        raw = data.strip()
+        if not raw:
+            return "(无参数)"
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return raw
+    key = LEAN_SUMMARY_KEYS.get(name)
+    if key and isinstance(data, dict):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return _format_tool_args(args)
+
+
+class _LeanLine:
+    """简洁模式的一行工具记录：`icon 工具名 摘要 [状态标记]`——**恒为一行**。
+
+    为什么不直接用 Text：Text 只有「整行截断」，超长命令会把行尾的 ✅/❌ 一并截掉。
+    这里按渲染时的可用宽度先截摘要、再放标记，任何宽度下都是一行且状态标记可见；
+    宽度实在不够（前缀+标记都放不下）才退回整行截断。
+    截断发生在渲染时（宽度只有渲染时才知道）：RichLog 在尺寸未知时会推迟渲染，
+    写入时刻拿到的宽度不可靠。__rich_measure__ 报告不截断宽度，RichLog 据此把
+    渲染宽度定为 min(本行宽度, 可用宽度)。
+    摘要先经 _single_line 转写成单行（换行 → 字面 `\\n`），否则多行 shell 命令
+    （heredoc / 换行串联的 `&&`）会把这一行拆成多行。
+    """
+
+    def __init__(
+        self,
+        icon: str,
+        name: str,
+        summary: str,
+        mark: str = "",
+        *,
+        color: str,
+        summary_color: str,
+        mark_color: str | None = None,
+    ) -> None:
+        self.icon = icon
+        self.name = name
+        self.summary = _single_line(summary)  # 换行/制表符/控制字符在这里就转写成单行
+        self.mark = mark
+        self.color = color
+        self.summary_color = summary_color
+        self.mark_color = mark_color or summary_color
+
+    def plain(self) -> str:
+        """不截断的完整文本（量宽 / 测试用）。"""
+        icon = f"{self.icon} " if self.icon else ""
+        summary = f" {self.summary}" if self.summary else ""
+        mark = f" {self.mark}" if self.mark else ""
+        return f"{icon}{self.name}{summary}{mark}"
+
+    def __rich_measure__(self, console: Any, options: Any) -> Measurement:
+        width = cell_len(self.plain())
+        return Measurement(width, width)
+
+    def __rich_console__(self, console: Any, options: Any) -> Any:
+        width = options.max_width
+        if width < cell_len(self.plain()):
+            # 被挤压（RichLog 把渲染宽度压到日志区可用宽度）说明这行要截断 →
+            # 额外留出右边距，避免行尾的 ✅/❌ 正好落在垂直滚动条下面；
+            # 能完整放下的行不动（否则白白的把短行也截掉一个字符）。
+            width -= LEAN_RIGHT_MARGIN
+        width = max(1, width)
+        text = Text(no_wrap=True, overflow="crop")
+        if self.icon:
+            text.append(f"{self.icon} ", style=self.color)
+        text.append(self.name, style=f"bold {self.color}")
+        tail = Text(no_wrap=True, overflow="crop")
+        if self.mark:
+            tail.append(" ", style=self.summary_color)
+            tail.append(self.mark, style=self.mark_color)
+        # 摘要只能占用剩下宽度（-1 是摘要前的空格）；尾部标记优先保留
+        room = width - text.cell_len - tail.cell_len - 1
+        if self.summary:
+            if cell_len(self.summary) <= room:
+                text.append(f" {self.summary}", style=self.summary_color)
+            elif room >= 2:  # 至少放得下 1 个字符 + 省略号
+                text.append(f" {set_cell_size(self.summary, room - 1)}…", style=self.summary_color)
+        text.append_text(tail)
+        if text.cell_len > width:  # 极窄兜底：前缀+标记都放不下，整行截断
+            text.truncate(width, overflow="ellipsis")
+        yield from text.__rich_console__(console, options)
+
+
+def _lean_line(palette: Theme, name: str, summary: str, *, role: str, mark: str = "") -> _LeanLine:
+    """构造简洁模式的一行工具记录（渲染成一行，见 _LeanLine）。
+
+    没有盒子，所以边框色在这里退化成前景色：tool_call 用调用图标，tool_result 用结果
+    图标，error 整行染红（图标 / 工具名 / 摘要 / 状态标记与下方错误正文同色，一眼看出
+    这次调用失败了）。
+    """
+    color = palette.role_border(role)
+    fail = role == "error"
+    return _LeanLine(
+        palette.tool_icon(name, result=role != "tool_call"),
+        name,
+        summary,
+        mark,
+        color=color,
+        summary_color=color if fail else palette.muted,
+        mark_color=color if fail else palette.muted,
+    )
+
+
+def _lean_detail(
+    text: str, style: str, *, head: int = LEAN_DETAIL_HEAD, tail: int = LEAN_DETAIL_TAIL
+) -> Text:
+    """简洁模式的续行块：首行 `→ `、后续行对齐缩进（失败正文 / !cmd 输出共用）。
+
+    超过 head+tail 行时只显示首尾并标注省略行数，避免一次输出几十上百行冲掉消息流。
+    """
+    lines = text.rstrip("\n").splitlines()
+    if len(lines) > head + tail + 1:
+        omitted = len(lines) - head - tail
+        lines = lines[:head] + [f"\n...（中间省略 {omitted} 行）...\n"] + lines[-tail:]
+    block = Text()
+    for i, line in enumerate(lines):
+        if i:
+            block.append("\n")
+        block.append(("  → " if i == 0 else "    ") + line, style=style)
+    return block
+
+
+def _lean_tool_result(
+    palette: Theme, name: str, summary: str, content: str
+) -> tuple[_LeanLine, Text | None]:
+    """简洁模式的工具结果：一行 `icon 工具名 摘要 ✅/❌`（+ 可选的错误正文续行块）。
+
+    成败判定与盒子模式一致：shell 按 `[exit=N]`（非 0 = 失败）、其余按 _tool_failed_role
+    的失败前缀；正文里 shell 的 [exit=] 头已被 _split_shell_exit 剥掉。
+    被 /stop 终止的工具结果（CANCEL_TEXT / exit=cancelled）既不算成功也不算失败，用 ⏹。
+    返回 (行, 正文块)：正文块为 None 时只写一行（成功时不显示输出）。
+    """
+    code, body = _split_shell_exit(content)
+    if code == "cancelled" or content.strip() == CANCEL_TEXT:
+        mark, role, detail = LEAN_CANCELLED, "tool_result", True  # /stop：既非成功也非失败
+    elif _tool_failed_role(content) == "error":
+        mark, role, detail = LEAN_FAIL, "error", True
+    else:
+        mark, role, detail = LEAN_OK, "tool_result", False
+    line = _lean_line(palette, name, summary, role=role, mark=mark)
+    if not detail or not body.strip():
+        return line, None
+    style = palette.role_error if role == "error" else palette.muted
+    return line, _lean_detail(body, style)
+
+
+def _lean_shell_result(
+    palette: Theme, cmd: str, out: str, code: Any
+) -> tuple[_LeanLine, Text | None]:
+    """简洁模式的 !shell 结果：一行 `❯ shell <cmd> ✅/❌` + 缩进输出块。
+
+    与 agent 回合里的工具结果不同：!cmd 是用户主动执行，输出本身就是要看的东西，
+    所以成功也显示（额度也更宽）；退出码由行尾标记表达。
+    """
+    if code == "cancelled":
+        mark, role = LEAN_CANCELLED, "tool_result"
+    elif str(code) == "0":
+        mark, role = LEAN_OK, "tool_result"
+    else:
+        mark, role = LEAN_FAIL, "error"
+    line = _lean_line(palette, "shell", cmd, role=role, mark=mark)
+    body = out.rstrip("\n")
+    if not body:
+        return line, None
+    style = palette.role_error if role == "error" else palette.body_text
+    return line, _lean_detail(body, style, head=LEAN_SHELL_HEAD, tail=LEAN_SHELL_TAIL)
 
 
 def _help_text() -> str:
@@ -668,6 +887,8 @@ class PieApp(App):
         self.session = session
         self.initial_prompt = initial_prompt
         self.palette = get_theme(session.config.theme)
+        # 简洁模式（Config.tui.lean）：只给 user / assistant 套盒子，工具调用/结果压成单行
+        self.lean = bool(getattr(getattr(session.config, "tui", None), "lean", False))
         self.CSS = build_css(self.palette)
         self._turn_worker: Worker | None = None
         self._shell_worker: Worker | None = None
@@ -691,6 +912,10 @@ class PieApp(App):
             highlight=True,
             markup=True,
             wrap=True,
+            # min_width=0：RichLog 默认 78，会把渲染宽度抬到 78，而本控件的可滚动内容区
+            # （减去边框/内边距/滚动条）其实更窄 → 每行末尾裁掉几列：盒子的右边框看不见、
+            # 简洁模式行尾的 ✅/❌ 被截掉。置 0 后渲染宽度 = min(内容宽度, 内容区宽度)。
+            min_width=0,
             id="log",
         )
         with VerticalScroll(id="assistant-stream"):
@@ -806,7 +1031,13 @@ class PieApp(App):
         self.query_one("#log", RichLog).write(_box(self.palette, text, role=role, **kwargs))
 
     def _render_tool_call(self, log: RichLog, name: str, args: Any) -> None:
-        """渲染一条工具调用（历史传 JSON 字符串，实时事件传 dict）。"""
+        """渲染一条工具调用（历史传 JSON 字符串，实时事件传 dict）。
+
+        简洁模式：一行 `icon 工具名 摘要`（read/write/edit 取 path、shell 取 command）。
+        """
+        if self.lean:
+            log.write(_lean_line(self.palette, name, _tool_summary(name, args), role="tool_call"))
+            return
         log.write(
             _box(
                 self.palette,
@@ -818,13 +1049,21 @@ class PieApp(App):
         )
 
     def _render_tool_result(
-        self, log: RichLog, name: str, content: str, *, truncate: bool = False
+        self, log: RichLog, name: str, content: str, *, summary: str = "", truncate: bool = False
     ) -> None:
         """渲染一条工具结果（实时事件与 resume 历史共用）。
 
         shell 结果（以 `[exit=N]` 开头）解析 exit code 进标题、正文去掉头部，失败染红框；
         truncate=True（历史回放）时超长结果截断显示 head/tail，避免 resume 一次性撑爆 TUI。
+        简洁模式：单行 `icon 工具名 摘要 ✅/❌`，只有失败才在下方缩进输出正文（summary
+        为调用时的参数摘要，历史回放与实时事件都从对应的 tool_call 拿）。
         """
+        if self.lean:
+            line, detail = _lean_tool_result(self.palette, name, summary, content)
+            log.write(line)
+            if detail is not None:
+                log.write(detail)
+            return
         code, body = _split_shell_exit(content)
         if code is not None:  # shell：标题带 exit code，正文不带 [exit=] 头
             title, body, role = _shell_result_box(body, code)
@@ -854,8 +1093,11 @@ class PieApp(App):
         与实时事件渲染保持一致的盒子样式：user → "你"，assistant → "pie"，
         tool_calls → ⚙，tool → ↳；system（system prompt / 窗口摘要）不显示。
         标题与图标都由角色决定，见 Theme.role_icon。
+        简洁模式下工具行需要「调用摘要」，用 tool_call_id 把工具结果与它对应的
+        调用参数配起来（历史里结果按调用顺序排在后面）。
         """
         log = self.query_one("#log", RichLog)
+        calls: dict[str, tuple[str, Any]] = {}  # tool_call_id → (工具名, 参数)，供结果行取摘要
         for d in self.session.full_history():
             role = d.get("role")
             if role == "system":
@@ -870,12 +1112,22 @@ class PieApp(App):
                         log.write(_box(self.palette, content, title="pie", role="assistant"))
                     for tc in tool_calls:
                         fn = tc.get("function") or {}
-                        self._render_tool_call(log, fn.get("name") or "工具", fn.get("arguments") or "")
+                        name = fn.get("name") or "工具"
+                        args = fn.get("arguments") or ""
+                        calls[tc.get("id") or ""] = (name, args)
+                        self._render_tool_call(log, name, args)
                 else:
                     log.write(_box(self.palette, content, title="pie", role="assistant"))
             elif role == "tool":
+                name, args = calls.pop(
+                    d.get("tool_call_id") or "", (d.get("tool_name") or "工具", None)
+                )
                 self._render_tool_result(
-                    log, d.get("tool_name") or "工具", d.get("content") or "", truncate=True
+                    log,
+                    name,
+                    d.get("content") or "",
+                    summary=_tool_summary(name, args) if args is not None else "",
+                    truncate=True,
                 )
             else:
                 log.write(_box(self.palette, content, role="system"))
@@ -1220,9 +1472,13 @@ class PieApp(App):
     def _run_shell(self, cmd: str) -> None:
         if not cmd:
             return
-        self.query_one("#log", RichLog).write(
-            _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", tool="shell")
-        )
+        log = self.query_one("#log", RichLog)
+        if self.lean:
+            log.write(_lean_line(self.palette, "shell", cmd, role="tool_call"))
+        else:
+            log.write(
+                _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", tool="shell")
+            )
         self._cancel_event = asyncio.Event()
         self._shell_worker = self.run_worker(
             self._exec_shell_async(cmd), group="shell", exclusive=True, exit_on_error=False
@@ -1290,8 +1546,16 @@ class PieApp(App):
         log = self.query_one("#log", RichLog)
         if code == "cancelled":
             out = (out.rstrip() + "\n[用户手动终止]").strip()
-        title, body, result_role = _shell_result_box(out, code)
-        log.write(_tool_result_box(self.palette, body, title=title, role=result_role, tool="shell"))
+        if self.lean:
+            line, detail = _lean_shell_result(self.palette, cmd, out, code)
+            log.write(line)
+            if detail is not None:
+                log.write(detail)
+        else:
+            title, body, result_role = _shell_result_box(out, code)
+            log.write(
+                _tool_result_box(self.palette, body, title=title, role=result_role, tool="shell")
+            )
         self._cancel_event = None
         self._shell_worker = None
         self._clear_stream()
@@ -1349,7 +1613,14 @@ class PieApp(App):
             self._flush_assistant_text(log)
             self._render_tool_call(log, ev.get("name", "工具"), ev.get("arguments", {}))
         elif ev_type == "tool_result":
-            self._render_tool_result(log, ev.get("name", "工具"), ev.get("text", ""))
+            # arguments 与 tool_call 事件同源：简洁模式的结果行要拿它取摘要（path / 命令）
+            name = ev.get("name", "工具")
+            self._render_tool_result(
+                log,
+                name,
+                ev.get("text", ""),
+                summary=_tool_summary(name, ev.get("arguments") or {}),
+            )
             self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
             # 正文流式显示已在 #assistant-stream 完成：此处把最终内容（以 answer 为准）
