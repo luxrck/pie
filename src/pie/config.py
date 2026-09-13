@@ -32,10 +32,39 @@ REASONING_LEVELS = ("none", "low", "high", "max")
 REASONING_NONE = REASONING_LEVELS[0]  # none = 关闭思考：请求时不发 reasoning_effort
 
 # 上下文压缩默认值
-DEFAULT_MAX_SEQ_LEN = 128_000
+DEFAULT_MAX_SEQ_LEN = 128_0000
 DEFAULT_KEEP_LAST_STEPS = 5
 DEFAULT_CONTEXT_SOFT_RATIO = 0.8
 DEFAULT_CONTEXT_TARGET_RATIO = 0.55
+
+# 单次生成上限（max_tokens）：默认 256000（256k）；显式设为 None 才不发送该参数（用服务端默认）
+# （DeepSeek：不传时非思考 8K / 思考 64K / reasoning_effort=max 时 128K；上限 384K）
+DEFAULT_MAX_TOKENS = 256_000
+MAX_TOKENS_AUTO = ("auto", "default", "none", "0", "")
+
+
+def parse_max_tokens(raw: str) -> int | None:
+    """解析 max_tokens 输入：auto/default/none/0/空 → None（不发送，用服务端默认）；支持 64k / 384K 简写。
+
+    非法输入抛 ValueError（由调用方转成提示文案）。
+    """
+    text = (raw or "").strip().lower()
+    if text in MAX_TOKENS_AUTO:
+        return None
+    multiplier = 1
+    if text.endswith("k"):
+        multiplier, text = 1000, text[:-1]
+    elif text.endswith("m"):
+        multiplier, text = 1_000_000, text[:-1]
+    try:
+        value = int(float(text) * multiplier)
+    except ValueError:
+        raise ValueError(f"无法识别的 token 数: {raw!r}（例：65536 / 64k / auto）") from None
+    if value < 1:
+        raise ValueError("max_tokens 必须 ≥ 1（要恢复默认请用 auto）")
+    return value
+
+
 # 提示词文件路径固化（不再作为配置项）
 SYSTEM_FILE = "SYSTEM.md"
 AGENTS_FILE = "AGENTS.md"
@@ -156,6 +185,7 @@ class Config:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = DEFAULT_API_KEY
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    max_tokens: int | None = DEFAULT_MAX_TOKENS  # 单次生成上限（默认 256000；None = 不发该参数、用服务端默认）
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN
     keep_last_steps: int = DEFAULT_KEEP_LAST_STEPS  # 工具级压缩保护窗口：最近 N 个 step 批次（跨轮次滚动）
     compaction: CompactionConfig | bool | None = field(default_factory=CompactionConfig)  # None = 不做任何上下文压缩
@@ -258,6 +288,14 @@ class Config:
             )
         if not path.exists() and path == CONFIG_FILE and LEGACY_CONFIG_FILE.exists():
             cfg.save()
+        # max_tokens 容错：允许手写成字符串（"auto" / "64k" / "384K"），0/负数按“不发送”处理
+        if isinstance(cfg.max_tokens, str):
+            try:
+                cfg.max_tokens = parse_max_tokens(cfg.max_tokens)
+            except ValueError:
+                cfg.max_tokens = DEFAULT_MAX_TOKENS  # 认不出的写法按默认值处理，不让它挡住启动
+        elif isinstance(cfg.max_tokens, int) and cfg.max_tokens < 1:
+            cfg.max_tokens = None
         cfg.config_file = str(path)  # 运行时属性：记录配置来源路径
         return cfg
 

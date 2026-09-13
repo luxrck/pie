@@ -42,7 +42,7 @@ from .context import content_text
 from .textkit import install_cjk_wrap, rich_text, strip_escapes
 from .theme import Theme, build_css, get_theme
 
-install_cjk_wrap()  # 显示层断行改成 CJK 友好（替换 rich.text.divide_line）
+install_cjk_wrap()  # 显示层断行改成 CJK 友好（Rich 正文 + TextArea 输入框）
 
 # 命令补全候选：(命令, 说明)
 PALETTE_COMMANDS: list[tuple[str, str]] = [

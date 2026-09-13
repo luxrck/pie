@@ -155,6 +155,7 @@ class OpenAILLM:
         base_url: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
         **client_kwargs: Any,
@@ -162,6 +163,8 @@ class OpenAILLM:
         self.model = model or DEFAULT_MODEL
         # "none"（关闭思考）归一为 None：_request_kwargs 只在非空时发参数
         self.reasoning_effort = None if reasoning_effort == REASONING_NONE else reasoning_effort
+        # 单次生成上限：None = 不发送 max_tokens，由服务端默认（DeepSeek 思考模式 64K，上限 384K）
+        self.max_tokens = max_tokens
         self.api_key = api_key
         self.base_url = base_url or None
         if timeout is not None:
@@ -209,6 +212,8 @@ class OpenAILLM:
             kwargs["reasoning_effort"] = effort
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if self.max_tokens is not None:  # 未配置就不发，交给服务端默认
+            kwargs["max_tokens"] = int(self.max_tokens)
         return kwargs
 
     async def complete(
