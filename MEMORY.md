@@ -9,6 +9,8 @@
 - 信奉 YOLO：不要权限确认，工具直接执行。
 - 偏好极简、可扩展的实现。
 - 不要自动更新版本号（pyproject/uv.lock 等），除非用户明确要求；提交时不要自拟版本号或改动版本号。
+- `max_seq_len = 128_0000`（128 万）是**刻意设定**，不是手误——已确认过，不要再当成笔误反复确认。
+- `Config.max_tokens` 默认 **256000**（256k，按 k=1000 换算），不要改回 None/不发送。
 
 ## 打包 / 还原
 
@@ -132,6 +134,7 @@ echo "还原完成: $SRC"
 
 - input() 在部分终端（WSL/mintty）退格按字节删除，删中文会截断成非法 UTF-8 → 改用 prompt_toolkit 行编辑（非 TTY 回退 input()），附带获得 ~/.pie/history.txt 输入历史。
 - 命令行参数有长度上限（Linux 单参数 128KiB / macOS 256KiB / Windows 32KiB），长任务走 stdin 或文件指针，不要塞进 argv。
+- 2026-09-13：**CJK 断行要装两处**。显示层有两条独立排版链路：① Rich（`#log`/盒子/Markdown）走 `rich.text.divide_line`（`install_cjk_wrap()` 替换模块属性即可）；② `#input` 的 TextArea 不走 Rich，而是 `textual.document._wrapped_document` 调 `textual._wrap.compute_wrap_offsets`——只修前者时输入框仍按「无空格的整串算一个词」换行：中文长串只要比**行尾剩余空间**宽就整段挪到下一行，上一行留大片空白（实测 width=30 时 `把 #log ` 之后只剩 8 格就换行）。两者分词都是 `\S+\s*|\s+`，所以修法一样：把全角字（`cell_len==2`）拆成单字 token。patch 的是 from-import 后那个模块的全局名，不能改 `textual._wrap` 本体。含 `\t` 的行回退原实现（tab 展开宽度依赖列位置、调用方会预计算 `precomputed_tab_sections`）。
 
 ### 打包与部署
 
@@ -156,6 +159,8 @@ echo "还原完成: $SRC"
 - thinking 模式要求 assistant tool_calls 消息回传时必须带 reasoning_content，缺失报 400 → LLMResult/Message 捕获并持久化，to_api 对 tool_calls 消息恒带该字段（空串兜底）。
 - 空串 reasoning_content 曾被 truthy 判断省略 → 改为 is not None / 恒带字段；None（原始响应没有该字段）才省略。
 - API 异常时打印请求诊断（消息数 / tool_calls 消息数 / 缺 reasoning 数），便于下次直接定位。
+- **max_tokens（2026-09-13 查官方文档核实）**：`Config.max_tokens` 默认 **256000**（用户指定；上限 384K/393216），None = 不发送该参数，由服务端默认——DeepSeek：非思考 8K / 思考模式 64K / `reasoning_effort=max` 时 128K。只有 `--max-tokens auto` 能临时回到“不发送”。**不做 /maxtokens 会话命令**（用户明确不要）。注意 **max_tokens 含思考 token**，给小了会只输出思考、正文为空。验收手段：不传时用 `max_tokens=10**9` 探边界，服务端 400 会回「valid range of max_tokens is [1, 393216]」。
+- `-t/--thinking` 的合法取值曾与配置层不一致：CLI 的 `THINKING_LEVELS` 有 `off`，但 `reasoning_effort` 在 API 侧只认 `none/low/high/max`（`minimal`→low、`medium/xhigh`→high 是服务端兼容），直接发 `off` 会被 400 拒（unknown variant）→ `_run` 里把 `off` 归一成 `REASONING_NONE`。
 
 ### 配置清理
 

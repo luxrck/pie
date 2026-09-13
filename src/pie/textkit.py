@@ -2,9 +2,13 @@
 
 都是纯函数、不依赖 Textual，便于单独测试（tests/test_tui.py）。
 
-CJK 断行需要 `install_cjk_wrap()` 显式安装一次（TUI 导入 tui.py 时调用）：
-Rich 的 Text.wrap() 在调用时从 `rich.text` 模块全局取 divide_line，替换那个模块属性
-即可让所有 Rich 渲染都用上。
+CJK 断行需要 `install_cjk_wrap()` 显式安装一次（TUI 导入 tui.py 时调用）。要装两处，
+因为显示层有两条独立的排版链路：
+
+- `#log` / 盒子 / Markdown 等 Rich 渲染 → `Text.wrap()` 在调用时从 `rich.text` 模块全局取
+  `divide_line`，替换那个模块属性即可。
+- `#input`（TextArea）→ 不走 Rich 排版，而是 `WrappedDocument` 调 `textual._wrap.compute_wrap_offsets`，
+  得单独替换 `_wrapped_document` 模块里这个名字。
 """
 
 from __future__ import annotations
@@ -100,19 +104,60 @@ def cjk_divide_line(text: str, width: int, fold: bool = True) -> list[int]:
     ]
 
 
-def install_cjk_wrap() -> bool:
-    """把 rich.text 的 divide_line 换成 CJK 友好实现（接口不在则静默跳过）。
+# ---- Textual TextArea（#input 输入框）的断行 ----
+#
+# TextArea 的换行由 WrappedDocument 负责，分词同样用 `\S+\s*|\s+`（textual._wrap.compute_wrap_offsets），
+# 于是「无空格的中文长串」被当成一个不可断的词：只要它比**行尾剩余空间**宽，就整段挪到下一行，
+# 上一行留下一大片空白（实测 width=30 时 "把 #log " 之后只剩 8 格就换行）。
+# 这里补一个同契约的实现（字符下标断点），行为与 cjk_divide_line 一致。
 
-    Text.wrap() 在调用时从 rich.text 模块全局取 divide_line，所以改这个模块属性即可
-    让所有 Rich 渲染（盒子正文、Markdown、状态栏…）都用上；只在 TUI 模块导入时安装。
+_textual_orig_wrap_offsets = None
+"""安装时捕获的 Textual 原实现：含 \t 的行交回它（tab 展开宽度依赖列位置）。"""
+
+
+def cjk_compute_wrap_offsets(
+    text: str,
+    width: int,
+    tab_size: int = 4,
+    fold: bool = True,
+    precomputed_tab_sections: list[tuple[str, int]] | None = None,
+) -> list[int]:
+    """CJK 友好版 compute_wrap_offsets（TextArea 用；契约与 textual._wrap 同）。
+
+    含制表符的行直接交回 Textual 原实现：tab 宽度随列位置变化，原实现会用调用方预计算的
+    `precomputed_tab_sections`，本实现不重算。
     """
+    if _textual_orig_wrap_offsets is not None and "\t" in text:
+        return _textual_orig_wrap_offsets(
+            text, width, tab_size, fold, precomputed_tab_sections
+        )
+    return cjk_divide_line(text, width, fold)
+
+
+def install_cjk_wrap() -> bool:
+    """把 Rich 与 Textual TextArea 的断行都换成 CJK 友好实现（接口不在则静默跳过）。
+
+    Rich：Text.wrap() 在调用时从 rich.text 模块全局取 divide_line，改这个模块属性即可
+    让所有 Rich 渲染（盒子正文、Markdown、状态栏…）都用上 —— 即 #log 区域。
+    Textual：WrappedDocument 在模块里按全局名调 compute_wrap_offsets，改 _wrapped_document
+    的同名属性即可 —— 即 #input 输入框。
+    只在 TUI 模块导入时安装。
+    """
+    global _textual_orig_wrap_offsets
     try:
         import rich.text as rich_text
     except Exception:  # pragma: no cover
         return False
-    if rich_text.divide_line is cjk_divide_line:
+    if rich_text.divide_line is not cjk_divide_line:
+        rich_text.divide_line = cjk_divide_line  # type: ignore[assignment]
+    try:
+        from textual.document import _wrapped_document as wrapped_document
+    except Exception:  # pragma: no cover - 没有 Textual 时只装 Rich 那份（CLI 模式）
         return True
-    rich_text.divide_line = cjk_divide_line  # type: ignore[assignment]
+    if wrapped_document.compute_wrap_offsets is not cjk_compute_wrap_offsets:
+        if _textual_orig_wrap_offsets is None:
+            _textual_orig_wrap_offsets = wrapped_document.compute_wrap_offsets
+        wrapped_document.compute_wrap_offsets = cjk_compute_wrap_offsets  # type: ignore[assignment]
     return True
 
 
