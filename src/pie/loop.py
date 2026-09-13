@@ -168,7 +168,15 @@ async def _run_tool_call(
     if cfg.verbose:
         print(f"{tag}结果: {clip_output(text, MAX_LOG_OUTPUT)}", file=sys.stderr)
     if on_event is not None:
-        on_event({"type": "tool_result", "name": call.name, "text": clip_output(text, 500)})
+        # arguments 一并推送：TUI 简洁模式的结果行要拿它取摘要（path / command）
+        on_event(
+            {
+                "type": "tool_result",
+                "name": call.name,
+                "text": clip_output(text, 500),
+                "arguments": args,
+            }
+        )
     return text
 
 
@@ -259,7 +267,9 @@ async def acomplete_turn(
     messages 由调用方持有，因此多轮对话可以共享同一份历史。
     on_event 回调（可选）实时推送：
       reasoning_delta / content_delta（流式生成增量）
-      tool_call / tool_result / tool_progress（工具调用与实时输出）
+      tool_call / tool_result / tool_progress（工具调用与实时输出；tool_result 带
+        name / text / arguments，arguments 供 UI 取“这次调的是哪个文件 / 命令”的摘要，
+        因为结果文本本身不一定含路径，且结果按真实完成顺序回推、与调用顺序不一定一致）
       answer（最终回复）
     同一批 tool_calls 用 asyncio.gather 并行执行；全部收尾后按模型返回顺序回填
     ToolMessage（历史扁平序列与串行一致，compaction 的 step 批次认定不受影响），
@@ -402,7 +412,14 @@ def _cancel_tools(
     for call, text in zip(llm_out.tool_calls, results):
         content = text if text is not None else CANCEL_TEXT
         if text is None and on_event is not None:
-            on_event({"type": "tool_result", "name": call.name, "text": CANCEL_TEXT})
+            on_event(
+                {
+                    "type": "tool_result",
+                    "name": call.name,
+                    "text": CANCEL_TEXT,
+                    "arguments": call.arguments,
+                }
+            )
         messages.add(_finalize_tool_message(call, content, manifest))
     return _cancel_turn(messages, on_event)
 
