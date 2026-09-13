@@ -66,7 +66,7 @@ pie --session 20260831-103224   # 恢复指定会话（id / 文件名 / 路径�
 直接输入消息即可，每条消息都会走完整的工具循环（read / edit / write / shell），历史上下文在会话内持续保留。
 每轮对话自动保存到 `~/.pie/sessions/<时间戳>.jsonl`，所以 `pie resume` 能恢复最近会话。
 真实终端下使用 **Textual TUI**（pi / tau 风格：消息流、工具调用日志、状态栏、底部输入）；非 TTY（管道/脚本）自动回退 readline。
-对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 fs 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/status` 查看 token 使用情况与当前会话文件、`/stop` 取消当前正在执行的模型请求 / 工具、`/help` 查看帮助。
+对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 fs 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/status` 查看 token 使用情况与当前会话文件、`/thinking` 切换思考深度、`/stop` 取消当前正在执行的模型请求 / 工具、`/help` 查看帮助。
 TUI 下发出消息后输入框**不会禁用**：模型请求 / 工具执行期间可以继续输入，输入 `/stop` 即手动取消——模型请求被中断时返回“用户手动终止”，工具执行被中断时工具结果同样填充“用户手动终止”（未执行的工具调用也补该文本，保证会话序列合法）；`!cmd` 的 shell 模式同样可用 `/stop` 终止（会 kill 子进程）。
 输入使用 prompt_toolkit 做 Unicode 安全行编辑：中文退格按字符删除，不会出现半个字符导致的 UTF-8 错误；管道/脚本输入时自动回退 `input()`。
 
@@ -94,6 +94,7 @@ pie [OPTIONS] [PROMPT]
     --mode text|json|transcript   print 输出格式（默认 text）
 -m, --model NAME              本次运行的模型（覆盖配置，不持久化）
 -t, --thinking LEVEL          本次思考强度（off..max，覆盖配置，不持久化）
+    --max-tokens N            本次单次生成上限（例 131072 / 128k / auto，覆盖配置，不持久化；默认 256000）
 -c, --config FILE             指定配置文件（默认 ~/.pie/config.toml）
 -r, --resume                  恢复最近的会话
     --session ID              恢复指定会话（id / 文件名 / 路径）
@@ -117,6 +118,10 @@ model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com/"
 api_key = "sk-..."   # 默认 key 已写入代码与配置
 reasoning_effort = "high"
+# 单次生成上限（默认 256000）；想用服务端默认就删掉这行并加 --max-tokens auto，或写 max_tokens = "auto"（仅本次生效）。
+# DeepSeek：不传时非思考 8K、思考模式（默认 high）64K、reasoning_effort=max 时 128K；上限 384K。
+# 注意 max_tokens 包含思考 token（thinking 模式下思考内容也占额度，给小了会只输出思考、正文为空）。
+max_tokens = 256000
 verbose = true
 max_seq_len = 128000
 keep_last_steps = 5

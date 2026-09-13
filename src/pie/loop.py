@@ -366,6 +366,7 @@ def run_agent(
         base_url=cfg.base_url,
         model=cfg.model,
         reasoning_effort=cfg.reasoning_effort,
+        max_tokens=cfg.max_tokens,
         timeout=cfg.timeout_seconds,
         max_retries=cfg.max_retries,
     )

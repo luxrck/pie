@@ -143,7 +143,7 @@ CATPPUCCIN_MOCHA = Theme(
     # 按工具名的图标覆盖（未配置的工具 → 上面的 role 图标 ⚙ / ↳；值为 "" = 该工具不显示图标）
     # 调用框用工具图标（一眼看出调的是哪个工具）；结果框保持 ↳（图标编码「形态」：
     # ↳ = 上一个框的产出，工具名仍在标题里），故默认不配 tool_result_icons。
-    tool_icons={"read": "🗎", "edit": "⟱", "write": "🖫", "shell": "🖳"},
+    tool_icons={"read": "✧", "edit": "⟱", "write": "✦", "shell": "❯"},
     tool_result_icons={},
     busy_border="#f38ba8",          # busy 边框（亮红）
     busy_border_hover="#ffb4c8",    # busy hover 边框（更亮）

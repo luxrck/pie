@@ -28,10 +28,12 @@ from .config import (
     CONFIG_FILE,
     PIE_DIR,
     REASONING_LEVELS,
+    REASONING_NONE,
     Config,
     _prompt,
     build_system_prompt,
     ensure_config,
+    parse_max_tokens,
 )
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
 from .input import read_input
@@ -169,6 +171,12 @@ def _parser() -> argparse.ArgumentParser:
         metavar="LEVEL",
         help="本次思考强度（off/minimal/low/medium/high/xhigh/max，覆盖配置，不持久化）",
     )
+    parser.add_argument(
+        "--max-tokens",
+        metavar="N",
+        help="本次单次生成上限（例：131072 / 128k / auto；覆盖配置，不持久化。"
+        "默认 256000，auto = 不发送该参数、用服务端默认：DeepSeek 思考模式 64K、上限 384K）",
+    )
     parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
     parser.add_argument("-r", "--resume", action="store_true", help="恢复当前目录下最近的会话")
     parser.add_argument("--cwd", metavar="PATH", help="内置工具的工作目录（默认当前目录）")
@@ -220,7 +228,12 @@ def _run(args: argparse.Namespace) -> int:
     if args.model:
         cfg.model = args.model
     if args.thinking:
-        cfg.reasoning_effort = args.thinking
+        # -t/--thinking 的 off 是给人看的名词，API 只认 none（其余 minimal/medium/xhigh 服务端兼容接受）
+        cfg.reasoning_effort = (
+            REASONING_NONE if args.thinking == "off" else args.thinking
+        )
+    if args.max_tokens is not None:
+        cfg.max_tokens = parse_max_tokens(args.max_tokens)
     if args.timeout_seconds is not None:
         cfg.timeout_seconds = args.timeout_seconds
     if args.max_retries is not None:
