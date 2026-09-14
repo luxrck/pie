@@ -2,7 +2,12 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
-## 2026-09-14
+## 2026-09-15
+
+- **修 `pie -p 你好` 收尾时那段 `RuntimeError: generator didn't stop after athrow()` 噪音**（用户报告）：新模块 **`aio.py`**（`run()` / `close_asyncgens()` / `event_loop()`），把 CLI 所有同步入口的 `asyncio.run` 换成 `aio.run`（`session.turn` / `loop.run_agent` / `tools.dispatch` / cli 的两处 `fetch_models`），`run_tui` 也改为自建循环（`App.run(loop=…)`）以便退出前收尾。
+  根因：openai 的流式响应读到 SSE `[DONE]` 就**就地 break**，httpx2/httpcore2 那串「响应字节流」异步生成器（`AsyncStream.__stream__` → `SSEDecoder.aiter_bytes` → `Response.aiter_bytes`/`aiter_raw` → `PoolByteStream.__aiter__` → `HTTP11ConnectionByteStream.__aiter__` → `safe_async_iterate` → `_receive_response_body`）会一直挂起在 yield 上；`asyncio.run` 收尾的 `loop.shutdown_asyncgens()` 按 `loop._asyncgens`（WeakSet，顺序随地址漂移）**一次性** aclose 它们，一旦「内层先关」httpcore2 的 `safe_async_iterate` 就抛这个 RuntimeError，被默认异常处理器打成一大段 Traceback（连接其实早已正确释放，纯噪音）。
+  修法：收尾前自己关一遍——分多轮、每轮先摘空集合再逐个 `aclose()`、单个失败留给下一轮（实测 2 轮清空），与顺序无关；长驻循环（TUI）里这些生成器本来是 GC 逐个回收关闭的，所以只有一次性 `asyncio.run` 会犯。
+  验证：`pie -p 你好` ×6 次 stderr 全空（修前必现）；带工具的多步任务、TUI（pty 驱动）一整轮 + `/stop` 取消再退出，均无 Traceback / 无 asyncgen 噪音；`tests/` 44/44。
 
 - **latte 代码块高亮主题改为 `solarized-light`**（接上条；**用户手改** `CATPPUCCIN_LATTE.code_theme`，由 `friendly`（底 `#f0f0f0`）换成 `solarized-light`（底 `#fdf6e3`））：同步更新 `theme.py` 注释、`tests/test_tui.py::test_markdown_code_styles`（浅色变体的 fence 底色期望改为**从 `palette.code_theme` 派生**，不再写死 `#f0f0f0`——以后再换高亮主题不必改测试）以及本文件 / `MEMORY.md` 里已过时的 `friendly` 描述。全套 44/44。
 

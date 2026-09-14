@@ -13,7 +13,8 @@
 
 ## 当前系统概览
 
-- **架构**：分层包（tools / llm / loop / config / chat / context / cli），src 布局，可全局安装（`uv tool install . --editable`）。内置工具仅 read / edit / write / shell，`@tool()` 按签名生成 schema，LLM 协议可注入。
+- **架构**：分层包（tools / llm / loop / config / chat / context / cli / aio），src 布局，可全局安装（`uv tool install . --editable`）。内置工具仅 read / edit / write / shell，`@tool()` 按签名生成 schema，LLM 协议可注入。
+  `aio.py` = 事件循环收尾（`run()` 代替 `asyncio.run`、`close_asyncgens()`、`event_loop()`；见「踩坑记录 → 事件循环与异步生成器」）。
   **Session 的三个路径/集合字段**（名字要一眼分清）：`path` = 会话 JSONL 自身的文件路径；`windows` = `/clear` 归档的历史窗口块（落在 `~/.pie/windows/`）；`files` = 图片 id 表（hash_id → file_id/本地副本/过期时间，见 `files.py`，存进 `__meta__`）。旧名 `file` / `fs` 已于 2026-09 改名（`__meta__` 里的 `fs` 键仍兼容读）。
 - **CLI 与交互**：`pie`（新对话）/ `pie resume`（恢复最近）/ `pie` 带参数（一次性子 agent，不写 sessions）/ `pie context info|verify|gc`；`-c/--config` 指定配置。真实终端走 Textual TUI，非 TTY 回退 readline/prompt_toolkit；输入以 `!` 开头走 shell 模式（不进上下文）。运行时命令：`/stat`（用量）、`/thinking`（切换思考深度）、`/model <id>`（切换模型，启动自动拉取可用列表）、`/compact [tools|turns]` 手动压缩（无参 = 工具级+轮次级）、`/stop` 或 `Esc`（取消当前任务：补全面板开着时 Esc 只收起面板）、`/clear`（切换窗口）。
 - **工具**：所有内置工具输出统一为 `Headers\n\nBody`（headers 一行一个 `[...]`，body 空则省略空行；状态/元数据放 header 区，如 shell 首行 `[exit=..]`、截断时 `[工具输出全文已保存: path]`、行号 `[行 a-b，共 N 行]`）。read 支持 offset/limit 分页 + 图片多模态 + 私有容量上限（_max_lines/_max_bytes/_max_image_bytes）；edit 为 edits 数组（oldText 唯一、防重叠、按原文非增量）；shell 支持私有容量上限（超限只保留尾部，全文落盘指针）。
@@ -60,6 +61,12 @@
 - `keep` 类参数要 clamp `max(1, keep)`（0 等价 1，当前轮必须保留），否则 `user_idx[m]` 越界崩。
 - 轮次进行中不做 pair 提取、pair 仅当轮次以 assistant 结尾时提取，否则产生 user→纯文本 assistant→tool_calls→tool 非法序列被 DeepSeek 400。
 - 工具返回全文，落盘统一在 harness 边界做（eager spill），工具内部不截断（截断会丢信息）。—— 例外：read/shell 支持配置容量上限（_max_lines/_max_bytes），截断时用 `write_raw` 落盘全文并返回独立指针标记，信息不丢。指针格式必须是独立的 `[工具输出全文已保存: path]`（`[` 紧挨可选前缀 + `全文已保存:`），不能嵌在其它文字里，否则 `extract_spill_path`（`_SPILL_RE`）匹配不到。
+
+### 事件循环与异步生成器
+
+- **收尾的 `RuntimeError: generator didn't stop after athrow()` 是 httpx2/httpcore2 的收尾顺序问题，不是我们的 bug**（`pie -p 你好` 即可复现，长驻循环不会）：openai 流式响应读到 SSE `[DONE]` 就地 break → 「响应字节流」那串异步生成器（`AsyncStream.__stream__` → … → `PoolByteStream.__aiter__` → `HTTP11ConnectionByteStream.__aiter__` → `safe_async_iterate`）一直挂起在 yield 上；`asyncio.run` 收尾的 `shutdown_asyncgens()` 按 `loop._asyncgens`（WeakSet，顺序随对象地址漂移，所以时好时坏）一次性 aclose，**内层先关**时 httpcore2 就抛 RuntimeError。连接此时已被正确释放（`HTTP11ConnectionByteStream.aclose()` 在抛错前已调用），纯噪音。
+- 对策：同步入口统一走 **`aio.run`**（不是 `asyncio.run`）——它收尾前先 `close_asyncgens()`：分多轮、每轮先摘空 `loop._asyncgens` 再逐个 `aclose()`、单个失败留给下一轮（与顺序无关，实测 2 轮清空）。**别在长驻循环（TUI）里按回合调它**：那会把同循环里无关的在用生成器一并关掉；TUI 只在 **`run_tui` 退出时**用 `aio.event_loop()`（自建循环交给 `App.run(loop=…)`）收一次尾。
+- 经验：凡是「收尾才出现、还时有时无」的 asyncio 报错，先怀疑**关闭顺序 / GC 时机**；`loop._asyncgens`（CPython 内部结构，3.6+ 稳定，拿不到就降级为原生行为）就是 `shutdown_asyncgens()` 用的那个集合。
 
 ### API / 模型（DeepSeek thinking）
 
