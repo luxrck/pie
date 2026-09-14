@@ -21,10 +21,12 @@ pie/
 │   ├── tools.py       # 工具层：@tool 装饰器 + ToolRegistry + 内置工具
 │   ├── llm.py         # 模型层：LLM 协议 + OpenAI 兼容实现
 │   ├── input.py       # 非 TTY 行编辑（prompt_toolkit，中文退格安全）
-│   ├── theme.py       # TUI 展示数据：配色 + 图标 + build_css（纯字符串，不依赖 Textual）
+│   ├── files.py       # 图片 Files API：本地内容寻址副本 + 上传/复用/失效回退
+│   ├── theme.py       # TUI 展示数据：配色 + 图标 + 主题族/变体 + build_css（纯字符串，不依赖 Textual）
+│   ├── termbg.py      # 终端背景明暗探测（OSC 11 → COLORFGBG）：供主题族自动选深/浅变体
 │   ├── textkit.py     # 显示层文本处理：CJK 友好断行 + 控制符/ANSI 转义清洗（纯函数）
 │   └── tui.py         # TUI 应用：布局/命令/回合 worker/流式渲染 + 日志区控件与框选复制
-├── tests/test_tui.py  # TUI 回归测试（无 pytest 依赖）
+├── tests/             # 回归测试（无 pytest 依赖）：test_theme / test_tui / test_config / test_session / test_files
 ├── AGENTS.md          # 项目说明（本文件）
 ├── MEMORY.md          # 项目持久记忆
 ├── SYSTEM.md          # agent 运行时 system prompt
@@ -61,6 +63,7 @@ uv run python tests/test_tui.py            # TUI 回归：框选复制保真 + C
 - system prompt 分层：SYSTEM.md（角色/原则）+ AGENTS.md（项目）+ MEMORY.md（记忆），由 `build_system_prompt(config)` 组装。
 - 提示词文件按“当前目录向上找项目根”解析，支持在任意目录运行 `pie`。
 - 用户偏好与重要决策写入 MEMORY.md，而不是散落在代码注释里。
+- 主题（theme.py）分两层：**族**（`THEME_FAMILIES`，如 `catppuccin` = 深色 `catppuccin-mocha` + 浅色 `catppuccin-latte`）与**具体变体**（`THEMES`）。`get_theme(name, dark=None)` 对族名按终端背景明暗自适应（`termbg.detect_dark_background()`：OSC 11 → COLORFGBG → None 按深色）；`Config.theme` 默认是族名。Markdown **不做全量接管**（走 Rich 默认）；只有浅色变体通过 `Theme.markdown_styles()`（字段 `markdown_code`，完整样式串）覆盖代码两键、并通过 `Theme.code_theme`（pygments 主题名）给 `Markdown(code_theme=...)` 换代码块高亮，`tui.on_mount` 非空时才 `console.push_theme(...)`。
 - TUI 分层：显示层文本处理（CJK 断行 / 转义清洗）在 `textkit.py`（纯函数、无 Textual 依赖），配色与 CSS 在 `theme.py`；其余全在 `tui.py`（应用编排 + 控件 + 日志区框选复制 `SelectableRichLog`，文件内用 `# ---- xxx ----` 分区）。`tui.py` 导入时调用 `textkit.install_cjk_wrap()` 替换 `rich.text.divide_line`（全角字逐字可断、英文词不断，纯 ASCII 走 Rich 原实现）。
 - 渲染 live 事件与 resume 历史共用同一套盒子 helper（`PieApp._render_tool_call/_render_tool_result/_notify`）与 `_format_tool_args`——要改工具盒样式改一处即可，别在事件分支里另写一份。
 
