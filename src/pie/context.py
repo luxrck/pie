@@ -25,7 +25,7 @@ from typing import Any, Iterable
 from .config import PIE_DIR
 
 CONTEXT_DIR = PIE_DIR / "context"
-WINDOWS_DIR = PIE_DIR / "windows"  # fs 历史窗口块（在 context/ 外，GC 不碰）
+WINDOWS_DIR = PIE_DIR / "windows"  # 历史窗口块（在 context/ 外，GC 不碰）
 
 _SPILL_RE = re.compile(r"\[(?:shell 输出|工具输出)?全文已保存: ([^\]]+)\]")
 _POINTER_RE = re.compile(r"\[(?:会话原文|轮次原文|工具输出全文)已保存: ([^\]]+)\]")
@@ -47,20 +47,28 @@ def content_text(content: Any) -> str:
                 parts.append(str(part.get("text") or ""))
             elif t == "image_url":
                 parts.append("[图片]")
+            elif t == "file":
+                parts.append("[图片]")
         return "\n".join(x for x in parts if x)
     return ""
 
 
+# 服务端规则：图片先缩到约 1300×1300 的像素量（小图会放大）再计 token，**单图上限 1024**。
+# 所以图不管怎么传（内联 base64 / Files API 的 file_id）都按同一个上界估，
+# 真实值以 provider 上报为准。
+IMAGE_TOKENS_MAX = 1024
+
+
 def _image_token_estimate(url: str) -> int:
-    """图片 part 的 token 估算：data URI 按 base64 负载量粗略估计（普通图 ~1-4K），
-    封顶防失真；外部 URL 无法估算取常见中间值。真实值以 provider 上报为准。"""
+    """图片 part 的 token 估算：data URI 按 base64 负载量粗估并**封顶 1024**（原来封 12000，
+    把一张 3 MB 的图估成 1.2 万 token，会让上下文虚高、提前触发压缩），file_id 直接取上界。"""
     if url.startswith("data:"):
-        return min(12000, 800 + len(url) // 256)
-    return 2000
+        return min(IMAGE_TOKENS_MAX, 800 + len(url) // 256)
+    return IMAGE_TOKENS_MAX
 
 
 def _content_tokens(content: Any) -> int:
-    """content 的 token 估算：str 按字符/4；多模态 parts 逐段算（text 按字符，image 按图像估算）。"""
+    """content 的 token 估算：str 按字符/4；多模态 parts 逐段算（text 按字符，图片按上界）。"""
     if isinstance(content, str):
         return len(content) // 4
     if isinstance(content, list):
@@ -72,6 +80,8 @@ def _content_tokens(content: Any) -> int:
             if t == "image_url":
                 url = (part.get("image_url") or {}).get("url") or ""
                 n += _image_token_estimate(url)
+            elif t == "file":  # Files API：url/file_id 都不含图，按单图上界估
+                n += IMAGE_TOKENS_MAX
             elif t == "text":
                 n += len(str(part.get("text") or "")) // 4
         return n
@@ -334,7 +344,8 @@ class ImageMessage(Message):
     轮数统计与标题提取；可随所在轮次/窗口一起被压缩落盘（原始 data URI 保留在
     raw 文件里，full_history 可恢复）。role 为 user：OpenAI 兼容 API 要求图片只能
     出现在 user 消息的 content parts。
-    content = [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {"url": "data:..."}}]
+    content = [{"type": "text", "text": ...}, {"type": "file", "file_id": "file-api-…"}]
+    （旧写法为内联 `{"type":"image_url","image_url":{"url":"data:…"}}`，不支持 Files API 时回退到它）
     """
 
     def __init__(self, content: list[dict[str, Any]] | None = None, **kwargs: Any) -> None:
@@ -485,14 +496,14 @@ class AgentMessage:
         session_cfg: Any = None,
         target: int | None = None,
         manifest: Path | None = None,
-        fs: list[Path] | None = None,
+        windows: list[Path] | None = None,
     ) -> Any:
         if tools:
             return self._compact_tools(tool_cfg, manifest)
         if turns:
             return self._compact_turns(turn_cfg, target, manifest)
         if session:
-            return self._compact_session(session_cfg, manifest, fs)
+            return self._compact_session(session_cfg, manifest, windows)
         return self
 
     def _compact_tools(self, tool_cfg: Any, manifest: Path | None) -> "AgentMessage":
@@ -590,10 +601,10 @@ class AgentMessage:
         return msg
 
     def _compact_session(
-        self, session_cfg: Any, manifest: Path | None, fs: list[Path] | None
+        self, session_cfg: Any, manifest: Path | None, windows: list[Path] | None
     ) -> "AgentMessage":
         """当前轮之前的历史整段落盘成新窗口，保留所有既有窗口摘要，
-        插入新窗口的“摘要 + 指针”SystemMessage；新窗口块追加进 fs。"""
+        插入新窗口的“摘要 + 指针”SystemMessage；新窗口块追加进 windows。"""
         user_idx = [i for i, e in enumerate(self.messages) if isinstance(e, UserMessage)]
         if not user_idx:
             self.compact_counts["session"] = False
@@ -618,8 +629,8 @@ class AgentMessage:
             return self
         raw = json.dumps([m.to_dict() for m in old], ensure_ascii=False, indent=1)
         path = write_raw(raw, "session")
-        if fs is not None:
-            fs.append(path)
+        if windows is not None:
+            windows.append(path)
         sc = session_cfg
         summary = build_window_summary(path, sc.head, sc.tail)
         if manifest is not None:
@@ -691,7 +702,7 @@ def maybe_compact(
     cfg: Any,
     current_tokens: int | None = None,
     manifest: Path | None = None,
-    fs: list[Path] | None = None,
+    windows: list[Path] | None = None,
 ) -> dict[str, Any]:
     """按需压缩：软阈值触发，tools → turns → session（各级受对应子配置 None 门控）。"""
     stats: dict[str, Any] = {
@@ -700,7 +711,7 @@ def maybe_compact(
         "tools": 0,
         "session": False,
     }
-    limit = cfg.max_seq_len
+    limit = cfg.context_window
     if limit <= 0 or cfg.compaction is None:  # compaction 未配置 = 不做任何压缩
         return stats
     tokens = current_tokens if current_tokens is not None else agent.tokens()
@@ -718,7 +729,7 @@ def maybe_compact(
     if turn_cfg and agent.tokens() > target:
         agent.compact(turns=True, turn_cfg=turn_cfg, target=target, manifest=manifest)
     if session_cfg is not None and agent.tokens() > target:
-        agent.compact(session=True, session_cfg=session_cfg, manifest=manifest, fs=fs)
+        agent.compact(session=True, session_cfg=session_cfg, manifest=manifest, windows=windows)
     stats["tools"] = agent.compact_counts["tools"]
     stats["turns"] = agent.compact_counts["turns"]
     stats["session"] = agent.compact_counts["session"]
@@ -773,9 +784,10 @@ def referenced_raw_paths() -> set[Path]:
 
 
 def collect_context_garbage() -> list[Path]:
-    """返回 context/ 下未被任何会话引用的文件（可安全删除）。fs 窗口块在 windows/ 下，不受影响。"""
+    """返回 context/ 下未被任何会话引用的文件（可安全删除）。窗口块在 windows/ 下，不受影响。"""
     referenced = referenced_raw_paths()
     return sorted(f for f in CONTEXT_DIR.glob("*.txt") if f.resolve() not in referenced)
+
 
 
 

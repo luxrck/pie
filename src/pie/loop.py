@@ -29,6 +29,7 @@ from .context import (
     maybe_compact,
     write_manifest,
 )
+from .files import ImageStore, is_stale_file_error, key_fingerprint, model_supports_files
 from .llm import LLM, LLMResult, OpenAILLM, ToolCall, UsageTracker
 from .tools import (
     ToolError,
@@ -155,7 +156,7 @@ async def _run_tool_call(
         )
     try:
         text = await _tool_call(
-            registry, call.name, args, cancel_event, on_event, tool_defaults=cfg.tools
+            registry, call.name, args, cancel_event, on_event, tool_defaults=cfg.tool_defaults()
         )
     except ToolError as e:
         text = f"[工具错误] {e}"
@@ -210,33 +211,53 @@ def _finalize_tool_message(
     return tool_msg
 
 
-def _build_image_parts(ref: Any) -> list[dict[str, Any]] | None:
-    """把 read 读取的图片编码为多模态 user content parts（data URI 内联 base64）。
-    文件缺失/已变化（大小不符）时返回 None（标记文本仍在 tool 结果里，不硬塞）。"""
+def _image_parts_from_raw(ref: Any, data: bytes, file_id: str | None) -> list[dict[str, Any]]:
+    """把一张图变成多模态 user content parts：优先 `file` 块（Files API），否则内联 base64。"""
+    dim = f"{ref.width}x{ref.height} " if ref.width and ref.height else ""
+    parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": f"[图片（由 read 工具读取，非用户输入）: {ref.path} {dim}{len(data)} 字节 {ref.mime}]",
+        }
+    ]
+    if file_id:
+        parts.append({"type": "file", "file_id": file_id})
+        return parts
+    b64 = base64.b64encode(data).decode("ascii")
+    parts.append({"type": "image_url", "image_url": {"url": f"data:{ref.mime};base64,{b64}"}})
+    return parts
+
+
+async def _build_image_parts(
+    ref: Any, *, store: Any = None, client: Any = None
+) -> list[dict[str, Any]] | None:
+    """读取 read 标记指向的图片并组装 parts。
+
+    先落一份**内容寻址副本**（`~/.pie/files/`，见 files.ImageStore）再从副本上传，
+    拿到 `file_id` 就用 `file` 块；未开启/模型不支持/上传失败 → 回退内联 base64。
+    文件缺失或已变化（大小不符）返回 None（标记文本仍在 tool 结果里，不硬塞）。
+    """
     try:
         data = Path(ref.path).read_bytes()
     except OSError:
         return None
     if ref.size and len(data) != ref.size:
         return None
-    dim = f"{ref.width}x{ref.height} " if ref.width and ref.height else ""
-    b64 = base64.b64encode(data).decode("ascii")
-    return [
-        {
-            "type": "text",
-            "text": f"[图片（由 read 工具读取，非用户输入）: {ref.path} {dim}{len(data)} 字节 {ref.mime}]",
-        },
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:{ref.mime};base64,{b64}"},
-        },
-    ]
+    file_id = None
+    if store is not None and client is not None:
+        file_id = await store.ensure(
+            client, data=data, mime=ref.mime, filename=Path(ref.path).name, src=str(ref.path)
+        )
+    return _image_parts_from_raw(ref, data, file_id)
 
 
-def _inject_read_images(
+async def _inject_read_images(
     messages: AgentMessage,
     calls: list[ToolCall],
     results: list[str | None],
+    *,
+    store: Any = None,
+    client: Any = None,
 ) -> None:
     """把本批 read 工具读到的图片作为 ImageMessage 注入（紧随全部工具结果之后，
     下轮模型请求即可看到图）。图片消息不是轮次边界，不影响压缩/轮数语义。"""
@@ -246,9 +267,59 @@ def _inject_read_images(
         ref = parse_image_marker(text)
         if ref is None:
             continue
-        parts = _build_image_parts(ref)
+        parts = await _build_image_parts(ref, store=store, client=client)
         if parts:
             messages.add(ImageMessage(content=parts))
+
+
+def _files_client(backend: LLM) -> Any:
+    """取后端的上传客户端（OpenAI 兼容的后端有 _client()）；没有就返回 None（走内联）。"""
+    factory = getattr(backend, "_client", None)
+    if not callable(factory):
+        return None
+    try:
+        return factory()
+    except Exception:
+        return None
+
+
+def _downgrade_file_blocks(messages: AgentMessage, store: Any) -> bool:
+    """把历史里的 `file` 块就地换成内联 base64（本地副本还在，字节拿得回来）。
+
+    服务端删了文件 / 会话中途换了 API key 时，历史里旧的 `file_id` 会让请求 400；
+    这时把所有 file 块降级成内联、并把对应记录标失效（下次同图重传）即可继续。
+    返回是否真的改动了什么。"""
+    changed = False
+    for message in messages.messages:
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        for i, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "file":
+                continue
+            file_id = str(part.get("file_id") or "")
+            entry = next(
+                (e for e in store.entries.values() if e.get("file_id") == file_id), None
+            )
+            local = Path(entry["local"]) if entry and entry.get("local") else None
+            try:
+                data = local.read_bytes() if local is not None else b""
+            except OSError:
+                data = b""
+            if not data:  # 副本也没了 → 干掉这个 part（总比让请求 400 强）
+                content[i] = {"type": "text", "text": "[图片已失效]"}
+                store.invalidate(file_id)
+                changed = True
+                continue
+            mime = str(entry.get("mime") or "image/png") if entry else "image/png"
+            b64 = base64.b64encode(data).decode("ascii")
+            content[i] = {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            }
+            store.invalidate(file_id)
+            changed = True
+    return changed
 
 
 async def acomplete_turn(
@@ -261,10 +332,14 @@ async def acomplete_turn(
     usage: UsageTracker | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     cancel_event: asyncio.Event | None = None,
+    image_files: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """处理一条用户消息：反复调用工具直到模型给出最终回复，并把回合追加进 messages。
 
     messages 由调用方持有，因此多轮对话可以共享同一份历史。
+    image_files 是会话级的图片记录（`Session.files`）：read 到的图片先落本地副本、
+    再上传拿 `file_id`（命中则不重传），历史里只留几十字节的 `file` 块；
+    传 None 则完全不碰上传（如不需要跨轮复用的场景）。
     on_event 回调（可选）实时推送：
       reasoning_delta / content_delta（流式生成增量）
       tool_call / tool_result / tool_progress（工具调用与实时输出；tool_result 带
@@ -281,13 +356,37 @@ async def acomplete_turn(
     """
     if user_turn is None:
         user_turn = sum(1 for m in messages.messages if isinstance(m, UserMessage)) or 1
+    # 图片记录：entries 就是 Session.files（就地更新 → 下次 save 自然带上）
+    store = (
+        ImageStore(
+            entries=image_files,
+            base_url=cfg.base_url,
+            key_fp=key_fingerprint(cfg.api_key),
+            ttl_days=cfg.files_ttl_days,
+            enabled=cfg.files_api and model_supports_files(cfg.model),
+        )
+        if image_files is not None
+        else None
+    )
     step = 0
     while True:
         step += 1
         if cancel_event is not None and cancel_event.is_set():
             return _cancel_turn(messages, on_event)
         maybe_compact(messages, cfg, messages.tokens(), manifest)
-        llm_out = await _model_call(backend, messages, registry, cfg, cancel_event, on_event)
+        try:
+            llm_out = await _model_call(
+                backend, messages, registry, cfg, cancel_event, on_event
+            )
+        except Exception as e:
+            # file_id 失效（服务端删了/中途换了 key）：把历史里的 file 块降级成内联、
+            # 记录标失效，再试一次（不重试就整个回合报废，代价太大）
+            if store is None or not is_stale_file_error(e) or not _downgrade_file_blocks(messages, store):
+                raise
+            print(f"[warn] file_id 已失效，已把历史里的图片降级为内联 base64 并重试：{e}", file=sys.stderr)
+            llm_out = await _model_call(
+                backend, messages, registry, cfg, cancel_event, on_event
+            )
         if llm_out is None:  # 用户 /stop 取消了模型请求
             return _cancel_turn(messages, on_event)
         if usage is not None and llm_out.prompt_tokens is not None:
@@ -358,7 +457,9 @@ async def acomplete_turn(
         for call, text in zip(calls, results):
             messages.add(_finalize_tool_message(call, text, manifest))
         # 工具结果全部回填后，统一注入 read 读取的图片（多模态 user 消息，紧随本批结果）
-        _inject_read_images(messages, calls, results)
+        await _inject_read_images(
+            messages, calls, results, store=store, client=_files_client(backend) if store else None
+        )
 
 
 def run_agent(
@@ -376,7 +477,7 @@ def run_agent(
         base_url=cfg.base_url,
         model=cfg.model,
         reasoning_effort=cfg.reasoning_effort,
-        max_tokens=cfg.max_tokens,
+        max_tokens=cfg.reserved_tokens,
         timeout=cfg.timeout_seconds,
         max_retries=cfg.max_retries,
     )
@@ -385,7 +486,9 @@ def run_agent(
         [SystemMessage(build_system_prompt(cfg)), UserMessage(task)],
         keep_last_steps=cfg.keep_last_steps,
     )
-    return asyncio.run(acomplete_turn(messages, cfg, registry, backend, user_turn=1))
+    return asyncio.run(
+        acomplete_turn(messages, cfg, registry, backend, user_turn=1, image_files={})
+    )
 
 
 def _cancel_turn(
@@ -422,6 +525,7 @@ def _cancel_tools(
             )
         messages.add(_finalize_tool_message(call, content, manifest))
     return _cancel_turn(messages, on_event)
+
 
 
 

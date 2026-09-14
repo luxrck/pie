@@ -1,4 +1,4 @@
-"""会话层：多轮对话（Session）+ AgentMessage 容器 + JSONL 持久化 + fs 窗口归档。"""
+"""会话层：多轮对话（Session）+ AgentMessage 容器 + JSONL 持久化 + windows 窗口归档。"""
 
 from __future__ import annotations
 
@@ -36,18 +36,19 @@ from .tools import ToolRegistry, default_tools
 
 @dataclass
 class Session:
-    """一次多轮对话：持有 AgentMessage 历史、fs 窗口归档，每轮走完整工具循环。"""
+    """一次多轮对话：持有 AgentMessage 历史、windows 窗口归档，每轮走完整工具循环。"""
 
     config: Config
     llm: LLM
     tools: ToolRegistry
     messages: AgentMessage = field(default_factory=AgentMessage)
-    fs: list[Path] = field(default_factory=list)  # 之前窗口的原始消息块文件
-    file: Path | None = None
+    windows: list[Path] = field(default_factory=list)  # 之前窗口的原始消息块文件
+    path: Path | None = None  # 会话文件（JSONL）自身路径
     manifest: Path | None = None
     turn_count: int = 0
     usage: UsageTracker = field(default_factory=UsageTracker)
     title: str | None = None  # 会话标题 = 首个用户 query（写入 __meta__）
+    files: dict[str, dict[str, Any]] = field(default_factory=dict)  # 图片 id 表：hash_id → 记录（见 files.py）
     available_models: list[str] | None = None  # 启动时拉取的可用模型 id（/model 切换/补全用，不持久化）
 
     async def fetch_models(self, timeout: float = 10.0) -> list[str]:
@@ -108,7 +109,7 @@ class Session:
             base_url=cfg.base_url,
             model=cfg.model,
             reasoning_effort=cfg.reasoning_effort,
-            max_tokens=cfg.max_tokens,
+            max_tokens=cfg.reserved_tokens,
             timeout=cfg.timeout_seconds,
             max_retries=cfg.max_retries,
         )
@@ -118,18 +119,18 @@ class Session:
         )
         if session_id:
             sid = Path(session_id)
-            file = sid if sid.is_absolute() or sid.parent != Path(".") else (
+            path = sid if sid.is_absolute() or sid.parent != Path(".") else (
                 PIE_DIR / "sessions" / f"{sid.stem}.jsonl"
             )
         else:
-            file = PIE_DIR / "sessions" / f"chat-{datetime.now():%Y%m%d-%H%M%S-%f}.jsonl"
+            path = PIE_DIR / "sessions" / f"chat-{datetime.now():%Y%m%d-%H%M%S-%f}.jsonl"
         return cls(
             config=cfg,
             llm=backend,
             tools=registry,
             messages=messages,
-            file=file,
-            manifest=CONTEXT_DIR / f"{file.stem}.manifest.jsonl",
+            path=path,
+            manifest=CONTEXT_DIR / f"{path.stem}.manifest.jsonl",
         )
 
     @classmethod
@@ -144,8 +145,9 @@ class Session:
         session = cls.new(config=config, llm=llm, tools=tools)
         dicts: list[dict] = []
         usage = UsageTracker()
-        fs_from_meta: list[str] = []
+        windows_from_meta: list[str] = []
         title_from_meta: str | None = None
+        files_from_meta: dict[str, dict[str, Any]] = {}
         with Path(path).open(encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -166,8 +168,9 @@ class Session:
                         if k in data.get("usage", {})
                     }
                     usage = UsageTracker(**known)
-                    fs_from_meta = data.get("fs") or []
+                    windows_from_meta = data.get("windows") or data.get("fs") or []  # 旧键 fs 兼容
                     title_from_meta = data.get("title")
+                    files_from_meta = data.get("files") or {}
                     continue
                 dicts.append(data)
         # 防御：带 tool_calls 但缺 reasoning_content 的消息补空串
@@ -191,17 +194,18 @@ class Session:
                     repaired = True
                     break
         session.usage = usage
-        session.fs = [Path(p) for p in fs_from_meta]
+        session.windows = [Path(p) for p in windows_from_meta]
         session.title = title_from_meta
+        session.files = files_from_meta
         # 重建 system 层：丢弃文件里的旧 system（提示词/窗口摘要），
-        # 按当前 SYSTEM.md + fs 历史窗口块动态组装（会话级摘要规则式）。
+        # 按当前 SYSTEM.md + windows 历史窗口块动态组装（会话级摘要规则式）。
         dicts = [d for d in dicts if d.get("role") != "system"]
         head: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(session.config)}
         ]
         sc = session.config.compaction.session if session.config.compaction else None
         if sc is not None:
-            for block in session.fs:
+            for block in session.windows:
                 if not block.exists():
                     continue
                 try:
@@ -222,7 +226,7 @@ class Session:
         session.messages = AgentMessage.from_flat(
             head + dicts, keep_last_steps=session.config.keep_last_steps
         )
-        session.file = Path(path)
+        session.path = Path(path)
         session.manifest = CONTEXT_DIR / f"{Path(path).stem}.manifest.jsonl"
         session.turn_count = sum(
             1 for m in session.messages.messages if isinstance(m, UserMessage)
@@ -291,16 +295,17 @@ class Session:
             usage=self.usage,
             on_event=on_event,
             cancel_event=cancel_event,
+            image_files=self.files,
         )
 
     def _window_summaries(self) -> list[SystemMessage]:
-        """为 fs 里所有历史窗口块生成“摘要 + 指针”SystemMessage（保持 fs 顺序）。
+        """为 windows 里所有历史窗口块生成“摘要 + 指针”SystemMessage（保持 windows 顺序）。
         会话级压缩关闭（session 为 None）时不生成摘要。"""
         sc = self.config.compaction.session if self.config.compaction else None
         summaries: list[SystemMessage] = []
         if sc is None:
             return summaries
-        for block in self.fs:
+        for block in self.windows:
             if not block.exists():
                 continue
             try:
@@ -315,9 +320,9 @@ class Session:
         return summaries
 
     def clear_window(self) -> None:
-        """/clear：把当前窗口（除 system 外）写入 fs 块，开新窗口；
+        """/clear：把当前窗口（除 system 外）写入 windows 块，开新窗口；
         新窗口带上所有历史窗口块的规则式摘要 + 文件指针（不只最新一块）。"""
-        # 过滤掉既有的窗口摘要：它们已在 fs 中，由 _window_summaries 统一重建，
+        # 过滤掉既有的窗口摘要：它们已在 windows 中，由 _window_summaries 统一重建，
         # 避免“摘要的摘要”嵌套导致旧窗口信息从可见上下文丢失。
         old = [
             m
@@ -333,7 +338,7 @@ class Session:
                     line = json.dumps(m.to_dict(), ensure_ascii=False) + "\n"
                     raw += line
                     f.write(line)
-            self.fs.append(block)
+            self.windows.append(block)
             if self.manifest is not None:
                 sc = self.config.compaction.session if self.config.compaction else None
                 head, tail = (
@@ -392,7 +397,8 @@ class Session:
         else:
             total = self.messages.tokens()
             label = "当前上下文占用（估算）："
-        limit = max(1, self.config.max_seq_len)
+        limit = self.config.context_budget()  # 可用输入预算 = 上下文窗口 - 为输出预留的 token
+        reserved_label = f"{self.config.reserved_tokens:,}" if self.config.reserved_tokens else "服务端默认"
         soft = self.config.soft_limit()
         target = self.config.target_limit()
         pct = total * 100 / limit
@@ -400,11 +406,12 @@ class Session:
         for m in self.messages.messages:
             roles[m.role] = roles.get(m.role, 0) + m.tokens()
         parts = []
-        if self.file is not None and self.file.exists():
-            parts.append(f"会话文件：{self.file}")
+        if self.path is not None and self.path.exists():
+            parts.append(f"会话文件：{self.path}")
         parts += [
             f"{label}{total:,} / {limit:,} tokens ({pct:.1f}%)",
-            f"软阈值 {soft:,} ({self.config.context_soft_ratio:.0%}) | 目标水位 {target:,} ({self.config.context_target_ratio:.0%})",
+            f"软阈值 {soft:,} ({self.config.soft_ratio:.0%}) | 目标水位 {target:,} ({self.config.target_ratio:.0%})",
+            f"输入预算 {limit:,} = 上下文窗口 {self.config.context_window:,} − 输出预留 {reserved_label}",
             "各角色占用（估算）：" + " | ".join(f"{k} {v:,}" for k, v in sorted(roles.items())),
         ]
         comp_events = self.compression_history()
@@ -495,7 +502,7 @@ class Session:
         )
 
     def save(self, path: str | Path | None = None) -> Path:
-        target = Path(path) if path is not None else self.file
+        target = Path(path) if path is not None else self.path
         if target is None:
             target = PIE_DIR / "sessions" / f"chat-{datetime.now():%Y%m%d-%H%M%S-%f}.jsonl"
         target = Path(target)
@@ -503,16 +510,18 @@ class Session:
         meta: dict[str, Any] = {
             "__meta__": True,
             "usage": asdict(self.usage),
-            "fs": [str(p) for p in self.fs],
+            "windows": [str(p) for p in self.windows],
             "cwd": str(Path.cwd()),
         }
         if self.title:
             meta["title"] = self.title
+        if self.files:  # 图片 id 表（空则不写，别把每个会话文件都撑起来）
+            meta["files"] = self.files
         with target.open("w", encoding="utf-8") as f:
             f.write(json.dumps(meta, ensure_ascii=False) + "\n")
             for m in self.messages.messages:
                 f.write(json.dumps(m.to_dict(), ensure_ascii=False) + "\n")
-        self.file = target
+        self.path = target
         return target
 
 
@@ -545,6 +554,7 @@ def _backfill_title(path: Path, title: str) -> None:
             lines[i] = json.dumps(data, ensure_ascii=False)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
+
 
 
 
