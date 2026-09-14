@@ -1,4 +1,4 @@
-"""Textual TUI 主题：集中管理界面配色与图标（按 role / 按工具），支持按名字切换。
+"""Textual TUI 主题：集中管理界面配色与图标（按 role / 按工具 / 按执行结果），支持按名字切换。
 
 只做「展示数据」：theme.py 不依赖 Textual / Rich，纯粹是颜色常量 + 图标常量 + 注册表。
 界面结构与样式生成（build_css / _box）保留在 tui.py，便于与控件布局绑定。
@@ -17,10 +17,10 @@ DEFAULT_THEME_NAME = "catppuccin-mocha"
 
 @dataclass(frozen=True)
 class Theme:
-    """TUI 界面配色 + 图标（按 role + 按工具名覆盖）。
+    """TUI 界面配色 + 图标（按 role + 按工具名覆盖 + 按执行结果）。
 
     字段按语义分组：背景/正文、边框（默认/暗/强调）、次级文本、滚动条、
-    各 role 边框与图标、按工具名的图标覆盖、发送按钮 busy 态。
+    各 role 边框与图标、按工具名的图标覆盖、简洁模式结果标记、发送按钮 busy 态。
     颜色值为 CSS 颜色字符串（hex / rgba / transparent）；图标为盒子标题前缀（"" = 无图标）。
     """
 
@@ -53,18 +53,21 @@ class Theme:
     role_error: str
     role_system: str
 
-    # 各 role 图标（盒子标题前缀；"" = 不显示图标）
+    # 各 role 图标（盒子标题前缀；"" = 不显示图标）。
+    # icon_ok / icon_error / icon_cancelled 是「执行结果」的字形：盒子模式下分作
+    # role=tool_result / error / cancelled 的标题图标，简洁模式下同一套字形放行首
+    # （见 lean_mark）——同一个字形在两处表示同一个意思，不再各配一份。
     icon_user: str
     icon_assistant: str
     icon_tool_call: str
-    icon_tool_result: str
-    icon_error: str
+    icon_ok: str          # 成功（role tool_result）
+    icon_error: str       # 失败/出错（role error）
+    icon_cancelled: str   # 被 /stop 终止（role cancelled；既非成功也非失败）
     icon_system: str
 
-    # 按工具名覆盖图标（可选）：tool_icons 用于工具调用框、tool_result_icons 用于
-    # 工具结果框，如 {"shell": "$", "read": "📄"}。未列出的工具回退对应 role 的
-    # 默认图标（icon_tool_call / icon_tool_result）。分两张表是因为同一工具会以
-    # 「调用」「结果」两种形态出现，两类图标互不覆盖（保留 ⚙ vs ↳ 的形态区分）。
+    # 按工具名覆盖图标（可选）：tool_icons 用于**工具调用**框（工具名 → 图标，如
+    # {"shell": "❯"}），未列出的回退 icon_tool_call；tool_result_icons 是对结果框状态
+    # 字形（icon_ok/error/cancelled）的可选覆盖（仅当“结果框仍想带工具自己的图标”时才配）。
     # hash=False：dict 不可哈希，不让它们参与 __hash__（Theme 仍可按值比较）。
     tool_icons: dict[str, str] = field(hash=False)
     tool_result_icons: dict[str, str] = field(hash=False)
@@ -75,43 +78,64 @@ class Theme:
     busy_text: str
 
     def role_border(self, role: str) -> str:
-        """按 role 取边框色：未知 role 回退 system 灰。"""
+        """按 role 取边框色：未知 role 回退 system 灰。
+
+        cancelled（被 /stop 终止）与 system 同色：既不是成功也不是失败，低调灰即可。
+        """
         return {
             "user": self.role_user,
             "assistant": self.role_assistant,
             "tool_call": self.role_tool_call,
             "tool_result": self.role_tool_result,
             "error": self.role_error,
+            "cancelled": self.role_system,
             "system": self.role_system,
         }.get(role, self.role_system)
 
     def role_icon(self, role: str) -> str:
         """按 role 取标题图标：未知 role 回退 system（无图标）。
 
-        图标与边框色语义不同，可分开指定——典型：工具结果框失败时边框染红
-        （role="error"），图标仍用 tool_result 的 ↳（见 tui._tool_result_box）。
+        role=tool_result / error / cancelled 的三个字形就是「执行结果」标记
+        （icon_ok / icon_error / icon_cancelled），盒子标题与简洁模式行首共用同一套。
         """
         return {
             "user": self.icon_user,
             "assistant": self.icon_assistant,
             "tool_call": self.icon_tool_call,
-            "tool_result": self.icon_tool_result,
+            "tool_result": self.icon_ok,
             "error": self.icon_error,
+            "cancelled": self.icon_cancelled,
             "system": self.icon_system,
         }.get(role, self.icon_system)
 
-    def tool_icon(self, name: str, *, result: bool = False) -> str:
-        """按工具名取图标：命中 tool_icons（调用）/ tool_result_icons（结果）则用它，
-        否则回退对应 role 的默认图标（icon_tool_call / icon_tool_result）；
-        name 为空或未配置的工具都走回退。
-
-        命中且值为 "" 表示该工具刻意不显示图标（未命中才回退，二者不同）。
+    def tool_icon(self, name: str) -> str:
+        """按工具名取**调用**图标：命中 tool_icons 则用它（值为 "" = 该工具不显示图标），
+        否则回退 role 默认（icon_tool_call）。name 为空或未配置的工具都走回退。
         """
-        table = self.tool_result_icons if result else self.tool_icons
-        icon = table.get(name)
-        if icon is None:
-            icon = self.role_icon("tool_result" if result else "tool_call")
-        return icon
+        icon = self.tool_icons.get(name or "")
+        return self.role_icon("tool_call") if icon is None else icon
+
+    def result_icon(self, role: str, name: str = "") -> str:
+        """工具**结果**框的图标：按 role 取状态字形（tool_result → icon_ok、error →
+        icon_error、cancelled → icon_cancelled、system → 无图标）。
+
+        role 由 tui 按执行结果判定（退出码 / 失败前缀 / 取消）。主题若按工具名配了
+        tool_result_icons（"" = 不要图标）则以它为准。
+        """
+        icon = self.tool_result_icons.get(name or "")
+        return self.role_icon(role) if icon is None else icon
+
+    def lean_mark(self, status: str) -> str:
+        """简洁模式单行工具记录行首的状态标记：status ∈ ok / fail / cancelled（未知回退 ok）。
+
+        与结果的 role 图标是同一套字形（icon_ok / icon_error / icon_cancelled）：主题只提供
+        **字形**，取哪个 status 由 tui 侧按执行结果判定。
+        """
+        return {
+            "ok": self.icon_ok,
+            "fail": self.icon_error,
+            "cancelled": self.icon_cancelled,
+        }.get(status, self.icon_ok)
 
 
 # catppuccin mocha 变体：recover 历史配色（背景透明 + 各 role 区分色）
@@ -136,14 +160,14 @@ CATPPUCCIN_MOCHA = Theme(
     role_system="#585b70",          # 命令反馈/系统提示（低调灰）
     icon_user="▎",              # 你
     icon_assistant="▎",         # pie 回复
-    icon_tool_call="⚙",         # 工具调用
-    icon_tool_result="↳",       # 工具结果
-    icon_error="✗",             # 出错
+    icon_tool_call="✽",         # 工具调用
+    icon_ok="✓",               # 成功的工具结果；简洁模式的成功标记
+    icon_error="✗",            # 出错框（含失败的工具结果）；简洁模式的失败标记
+    icon_cancelled="■",         # 被 /stop 终止（role cancelled）；简洁模式同一字形
     icon_system="",             # 命令反馈/系统提示（无图标）
-    # 按工具名的图标覆盖（未配置的工具 → 上面的 role 图标 ⚙ / ↳；值为 "" = 该工具不显示图标）
-    # 调用框用工具图标（一眼看出调的是哪个工具）；结果框保持 ↳（图标编码「形态」：
-    # ↳ = 上一个框的产出，工具名仍在标题里），故默认不配 tool_result_icons。
-    tool_icons={"read": "✧", "edit": "⟱", "write": "✦", "shell": "❯"},
+    # 按工具名覆盖图标：tool_icons = 调用框（一眼看出调的是哪个工具）；
+    # tool_result_icons = 结果框对状态字形（✅/❌/⏹）的可选覆盖，默认留空。⟱
+    tool_icons={"read": "✧", "edit": "✽", "write": "✦", "shell": "✛"},
     tool_result_icons={},
     busy_border="#f38ba8",          # busy 边框（亮红）
     busy_border_hover="#ffb4c8",    # busy hover 边框（更亮）
@@ -304,4 +328,5 @@ CommandPalette {{
 Header {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
 Footer {{ background: {palette.screen_bg}; color: {palette.body_text}; }}
 """
+
 

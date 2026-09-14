@@ -31,25 +31,37 @@ DEFAULT_REASONING_EFFORT = "high"
 REASONING_LEVELS = ("none", "low", "high", "max")
 REASONING_NONE = REASONING_LEVELS[0]  # none = 关闭思考：请求时不发 reasoning_effort
 
-# 上下文压缩默认值
-DEFAULT_MAX_SEQ_LEN = 128_0000
+# 上下文默认值：context_window = 模型最大上下文长度（服务端把输入 + 输出算在一起）；
+# reserved_tokens = 每次请求为输出预留的 token（就是发给 API 的 max_tokens）。
+# 于是「可用输入预算 = context_window - reserved_tokens」。
+DEFAULT_CONTEXT_WINDOW = 1024 * 1024
 DEFAULT_KEEP_LAST_STEPS = 5
-DEFAULT_CONTEXT_SOFT_RATIO = 0.8
-DEFAULT_CONTEXT_TARGET_RATIO = 0.55
+# 压缩水位比例：相对「可用输入预算」（不是整个窗口）
+DEFAULT_SOFT_RATIO = 0.8
+DEFAULT_TARGET_RATIO = 0.55
 
-# 单次生成上限（max_tokens）：默认 256000（256k）；显式设为 None 才不发送该参数（用服务端默认）
+# 每次请求为输出预留的 token：默认 128000（128k）；显式设为 None 才不发送该参数（用服务端默认）
 # （DeepSeek：不传时非思考 8K / 思考 64K / reasoning_effort=max 时 128K；上限 384K）
-DEFAULT_MAX_TOKENS = 256_000
-MAX_TOKENS_AUTO = ("auto", "default", "none", "0", "")
+DEFAULT_RESERVED_TOKENS = 128_000
+RESERVED_TOKENS_AUTO = ("auto", "default", "none", "0", "")
+
+# 图片上传（DeepSeek Files API，见 files.py）：默认开启，任何失败都静默回退内联 base64。
+# files_ttl_days = 上传件在服务端的保留天数（1~30；0 = 不设过期、永久保留）。
+DEFAULT_FILES_API = True
+DEFAULT_FILES_TTL_DAYS = 30
+# read 图片的字节上限：内联时受单图 32 MiB 限制；开了 Files API 后放宽到 64 MiB（file_id 单图上限）。
+IMAGE_MAX_BYTES_INLINE = 32 * 1024 * 1024
+IMAGE_MAX_BYTES_FILES = 64 * 1024 * 1024
 
 
-def parse_max_tokens(raw: str) -> int | None:
-    """解析 max_tokens 输入：auto/default/none/0/空 → None（不发送，用服务端默认）；支持 64k / 384K 简写。
+def parse_reserved_tokens(raw: str) -> int | None:
+    """解析 reserved_tokens 输入：auto/default/none/0/空 → None（不发送 max_tokens，用服务端默认）；
+    支持 64k / 384K 简写。
 
     非法输入抛 ValueError（由调用方转成提示文案）。
     """
     text = (raw or "").strip().lower()
-    if text in MAX_TOKENS_AUTO:
+    if text in RESERVED_TOKENS_AUTO:
         return None
     multiplier = 1
     if text.endswith("k"):
@@ -61,7 +73,7 @@ def parse_max_tokens(raw: str) -> int | None:
     except ValueError:
         raise ValueError(f"无法识别的 token 数: {raw!r}（例：65536 / 64k / auto）") from None
     if value < 1:
-        raise ValueError("max_tokens 必须 ≥ 1（要恢复默认请用 auto）")
+        raise ValueError("reserved_tokens 必须 ≥ 1（要恢复默认请用 auto）")
     return value
 
 
@@ -173,11 +185,17 @@ class TuiConfig:
 class CompactionConfig:
     """压缩总配置：写了 [compaction] 即开启，默认三级全开；
     某级为 None（显式 tool/turn/session = false）表示关闭该级；
-    整个 compaction 为 None（不写 [compaction]）表示不做任何压缩。"""
+    整个 compaction 为 None（不写 [compaction]）表示不做任何压缩。
+
+    两个水位比例都相对「可用输入预算」（= context_window - reserved_tokens）：
+    soft_ratio 触发自动压缩，target_ratio 是压缩后的目标水位（迟滞防抖，应小于 soft_ratio）。
+    """
 
     tool: ToolCompaction | None = field(default_factory=ToolCompaction)
     turn: bool | None = True  # 轮次级（level 2）：摘要只保留用户输入 + 模型最终输出，中间过程显式省略标注
     session: SessionCompaction | None = field(default_factory=SessionCompaction)
+    soft_ratio: float = DEFAULT_SOFT_RATIO  # 软阈值 = 可用输入预算 × soft_ratio
+    target_ratio: float = DEFAULT_TARGET_RATIO  # 目标水位 = 可用输入预算 × target_ratio
 
 
 def _resolve_config_file(path: str | Path | None = None) -> Path:
@@ -196,12 +214,10 @@ class Config:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = DEFAULT_API_KEY
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
-    max_tokens: int | None = DEFAULT_MAX_TOKENS  # 单次生成上限（默认 256000；None = 不发该参数、用服务端默认）
-    max_seq_len: int = DEFAULT_MAX_SEQ_LEN
+    reserved_tokens: int | None = DEFAULT_RESERVED_TOKENS  # 每次请求为输出预留的 token（= API 的 max_tokens；None = 不发该参数、用服务端默认）
+    context_window: int = DEFAULT_CONTEXT_WINDOW  # 模型最大上下文长度（输入 + 输出一起算）
     keep_last_steps: int = DEFAULT_KEEP_LAST_STEPS  # 工具级压缩保护窗口：最近 N 个 step 批次（跨轮次滚动）
     compaction: CompactionConfig | bool | None = field(default_factory=CompactionConfig)  # None = 不做任何上下文压缩
-    context_soft_ratio: float = DEFAULT_CONTEXT_SOFT_RATIO
-    context_target_ratio: float = DEFAULT_CONTEXT_TARGET_RATIO
     timeout_seconds: float = 60.0  # HTTP 超时（OpenAI 兼容客户端）
     max_retries: int = 2  # 请求重试次数
     max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
@@ -210,6 +226,8 @@ class Config:
     # 按工具名设置默认私有参数（下划线开头，不进 schema）：如 read: {_max_lines, _max_bytes, _max_image_bytes}
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     tui: TuiConfig = field(default_factory=TuiConfig)  # TUI 渲染（[tui] lean = true → 简洁模式）
+    files_api: bool = DEFAULT_FILES_API  # 图片走 Files API（上传一次拿 file_id，失败回退内联）
+    files_ttl_days: int = DEFAULT_FILES_TTL_DAYS  # 上传件在服务端的保留天数（1~30；0 = 永久）
 
     def __post_init__(self) -> None:
         # 归一化旧 bool 写法（compaction = true / false），保证下游只见到
@@ -219,17 +237,50 @@ class Config:
         elif self.compaction is False:
             self.compaction = None
 
+    def tool_defaults(self) -> dict[str, dict[str, Any]]:
+        """工具私有默认参数（下划线开头，由 dispatch 注入）。用户配置优先，未配置时给派生默认。
+
+        目前唯一的派生默认是 `read` 的 `_max_image_bytes`：内联受单图 32 MiB 上限约束，
+        开了 Files API 后放宽到 64 MiB（file_id 单图上限）。
+        """
+        defaults = {
+            name: dict(values) for name, values in self.tools.items() if isinstance(values, dict)
+        }
+        image_cap = IMAGE_MAX_BYTES_FILES if self.files_api else IMAGE_MAX_BYTES_INLINE
+        defaults.setdefault("read", {}).setdefault("_max_image_bytes", image_cap)
+        return defaults
+
+    def context_budget(self) -> int:
+        """可用输入预算：服务端按「输入 tokens + max_tokens ≤ 窗口」判超限，
+        所以真正能装历史的只有 context_window - reserved_tokens。"""
+        return max(1, self.context_window - int(self.reserved_tokens or 0))
+
+    def _ratio(self, *, soft: bool) -> float:
+        comp = self.compaction if isinstance(self.compaction, CompactionConfig) else None
+        if comp is None:  # 压缩关闭时水位无用，给默认值只为展示
+            return DEFAULT_SOFT_RATIO if soft else DEFAULT_TARGET_RATIO
+        return comp.soft_ratio if soft else comp.target_ratio
+
+    @property
+    def soft_ratio(self) -> float:
+        """软阈值比例（相对可用输入预算）。"""
+        return self._ratio(soft=True)
+
+    @property
+    def target_ratio(self) -> float:
+        """目标水位比例（相对可用输入预算）。"""
+        return self._ratio(soft=False)
+
     def soft_limit(self) -> int:
         """软阈值：触发自动压缩的 token 水位；--auto-compact-threshold 覆盖。"""
         override = getattr(self, "auto_compact_threshold", None)
         if override:
             return int(override)
-        return int(self.max_seq_len * self.context_soft_ratio)
+        return max(1, int(self.context_budget() * self.soft_ratio))
 
     def target_limit(self) -> int:
-        """目标水位：压缩后应降到该值以下（与软阈值同比例缩放）。"""
-        soft = self.soft_limit()
-        return max(1, int(soft * self.context_target_ratio / max(0.001, self.context_soft_ratio)))
+        """目标水位：压缩后应降到该值以下（相对同一份可用输入预算）。"""
+        return max(1, int(self.context_budget() * self.target_ratio))
 
     @classmethod
     def load(cls, config_file: str | Path | None = None) -> "Config":
@@ -242,6 +293,10 @@ class Config:
                 data = tomllib.load(f)
         elif path == CONFIG_FILE and LEGACY_CONFIG_FILE.exists():
             data = json.loads(LEGACY_CONFIG_FILE.read_text(encoding="utf-8"))
+        # 旧键迁移（2026-09 改名）：max_tokens → reserved_tokens、max_seq_len → context_window
+        for old, new in (("max_tokens", "reserved_tokens"), ("max_seq_len", "context_window")):
+            if old in data and new not in data:
+                data[new] = data[old]
         for f in fields(cls):
             if f.name not in data:
                 continue
@@ -278,12 +333,22 @@ class Config:
                     elif sd is False:  # 显式关闭会话级
                         cfg.compaction.session = None
                     # 不写子表 = 保持默认开启；旧写法 session = true 无效果（默认即开）
+                    # 水位比例：相对可用输入预算；旧顶层键 context_soft_ratio/context_target_ratio 迁进来
+                    comp = cfg.compaction
+                    comp.soft_ratio = float(
+                        cd.get("soft_ratio", data.get("context_soft_ratio", comp.soft_ratio))
+                    )
+                    comp.target_ratio = float(
+                        cd.get("target_ratio", data.get("context_target_ratio", comp.target_ratio))
+                    )
                 elif isinstance(cd, bool):  # 旧扁平写法 compaction = true / false
                     cfg.compaction = (
                         CompactionConfig(
                             tool=ToolCompaction(),
                             turn=True,
                             session=SessionCompaction(),
+                            soft_ratio=float(data.get("context_soft_ratio", DEFAULT_SOFT_RATIO)),
+                            target_ratio=float(data.get("context_target_ratio", DEFAULT_TARGET_RATIO)),
                         )
                         if cd
                         else None
@@ -302,23 +367,33 @@ class Config:
                 if any(c is not None for c in (tool, turn, session))
                 else None
             )
+        if "compaction" not in data and isinstance(cfg.compaction, CompactionConfig):
+            # 没有 [compaction] 段时，旧顶层水位比例直接写进默认 compaction
+            if "context_soft_ratio" in data:
+                cfg.compaction.soft_ratio = float(data["context_soft_ratio"])
+            if "context_target_ratio" in data:
+                cfg.compaction.target_ratio = float(data["context_target_ratio"])
         if not path.exists() and path == CONFIG_FILE and LEGACY_CONFIG_FILE.exists():
             cfg.save()
-        # max_tokens 容错：允许手写成字符串（"auto" / "64k" / "384K"），0/负数按“不发送”处理
-        if isinstance(cfg.max_tokens, str):
+        # reserved_tokens 容错：允许手写成字符串（"auto" / "64k" / "384K"），0/负数按“不发送”处理
+        if isinstance(cfg.reserved_tokens, str):
             try:
-                cfg.max_tokens = parse_max_tokens(cfg.max_tokens)
+                cfg.reserved_tokens = parse_reserved_tokens(cfg.reserved_tokens)
             except ValueError:
-                cfg.max_tokens = DEFAULT_MAX_TOKENS  # 认不出的写法按默认值处理，不让它挡住启动
-        elif isinstance(cfg.max_tokens, int) and cfg.max_tokens < 1:
-            cfg.max_tokens = None
+                cfg.reserved_tokens = DEFAULT_RESERVED_TOKENS  # 认不出的写法按默认值处理，不让它挡住启动
+        elif isinstance(cfg.reserved_tokens, int) and cfg.reserved_tokens < 1:
+            cfg.reserved_tokens = None
         cfg.config_file = str(path)  # 运行时属性：记录配置来源路径
         return cfg
 
     def save(self, config_file: str | Path | None = None) -> "Config":
         path = _resolve_config_file(config_file)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_toml_dump(asdict(self)), encoding="utf-8")
+        data = asdict(self)
+        # TOML 没有 null：reserved_tokens = None（不发送 max_tokens）写成 "auto"，load 时再解析回去
+        if data.get("reserved_tokens", 0) is None:
+            data["reserved_tokens"] = "auto"
+        path.write_text(_toml_dump(data), encoding="utf-8")
         return self
 
 
@@ -414,6 +489,17 @@ def _resolve_prompt_file(name: str) -> Path | None:
     return None
 
 
+def _context_line(config) -> str:
+    """system prompt 里的上下文说明：窗口多大、预留给输出多少、历史能占多少。"""
+    reserved = (
+        f"为输出预留 {config.reserved_tokens:,}" if config.reserved_tokens else "输出预留用服务端默认"
+    )
+    return (
+        f"当前模型上下文窗口：{config.context_window:,} tokens（{reserved}，"
+        f"可用输入预算约 {config.context_budget():,}）"
+    )
+
+
 def _read_text(path: str | Path | None) -> str:
     if path is None:
         return ""
@@ -440,7 +526,7 @@ def build_system_prompt(
     )
     parts: list[str] = [
         base or SYSTEM_PROMPT,
-        f"当前模型最大上下文长度：{config.max_seq_len}",
+        _context_line(config),
         f"当前工作目录：{os.getcwd()}",
     ]
 
@@ -460,6 +546,7 @@ def build_system_prompt(
         parts.append(block)
     parts.extend(str(p) for p in append_prompts if p)
     return "\n\n".join(parts)
+
 
 
 

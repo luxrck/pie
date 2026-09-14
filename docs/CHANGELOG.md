@@ -1,0 +1,192 @@
+# CHANGELOG — 关键决策与变更记录
+
+本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
+
+## 2026-09-14
+
+- **图片改走 Files API：上传一次拿 `file_id`，历史里只留 `file` 块**（用户提议，依据 [Files API 文档](https://api-docs.deepseek.com/guides/files_api/)）。起因：`read` 到的图原先一律内联 base64，而那条 ImageMessage 会留在历史里 → **同一张图每轮请求重发**（3 MB 图 ≈ 4 MiB body/轮），且受 inline 的「单图 32 MiB / body 48 MiB」限制。
+  - **实测先确认了三件事**：① `{"type":"file","file_id":…}` 确实让 deepseek-flash 看到图；② **prompt_tokens 与内联完全一致**（计费按尺寸、单图 ≤1024）→ 换法省的是**请求体/重复传输/上限**，不是钱；③ 同一张图上传两次得到**两个不同 file_id**（服务端不去重）→ “不重传”只能靠本地记录，这也给下面“按会话记”补了硬理由。
+  - 新模块 `files.py`：`hash_id = img-<sha256[:16]>`（形状对齐 context 的 `turn-<hash>`）；本地内容寻址副本 `~/.pie/files/<hash_id><ext>`；**先落副本、再从副本上传**（不变量：服务端那份 == 本地这份）；`ImageStore.ensure()` 命中（同 hash + 同 `base_url`/`key_fp` + 未过期）就用旧 id，否则上传并**就地写入 `Session.files`**。
+  - **记录放每会话的 `__meta__.files`，不建全局缓存**（用户提议）：`Session.save()` 本来就是全量重写，加一个字段零成本，于是 last-wins/墓碑/跨进程追加/去重压缩**全部消失**——“重传、换 key、失效”只是内存 dict 就地覆盖。代价：跨会话不复用（会重传一次）、`pie -p` 一次性模式没有 `__meta__`（同一次运行内仍去重）。
+  - 回退与自愈：上传失败 / 模型不支持 `file` 块 / `files_api=false` → **静默回退内联 base64**（行为与从前一致）；请求报 `400 … file_ids do not exist or are not created under your account` → `_downgrade_file_blocks()` 把历史里的 file 块**就地降级成内联**（字节从本地副本取）并重试一次（`is_stale_file_error` 认这个错）。
+  - 配置：`files_api = true`、`files_ttl_days = 30`（上传时带 `expires_after`，走 `extra_body`；0 = 永久）；`Config.tool_defaults()` 派生 `read._max_image_bytes`（内联 32 MiB ↔ Files API 64 MiB），loop 改用它而不是裸 `cfg.tools`。
+  - 顺手修一个独立问题：**图片 token 估算原先是 `min(12000, 800 + base64长度/256)`**——服务端规则是**单图 ≤1024**，大图被估成 1.2 万（上下文虚高、提前触发压缩）→ 现在封顶 1024（`context.IMAGE_TOKENS_MAX`），file 块也按同一上界估。
+  - CLI：`pie files list`（各会话记的图）/ `pie files gc [--delete]`（本地副本是无状态扫描回收：副本**跨会话共享**，所以删会话不会自动删副本；服务端那份由 `expires_after` 过期，本命令**不动服务端**）。
+  - 验证：新增 `tests/test_files.py`（12 例：hash/幂等落盘/上传一次再复用/换 key·端点·过期·主动失效→重传/失败返回 None 且不写记录/关闭时不落副本/`is_stale_file_error`/parts 优先 file 块与回退 inline/降级重写历史/`gc` 只删未引用），`pytest tests/` 37/37；真机端到端：`pie -p "看 half.png 说颜色"` 后服务端多一个 `img-85fbd97740797558.png`（证明是**从本地副本上传**）、`~/.pie/files/` 出现副本、同一会话 resume 后再读同一张图**服务端文件数不变**（命中记录不重传）；另用裸 API 对拍 file 块与内联 base64 两种编码，回答一致（排除“传图变形”）。
+
+- **Session 字段改名：`.file` → `.path`、`.fs` → `.windows`**（用户提出这三个名字容易混）。起因是准备加第三个字段 `.files`（图片 id 表），三个名字挤在一起时 `.file` / `.fs` / `.files` 完全分不清。改成按语义命名：
+  - `Session.path` = 会话 JSONL 文件自身的路径（原先叫 `file`，最容易和新增的 `files` 撞）；
+  - `Session.windows` = `/clear` 归档的历史窗口块列表（原先叫 `fs`，而这个缩写同时被用作压缩管道里的形参名）；顺带把 `context.py` 里 `compact(session=..., fs=)` / `maybe_compact(fs=)` / `_compact_session(..., fs)` 的形参一并改名 `windows`。现在属性名与目录名（`context.WINDOWS_DIR = ~/.pie/windows`）一致。
+  - **持久化也改名但不迁移用户文件**：`__meta__` 现在写 `"windows"`，读时 `data.get("windows") or data.get("fs")` → 旧会话直接可用，不重写、不报错。
+  - 顺手把两处提示文案里的黑话去掉：「已切换新窗口（归档 N 个历史窗口块，文件在 ~/.pie/windows/）」。
+  - 验证：新增 `tests/test_session.py`（4 例：save 写 `windows` 键 + 置 `path` / load 还原 `path`+`windows` / **旧 `fs` 键兼容读** / `/stat` 的「会话文件」行走 `path`），`uv run python tests/test_session.py` 4/4、`pytest tests/` 24/24；`pie -p "..." --mode json` 端到端吐出的 `session` 路径正常。
+  - 陷阱记录：`Session` 是 dataclass，机械替换 `self.file`/`session.file` **漏掉了字段声明 `file: Path | None = None` 与 `Session.new` 里的 `file=file` 构造参数** → 表现为「`save()` 后才凭空出现 `self.path`」（写路径时不再是 dataclass 字段）。改名这类事必须把“字段声明 + 构造调用 + 形参”一起扫，不能只替 `self.x`/`obj.x`。
+
+- **配置改名 + 上下文预算算对：`max_seq_len` → `context_window`、`max_tokens` → `reserved_tokens`、压缩水位比例移进 `[compaction]`**。起因是用户会话撞了 400：`This model's maximum context length is 1048576 tokens. However, you requested 1049513 tokens (793513 in the messages, 256000 in the completion)`——**只超 937 个 token**，但整个回合被打断。查下去发现 pie 对「上下文」的理解和服务端不一致：
+  - **服务端预检是 `输入 tokens + max_tokens ≤ 窗口`**：`max_tokens` 是「最坏情况下给输出留的位置」而不是已生成量，所以**可用输入预算 = 窗口 − max_tokens**。而 pie 的软阈值是 `max_seq_len × 0.8 = 1,024,000`（还建立在 `max_seq_len = 1,280,000` 这个比真实窗口 1,048,576 更大的假设上）→ 793,513 的输入判定为「还早，不压」→ 带着 256,000 的预留发出去 → 400。
+  - 改名（用户指定）：`Config.max_tokens` → **`reserved_tokens`**（语义从“单次生成上限”纠正为“为输出预留”）；`Config.max_seq_len` → **`context_window`**；`context_soft_ratio` / `context_target_ratio` 从 Config 顶层移入 `CompactionConfig`，改名 **`soft_ratio` / `target_ratio`**。
+  - **语义修正**：两个比例现在相对 `context_window - reserved_tokens`（新增 `Config.context_budget()`），不是整个窗口。`target_limit()` 也随之简化——以前是 `soft × target/soft` 的间接换算，现在同一份预算上各自乘比例。
+  - `Session.usage_report()` 的分母改成 `context_budget()`（并多一行写明「输入预算 = 窗口 − 输出预留」）；system prompt 的「当前模型最大上下文长度」也改成「窗口 / 预留 / 可用输入预算」三件套（`config._context_line()`）。
+  - 迁移：`Config.load` 把旧键 `max_tokens`/`max_seq_len` 接到新键上，旧顶层 `context_*_ratio` 接进 `[compaction]`（新键优先，同名并存时不被覆盖）；CLI `--max-tokens` 保留为 `--reserved-tokens` 的别名（`dest=reserved_tokens`）。顺手修一个往返 bug：TOML 没 null，`reserved_tokens = None`（不发送 max_tokens）以前会被 `_toml_dump` 跳过、重启后静默回落到 256000 → 现在 `save()` 写成 `"auto"`（`load` 认它）。
+  - 用户配置已重写为新键名，并把 `context_window` 从 1,280,000 校正为**实测值 1,048,576**（备份在 `/tmp/config.toml.bak`）。实测值来源：`GET /models` 不返回 context_length，只有超限报错里带。
+  - 验证：新增 `tests/test_config.py`（10 例：预算公式 / 比例相对预算 / 阈值覆盖 / auto 语义 / 旧键迁移（含无 `[compaction]` 段的旧比例）/ 新键优先 / save-load 往返 / **真实窗口回归（793,513 ≥ 软阈值）** / usage_report 分母），`uv run python tests/test_config.py` 10/10、`pytest tests/` 20/20；真实配置实测：窗口 1,048,576 − 预留 256,000 = 预算 792,576，软阈值 634,060（80%）、目标 435,916（55%）——上次那枪 793,513 现在会触发压缩。
+
+- **简洁模式（`[tui] lean = true`）的工具行：状态标记挪到行首、删掉自定义 renderable `_LeanLine`**。起因是用户反映工具调用/结果单行一路顶到日志区左右边缘，与下面带盒子的回复（正文内缩「边框 1 + 内边距 1」= 2 列）不齐。推演后发现**留白和「标记放哪」是同一个问题**：
+  - `_LeanLine`（83 行的类：自定义 `__rich_measure__`/`__rich_console__`，按可用宽度先截摘要、再把 ✅/❌ 贴到行尾，还用 `set_cell_size` 手算省略号）的全部存在理由，就是 docstring 里那句「Text 只能整行截断，超长命令会把**行尾**的 ✅/❌ 一并截掉」。把状态标记放到**行首**后，`Text` 的右截断天然保住它 → **整个类可以删**（连带 `Measurement`/`set_cell_size` 两个 import 与 `LEAN_RIGHT_MARGIN`）。实测：`Text(no_wrap=True, overflow="ellipsis")` 在任意宽度下恒 1 行、行首标记恒保留、`…` 也是白送的。
+  - 但 **`_single_line()` 必须保留**，只是服务对象从 `_LeanLine` 变成 `Text`：`no_wrap` 只管「不按空白回绕」，真换行（heredoc / 换行串联的 `&&`）仍强制断行；tab 会被 Rich 按制表位展开、而 `cell_len` 只算 1 格 → 撑破宽度。实测两者都复现。
+  - **留白**：不用 Panel（实测 `Panel(_LeanLine, box=SIMPLE, padding=(0,1))` 恒产 **3 行**，上下各多一行空白；用 `Box("")` 造无边框 Box 直接抛 `ValueError`；且 `child_width = width - 2` 写死按边框算，语义是「边框里的内边距」）——用 `rich.padding.Padding`（就是「无边框 Panel」，`Padding.indent()` 本来就干这个）。
+  - **不再写魔法 2**：`#log` 的 CSS padding（=1）与这件事无关（工具行与盒子共享同一内容区，改它不破坏对齐）；真正要对齐的是**盒内正文**的列偏移 = Panel 边框 + 内边距。所以把盒子几何抽成 `_BOX_BORDER = 1` / `_BOX_PADDING = (0, 1)`，`BOX_INSET = _BOX_BORDER + _BOX_PADDING[1]`，`_box()` 与 `_render_assistant_stream()` 都改用 `_BOX_PADDING`，工具行/续行块用 `BOX_INSET`——以后改盒子内边距，工具行自动跟着走。
+  - 于是 `_lean_line() -> Padding(Text, (0, BOX_INSET))`（约 12 行）；`_lean_detail` 也改成「块内缩进留在文本里 + 外面套同一个 Padding」，首行 `→` 正好落在工具行图标的下一列。附带修好一个真 bug：`_copy_source` 现在会剥掉 `Padding`（源文本 = 里面真正的内容），lean 行从「按显示行拼接」的回退升级成「按源文本切」——之前工具行带 2 列留白而回退只去 1 个前导空格，**框选复制每行会多 1 个空格**，现在逐字节干净。
+  - 代价（有意为之）：结果行的图标改成「执行结果」本身（✅/❌/⏹），不再用工具身份图标（`↳`/`$`）——见下一条（两处由此合并成一套字形）。
+  - 验证：`tests/test_tui.py` 的 `test_lean_tool_lines_are_padded` 重写为断言「标记在行首 / 正文列 == 盒内正文列（`BOX_INSET`）/ 无边框字符 / 超长行单行且行首标记保留 / 窄宽（24 列）下标记不丢 / 框选复制不带留白」，10/10 通过；`self_check()` OK。
+- **「执行结果」字形统一：`icon_ok` / `icon_error` / `icon_cancelled`（合并 lean 标记与结果框图标）**：上一步把 ✅/❌/⏹ 收进 Theme 时先落地为 `icon_lean_*`，但随即发现它们与既有的 `icon_tool_result`(↳) / `icon_error`(✗) 是**同一件事**——都在回答「这次执行结果如何」——于是合并成三个字段：
+  - `icon_lean_ok` + `icon_tool_result` → **`icon_ok`**（✅）；`icon_lean_fail` + `icon_error` → **`icon_error`**（❌，原来是 ✗）；`icon_lean_cancelled` → **`icon_cancelled`**（⏹）。取舍：`icon_error` 保名换字形（✅/❌/⏹ 成一套，盒子模式下 `✅ read` 与 `❌ read` 也成对；想回 ✗ 改 theme 一行）。
+  - `role_icon`：`tool_result → icon_ok`、`error → icon_error`，新增 **`cancelled → icon_cancelled`**（`role_border("cancelled")` = system 灰）。于是盒子里 `↳ read` 变成 `✅ read`、失败的变成 `❌ read`，而 `_tool_result_box` **必须按 role 取图标**（原先是 `tool_icon(tool, result=True)`，那条路在合并后会把失败的也画成 ✅）。
+  - `tool_icon(name)` 去掉 `result=`（只剩**调用**形态）；结果框走新 accessor **`result_icon(role, name)`**（按 role 取状态字形，`tool_result_icons` 仍可 opt-in 覆盖）。`lean_mark(status)` 改成映射到同三个字段。
+  - 顺手补一个真缺口：**`_tool_failed_role` 现在识别 `/stop` 取消**（内容 = `CANCEL_TEXT`）→ role `cancelled`（以前落回 `tool_result`，合并后会画成 ✅；shell 侧的 `[exit=cancelled]` 也从 `system` 改为 `cancelled`，两模式对取消的处理终于一致：低调灰 + ⏹）。
+  - 另：接手时 `theme.py` 里 `icon_tool_result="✓"` 少了个逗号（手改到一半）→ 本轮重写顺手修掉。
+  - 验证：`tests/test_tui.py` 10/10 + `self_check()` OK；headless 双模式对拍（call/success/fail/cancel/error 五种）→ 盒子标题 `✧ read / ✅ read / ❌ read / ⏹ read / ❌ shell [1] / ⏹ shell`、简洁单行 `✧ read a.txt / ✅ read a.txt / ❌ read a.txt / ⏹ read a.txt / ❌ shell ls / ⏹ shell sleep 100` 与 `❌ 出错啦` 一致。
+
+## 2026-09-10
+
+- **tui.py 分层重构（1658 → 989 行）+ 回归测试落地**：起因是「一个文件装了 5 个子系统」——ast 统计显示 `PieApp` 772 行（47%）、复制机制 353 行（21%）、`build_css` 135 行、断行/清洗 119 行、其余是控件与常量。分两步做：
+  - **纯搬家**：`textkit.py`（CJK 断行 + 转义清洗，纯函数、不依赖 Textual；`install_cjk_wrap()` 改由 tui.py 显式调用）、`logcopy.py`（`SelectableRichLog` + 「显示行 → 源文本」对齐/切片）、`build_css` 并入 `theme.py`（与配色数据同处）；顺带删掉 tui.py 中已死的 import（`re` / `Strip` / `VerticalGroup` / `Header` / `Footer`）。
+  - **去重**：工具结果渲染（shell exit code 解析 + 失败判定）此前在实时事件与 resume 历史里各写一份（且只有历史版截断超长）→ 合 `_render_tool_result(..., truncate=)`；工具调用渲染（dict ↔ JSON 串）→ `_render_tool_call` + 纯函数 `_format_tool_args`；「先固化流式正文再写下一个盒子」→ `_flush_assistant_text`；`/help` 改由 `PALETTE_COMMANDS` 生成（此前两处维护，文案已开始漂移）；22 处提示盒改走 `self._notify(text, role=...)`；CSS 滚动条 5 行块（#log / #assistant-stream）→ `build_css` 里一个 `scrollbar` 变量；选中区间排序（`_selected_text` / `render_line`）→ `logcopy._sel_range`（当日后续随 logcopy 并回改为 `SelectableRichLog._sel_range`）。`_append_event` 65→35 行、`_command` 102→86 行，PieApp 772→729 行。
+  - 顺手修一个真 bug：`/model refresh` 此前不传 `notify=True`，拉取失败/成功都没有任何反馈（静默）——现会给反馈。
+  - **后续（同日）**：按用户偏好把 `logcopy.py` 又并回 `tui.py`——它只服务这个 App，单开模块多一跳；`tui.py` 现 1388 行，内部用 `# ---- xxx ----` 分区（应用编排 / 日志区控件）。`textkit.py`（纯函数、无 Textual）与 `theme.py` 的 `build_css` 保留在外。tests/test_tui.py 9/9。
+- **补 TUI 回归测试**（`tests/test_tui.py`，无 pytest 依赖，`uv run python tests/test_tui.py`）：断行（纯 ASCII 与 Rich 原实现逐字节一致 / 中文填满宽度 / 英文词不切开 / 3000 例随机混排断点合法）、复制（12 种 Markdown + 3 种纯文本 × 3 种终端宽整盒复制 = 源文本、部分行选择无换行、真机鼠标拖拽走剪贴板）、渲染（工具参数 dict/JSON 串归一、shell exit code 进标题、超长只历史回放截断）、命令冒烟（/help /status 未知命令与参数）。重构全程以它为安全网：9/9 通过。
+
+- **CJK 友好断行：全角字之间也可断**（TUI 显示层）：Rich 只在空白处断行（`rich.text.divide_line` → `rich._wrap.divide_line` 用 `\s*\S+\s*` 分词）——中文长句没有空格 → 整段被挪到下一行、上一行大片留白（实测宽 74 下只用 42 格，用户截图“第一行很短”即此）。做法：在 `tui.py` 把 `rich.text.divide_line` 换成 `_cjk_divide_line`（模块导入时安装），只改**分词单位**——全角字（`cell_len == 2`）各自成一个 token、非全角串仍按词，其余逻辑（放不下就换行、比整行宽则 `chop_cells` 硬折、`fold=False` 时整体挪行）与 Rich 逐行对齐；于是“英文词尽量不断、中文可逐字折”。纯 ASCII 文本直接交回 Rich 原实现（逐字节不变），Rich 接口不在时静默跳过。踩坑：零宽断点（U+200B）行不通——Python `\s` 不匹配它，Rich 的分词认不出来（实测过）；`chop_cells` 在宽度极小时会产出空块 → 断点需去重（fuzz 发现）。验证：用户那句中文长句宽 74 下首行 42 格 → 73 格；纯 ASCII 与 Rich 原实现一致（4000 例随机串 × 4 宽 × fold 两种）；30000 例随机混排（中文/全角标点/emoji/韩文/日文/ASCII）× 9 种宽度无重复/越界断点；`keep-intact-token` 这类英文词不被切开；真机 `PieApp` 挂载（空会话）+ 盒子渲染/复制、窄表格内长 CJK 单元格逐字折行均正常；复制探针 6 组（46/74/104 宽）全绿。
+
+- **框选复制长行不再断行/丢空格**（`#log` 的 `SelectableRichLog`）：根因是复制按 `RichLog.lines`（**软换行后的显示行**）逐行拼接——长行在盒内被 Rich 折成多行，拼出来就是多行；而且 Rich 在盒内换行点会**直接吃掉那个空格**（实测 `Panel(Text('aaaaaa bbbb cccc dddd…'), padding=(0,1))` 在宽 24 下折成 `'aaaaaa bbbb cccc'` + `'dddd…'`，空格没了），所以光按显示行拼接既多换行又丢空格。改法：每次 `log.write()` 记下「源文本 + 显示行 → 源文本字符区间」的对齐表（`_CopyEntry`），复制时按字符区间**切源文本**（同一源文本的相邻显示行合并成一个切片 → 被吃掉的空格与真实换行随切片一并还原），拿不到映射才回退老的按行拼接。源文本取法：`Panel` → 盒内正文；`Text` → `.plain`（先 `expand_tabs()`，与 Rich 显示时 tab_size=8 的展开一致，否则含 tab 的输出对不上）；`Markdown` → **宽渲染（4096）后的纯文本**（`.markup` 不行：渲染会去围栏/加缩进/合并段落，与显示行对不上；宽渲染拿到的既是「屏幕上的文字」又保持每条逻辑行完整，长代码行/段落复制就是一整行）。对齐失败（逐行匹配不上、或源文本尾部有残留）返回 None 走回退，不猜。顺带修回退路径：整行是盒边框时（哪怕只选到半截 `╰───`）统一丢弃。验证：`run_test()` 下 4 组探针——长英文行/长中文行/超长单词/多行含空行/工具结果盒/JSON 参数框/跨两条写入/含标题边框的选择/短行，复制结果逐字节等于源文本；assistant 的 Markdown 六态（段落、围栏代码块、加粗与行内代码、列表、标题、表格）对齐成功且整盒复制 = 渲染后的完整逻辑行（长命令保持一行）；真机 `Pilot.mouse_down/mouse_up` 拖选一整行长行，剪贴板内容 = 原文一行；`self_check()` OK。
+
+  **后续：两处对齐失效（用户实测反馈后修）**。① **Rich 给 Markdown 列表续行加悬挂缩进**（`• ` 项折行后续行多 2 格、`1. ` 多 3 格），源文本里没这 2 格 → 逐行匹配直接对不上，**整个答案框**回退成按显示行拼接（用户截图“第一行很短”就是这个）。② **Rich 给引用（blockquote）的每条显示行重复加 `▌ ` 装饰**（源文本里只有首个逻辑行有）→ 同样对不上。改法：`_split_log_row` 把**行首空白一律不计内容**（只计入 x0，供单元格→字符换算），`_align_spans` 在整行匹配失败时再试「去掉行首 `▌` 装饰」，并把被忽略的字符数记进 spans（`(start, end, off)`）——切片仍按源文本精确切，装饰不会进复制内容；两层都不命中才回退。教训：对齐不能只靠“源文本选择得对”+“对不上就回退”兵底，**必须容忍渲染产生的显示装饰**，否则一个列表项就能让整条消息回退。已知仍回退的一种：Markdown 分隔线 `---` 被渲染成**随宽度铺满**的规则线，不存在与宽度无关的源文本，回退后复制到与显示等宽的那一行（可接受）。验证：`run_test()` 下 3 种终端宽（46/74/104）× 12 种 Markdown 形态（段落/无序列表/有序列表/嵌套列表/块引用/围栏代码/缩进代码/标题/表格/加粗行内代码/分隔线）+ 3 种纯文本形态（长行/含 tab 缩进/shell 结果盒），除分隔线（INFO）外全部逐字节等于源文本；用户截图里那个列表项 case 三种宽下均复制为单行。
+
+- **各 role 图标集中到 Theme**：原先盒子标题前缀（▎/⚙/↳/✗）散落在 tui.py 的 `_box(..., icon=...)` 调用点上，每处重复且只靠调用方自己保证一致。现 Theme 新增 `icon_user/icon_assistant/icon_tool_call/icon_tool_result/icon_error/icon_system` 六个字段 + `role_icon(role)` 取用方法（与既有 `role_border(role)` 同构，未知 role 回退 system），`_box(icon=None)` 默认用该 role 的主题图标，调用点不再传字面量；`_render_assistant_stream()` 的流式面板标题（原硬编码 `"▎ pie"`）改走 `palette.role_icon("assistant")`。图标与边框色语义解耦：工具结果失败时边框染红（role="error"）但图标仍是 ↳，故新增 `_tool_result_box(palette, body, title, role)` helper 显式指定图标，供实时 / resume / !shell 三处共用。顺带统一：`role="error"` 的普通错误框（/compact 参数错、未知命令、回合异常）此前有的带 ✗ 有的不带，现统一 ✗。验证：headless `run_test()` 跑 `_submit` / `_append_event`（tool_call/tool_result/answer）、`_show_shell_result`、`_fail_turn`、`_render_history`，日志盒子标题依次为 ▎ 你 / ⚙ read / ↳ read / ↳ shell [1] / ▎ pie / ↳ shell [0] / ↳ shell [1]（无输出）/ ✗ 出错；流式面板标题为 ▎ pie。
+
+- **图标支持按工具名覆盖**：同一工具会以「调用框」「结果框」两种形态出现（标题都是工具名），所以没有把 `icon_tool_call` 直接改成 dict（role 默认值仍需保留、与 `role_border` 对称），而是新增两张可选覆盖表 `Theme.tool_icons` / `Theme.tool_result_icons`（工具名 → 图标）+ `Theme.tool_icon(name, *, result=False)`：命中就用配置值，未命中回退对应 role 默认图标（⚙ / ↳）；命中且值为 "" = 该工具刻意不显示图标（与未命中相区别）。两张表对应两种形态、互不覆盖，保留 ⚙ vs ↳ 的形态区分。`_box` 新增 `tool=` 参数（优先级：显式 icon > 工具图标 > role 图标）；`_tool_result_box` 改用该工具的 result 图标（失败染红框时依旧用结果图标而非 ✗）。默认主题两张表为空 → 外观与之前完全一致。dict 字段声明为 `field(hash=False)`（dict 不可哈希，不让它们参与 `__hash__`）。验证：默认主题输出与改前逐字节一致；自定义 `tool_icons={"shell": "$", "read": "R", "edit": "E"}, tool_result_icons={"shell": "$", "read": ""}` 下，实时事件与 resume 历史两条渲染路径标题分别为 `▎ 你 / R read / read（结果图标置空）/ E edit / ↳ edit（未配置回退 ↳，失败框仍 ↳）/ $ shell / $ shell [1] / ▎ pie / $ shell [0]`。
+
+- **4 个内置工具配上默认图标**：`tool_icons={"read": "R", "edit": "E", "write": "W", "shell": "$"}`（默认主题）。选型：不用 emoji（双宽、字体不一，容易把 Panel 边框撞歪）；改用单宽、跨字体稳定的 ASCII 字母/符号，一看就懂；`$` 顺带与 !shell 里 `$ {cmd}` 的惯例一致。`tool_result_icons` 保持空 → 结果框仍是 ↳：图标在不同盒子位上语义不同：调用框的图标回答「调的是哪个工具」（标题里的工具名反而次要），结果框的图标回答「这是上一个框的产出」（工具名已在标题里），两者不混。效果：`R read {参数} / ↳ read 输出 / E edit {...} / ↳ edit 输出 / W write {...} / ↳ write 输出 / $ shell {command} / ↳ shell [0]`（失败仍 `↳ shell [1]` 红框）。若想结果框也带工具图标，把同一张表再赋给 `tool_result_icons` 即可。
+
+- **修复 shell 输出含 ANSI 控制符时 #log 盒子画歪**（`ls --color`）：根因是 Rich 排版把不可见的转义字节也算进文本宽度（`cell_len("\x1b[01;32mAGENTS.md\x1b[0m")` = 19 对可见 9）→ Panel 量出的内容宽比实际大，顶/底边框落在 78 列而内容行右边框落在 65-68 列（RichLog 的 `min_width=78` 下不被 crop，终端直接呈现错位：内容右框在中间、外框在最右）。修复：tui.py 新增显示层清洗 `_strip_escapes()` / `_rich_text()`——先剔 ANSI 转义（SGR 保留交 `Text.from_ansi` 解成 Rich 样式，故 `ls --color` 配色保留；OSC / 光标移动 / 字符集选择 / 其余单字符转义剔除）、再剔 C0 控制符（保留 `\n` `\t`，`\r\n` 归一成 `\n`、孤立 `\r` 剔除），`_box()`（「markdown 走 `keep_sgr=False`）、`_render_stream()`、`_render_assistant_stream()` 统一走它。踩坑：**必须先剔转义再剔控制符**——OSC 以 BEL(`\x07`) 结尾，先删 BEL 会让 `\x1b]...` 的匹配吞掉其后全部文本（实测丢内容）。验证：Textual `run_test()` 下 `ls --color` 的 tool_result 盒子各行可见宽全为 78（修复前 65/68/78 混杂），且无残留 ESC；`\t` 由 Rich 自己按 tab stop 展开、宽度量得准，不必手工替换。
+
+- **TUI 选中高亮统一（输入框 vs 日志区）**：`#input .text-area--selection` 补 `text-style: none`。根因：App 用 ansi-dark 主题 → TextArea 的 `:ansi` 规则给选中加 `text-style: reverse`（并 `background: transparent`）；`#input` 的 ID 规则虽更具体、能覆盖 background/color，但没声明 text-style，低优先级的 reverse 仍叠加 → 输入框选中呈反色，与 `#log` 鼠标框选（accent 底 + accent_text 字）视觉相反。修复后两者 style 完全一致（实测两边选中 Segment.style 均为 `#06121f on #89b4fa`）。
+- **TUI 新增 Esc 手动终止（等价 /stop）**：`PieApp.action_escape()`——补全面板开着先收起（保留原有 Esc 语义），否则若 `_busy()`（回合 / !shell 在跑）则等价 `/stop` 置位 `_cancel_event`；空闲时无副作用。绑定两处：`PieTextArea` 的 escape 绑定（输入框有焦点时）与 `PieApp.BINDINGS`（`*App.BINDINGS` + escape，焦点在别处如日志区时兜底；Ctrl+Q/Ctrl+C 保留）。取消逻辑抽成 `PieApp._stop()`（`/stop` 与 Esc 共用），重复触发（已在取消中）静默忽略，避免连按 Esc 刷屏。文案同步：placeholder、忙时提示、`/help`、PALETTE 的 /stop 描述。测试：Textual `run_test()` 驱动 Esc——空闲无副作用、面板显示时仅收起面板、忙时置位取消、`set_focus(None)` 时 App 级绑定兜底。
+
+## 2026-09-09
+
+- **/reasoning 改为 /thinking，新增 /model 命令（运行时切换模型）**：
+  - 命令改名：`/reasoning` → `/thinking`（TUI 补全面板、readline 模式、帮助文案同步）；内部配置项 `reasoning_effort`、CLI `-t/--thinking` 不变。`/thinking` 无参数时显示当前深度。
+  - `/model`：无参数列出当前模型 + 可用列表；`/model <id>` 切换并持久化到 config.toml（下次启动/请求即生效）；`/model refresh` 重新拉取。切换语义 = 更新 `session.config.model` + `llm.model`（loop 每请求读 `cfg.model`，故下个请求即用新模型，无需重建 client）。非法 id（不在列表内）拒绝并提示。
+  - 启动拉取模型列表：`OpenAILLM.list_models()`（GET /models，OpenAI 兼容/DeepSeek 均支持）→ `Session.fetch_models()` 缓存到 `Session.available_models`（不持久化）。TUI 在 on_mount 用后台 worker 拉取（不阻塞 UI，成功/失败各提示一行，失败可 /model refresh 重试）；readline 回退模式在 banner 后同步拉取（8s 超时，失败仅 warn）。自定义 LLM 后端无 list_models → 静默降级，/model <id> 仍可手动切换。
+  - Session 新增复用方法 `set_model` / `set_reasoning_effort`（更新 config + llm 实例 + 持久化），TUI 与 readline 共用。
+  - 交互拉取会真实请求端点一次（慢网络下启动延迟：TUI 后台无感；readline 最多 8s）。
+- **/compact 全部还原为原始实现（auto|tools|turns）**：按用户要求撤回本轮对 /compact 的全部迭代（“配置式查看+compact_mode+all/tool/turn 词汇+← 当前 标注”），`Session.compact(mode="auto")`、TUI/readline 的 `/compact` 命令、PALETTE 静态三条候选均与 HEAD 一致：`/compact`（无参 = auto，工具级 + 轮次级）、`/compact tools`（工具级）、`/compact turns`（轮次级）。
+- **修复 /stop 与超时对 agent shell 工具不生效（卡到命令自然结束）**：根因是 `create_subprocess_shell` 未建独立进程组，取消/超时路径的 `proc.kill()` 只杀 `/bin/sh`，真正干活的孙进程（如 `sleep 300`）变成孤儿并**继续持有 stdout 管道写端**；Python 3.12+ 的 asyncio 子进程 `wait()` 要等 stdio 管道 EOF 才返回 → `finally` 里 `await proc.wait()` 被卡到孙进程自然退出（实测 `sleep 300` 取消耗时 299s）。修复：`create_subprocess_shell(..., start_new_session=True)`（独立进程组，对齐 TUI !shell 的既有做法）+ 终止时 `_terminate_proc_group` 用 `os.killpg(os.getpgid(pid), SIGKILL)` 杀整个进程组（pipe 立即 EOF）→ 取消耗时 0.003s、超时路径也一并杀干净；kill 后 `wait()` 限时 3s（进程处不可中断 D-state、SIGKILL 排队时不阻塞取消/超时路径）。
+- **loop._wait_cancellable 取消清理不再无限等**：取消后 `await asyncio.wait({task}, timeout=CANCEL_GRACE=3.0)` 等工具清理（asyncio.wait 不打断清理、不二次 cancel），超时则让清理后台继续、先终止回合返回 None；对 done 且非 cancelled 的 task 消费 exception 避免告警。避免个别工具清理自身真卡（如不可杀进程）时 /stop 本身不返回。
+- **TUI !shell 收尾 wait 加 3s 限时**：killpg 后 `await proc.wait()` 若遇进程组内 D-state 进程会卡住 worker（UI 保持 busy），改为 `asyncio.wait_for(proc.wait(), 3)`，超时 code 标 `uninterruptible`（SIGKILL 已排队，不阻塞 UI）。
+
+## 2026-09-02
+
+- **read 支持图片（多模态）**：read 读图片返回机器可读标记 `[图片已读取: path=..., mime=..., size=..., dim=...]`（offset/limit 对图片无意义忽略；魔数嗅探 PNG/JPEG/GIF/WebP/BMP + 文件头解析宽高，超 READ_IMAGE_MAX_BYTES=12MB 拒绝内联）；loop 层 `_inject_read_images` 用 `tools.parse_image_marker` 解析标记 → base64 data URI → 注入 `ImageMessage`（context.py，role=user 的多模态 content parts，synthetic=True）。设计关键：OpenAI 兼容 API 图片只能放 user 消息 content parts（tool content 必须 string）；ImageMessage 不是 UserMessage 子类 → 不构成轮次边界，轮次级/会话级压缩的轮次认定、turn_count、标题、摘要提取（synthetic 排除）全部不受影响，可随所在轮/窗口一起落盘；Message.content 类型放宽为 str | list[dict]（to_api 原样透传 parts），tokens() 对图片 part 按 data URI 长度折算（封顶 12k，真实值以 provider 上报为准）；to_dict 新增 cls 字段（from_dict 还原类），synthetic 仅 True 时写出。纯文本模型收图会 400——换多模态模型即可，未加开关。
+
+- **出厂默认常量归位 config.py**：DEFAULT_MODEL + REASONING_LEVELS/REASONING_NONE 统一由 config 定义（原在 llm.py）；llm.py 改 `from .config import DEFAULT_MODEL, REASONING_NONE`（仅构造回退与 none 归一/请求过滤用），tui.py 改从 .config import（/reasoning 校验与补全）；依赖方向 llm→config（config.py 不再 import llm，环消除，llm→config→input 为叶子链）。公开 API 不变（pie.DEFAULT_MODEL 改从 config 导出，REASONING_* 非公开 API）。修正同日旧条目「config 依赖 llm，放这里避免循环 import」——config 已不依赖 llm，该理由仅历史有效。
+
+- **TUI 工具结果失败红框**：工具结果渲染（实时 _append_event / resume _write_tool_result / !shell _show_shell_result）按文本前缀判失败：shell 返回 `[exit=N]` 且 N≠0（命令执行失败）与 `[shell] 超时` / `[工具错误]` / `[工具异常]` / `[参数解析失败]`（工具调用层失败）用 `role="error"` 红框（#f38ba8），其余 `tool_result` 棕框；!shell 按 code 判（0→tool_result，cancelled→system 低调灰，其余→error）。判定逻辑收敛到 tui.py `_tool_failed_role(text)`，tools.py/loop.py 不改（成败语义仍在 harness 层保持为纯文本事实）。
+
+- **工具执行并行化（loop.py）**：同一批 tool_calls 用 asyncio.gather 并行执行（_run_tool_call），全部收尾后按模型返回顺序回填 ToolMessage（_finalize_tool_message），历史扁平序列与串行逐字节一致 → _step_batches / keep_last_steps / 轮次级 / 会话级认定零影响，compaction 代码不改。单工具失败（ToolError/异常）文本化照常返回、不拖累同批；/stop 取消（_cancel_tools）按 call 粒度收尾：真实完成保留结果、被取消补 CANCEL_TEXT，保证每条 tool_calls 恰好对应一条 tool 消息。tool_result 事件按真实完成顺序实时推（与历史回填顺序解耦）。AGENTS.md 已知限制移除“不支持并行工具调用”。
+
+- **TUI 透明背景**：PieApp.on_mount 设 `self.theme = "ansi-dark"`（background=ansi_default + ansi=True），背景输出 `49`（终端默认背景）透出终端窗口色。踩坑：Textual 8.x 默认主题 ansi=False 会启用 ANSIToTruecolor 过滤器，把 ANSI/default 色映射成 MONOKAI 主题背景 rgb(12,12,12)；CSS `background: transparent` 解析为 alpha=0 黑，rich_color 丢弃 alpha 变纯黑——两者都不透明。ansi-dark 主题 background=ansi_default 且 ansi=True → native ANSI 色直通。SCREEN_BG/LOG_BG 保持 "transparent" 配合叠加（子组件 transparent 叠加到 App 的 ansi_default 不变）。
+
+- **WSL /mnt/d 跨盘文件 IO 慢**：openai 3.5.0 import 需 7.7s（3628 次 posix.stat，每次 ~1ms）；import pie.config 8.7s。验证/测试要留足超时（pty 测试至少等 10s+）。
+
+- **TextArea 文字选中高亮统一为 #log 鼠标框选色**：`#input`（PieTextArea）的 `.text-area--selection` 在 ansi-dark 主题下被 Textual 内置 `&:ansi` 规则覆盖成 `background: transparent + text-style: reverse`（反转色），与 #log 自定义框选（蓝底深字）不一致。修复：颜色提为共享常量 SELECTION_BG（#89b4fa）/ SELECTION_FG（#06121f），SELECTION_STYLE 引用之，并在 PieApp CSS 的 `#input` 块内加 `& .text-area--selection {{ background: {SELECTION_BG}; color: {SELECTION_FG}; }}`（#input 是 ID 选择器，优先级压过内置 class 规则）。headless 验证 get_component_rich_style("text-area--selection") = #06121f on #89b4fa。
+
+- **TextArea placeholder 颜色在 ansi-dark 主题下偏亮**：Textual 8.x 默认 `.text-area--placeholder { color: $text 40%; }`，而 ansi-dark 下 `$text` 是终端默认前景色（偏白），叠透明背景显得亮。覆盖规则加在 PieApp CSS 的 `#input` 块内：`& .text-area--placeholder { color: #585b70; }`（catppuccin mocha surface2 暗灰）。注意 CSS 是 f-string，嵌套规则里的花括号要写成 `{{ }}`。
+
+- **shell 工具移除 cwd / limit 参数**：始终在当前工作目录执行；超长输出不做内部截断，全文返回后交回 harness 工具级压缩（按行 head+tail 落盘指针，keep_last_steps 保护窗口）；tools.py 不再用 write_raw（import 移除）。TUI 的 `!` shell 模式与 CLI `--cwd`/`pie sessions -l` 不受影响。
+
+- **轮次级压缩摘要不再保留 user_input**：UserMessage 本身保留在 AgentMessage 中（压缩只替换其后的叶子），摘要重复写入用户输入是冗余，且会污染 summarize_turns 的 (q, final) 提取（final 混入重复 q）；_compact_turn_span 签名去掉 user_input 参数，摘要只保留模型最终输出（pie: ...）+ 中间过程省略标注。修正 09-01「只保留用户输入 + 模型最终输出」的表述。
+
+- **移除 ModelMessage 容器**：AgentMessage 直接持有扁平叶子消息列表（[System, User, Assistant, Tool, ...]），轮次边界由 UserMessage 隐式表达（一个 User 及其后的 assistant/tool 叶子构成一轮）；ModelMessage 职责并入 AgentMessage：add 直存叶子、to_api 直接遍历、轮次级压缩由 _compact_turns/_compact_turn_span 承担；flatten_messages 删除（chat/loop 改用 messages.messages 直遍历）。轮次级压缩每次循环重扫 user 索引（切片替换会漂移后续索引，预计算索引会误压进行中轮次），从最老开始压、最后一个 user 之后（进行中轮次）不压、已压缩轮（span 全 level>=2）跳过。
+
+- **新增 TUI 命令 /reasoning <none|low|high|max> 运行时切换思考深度**：更新 session.config.reasoning_effort + 当前 llm 实例属性（OpenAILLM.reasoning_effort 每次请求由 _request_kwargs 读取，下个请求即生效）+ cfg.save() 持久化（重启仍生效，写回来源 config_file）。级别常量 REASONING_LEVELS/REASONING_NONE 放 llm.py；none=关闭思考：归一为 None → 请求不发 reasoning_effort 参数（__init__ 归一 + _request_kwargs 过滤双保险，运行时赋 "none" 也不发）。补全面板给 4 条具体候选。
+
+## 2026-09-01
+
+- **轮次级压缩摘要改为「只保留用户输入 + 模型最终输出」**：中间被省略的过程用 `...[中间过程省略]...` 显式标注（无中间过程则不标注）；CompactionConfig.turn 由 TurnCompaction(head/tail) 收敛为 bool（true 开启 / false 关闭），旧 [compaction.turn] 子表 dict 写法自动迁移为开启；用户输入从 AgentMessage 层（前一个 UserMessage）传入 ModelMessage._compact_turn。
+
+- **write / shell 工具 schema 显式化**（对齐 TypeBox 风格）：write 参数带 description；shell 参数名 cmd → command（旧会话历史中的 cmd 只回传不重新 dispatch，无需兼容映射）、timeout 默认 None（不设则无超时，subprocess.run 不再有默认 120s）、保留 cwd/limit 并补充 description；cli.py self_check 同步改 {"command": ...}。
+
+- **内置 SYSTEM_PROMPT 承担分层说明职责**：「分层提示与记忆」章节解释 SYSTEM.md / AGENTS.md / MEMORY.md / ~/.pie/memory.md 的注入与维护，build_system_prompt 只做纯内容拼接、不再硬编码引导语；首次运行（ensure_config 写配置）同时创建全局记忆种子 ~/.pie/memory.md（GLOBAL_MEMORY_TEMPLATE，已存在则不覆盖）——解决“无 SYSTEM.md 且无记忆文件时模型完全不知道记忆机制”的种子缺失问题。
+
+- **compaction 改为“显式配置”语义**：Config.compaction 默认为 None（不写 [compaction] = 不做任何压缩）；写了 [compaction] 则默认三级全开（tool/turn/session 默认非 None），子表只调 head/tail 参数，`tool/turn/session = false` 显式关闭对应级；移除所有 enabled 键（旧 enabled=false 迁移为整体 None，enabled=true 无效果）；各级 compact() 改传子配置对象（tool_cfg/turn_cfg/session_cfg）而非整个 cfg，消除空指针依赖；_toml_dump 跳过 None 值（TOML 无 null）。
+
+- **keep_last_steps 恢复跨轮次滚动语义**（仅工具级压缩）：保护最近 N 个 step 批次（每批 = assistant(tool_calls) + 后续 tool 结果），窗口跨轮次滚动、当前轮最近的批次恒在窗口内；窗口外未压缩 ToolMessage（含历史轮次）从最老开始落盘成指针。轮次级/会话级保护规则不变（只保护当前轮 / 最后一个 user 之前），避免 8-31 饿死问题回归。实现：_step_batches + _protected_step_tool_indices（保护粒度 = step 批次，跨轮次）。
+
+## 2026-08-31
+
+- **重构——摘要只保留规则式**：移除子 agent 摘要器（_make_subagent_summarizer）与 LLM 摘要模式（parse_summary_output / remember_facts / 滚式 / compress_summarizer / subagent_timeout / remember_facts / subagent_config_file / ensure_subagent_config）。
+
+- **/usage 改名 /stat**：usage_report 新增“会话文件：<path>”行（仅当会话文件已保存存在时显示），TUI 状态栏过滤该行保持首/尾摘要。
+
+- **语义收敛——只保留 keep_last_steps（默认 5）决定保护窗口**（最近 N 个 step 批次所在轮次，跨轮次滚动，当前轮恒在窗口内）；移除 keep_last_turns 与 compress_current_turn；纯文本会话（无 step 批次）保护全部、不压缩。
+
+- **三级压缩开关合并为 compaction（bool）**：true 时工具/轮次/会话三级全部启用；旧键 compress_tools/compress_turns/compress_session 自动迁移（取三者 AND，新键优先）。
+
+- **compaction 改为嵌套结构 [compaction] enabled + [compaction.tool] head/tail**（工具级压缩按行保留 head+tail，行数不足则不压）；旧扁平 compaction=true 与更早三键自动迁移。
+
+- **修复轮次级/会话级被饿死**：保护窗口收窄为“只保护当前轮”，已完成轮次不再受 keep_last_steps 窗口保护（跨轮次滚动语义取消），轮次级/会话级恢复工作；keep_last_steps 只负责当前轮内最近 N 批 verbatim。
+
+- **上下文管理重构为容器模型**：AgentMessage（整场对话）/ ModelMessage（一轮内 assistant+tool）/ 叶子 System/User/Assistant/ToolMessage；compact(tools|turns|session) 为容器方法，支持切片与拼接；tokens() 用 provider 基线 + 压缩比例估算；compaction.session 默认 false（/clear 切换窗口）；fs 为历史窗口块列表（~/.pie/windows/，GC 不碰）；会话文件新格式，不兼容旧文件。
+
+- **会话 meta 不再记录 manifest 路径**：消息自带 raw_path 自描述，manifest 降级为按文件名推导的可选审计日志；verify_context 以消息字段 + fs 为准。
+
+- **新增 Textual TUI（src/pie/tui.py，pi/tau 风格）**：真实终端下 chat/resume 走图形界面，工具日志经 complete_turn 的 on_event 回调实时展示；非 TTY 回退 readline。
+
+- **移除 compress_max_turns_per_event**（LLM 摘要时代遗留的每事件封顶）；规则式下轮次级一次压到目标水位或无可压轮次，压不完再升级会话级。
+
+- **移除 spill_threshold_chars / read_spill_threshold_chars 与 harness 级工具级压缩**：shell 新增 limit 参数（默认 200 行，超限全文落盘 + 指针 + 最后 limit 行），read 用 offset/limit 分页；shell 落盘指针在 loop 里写入 manifest（kind=tool）。
+
+- **移除 use_memory 配置**：SYSTEM.md / AGENTS.md / MEMORY.md 存在即加载，不再有跳过开关。
+
+- **修复 /save 自定义路径的 manifest 关联**：__meta__ 记录 manifest 路径，load 优先使用；新增 Session.full_history() 按 manifest 展开压缩内容重建完整转录（压缩视图 vs 完整历史的差异是设计，原始数据始终在 step/turn/session-*.txt）。
+
+- **TUI 新增 shell 模式**：输入以 `!` 开头时输入框边框变 tool_call 橙色（#9c4916，CSS 类 shell-mode 切换），提交后 `!` 后内容直接 subprocess 执行（shell=True，120s 超时，超 200 行截断显示前 100 后 50），结果输出到 log 但不经过 LLM、不进会话上下文（不写 messages、不 save）。
+
+- **修正工具级/step 级语义**：工具级压缩只压缩 tool 返回文本（内容落盘成指针，消息保留，绝不删除）；当前轮 step 压缩改为内容级（spill_turn_tool_results），整批删除的 compress_step_batches 已移除；stats 字段 spilled 改名为 tools。
+
+- **压缩指针写入消息自身字段（Message.raw_path / raw_hash）**：消息自描述，full_history() 按消息顺序精确重建；referenced_raw_paths() 同时扫 manifest 与会话消息字段，GC/verify 不再依赖文件名 stem 关联。
+
+## 2026-08-29
+
+- **上下文压缩文件用内容 sha256 前 16 位命名**（不做 turn-range）；摘要子 agent 实现为 shell 调 pie 一次性模式；CLI 新增 -c/--config。
+
+- **三级上下文压缩**（工具级 eager spill / 轮次级 / 会话级），token 计数用 API usage.prompt_tokens；单条消息压缩级别只升不降（0→1→2→3）。
+
+- **read 返回全文不截断、支持 offset（1 起）/ limit 分页**；edit 为 edits 数组（oldText 唯一、互不重叠、按原文非增量应用），对齐 pi-agent。
+
+- **shell 工具不内部截断**，全文交回 harness 统一做 1 级压缩；spill 按工具区分：read 默认不落盘（>100K），shell 等按 8K。
+
+- **压缩事件写会话 manifest（~/.pie/context/<session>-manifest.jsonl）**，maybe_compact 返回节省 token 统计，Session 提供 compression_history / verify_context / raw_history；`pie context info/verify/gc` 维护命令。
+
+- **摘要为规则式**：工具=head+tail，轮次=user+最终输出，会话级=指针+保护区域 verbatim。
+
+- **/usage 显示当前上下文占用**（估算+百分比）、压缩次数与落盘原文量、API 上报与累计；UsageTracker 经会话文件 __meta__ 跨 resume 恢复。
+
+- **DeepSeek thinking 400 真根因 = 会话级压缩在轮次进行中 pair 提取**：产生 user→纯文本 assistant→tool_calls→tool 非法序列；修复：进行中轮次不 pair 提取（turn_in_progress）、pair 仅当轮次以 assistant 结尾时提取、Session.load 自动修复已损坏序列。
+
+- **tool_call 参数膨胀**（write 大 content + thinking reasoning 大）是上下文主要消耗源，决策：留给自动压缩处理，不单独改工具。
+
+- **新增 keep_last_steps（当前轮次内必须完整保留的最近 step 批次数，默认 3）与 compress_current_turn（默认 true）**：进行中的轮次超限时压缩较早 step 批次（整批落盘 + manifest kind=step），解决长工具循环单轮撑爆上下文的问题。
+
+## 2026-08-28
+
+- **harness 采用 OpenAI 兼容接口**：默认模型 deepseek-v4-flash（reasoning_effort=high），默认 API https://api.deepseek.com/，配置只从 ~/.pie/config.toml 读取。
+
+- **包名为 pie，入口 python -m pie**：内置工具仅 read / edit / write / shell，扩展用 @tool() + ToolRegistry。
+
+- **配置持久化到 ~/.pie/config.toml**（旧 config.json 自动迁移），记忆文件为 MEMORY.md 与 ~/.pie/memory.md。
+
+- **CLI 为 pie（新对话）/ pie resume（恢复最近会话）/ pie [PROMPT]（一次性子 agent，不写 sessions）**；Session 支持多轮对话与 JSONL 会话持久化；支持全局安装（uv tool install . --editable），任意目录可运行。
+

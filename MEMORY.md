@@ -1,182 +1,91 @@
 # MEMORY.md — 持久记忆
 
-本文件是项目的持久记忆：记录用户偏好、关键决策和踩过的坑。agent 在每次会话开始时读取，并可在运行中用 edit/write 更新。
+本文件是项目的持久记忆：记录用户偏好、当前系统概览与踩坑记录。agent 在每次会话开始时读取，并可在运行中用 edit/write 更新。
 
 保持简洁：只记跨会话仍然有效的事实，不要记临时状态。
+历史关键决策与变更记录已移至 `docs/CHANGELOG.md`（本文件只保留当前状态）。
 
 ## 用户偏好
 
 - 信奉 YOLO：不要权限确认，工具直接执行。
 - 偏好极简、可扩展的实现。
-- 不要自动更新版本号（pyproject/uv.lock 等），除非用户明确要求；提交时不要自拟版本号或改动版本号。
-- `max_seq_len = 128_0000`（128 万）是**刻意设定**，不是手误——已确认过，不要再当成笔误反复确认。
-- `Config.max_tokens` 默认 **256000**（256k，按 k=1000 换算），不要改回 None/不发送。
+- TUI 背景透明：露出终端窗口背景色（Ubuntu 终端默认深红色），不画自己的背景色。
 
-## 打包 / 还原
+## 当前系统概览
 
-打包
-```bash
-find . -type f \( -name '*.py' -o -name '*.toml' -o -name '*.md' \) \
-   -not -path './.git/*' \
-   -not -path './.venv/*' \
-   -not -path '*/__pycache__/*' \
-   -not -path './dist/*' \
-   -print0 | sort -z | while IFS= read -r -d '' f; do
-     printf '===== %s =====\n' "$f"
-     cat "$f"
-     printf '\n'
-   done > pie-export.txt
-```
+- **架构**：分层包（tools / llm / loop / config / chat / context / cli），src 布局，可全局安装（`uv tool install . --editable`）。内置工具仅 read / edit / write / shell，`@tool()` 按签名生成 schema，LLM 协议可注入。
+  **Session 的三个路径/集合字段**（名字要一眼分清）：`path` = 会话 JSONL 自身的文件路径；`windows` = `/clear` 归档的历史窗口块（落在 `~/.pie/windows/`）；`files` = 图片 id 表（hash_id → file_id/本地副本/过期时间，见 `files.py`，存进 `__meta__`）。旧名 `file` / `fs` 已于 2026-09 改名（`__meta__` 里的 `fs` 键仍兼容读）。
+- **CLI 与交互**：`pie`（新对话）/ `pie resume`（恢复最近）/ `pie` 带参数（一次性子 agent，不写 sessions）/ `pie context info|verify|gc`；`-c/--config` 指定配置。真实终端走 Textual TUI，非 TTY 回退 readline/prompt_toolkit；输入以 `!` 开头走 shell 模式（不进上下文）。运行时命令：`/stat`（用量）、`/thinking`（切换思考深度）、`/model <id>`（切换模型，启动自动拉取可用列表）、`/compact [tools|turns]` 手动压缩（无参 = 工具级+轮次级）、`/stop` 或 `Esc`（取消当前任务：补全面板开着时 Esc 只收起面板）、`/clear`（切换窗口）。
+- **工具**：所有内置工具输出统一为 `Headers\n\nBody`（headers 一行一个 `[...]`，body 空则省略空行；状态/元数据放 header 区，如 shell 首行 `[exit=..]`、截断时 `[工具输出全文已保存: path]`、行号 `[行 a-b，共 N 行]`）。read 支持 offset/limit 分页 + 图片多模态 + 私有容量上限（_max_lines/_max_bytes/_max_image_bytes）；edit 为 edits 数组（oldText 唯一、防重叠、按原文非增量）；shell 支持私有容量上限（超限只保留尾部，全文落盘指针）。
+- **上下文压缩**：三级——工具级（按行保留 head+tail 落盘指针）/ 轮次级 / 会话级，摘要全部规则式（零模型调用）。工具级保护窗口由 `keep_last_steps` 决定（最近 N 个 step 批次，跨轮次滚动）；轮次级只保护当前轮、已完成轮次可压。内容 hash 落盘 + 指针链 + 压缩级别只升不降 + 软阈值 / 目标水位迟滞（比例在 `[compaction]` 的 `soft_ratio` / `target_ratio`，**相对可用输入预算 = `context_window` - `reserved_tokens`**，默认 80% / 55%）；manifest 索引 + verify/gc。`compaction` 为显式配置：默认 None 不做任何压缩，写了则三级全开（子表调 head/tail，`tool/turn/session = false` 关闭对应级）。
+- **模型层**：OpenAI 兼容接口，`reasoning_effort` 透传；`reasoning_content` 捕获/持久化/原样回传（thinking 模式 400 已修）。采集 provider usage（prompt/completion）+ UsageTracker 跨 resume 累计。**上下文账**：`context_window`（模型窗口，输入 + 输出一起算）+ `reserved_tokens`（每次请求为输出预留，就是发给 API 的 `max_tokens`，`None`/`"auto"` = 不发、用服务端默认）→ `Config.context_budget() = 二者相减`；`/stat` 与 system prompt 都按这份预算展示。
+- **图片（`read` → 多模态注入）**：read 返回标记文本，harness 把图片作为**多模态 user 消息**注入（图片只能在 user 消息里）。默认走 **Files API**：先落本地内容寻址副本 `~/.pie/files/<hash_id>`（`hash_id = img-<sha256[:16]>`）→ **从副本上传**拿 `file_id` → 历史里只留 `{"type":"file","file_id":…}`。记录按会话存 `__meta__.files`（无全局缓存）；未命中/过期/换 key/模型不支持/上传失败 → 静默回退内联 base64。维护：`pie files list|gc`。
+- **TUI 主题**：`theme.py` 集中所有展示数据（配色 + 图标，不依赖 Textual/Rich），四类取用：`Theme.role_border(role)`（未知 role 回退 system；`cancelled` 与 system 同色）、`Theme.role_icon(role)`、`Theme.tool_icon(name)`（**调用**框图标：`tool_icons` 按工具名覆盖，未配置回退 `icon_tool_call`，值 `""` = 无图标）、`Theme.result_icon(role, name)`（**结果**框图标：按 role 取状态字形，可被 `tool_result_icons` 覆盖）、`Theme.lean_mark(status)`（简洁模式行首标记，status ∈ ok/fail/cancelled，未知回退 ok）。
+  **「执行结果」字形只有一套**：`icon_ok(✅)` / `icon_error(❌)` / `icon_cancelled(⏹)`——盒子模式作 role=tool_result/error/cancelled 的标题图标（`↳` 那套「这是上一个框的产出」已废），简洁模式同一套放行首；取哪个由 tui 侧按执行结果判定（退出码/失败前缀/取消）。角色轴与结果轴分开：**调用**框图标回答「调的是哪个工具」（`tool_icons` + `tool_result_icons` 是对结果字形的 opt-in 覆盖），结果框图标回答「结果如何」。默认主题：`tool_icons={"read": "✧", "edit": "⟱", "write": "✦", "shell": "❯"}`，`tool_result_icons={}`。原则：**视图层不再出现图标字面量**。tui.py 的 `_box(icon=None, tool="")` 优先级：显式 icon > 工具图标 > role 图标。
+- **TUI 显示**：断行是 CJK 友好的——tui.py 导入时调 `textkit.install_cjk_wrap()`（全角字逐字可断、英文词不断，纯 ASCII 交回 Rich 原实现）；`tui.py` 的 `SelectableRichLog` 框选复制按「源文本 + 显示行对齐」切来源文本（不是拼显示行），长行复制为一行。tui.py 只做应用编排（布局/命令/回合 worker/流式），live 事件与 resume 历史共用 `_render_tool_call/_render_tool_result/_notify`。
+- **TUI 简洁模式**（`[tui] lean = true`）：只给 user / assistant 套盒子，工具调用/结果压成单行 `Text`（`[状态标记|工具图标] 工具名 摘要`——结果行 ✅/❌/⏹ 在**行首**，失败时下方 `→ 正文` 续行），外面套 `Padding(text, (0, BOX_INSET))` 与盒内正文对齐。`BOX_INSET` 由盒子几何推导（`_BOX_BORDER + _BOX_PADDING[1]`，`_box()` / `_render_assistant_stream()` 共用 `_BOX_PADDING`）——别另写 2；`#log` 的 CSS padding 与这件事无关（同一内容区，改它不破坏对齐）。标记放行首是关键：`Text(no_wrap=True, overflow="ellipsis")` 的右截断天然保住它，所以没有自定义 renderable（`_LeanLine` 已删，`Measurement`/`set_cell_size`/`LEAN_RIGHT_MARGIN` 一并删；`_single_line()` 仍必须：真换行在 `no_wrap` 下照样断行、tab 会撑破宽度）。代价：lean 下结果行不再用工具身份图标——状态即图标。状态标记字形在主题里（`icon_ok/icon_error/icon_cancelled` + `palette.lean_mark(status)`，与盒子模式结果框标题同一套），tui 侧只负责「按执行结果选 status」。改 lean 渲染后跑 `tests/test_tui.py`（`test_lean_tool_lines_are_padded` 含「框选复制不带留白」断言）。
+- **配置**：只从 `~/.pie/config.toml` 读取（保留 `PIE_DIR` / `PIE_CONFIG_FILE` 路径重定向）；`Config.tools`（dict，按工具名设默认私有参数，如 read: {_max_lines,_max_bytes,_max_image_bytes}）由 dispatch/adispatch 注入下划线私有参数（`_inject_tool_defaults`，只注入下划线且不覆盖显式传参）；SYSTEM.md / AGENTS.md / MEMORY.md / `~/.pie/memory.md` 存在即注入 system prompt。
 
-还原
-```bash
-#!/usr/bin/env bash
-# restore.sh — 从 pie-export.txt 还原项目文件
-# 用法: bash restore.sh [导出文件，默认 pie-export.txt]
-# 格式: 每个文件段以 "===== <相对路径> =====" 开始，以 "===== END <路径> =====" 结束（兼容无 END 的旧格式）
-set -u
-
-SRC="${1:-pie-export.txt}"
-if [ ! -f "$SRC" ]; then
-  echo "找不到导出文件: $SRC" >&2
-  exit 1
-fi
-
-out=""
-while IFS= read -r line || [ -n "$line" ]; do
-  if [[ "$line" == "===== "* ]]; then
-    if [[ "$line" == "===== END "* ]]; then
-      out=""                      # END 标记：当前文件结束
-    else
-      path="${line#===== }"       # 去掉前缀 "===== "
-      path="${path% =====}"       # 去掉后缀 " ====="
-      if [ -n "$path" ]; then
-        mkdir -p "$(dirname -- "$path")"
-        : > "$path"               # 创建 / 清空目标文件
-        out="$path"
-      fi
-    fi
-    continue
-  fi
-  if [ -n "$out" ]; then
-    printf '%s\n' "$line" >> "$out"
-  fi
-done < "$SRC"
-
-echo "还原完成: $SRC"
-```
-
-## 关键决策
-
-- 2026-08-28：harness 采用 OpenAI 兼容接口，默认模型 deepseek-v4-flash（reasoning_effort=high），默认 API https://api.deepseek.com/，配置只从 ~/.pie/config.toml 读取。
-- 2026-08-28：包名为 pie，入口 python -m pie；内置工具仅 read / edit / write / shell，扩展用 @tool() + ToolRegistry。
-- 2026-08-28：配置持久化到 ~/.pie/config.toml（旧 config.json 自动迁移），记忆文件为 MEMORY.md 与 ~/.pie/memory.md。
-- 2026-08-28：CLI 为 pie（新对话）/ pie resume（恢复最近会话）/ pie [PROMPT]（一次性子 agent，不写 sessions）；Session 支持多轮对话与 JSONL 会话持久化；支持全局安装（uv tool install . --editable），任意目录可运行。
-- 2026-08-29：上下文压缩文件用内容 sha256 前 16 位命名（不做 turn-range）；摘要子 agent 实现为 shell 调 pie 一次性模式；CLI 新增 -c/--config。
-- 2026-08-29：三级上下文压缩（工具级 eager spill / 轮次级 / 会话级），token 计数用 API usage.prompt_tokens；单条消息压缩级别只升不降（0→1→2→3）。
-- 2026-08-29：read 返回全文不截断、支持 offset（1 起）/ limit 分页；edit 为 edits 数组（oldText 唯一、互不重叠、按原文非增量应用），对齐 pi-agent。
-- 2026-08-29：shell 工具不内部截断，全文交回 harness 统一做 1 级压缩；spill 按工具区分：read 默认不落盘（>100K），shell 等按 8K。
-- 2026-08-29：压缩事件写会话 manifest（~/.pie/context/<session>-manifest.jsonl），maybe_compact 返回节省 token 统计，Session 提供 compression_history / verify_context / raw_history；`pie context info/verify/gc` 维护命令。
-- 2026-08-29：摘要为规则式：工具=head+tail，轮次=user+最终输出，会话级=指针+保护区域 verbatim。
-- 2026-08-31：重构——摘要只保留规则式；移除子 agent 摘要器（_make_subagent_summarizer）与 LLM 摘要模式（parse_summary_output / remember_facts / 滚式 / compress_summarizer / subagent_timeout / remember_facts / subagent_config_file / ensure_subagent_config）。
-- 2026-08-29：/usage 显示当前上下文占用（估算+百分比）、压缩次数与落盘原文量、API 上报与累计；UsageTracker 经会话文件 __meta__ 跨 resume 恢复。
-- 2026-08-31：/usage 改名 /stat；usage_report 新增“会话文件：<path>”行（仅当会话文件已保存存在时显示），TUI 状态栏过滤该行保持首/尾摘要。
-- 2026-08-31：/stat 改名 /status（命令字符串、帮助文本、补全候选、README 同步更新）。
-- 2026-08-29：DeepSeek thinking 400 真根因 = 会话级压缩在轮次进行中 pair 提取，产生 user→纯文本 assistant→tool_calls→tool 非法序列；修复：进行中轮次不 pair 提取（turn_in_progress）、pair 仅当轮次以 assistant 结尾时提取、Session.load 自动修复已损坏序列。
-- 2026-08-29：tool_call 参数膨胀（write 大 content + thinking reasoning 大）是上下文主要消耗源，决策：留给自动压缩处理，不单独改工具。
-- 2026-08-29：新增 keep_last_steps（当前轮次内必须完整保留的最近 step 批次数，默认 3）与 compress_current_turn（默认 true）：进行中的轮次超限时压缩较早 step 批次（整批落盘 + manifest kind=step），解决长工具循环单轮撑爆上下文的问题。
-- 2026-08-31：语义收敛——只保留 keep_last_steps（默认 5）决定保护窗口（最近 N 个 step 批次所在轮次，跨轮次滚动，当前轮恒在窗口内）；移除 keep_last_turns 与 compress_current_turn；纯文本会话（无 step 批次）保护全部、不压缩。
-- 2026-08-31：三级压缩开关合并为 compaction（bool）：true 时工具/轮次/会话三级全部启用；旧键 compress_tools/compress_turns/compress_session 自动迁移（取三者 AND，新键优先）。
-- 2026-08-31：compaction 改为嵌套结构 [compaction] enabled + [compaction.tool] head/tail（工具级压缩按行保留 head+tail，行数不足则不压）；旧扁平 compaction=true 与更早三键自动迁移。
-- 2026-08-31：修复轮次级/会话级被饿死——保护窗口收窄为“只保护当前轮”，已完成轮次不再受 keep_last_steps 窗口保护（跨轮次滚动语义取消），轮次级/会话级恢复工作；keep_last_steps 只负责当前轮内最近 N 批 verbatim。
-- 2026-08-31：上下文管理重构为容器模型——AgentMessage（整场对话）/ ModelMessage（一轮内 assistant+tool）/ 叶子 System/User/Assistant/ToolMessage；compact(tools|turns|session) 为容器方法，支持切片与拼接；tokens() 用 provider 基线 + 压缩比例估算；compaction.session 默认 false（/clear 切换窗口）；fs 为历史窗口块列表（~/.pie/windows/，GC 不碰）；会话文件新格式，不兼容旧文件。
-- 2026-08-31：会话 meta 不再记录 manifest 路径——消息自带 raw_path 自描述，manifest 降级为按文件名推导的可选审计日志；verify_context 以消息字段 + fs 为准。
-- 2026-08-31：新增 Textual TUI（src/pie/tui.py，pi/tau 风格）——真实终端下 chat/resume 走图形界面，工具日志经 complete_turn 的 on_event 回调实时展示；非 TTY 回退 readline。
-- 2026-08-31：移除 compress_max_turns_per_event（LLM 摘要时代遗留的每事件封顶）；规则式下轮次级一次压到目标水位或无可压轮次，压不完再升级会话级。
-- 2026-08-31：移除 spill_threshold_chars / read_spill_threshold_chars 与 harness 级工具级压缩——shell 新增 limit 参数（默认 200 行，超限全文落盘 + 指针 + 最后 limit 行），read 用 offset/limit 分页；shell 落盘指针在 loop 里写入 manifest（kind=tool）。
-- 2026-08-31：移除 use_memory 配置——SYSTEM.md / AGENTS.md / MEMORY.md 存在即加载，不再有跳过开关。
-- 2026-08-31：修复 /save 自定义路径的 manifest 关联——__meta__ 记录 manifest 路径，load 优先使用；新增 Session.full_history() 按 manifest 展开压缩内容重建完整转录（压缩视图 vs 完整历史的差异是设计，原始数据始终在 step/turn/session-*.txt）。
-- 2026-08-31：TUI 新增 shell 模式——输入以 `!` 开头时输入框边框变 tool_call 橙色（#9c4916，CSS 类 shell-mode 切换），提交后 `!` 后内容直接 subprocess 执行（shell=True，120s 超时，超 200 行截断显示前 100 后 50），结果输出到 log 但不经过 LLM、不进会话上下文（不写 messages、不 save）。
-- 2026-09-01：清理第一类死代码——删除 cli.py 的 chat_main/resume_main/once_main 兼容入口（main() 已用 argv[0] 分发 + _run 替代）与 --new-session 死参数；删除 Session.to_messages / maybe_compact / verify_context / raw_history（无调用方，被 messages.to_api() / context.maybe_compact / referenced_raw_paths() / full_history() 取代）；删除 tui.py 的 BORDER_* 兼容别名（_box 直接用 ROLE_BORDERS）；README 同步去掉 verify_context/raw_history 引用。
-- 2026-09-01：新增手动取消（TUI `/stop`）——发出消息后输入框不再 disabled（等待期间可继续输入）；loop 层 `complete_turn` / `Session.turn` 新增 `cancel_event`（threading.Event）参数，`_run_cancellable` 在子线程跑阻塞调用并 poll 取消标志（50ms 粒度）；模型请求被取消 → 回合终止、历史写 AssistantMessage("用户手动终止")；工具执行被取消 → 该工具（及未执行工具）结果填充 ToolMessage("用户手动终止")，再写 AssistantMessage("用户手动终止")，保证 tool_call_id 一一对应（API 序列合法）；TUI shell 模式（!）改 Popen 轮询，/stop kill 子进程；处理中提交普通消息提示“正在处理中，输入 /stop 可取消”，取消收尾时 join 等待避免新旧回合并发写历史。
-- 2026-09-01：TUI 输入框右侧按钮（`#send-btn`）两用：空闲“▶ 发送”点击提交输入框内容（等价回车），处理中变“■ 停止”点击等价 `/stop`；实现 = `#input-bar` Horizontal 布局（输入框 `width: 1fr` + 按钮 `width: 8; height: 100%` 等高），按钮 `min-width: 0; padding: 0 1` 收窄，`can_focus=False` 不抢焦点；状态在 `_submit/_run_shell`（进入 busy）与 `_finish_turn/_fail_turn/_show_shell_result`（退出）切换。
-- 2026-09-01（修订）：按钮从右下角悬浮改为输入框右侧等高——用户嫌悬浮覆盖丑；`layers/overlay/dock/offset-y` 全部移除，`_place_send_button` 删除；Textual `pilot.click` 的 offset 是像素偏移（非百分比），headless 测试需等布局稳定或显式传中心 offset。
-- 2026-09-01（再修订）：用户最终决定**移除 send-btn**——输入框恢复为直接 yield（去掉 Horizontal 容器），`_update_send_button` / `on_button_pressed` / CSS 规则全部删除，功能回退到纯 `/stop` 文本命令 + 回车提交。
-- 2026-09-01（最终）：用户决定**恢复 send-btn**（加回来）——恢复为输入框右侧按钮：`Horizontal(id="input-bar")` 容器 + `Button("▶")`，label 纯符号（空闲 `▶` / busy `■`），CSS 用 `min-width: 0; padding: 1; text-align: center`（用户此前手动改窄过），`can_focus=False`。
-- 2026-09-01（再修订）：send-btn 样式改为**透明背景、只以 border 为边界**——Textual 默认 background 覆盖整个 widget 区域（含 border 之下），border 字符其实是画在背景色块上的前景描边，视觉上“border 在 background 内部”；改 `background: transparent` 后 border 即按钮唯一边界，内部露出下层背景；hover/busy 改用边框颜色区分：空闲 border `#45475a` / hover `#89b4fa`，busy border `#f38ba8` / busy:hover `#ffb4c8`（文字颜色同步）。
-- 2026-09-01（再再修订）：**busy 时恢复暗红背景**（用户明确要求，允许 busy 状态下 border 在背景内部）——空闲仍透明背景+border 边界；busy 未 hover 背景 `#3a1d1d` + 边框 `#f38ba8`，busy:hover 背景 `#5a2d2d` + 边框 `#ffb4c8`，文字 `#f38ba8`。
-- 2026-09-01（再再再修订）：**取消 busy 暗红背景，暗红挪到 border**——所有状态背景统一透明（border 即边界）；busy 边框 `#3a1d1d`（暗红，即原背景色）/ busy:hover 边框 `#5a2d2d`（提亮暗红），文字 `#f38ba8`；注意 `#3a1d1d` 与屏幕背景 `#1a1a24` 对比度低，边框偏暗（如需可见可调亮）。
-- 2026-09-01（再再再再修订）：**busy 边框提亮为亮红**——用户反馈暗红边框不醒目；busy 边框 `#f38ba8`（error 色）/ busy:hover 边框 `#ffb4c8`（更亮），文字同步，背景仍透明。
-- 2026-08-31：修正工具级/step 级语义——工具级压缩只压缩 tool 返回文本（内容落盘成指针，消息保留，绝不删除）；当前轮 step 压缩改为内容级（spill_turn_tool_results），整批删除的 compress_step_batches 已移除；stats 字段 spilled 改名为 tools。
-- 2026-08-31：压缩指针写入消息自身字段（Message.raw_path / raw_hash）——消息自描述，full_history() 按消息顺序精确重建；referenced_raw_paths() 同时扫 manifest 与会话消息字段，GC/verify 不再依赖文件名 stem 关联。
-- 2026-09-02：TUI 样式整理成 theme——新增 src/pie/theme.py（Theme 纯数据 + THEMES 注册表 + get_theme），Config 新增 theme 键（默认 catppuccin-mocha）持久化到 config.toml；PieApp 实例持有 self.palette=get_theme(config.theme)，CSS 经 build_css(palette) 在 __init__ 注入实例属性 self.CSS（Textual load 阶段读实例属性，可按主题动态生成）；tui.py 不再有硬编码颜色常量，_box/选中高亮/补全面板均走 palette。注意：RichLog 已有只读 property selection_style，选中样式需用私有名 self._selection_style；选中的高亮样式需在 compose 里传给 SelectableRichLog(selection_style=Style(...))。
-- 2026-09-02：resume 含图片消息的会话时 TUI 崩溃（on_mount → full_history）——message_raw_path() 对多模态 content（list，如 ImageMessage）直接 re.search 抛 TypeError；修复为统一先经 content_text() 归一（图片 part 不参与指针匹配）再扫压缩指针。教训：扫描消息 content 的代码必须兼容 str / list 两种形态。
-- 2026-09-13：TUI 新增简洁模式（`[tui] lean = true`，config.TuiConfig.lean）——只有 user/assistant 套盒子，工具调用/结果压成单行：`icon 工具名 摘要`、结果行尾 ✅/❌（shell 非 0 退出码、`[工具错误]` 等前缀判失败）、⏹（/stop 终止），只有失败/终止才在下方 2 空格缩进输出正文（首行 `→ `，超 12+7 行取首尾标注省略）。摘要取参：read/write/edit → path，shell → command，其余退回参数 JSON（LEAN_SUMMARY_KEYS）。摘要来源：历史回放用 tool_call_id 把 tool 消息配回它的 tool_calls 参数；实时则给 tool_result 事件新增 `arguments` 字段（loop._run_tool_call / _cancel_tools）。`!cmd` 也走简洁渲染（调用行 + 输出总显示，额度 50+20 行，因输出是用户主动要看的）。/status /help 等 `_notify`（system/error role）仍用盒子（未纳入简洁模式）。
-- 2026-09-13（再修订）：lean 工具行**恒占一 display 行**——用自定义 Rich renderable `_LeanLine`（不用 Text）而不是 no_wrap+ellipsis：Text 只能整行截断，长 shell 命令会把行尾 ✅/❌ 一起截掉。`_LeanLine.__rich_measure__` 报告不截断宽度（RichLog 据此把渲染宽度定为 min(本行, 可用宽度)），`__rich_console__` 在渲染时先截摘要（set_cell_size + `…`）再拼标记，标记优先保留；截断放在渲染时是因为 RichLog 尺寸未知时会推迟渲染，写入时刻拿不到可用宽度。工具结果/!cmd 现返回 (行, 正文块) 两个 renderable 分两次 write（行不换行、正文块正常换行）；`_LeanLine` 不在 `_copy_source` 支持范围 → 框选复制走显示行回退（所见即所得，含 `…`）。
-- 2026-09-13（再修订 2，重要坑）：lean 行尾 ✅/❌ 仍被切，真凶是 **RichLog 默认 `min_width=78`**：write 时 `render_width = max(min(measure, scrollable_content_region.width), min_width)`，而 `#log` 的可滚动内容区（屏宽 − 边框2 − padding2 − 滚动条1）只有 75 → 每行末尾被 `render_line` 的 `crop(0, region.width)` 裁掉 3 列：**盒子的右边框也一直看不见**（潜在老 bug）。修复：`SelectableRichLog(..., min_width=0)` → 渲染宽度 = min(内容宽, 内容区宽)。另：需要截断的 lean 行额外留 1 列右边距（`LEAN_RIGHT_MARGIN=1`）。
-- 2026-09-13（再修订 4）：失败的工具结果行**整行染红**（图标 / 工具名 / 摘要 / ❌ 同为 role_error），与下方错误正文同色，一眼看出哪次调用挂了；`_LeanLine` 的 `muted` 参数改名 `summary_color`（成功/调用行传 muted，失败行传 error）。
-- 2026-09-13（验证手段）：`run_test()` 里看不到真实裁剪（headless 驱动宽度与真实终端不同）；要看“用户实际看到了什么”用 `pty.fork()` + `TIOCSWINSZ` 设 80x24 + `pyte.Screen/Stream` 解析屏幕，并对比 `log.lines[i]`（写入时的 strip）与 `log.render_line(i)`（真正显示的）；依赖用 `uv run --with pyte` 临时装，不要 `uv add`（会改 pyproject/uv.lock）。
-- 2026-09-13（再修订 3）：摘要**先转写成单行**再进 `_LeanLine`（`_single_line`）——多行 shell 命令（heredoc / 换行串联的 `&&`）会让 `Text` 按 `\n` 分行，一行承诺失效。转写规则：`\r\n`/`\r`/`\n` → 字面 `\n` 两字符（与参数 JSON 写法一致），tab → 一个空格（Rich 会按制表位展开成变宽空格，让宽度计算与标记位置失准），其余 C0 控制字符丢弃；`_tool_summary` 仍返回原文，转写只在 `_LeanLine.__init__` 一处做（“恒为一行”的承诺由它自己负责，`!cmd` 路径也走同一处；执行用的命令仍是原文）。
-
-## 项目演进总结（优化改进一览）
-
-- 架构：单文件 → 分层包（tools / llm / loop / config / chat / context / cli），src 布局，可全局安装（uv tool install --editable）；@tool() 按签名自动生成 schema，LLM 协议可注入，扩展点明确。
-- CLI 与交互：pie（新对话）/ pie resume（恢复最近）/ pie [PROMPT]（一次性子 agent，不写 sessions）/ pie context info|verify|gc；-c/--config 指定配置文件；prompt_toolkit Unicode 安全输入 + 历史；任意目录运行；无 max_turns（长任务不设步数上限）。
-- 工具：read 全文不截断 + offset/limit 分页；edit edits 数组（oldText 唯一、防重叠、按原文非增量）；shell 全文返回不丢数据；spill 按工具区分（read 是工作集默认不落盘）。
-- 上下文压缩：轮次级 user+最终输出 / 当前轮 step 批次 / 会话级 指针+保护区域 verbatim（工具级落盘由 shell limit 与 read 分页承担）；保护区域由 keep_last_steps 唯一决定（最近 N 个 step 批次所在轮次），摘要全部规则式零模型调用；内容 hash 落盘、指针链、压缩级别只升不降、软阈值 80% / 目标水位 55% 迟滞；manifest 索引 + verify/gc；压缩统计（节省 token）。
-- 模型层：reasoning_effort 透传；reasoning_content 捕获/持久化/原样回传（thinking 模式 400 已修）；采集 provider usage（prompt/completion）+ UsageTracker 跨 resume 累计；API 异常打印请求诊断。
-- 可观测性：/usage 显示当前上下文占用（估算+百分比）、预算水位、各角色占比、压缩次数与落盘原文量、最近上报、累计用量；调试日志 [t{x}s{y}]（用户轮次 × 工具步骤）。
-- 决策备忘：子 agent = shell 调 pie 一次性模式（argv 只传短指令）；tool_call 参数膨胀留给自动压缩。
-- 待办：/usage 主行改用 provider 上报值（chars/4 对中文低估）；write 参数与 reasoning 纳入压缩统计口径。
-
-## 问题与解决（踩坑记录）
+## 踩坑记录
 
 ### 注解与类型
 
-- `from __future__ import annotations` 会把注解变成字符串，@tool() 拿到的是 "str" 而非 str → 用 get_type_hints(fn) 解析真实类型。
-- `str | None` 的 get_origin 在 Python 3.13 返回 types.UnionType、3.14 返回 typing.Union（两者合一）→ 判断要写 `origin is Union or origin is types.UnionType`；全局 uv tool 环境的 Python 可能和项目 .venv 不同（本项目：工具 3.13 / .venv 3.14），跨版本改动要两个环境都实测。
+- `from __future__ import annotations` 使注解变成字符串 → `@tool()` 用 `get_type_hints(fn)` 解析真实类型。
+- `str | None` 的 `get_origin` 在 Python 3.13 返回 `types.UnionType`、3.14 返回 `typing.Union`（两者合一）→ 判断要写 `origin is Union or origin is types.UnionType`；全局 uv 工具环境（3.13）与项目 .venv（3.14）可能不同，跨版本改动要两环境都实测。
 
 ### 输入与终端
 
-- input() 在部分终端（WSL/mintty）退格按字节删除，删中文会截断成非法 UTF-8 → 改用 prompt_toolkit 行编辑（非 TTY 回退 input()），附带获得 ~/.pie/history.txt 输入历史。
-- 命令行参数有长度上限（Linux 单参数 128KiB / macOS 256KiB / Windows 32KiB），长任务走 stdin 或文件指针，不要塞进 argv。
-- 2026-09-13：**CJK 断行要装两处**。显示层有两条独立排版链路：① Rich（`#log`/盒子/Markdown）走 `rich.text.divide_line`（`install_cjk_wrap()` 替换模块属性即可）；② `#input` 的 TextArea 不走 Rich，而是 `textual.document._wrapped_document` 调 `textual._wrap.compute_wrap_offsets`——只修前者时输入框仍按「无空格的整串算一个词」换行：中文长串只要比**行尾剩余空间**宽就整段挪到下一行，上一行留大片空白（实测 width=30 时 `把 #log ` 之后只剩 8 格就换行）。两者分词都是 `\S+\s*|\s+`，所以修法一样：把全角字（`cell_len==2`）拆成单字 token。patch 的是 from-import 后那个模块的全局名，不能改 `textual._wrap` 本体。含 `\t` 的行回退原实现（tab 展开宽度依赖列位置、调用方会预计算 `precomputed_tab_sections`）。
-
-### 打包与部署
-
-- uv_build 默认要求 src 布局（报 Expected a Python module at src/pie/__init__.py）→ 包移到 src/pie/。
-- uv 在沙箱里缓存目录只读导致 sync/run 失败 → 用 UV_CACHE_DIR 指向可写目录（环境问题，非代码）。
+- Textual TextArea 在 ansi 主题（App 用 ansi-dark）下选中高亮会多一条 `text-style: reverse`（来自 `&:ansi .text-area--selection`）：`#input .text-area--selection` 这类 ID 规则能覆盖 background/color，但**覆盖不了没声明的 text-style**（未声明 ≠ 清除）→ 选中呈反色，和 #log 鼠标框选（accent 底 + accent_text 字）看着正好相反。要统一必须显式写 `text-style: none`。
+- TUI 长流式文本别塞非滚动 Static（超出可视区的行被裁掉，视觉停更）→ 窗口化尾部或换 RichLog auto_scroll。
+- **工具输出进 RichLog 前必须清洗控制符/ANSI 转义**：Rich 排版把不可见转义字节计成宽度（`cell_len("\x1b[01;32mA\x1b[0m")` = 10 对可见 1）→ Panel 量出的内容宽比实际大，盒子的顶/底边框与内容行右边框不在一列（`ls --color` 必现）。清洗走 textkit.py 的 `strip_escapes()` / `rich_text()`（SGR 交 `Text.from_ansi` 解成样式，其余转义 + C0 剔除，`\r\n`→`\n`、孤立 `\r` 删）。顺序要紧：**先剔转义再剔控制符**，否则 OSC 的结束符 BEL(`\x07`) 先没，`\x1b]...` 的匹配会吞掉后面全部文本。
+- `input()` 在部分终端（WSL/mintty）退格按字节删中文会截断 → 改用 prompt_toolkit 行编辑。
+- **框选复制要按「源文本」切，不能按显示行拼**：`RichLog.lines` 是软换行后的显示行，且 Rich 在盒内换行点会直接吃掉那个空格（`'aaaaaa bbbb cccc' + 'dddd…'`）→ 按显示行拼接既多出换行又丢空格。`tui.py` 的 `SelectableRichLog` 每次 write 记 `_CopyEntry(row, count, src, spans)`，复制时按字符区间切 src（同一 src 的相邻显示行合并 → 空格/换行都回来），无映射才回退。src 取法：Panel→盒内正文、Text→`.plain`（先 `expand_tabs()`，与显示一致，含 tab 的输出才对得上）、Markdown→宽渲染(4096)纯文本（`.markup` 与显示行对不上）。对齐失败即回退，不猜。两个必须容忍的显示装饰（实测踩坑）：Rich 给 Markdown **列表续行加悬挂缩进**（源文本里没有），给**引用每行重复加 `▌ `**（源文本只首个有）——故行首空白一律不计内容（只计入 x0），整行匹配失败时再试去掉行首 `▌` 并把忽略字符数记进 span `(start, end, off)`。否则一个列表项就能让整条消息回退。分隔线 `---` 会被渲染成随宽度铺满的规则线 → 无宽度无关源文本 → 回退（可接受）。
+- 显示层换行：已改成 **CJK 友好断行**——`textkit.py` 的 `install_cjk_wrap()`（tui.py 导入时调用）把 `rich.text.divide_line` 换成 `cjk_divide_line`（全角字 `cell_len == 2` 各自成一个 token，非全角串仍按词，其余逻辑同 Rich；纯 ASCII 交回原实现逐字节不变）。否则 Rich 只按空白断行：中文长句没空格 → 整段挪到下一行、上一行留白（宽 74 实测只用 42 格）。零宽断点（U+200B）无效：Python `\s` 不匹它、Rich 分词认不出。
+- 命令行参数有长度上限，长任务走 stdin 或文件指针，不要塞进 argv。
 
 ### 会话与文件
 
-- 会话文件名秒级时间戳同秒碰撞会互相覆盖、resume 错乱 → 文件名加微秒 %f。
-- /save 自定义路径时 manifest 按文件名 stem 查找可能错位（已知边缘问题，待修）。
+- 会话文件名秒级时间戳同秒碰撞会互相覆盖 → 文件名加微秒 `%f`。
+- `/save` 自定义路径时 manifest 按文件名 stem 查找可能错位（已知边缘问题，待修）。
+
+### 子进程与取消（/stop）
+
+- **agent shell 工具必须 `create_subprocess_shell(..., start_new_session=True)` + killpg 杀进程组**：只 `proc.kill()` 杀 `/bin/sh` 时子孙进程（真正干活的）变孤儿并持有 stdout 管道写端，Python 3.12+ asyncio 的 `wait()` 要等 stdio 管道 EOF 才返回 → 取消/超时被卡到子孙自然退出（实测 sleep 300 卡 299s）。终止统一走 `_terminate_proc_group`（killpg SIGKILL 整个进程组，pipe 立即 EOF）；kill 后 `wait()` 限时 3s，防 D-state（不可中断内核态）进程拖死取消/超时路径。TUI !shell 的 `_exec_shell_async` 同款（start_new_session + killpg + wait 限时）。
+- **loop._wait_cancellable 取消后不无限等清理**：`await asyncio.wait({task}, timeout=CANCEL_GRACE=3.0)`，超时则清理后台继续、先终止回合；别用 `asyncio.gather(task, ..., return_exceptions=True)` 无限等 task 结束。
 
 ### 上下文压缩
 
-- 2026-09-03：工具级压缩误报修复——`_finalize_tool_message` 先前对所有工具结果调用 `extract_spill_path` 全局搜 `[...全文已保存: ...]`；而 `read` 读取源码时输出常含该格式字面量（如 `[工具输出全文已保存: {path}]`、`{spill}`、`{write_raw(content, 'tool')}`），被 `_SPILL_RE` 误匹配 → 伪造 raw_path/raw_hash、compress_level=1 并写假 level=1 manifest，导致离软阈值很远时也报“工具压缩”。修复：① 仅 `call.name=='shell'` 时提取（该机制本就为 shell 落盘设计，read/edit/write 落盘指针在 content 里自描述、`message_raw_path` 可恢复）；② `extract_spill_path` 加路径存在校验（真 spill 指针必指向刚落盘的文件）。
-- keep_last_steps=0（旧键 keep_last_turns/keep_last_k_turns 已移除）：user_idx[m] 越界 IndexError（compress_session 必崩、maybe_compact 触发时崩），轮次级还会把进行中的当前轮压掉 → 统一 clamp max(1, keep)，0 等价 1（当前轮必须保留）。
-- 会话级压缩在轮次进行中 pair 提取“最终输出”，产生 user→纯文本 assistant→assistant(tool_calls)→tool 非法序列，被 DeepSeek 400 拒绝（reasoning_content 缺失/空串都不是根因）→ 进行中轮次不 pair 提取、pair 仅当轮次以 assistant 结尾时提取、Session.load 自动修复。
-- shell 工具内部 clip_output 截断后丢弃全文（信息丢失）→ 工具返回全文，落盘统一在 harness 边界做（eager spill）。
-- 压缩只统计 content，reasoning_content 和 tool_call 参数不计入，超大 thinking 消息可能漏过统计（与用量低估相关，见待办）。
+- `keep` 类参数要 clamp `max(1, keep)`（0 等价 1，当前轮必须保留），否则 `user_idx[m]` 越界崩。
+- 轮次进行中不做 pair 提取、pair 仅当轮次以 assistant 结尾时提取，否则产生 user→纯文本 assistant→tool_calls→tool 非法序列被 DeepSeek 400。
+- 工具返回全文，落盘统一在 harness 边界做（eager spill），工具内部不截断（截断会丢信息）。—— 例外：read/shell 支持配置容量上限（_max_lines/_max_bytes），截断时用 `write_raw` 落盘全文并返回独立指针标记，信息不丢。指针格式必须是独立的 `[工具输出全文已保存: path]`（`[` 紧挨可选前缀 + `全文已保存:`），不能嵌在其它文字里，否则 `extract_spill_path`（`_SPILL_RE`）匹配不到。
 
 ### API / 模型（DeepSeek thinking）
 
-- thinking 模式要求 assistant tool_calls 消息回传时必须带 reasoning_content，缺失报 400 → LLMResult/Message 捕获并持久化，to_api 对 tool_calls 消息恒带该字段（空串兜底）。
-- 空串 reasoning_content 曾被 truthy 判断省略 → 改为 is not None / 恒带字段；None（原始响应没有该字段）才省略。
-- API 异常时打印请求诊断（消息数 / tool_calls 消息数 / 缺 reasoning 数），便于下次直接定位。
-- **max_tokens（2026-09-13 查官方文档核实）**：`Config.max_tokens` 默认 **256000**（用户指定；上限 384K/393216），None = 不发送该参数，由服务端默认——DeepSeek：非思考 8K / 思考模式 64K / `reasoning_effort=max` 时 128K。只有 `--max-tokens auto` 能临时回到“不发送”。**不做 /maxtokens 会话命令**（用户明确不要）。注意 **max_tokens 含思考 token**，给小了会只输出思考、正文为空。验收手段：不传时用 `max_tokens=10**9` 探边界，服务端 400 会回「valid range of max_tokens is [1, 393216]」。
-- `-t/--thinking` 的合法取值曾与配置层不一致：CLI 的 `THINKING_LEVELS` 有 `off`，但 `reasoning_effort` 在 API 侧只认 `none/low/high/max`（`minimal`→low、`medium/xhigh`→high 是服务端兼容），直接发 `off` 会被 400 拒（unknown variant）→ `_run` 里把 `off` 归一成 `REASONING_NONE`。
+- **Vision / Files API 实测（2026-09）**：上传 `POST /files`（purpose=user_data）后，用 `{"type":"file","file_id":…}` 引用，`deepseek-flash` 确实看得到图；**prompt_tokens 与内联 base64 完全一致**（计费按尺寸，单图 ≤1024，与编码无关）——换 Files API 省的是**请求体/重复传输/上限**，不是钱（3 MB 图：内联 body 4 MiB ↔ file_id 187 B）。
+- **`expires_after` 要进 `extra_body`**（openai SDK 不认这个 DeepSeek 扩展字段），带上后响应才有 `expires_at`；**服务端不做内容去重**（同图传两次 = 两个 file_id），所以“不重传”完全靠本地记录。
+- **失效 file_id 的报错可识别**：`400 … the following file_ids do not exist or are not created under your account`（`files.is_stale_file_error` 认它）→ 触发“把历史里的 file 块降级成内联 + 重试一次”。
+- **上下文窗口与输出预留是两笔账**：服务端按「输入 tokens + `max_tokens` ≤ 窗口」**预检**，超了直接 400（`BadRequestError`）且 `loop` 不兜底 → 整个回合被打断。所以压缩软阈值必须相对 `context_window - reserved_tokens` 算（2026-09 已改），按整个窗口 × 比例会在输入还没到水位时就把请求发超限（实例：793,513 输入 + 256,000 预留 = 1,049,513 > 1,048,576）。
+- **窗口大小服务端只在超限报错里告诉你**：`GET /models` 只返回 id（无 context_length）；本部署 deepseek-flash 实测窗口 1,048,576、`max_tokens` 合法区间 `[1, 393216]`。
+
+- OpenAILLM 懒创建连接池：首次真实请求在事件循环内同步建连（WSL2 实测 ~6s）阻塞 UI → `on_mount` 后台 prewarm 极小请求。
+- thinking 模式要求 assistant tool_calls 消息回传时必须带 `reasoning_content`（`is not None` 判断、空串兜底），缺失报 400。
 
 ### 配置清理
 
-- save_history 是死配置（chat 无条件保存、one-shot 强制关闭）、resolve_config 的 OPENAI_* env 覆盖是 CLI 参数时代遗留、OpenAILLM 构造器还有 env 回退 → 全部移除，配置只从 ~/.pie/config.toml 读取（保留 PIE_DIR / PIE_CONFIG_FILE 路径重定向）。
+- `save_history`、`resolve_config` 的 OPENAI_* env 覆盖、OpenAILLM 构造器 env 回退均为死配置/遗留，已移除；配置只从 `~/.pie/config.toml` 读取。
 
 ### 用量统计
 
-- resume 后 /usage 累计显示 0（UsageTracker 不持久化）→ 会话 JSONL 首行 __meta__ 保存用量，load 时恢复。
+- resume 后 `/stat` 累计显示 0（UsageTracker 不持久化）→ 会话 JSONL 首行 `__meta__` 保存用量，load 时恢复。
 
-### 已知问题 / 待办
+## 已知问题 / 待办
 
-- 当前上下文估算用 chars/4 对中文严重低估（实例：估算 1,792 vs provider 上报 30,609）→ /usage 应优先展示 provider 上报值（last_prompt_tokens 已采集，主行待改）。
-- write(content=全文) 参数 + thinking reasoning 体积大是上下文主要消耗源，且不在 spill 统计口径内；决策：留给自动压缩处理。
+- 仓库级回归测试在 `tests/test_tui.py`（`uv run python tests/test_tui.py`，无需 pytest）：覆盖框选复制保真、CJK 断行、工具/命令渲染冒烟；改 TUI / 复制 / 断行后必跑。
+- `PieApp._command` 仍是 86 行 if/elif（12 个分支）——可拆 `_cmd_*` 分组方法（可选，收益以可读性为主）；两个流式面板（#stream / #assistant-stream）各维护一份 tail 窗口状态机，可合并（风险中等）。
+
+- 上下文估算用 chars/4 对中文严重低估（实例：估算 1,792 vs provider 上报 30,609）→ `/stat` 主行应优先展示 provider 上报值（`last_prompt_tokens` 已采集，主行待改）。
+- `write(content=全文)` 参数 + thinking reasoning 体积大是上下文主要消耗源，且不在 spill 统计口径内；决策：留给自动压缩处理。
+- `resume` 只能恢复最近一次会话，不支持选择历史会话。
+- 上下文窗口 `context_window` 仍是手填，没与真实窗口校验/自动探测：400 里的 `maximum context length is N` 是最省的探测源，可做「报错 → 写回配置 → 强制压缩 → 重试」自愈（图片那条 file_id 自愈已做）。
+- `maybe_compact(..., windows=)` 与 `compact(session=..., windows=)` 这条链路**没有调用方传值**（`loop.py` 只传到 `manifest`）→ 自动触发的会话级压缩会把窗口块写进 `context/` 但**不登记到 `session.windows`**（只有 `/clear` 会登记）；影响 resume 后的窗口摘要重建。
+

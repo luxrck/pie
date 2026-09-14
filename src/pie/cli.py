@@ -5,6 +5,7 @@
   pie -r | pie resume             恢复当前目录下最近的会话
   pie --session <id> [PROMPT]     恢复指定会话
   pie sessions                    列出历史会话
+  pie files                       图片上传件维护（list/gc）
   pie setup                       交互式配置模型与网络参数
   pie context                     上下文压缩维护（info/verify/gc）
 """
@@ -33,9 +34,10 @@ from .config import (
     _prompt,
     build_system_prompt,
     ensure_config,
-    parse_max_tokens,
+    parse_reserved_tokens,
 )
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
+from .files import FILES_DIR, collect_file_garbage, iter_session_files
 from .input import read_input
 from .tools import default_tools, parse_image_marker, tools_from_spec
 
@@ -66,7 +68,7 @@ CHAT_HELP = """\
 命令：
   /exit, /quit   退出
   /reset         清空对话历史（保留 system prompt 与记忆）
-  /clear         当前窗口写入 fs 归档，开新窗口
+  /clear         当前窗口写入 windows 归档，开新窗口
   /compact       手动压缩：/compact tools（工具级）、/compact turns（轮次级）、/compact（两者）
   /save [文件]   保存会话（不带参数则保存到当前会话文件）
   /thinking      查看思考深度（/thinking <none|low|high|max> 切换）
@@ -172,10 +174,12 @@ def _parser() -> argparse.ArgumentParser:
         help="本次思考强度（off/minimal/low/medium/high/xhigh/max，覆盖配置，不持久化）",
     )
     parser.add_argument(
-        "--max-tokens",
+        "--reserved-tokens",
+        "--max-tokens",  # 旧名保留为别名（它就是 API 的 max_tokens）
+        dest="reserved_tokens",
         metavar="N",
-        help="本次单次生成上限（例：131072 / 128k / auto；覆盖配置，不持久化。"
-        "默认 256000，auto = 不发送该参数、用服务端默认：DeepSeek 思考模式 64K、上限 384K）",
+        help="每次请求为输出预留的 token（即 API 的 max_tokens；例：131072 / 128k / auto；"
+        "覆盖配置，不持久化。默认 256000，auto = 不发送该参数、用服务端默认：DeepSeek 思考模式 64K、上限 384K）",
     )
     parser.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
     parser.add_argument("-r", "--resume", action="store_true", help="恢复当前目录下最近的会话")
@@ -232,8 +236,8 @@ def _run(args: argparse.Namespace) -> int:
         cfg.reasoning_effort = (
             REASONING_NONE if args.thinking == "off" else args.thinking
         )
-    if args.max_tokens is not None:
-        cfg.max_tokens = parse_max_tokens(args.max_tokens)
+    if args.reserved_tokens is not None:
+        cfg.reserved_tokens = parse_reserved_tokens(args.reserved_tokens)
     if args.timeout_seconds is not None:
         cfg.timeout_seconds = args.timeout_seconds
     if args.max_retries is not None:
@@ -302,7 +306,7 @@ def _print_main(session: Session, args: argparse.Namespace, save: bool) -> int:
             json.dumps(
                 {
                     "answer": answer,
-                    "session": str(session.file),
+                    "session": str(session.path),
                     "turns": session.turn_count,
                     "usage": asdict(session.usage),
                 },
@@ -332,7 +336,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
             )
 
     print(
-        f"pie：{'恢复会话 ' + str(session.file) if resumed else '新对话'}"
+        f"pie：{'恢复会话 ' + str(session.path) if resumed else '新对话'}"
         "（/help 查看命令，/exit 退出，Ctrl-D 也可）",
         file=sys.stderr,
     )
@@ -371,7 +375,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
                     print("已清空历史（保留 system prompt 与记忆）")
                 elif cmd == "/clear":
                     session.clear_window()
-                    print(f"已切换新窗口（历史归档 {len(session.fs)} 个，fs 文件在 ~/.pie/windows/）")
+                    print(f"已切换新窗口（归档 {len(session.windows)} 个历史窗口块，文件在 ~/.pie/windows/）")
                 elif cmd == "/compact":
                     mode = arg.strip() or "auto"
                     if mode not in ("auto", "tools", "turns"):
@@ -388,10 +392,10 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
                         _safe_save(session)
                 elif cmd == "/save":
                     if arg.strip():
-                        session.file = Path(arg.strip())
+                        session.path = Path(arg.strip())
                     _safe_save(session)
-                    if session.file is not None:
-                        print(f"会话已保存: {session.file}")
+                    if session.path is not None:
+                        print(f"会话已保存: {session.path}")
                 elif cmd == "/status":
                     print(session.usage_report())
                 elif cmd == "/thinking":
@@ -439,7 +443,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
             print(answer)
             _safe_save(session)
             if cfg.verbose:
-                print(f"[saved] {session.file}", file=sys.stderr)
+                print(f"[saved] {session.path}", file=sys.stderr)
     finally:
         if len(session.messages) > 1:
             _safe_save(session)
@@ -572,17 +576,68 @@ def context_main(argv: list[str]) -> int:
     return 0
 
 
+def files_main(argv: list[str]) -> int:
+    """图片上传件维护：list（各会话记的图片）/ gc（清未被任何会话引用的本地副本）。
+
+    上传结果按会话存在 `__meta__.files`（不做全局缓存），所以这里只是把会话里的记录
+    读出来看看；本地副本 `~/.pie/files/` 是跨会话共享的，回收靠一次无状态扫描。
+    服务端那份不在本命令职责内：它由上传时的 `expires_after`（默认 30 天）自行过期。
+    """
+    parser = argparse.ArgumentParser(prog="pie files", description="图片上传件维护工具")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("list", help="列出各会话记录的图片（本地副本 + file_id + 过期时间）")
+    gc = sub.add_parser("gc", help="列出 / 删除未被任何会话引用的本地副本")
+    gc.add_argument("--delete", action="store_true", help="真正删除未引用副本")
+    args = parser.parse_args(argv)
+
+    if args.action == "list":
+        rows = list(iter_session_files())
+        if not rows:
+            print(f"暂无图片记录（会话 __meta__.files 为空；副本目录 {FILES_DIR}）")
+            return 0
+        for session_file, image_hash, entry in rows:
+            expires_at = entry.get("expires_at")
+            expires_txt = (
+                datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+                if expires_at
+                else "永久"
+            )
+            print(
+                f"{image_hash}  {int(entry.get('size') or 0):>10,} B  {entry.get('mime') or '?'}  "
+                f"{Path(str(entry.get('local') or '')).name}"
+            )
+            print(
+                f"    file_id={entry.get('file_id')}  过期={expires_txt}  "
+                f"源={entry.get('src')}"
+            )
+            print(f"    会话={session_file.stem}")
+        return 0
+
+    garbage = collect_file_garbage()
+    print(f"未被引用的本地副本 {len(garbage)} 个:")
+    for path in garbage:
+        print(" ", path)
+    if args.delete:
+        for path in garbage:
+            path.unlink(missing_ok=True)
+        print(f"已删除 {len(garbage)} 个文件")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "resume":
         argv = ["-r", *argv[1:]]
     elif argv and argv[0] == "sessions":
         return sessions_main(argv[1:])
+    elif argv and argv[0] == "files":
+        return files_main(argv[1:])
     elif argv and argv[0] == "setup":
         return setup_main(argv[1:])
     elif argv and argv[0] == "context":
         return context_main(argv[1:])
     return _run(_parser().parse_args(argv))
+
 
 
 
