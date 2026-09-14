@@ -200,3 +200,4 @@ def rich_text(text: str, style: str = "") -> Text:
         return Text.from_ansi(text, style=style)
     return Text(text, style=style)
 
+

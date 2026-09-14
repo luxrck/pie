@@ -1,9 +1,10 @@
 [project]
 name = "pie"
-version = "0.0.4"
+version = "0.1.0"
 description = "极简 agent harness：内置 read / edit / write / shell 四个工具，YOLO 模式"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=2.4.6",
     "openai>=1.40",
     "prompt_toolkit>=3.0",
     "rich>=13.0",
