@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import aio
 from .config import (
     PIE_DIR,
     REASONING_NONE,
@@ -270,9 +271,9 @@ class Session:
         user_input: str,
         on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
-        """同步入口（内部 asyncio.run；须在无事件循环的线程调用，如 CLI readline/print）。
+        """同步入口（内部 aio.run；须在无事件循环的线程调用，如 CLI readline/print）。
         TUI / 其他 async 环境请用 aturn()。"""
-        return asyncio.run(self.aturn(user_input, on_event=on_event))
+        return aio.run(self.aturn(user_input, on_event=on_event))
 
     async def aturn(
         self,

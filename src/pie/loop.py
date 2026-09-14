@@ -1,7 +1,7 @@
 """循环层：把任务、模型、工具编排成“想 → 做 → 看 → 总结”的 agent 循环（包名 pie）。
 
 异步主路径：acomplete_turn() 是唯一实现；run_agent() 是同步薄包装
-（内部 asyncio.run，须在无事件循环的线程调用）。流式模型输出
+（内部 aio.run，须在无事件循环的线程调用）。流式模型输出
 （reasoning/content 增量）与工具实时输出（shell 逐行）通过 on_event 推送，
 供 TUI 边生成边显示。
 """
@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from . import aio
 from .config import Config, build_system_prompt, resolve_config
 from .context import (
     AgentMessage,
@@ -486,7 +487,7 @@ def run_agent(
         [SystemMessage(build_system_prompt(cfg)), UserMessage(task)],
         keep_last_steps=cfg.keep_last_steps,
     )
-    return asyncio.run(
+    return aio.run(
         acomplete_turn(messages, cfg, registry, backend, user_turn=1, image_files={})
     )
 
