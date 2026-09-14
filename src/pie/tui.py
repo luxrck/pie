@@ -38,6 +38,7 @@ from textual.strip import Strip
 from textual.widgets import Button, RichLog, Static, TextArea
 from textual.worker import Worker
 
+from . import aio
 from .config import REASONING_LEVELS
 from .context import content_text
 from .loop import CANCEL_TEXT
@@ -1612,5 +1613,8 @@ class PieApp(App):
 
 
 def run_tui(session: Session, initial_prompt: str | None = None) -> None:
-    PieApp(session, initial_prompt).run()
+    """跑 TUI。循环由 pie 自建（`aio.event_loop`）而不是 textual 自取全局/新循环，
+    这样退出时能先把残留的异步生成器关干净（否则见 aio.py 的说明）。"""
+    with aio.event_loop() as loop:
+        PieApp(session, initial_prompt).run(loop=loop)
 

@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import json
 import os
@@ -24,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import aio
 from .session import Session
 from .config import (
     CONFIG_FILE,
@@ -343,7 +343,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
     # readline 回退模式（非 TTY / TUI 启动失败）：启动时同步拉取可用模型列表
     # （/model 查看与切换用）；TTY 走 TUI 时由 PieApp.on_mount 后台拉取，不在此阻塞。
     try:
-        asyncio.run(session.fetch_models(timeout=8))
+        aio.run(session.fetch_models(timeout=8))
     except Exception as e:
         print(f"[warn] 获取可用模型列表失败: {e}（/model <id> 仍可直接切换）", file=sys.stderr)
     if initial_prompt:
@@ -423,7 +423,7 @@ def _interactive_main(session: Session, initial_prompt: str | None, resumed: boo
                             print("（可用模型列表未获取到：/model <id> 直接切换，或 /model refresh 重新拉取）")
                     elif name == "refresh":
                         try:
-                            models = asyncio.run(session.fetch_models(timeout=8))
+                            models = aio.run(session.fetch_models(timeout=8))
                             print(f"已获取可用模型 {len(models)} 个（/model 查看）")
                         except Exception as e:
                             print(f"获取失败: {e}")

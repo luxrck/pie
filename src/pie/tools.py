@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Union, get_args, get_origin, get_type_hints
 
+from . import aio
 from .context import write_raw
 
 
@@ -176,14 +177,14 @@ class ToolRegistry:
         args: dict[str, Any],
         tool_defaults: dict[str, dict[str, Any]] | None = None,
     ) -> str:
-        """同步分发（须在无事件循环的线程调用）：async 工具用 asyncio.run 包装。"""
+        """同步分发（须在无事件循环的线程调用）：async 工具用 aio.run 包装。"""
         t = self._tools.get(name)
         if t is None:
             raise ToolError(f"未知工具: {name}（可用: {', '.join(self._tools)}）")
         handler = t.handler
         args = _inject_tool_defaults(name, args, handler, tool_defaults)
         if inspect.iscoroutinefunction(handler):
-            return asyncio.run(handler(**args))
+            return aio.run(handler(**args))
         return handler(**args)
 
     async def adispatch(
