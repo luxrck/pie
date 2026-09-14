@@ -3,16 +3,21 @@
 只做「展示数据」：theme.py 不依赖 Textual / Rich，纯粹是颜色常量 + 图标常量 + 注册表。
 界面结构与样式生成（build_css / _box）保留在 tui.py，便于与控件布局绑定。
 
-当前内置 catppuccin-mocha（还原历史配色的默认主题）；
-后续扩展新主题只需在 THEMES 里加一项 Theme。
+主题分两层：
+- **主题族**（THEME_FAMILIES，如 `catppuccin`）：一个族 = 深色 + 浅色两个变体，取主题时按
+  终端背景明暗（termbg.detect_dark_background）自动选一个——这就是「一套主题同时适应
+  深色/浅色终端」；
+- **具体变体**（THEMES，如 `catppuccin-mocha` / `catppuccin-latte`）：固定明暗，不探测。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# 默认主题名（config.theme 缺省值）
-DEFAULT_THEME_NAME = "catppuccin-mocha"
+from .termbg import detect_dark_background
+
+# 默认主题名（config.theme 缺省值）：主题族 → 按终端明暗自适应
+DEFAULT_THEME_NAME = "catppuccin"
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,15 @@ class Theme:
     screen_bg: str       # 窗口背景（transparent = 露出终端底色）
     log_bg: str          # 消息流背景
     body_text: str       # 正文文本色
+    # 代码（Markdown 行内代码 / 代码块）的样式覆盖：**完整的 Rich 样式串**
+    # （如 "#4c4f69 on #e6e9ef" 或 "bold cyan"）；空串 = 不覆盖（沿用 Rich
+    # 默认的 `cyan on black`）。只给浅色变体用——Rich 默认给代码配了硬编码黑底，
+    # 在浅色终端里像一块墨；深色变体用默认就正好。
+    markdown_code: str
+    # 代码块（围栏）的语法高亮主题（pygments 主题名），经 `Markdown(code_theme=...)` 传入。
+    # 高亮 token 自带背景色、会盖过 `markdown.code_block`，所以浅色变体必须配浅色主题
+    # （现为 solarized-light）——否则仍是一块 monokai 的 `#272822`。
+    code_theme: str
 
     # 边框
     border: str          # 输入框 / 补全面板 / 发送按钮 默认边框
@@ -76,6 +90,17 @@ class Theme:
     busy_border: str
     busy_border_hover: str
     busy_text: str
+
+    def markdown_styles(self) -> dict[str, str]:
+        """最小 Markdown 覆盖：只改带硬编码黑底的代码（`markdown_code` 为空则不覆盖）。
+
+        其余 markdown.* 元素（标题/引用/表格/链接）保持 Rich 默认的 ANSI 具名色，由浅色终端
+        自行映射；不接管它们就不会与终端脱节。注意：**带语言标注的代码块（fence）底色由
+        `Markdown(code_theme=...)` 的高亮主题 token 自带，本覆盖治不到它**。
+        """
+        if not self.markdown_code:
+            return {}
+        return {"markdown.code": self.markdown_code, "markdown.code_block": self.markdown_code}
 
     def role_border(self, role: str) -> str:
         """按 role 取边框色：未知 role 回退 system 灰。
@@ -138,12 +163,29 @@ class Theme:
         }.get(status, self.icon_ok)
 
 
-# catppuccin mocha 变体：recover 历史配色（背景透明 + 各 role 区分色）
+# 图标（字形不随明暗变化，各变体共用）
+_SHARED_ICONS: dict[str, object] = dict(
+    icon_user="▎",              # 你
+    icon_assistant="▎",         # pie 回复
+    icon_tool_call="✽",         # 工具调用
+    icon_ok="✓",               # 成功的工具结果；简洁模式的成功标记
+    icon_error="✗",            # 出错框（含失败的工具结果）；简洁模式的失败标记
+    icon_cancelled="■",         # 被 /stop 终止（role cancelled）；简洁模式同一字形
+    icon_system="",             # 命令反馈/系统提示（无图标）
+    # 按工具名覆盖图标：tool_icons = 调用框（一眼看出调的是哪个工具）；
+    # tool_result_icons = 结果框对状态字形（✅/❌/⏹）的可选覆盖，默认留空。
+    tool_icons={"read": "✧", "edit": "✽", "write": "✦", "shell": "✛"},
+    tool_result_icons={},
+)
+
+# catppuccin mocha（深色变体）：recover 历史配色（背景透明 + 各 role 区分色）
 CATPPUCCIN_MOCHA = Theme(
     name="catppuccin-mocha",
     screen_bg="transparent",
     log_bg="transparent",
     body_text="#cdd6f4",            # text
+    markdown_code="",                # 深色变体不覆盖（Rich 默认的黑底在这里正好）
+    code_theme="monokai",           # 代码块高亮：Rich 默认就是它（#272822 底）
     border="#45475a",               # surface0
     border_dim="#313244",           # surface1（日志边框比输入框更暗）
     accent="#89b4fa",               # blue
@@ -158,44 +200,92 @@ CATPPUCCIN_MOCHA = Theme(
     role_tool_result="#805b45",     # 工具结果（棕）
     role_error="#f38ba8",           # 出错（红）
     role_system="#585b70",          # 命令反馈/系统提示（低调灰）
-    icon_user="▎",              # 你
-    icon_assistant="▎",         # pie 回复
-    icon_tool_call="✽",         # 工具调用
-    icon_ok="✓",               # 成功的工具结果；简洁模式的成功标记
-    icon_error="✗",            # 出错框（含失败的工具结果）；简洁模式的失败标记
-    icon_cancelled="■",         # 被 /stop 终止（role cancelled）；简洁模式同一字形
-    icon_system="",             # 命令反馈/系统提示（无图标）
-    # 按工具名覆盖图标：tool_icons = 调用框（一眼看出调的是哪个工具）；
-    # tool_result_icons = 结果框对状态字形（✅/❌/⏹）的可选覆盖，默认留空。⟱
-    tool_icons={"read": "✧", "edit": "✽", "write": "✦", "shell": "✛"},
-    tool_result_icons={},
+    **_SHARED_ICONS,
     busy_border="#f38ba8",          # busy 边框（亮红）
     busy_border_hover="#ffb4c8",    # busy hover 边框（更亮）
     busy_text="#f38ba8",            # busy 文字
 )
 
 
+# catppuccin latte（浅色变体）：同一套语义字段，换成浅色背景下的可读配色
+CATPPUCCIN_LATTE = Theme(
+    name="catppuccin-latte",
+    screen_bg="transparent",
+    log_bg="transparent",
+    body_text="#4c4f69",            # text
+    markdown_code="bold cyan",       # 浅色变体：去掉黑底、只留青色粗体字
+    code_theme="solarized-light",   # 代码块高亮：暖白底 #fdf6e3（换掉 monokai 的黑块）
+    border="#9ca0b0",               # overlay0（浅色下边框要够看得见）
+    border_dim="#ccd0da",           # surface0（日志边框比输入框更淡）
+    accent="#1e66f5",               # blue
+    accent_text="#ffffff",          # 选中文字（蓝底白字）
+    muted="#7c7f93",                # overlay2（状态栏/stream/滚动条滑块）
+    faint="#9ca0b0",                # overlay0（占位符/系统框）
+    scrollbar_track="rgba(124, 127, 147, 0.35)",
+    scrollbar_track_hover="rgba(124, 127, 147, 0.5)",
+    role_user="#1e66f5",            # 你（蓝）
+    role_assistant="#0f766e",       # pie 回复（深青，白底可读）
+    role_tool_call="#9c4916",       # 工具调用（橙棕）
+    role_tool_result="#805b45",     # 工具结果（棕）
+    role_error="#d20f39",           # 出错（红）
+    role_system="#8c8fa1",          # 命令反馈/系统提示（低调灰）
+    **_SHARED_ICONS,
+    busy_border="#d20f39",          # busy 边框（红）
+    busy_border_hover="#e64553",    # busy hover 边框（更亮）
+    busy_text="#d20f39",            # busy 文字
+)
+
+
+# 主题族：一个族 = (深色变体, 浅色变体)，取用时按终端背景明暗自动选
+THEME_FAMILIES: dict[str, tuple[Theme, Theme]] = {
+    "catppuccin": (CATPPUCCIN_MOCHA, CATPPUCCIN_LATTE),
+}
+
 THEMES: dict[str, Theme] = {
     CATPPUCCIN_MOCHA.name: CATPPUCCIN_MOCHA,
+    CATPPUCCIN_LATTE.name: CATPPUCCIN_LATTE,
 }
 
 
-def get_theme(name: str | None) -> Theme:
-    """按名字取主题；名字不存在或为空时回退默认主题（catppuccin-mocha）。
+def _match_family(key: str) -> tuple[Theme, Theme] | None:
+    if key in THEME_FAMILIES:
+        return THEME_FAMILIES[key]
+    lower = key.lower()
+    for name, family in THEME_FAMILIES.items():
+        if name.lower() == lower:
+            return family
+    return None
 
-    归一化：忽略首尾空白与大小写（连字符/下划线原样匹配），
-    匹配不到也回退默认，不让未知主题名打断界面启动。
-    """
-    if not name:
-        return CATPPUCCIN_MOCHA
-    key = str(name).strip()
+
+def _match_theme(key: str) -> Theme | None:
     if key in THEMES:
         return THEMES[key]
-    # 大小写不敏感兜底
     lower = key.lower()
-    for theme_name, theme in THEMES.items():
-        if theme_name.lower() == lower:
+    for name, theme in THEMES.items():
+        if name.lower() == lower:
             return theme
+    return None
+
+
+def get_theme(name: str | None = None, dark: bool | None = None) -> Theme:
+    """按名字取主题（支持「族名」与「具体变体名」两种），未知/为空时回退默认。
+
+    - **族名**（如 ``catppuccin``）：按 `dark` 选深/浅变体；`dark` 为 None 时探测终端背景
+      （termbg），探测不到按深色处理——这就是「一套主题适应深色/浅色终端」。
+    - **具体变体名**（如 ``catppuccin-mocha``）：固定返回，`dark` 不参与。
+
+    名字匹配忽略首尾空白与大小写；未知主题名不打断界面启动。
+    """
+    key = str(name).strip() if name else DEFAULT_THEME_NAME
+    family = _match_family(key)
+    if family is not None:
+        dark_variant, light_variant = family
+        if dark is None:
+            dark = detect_dark_background()
+        return light_variant if dark is False else dark_variant
+    theme = _match_theme(key)
+    if theme is not None:
+        return theme
     return CATPPUCCIN_MOCHA
 
 

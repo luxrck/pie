@@ -233,8 +233,11 @@ def test_copy_real_mouse_drag() -> None:
     asyncio.run(run())
 
 
-def _dummy_session(lean: bool = False):
-    """空会话（不连模型），供 PieApp 冒烟。lean=True 走简洁模式渲染。"""
+def _dummy_session(lean: bool = False, theme: str = "catppuccin-mocha"):
+    """空会话（不连模型），供 PieApp 冒烟。lean=True 走简洁模式渲染。
+
+    主题默认固定 mocha：测试不依赖终端背景探测的结果。
+    """
     from pie.config import Config, TuiConfig
     from pie.session import Session
     from pie.tools import default_tools
@@ -244,7 +247,9 @@ def _dummy_session(lean: bool = False):
             raise NotImplementedError
 
     return Session(
-        config=Config(tui=TuiConfig(lean=lean)), llm=_DummyLLM(), tools=default_tools()
+        config=Config(theme=theme, tui=TuiConfig(lean=lean)),
+        llm=_DummyLLM(),
+        tools=default_tools(),
     )
 
 
@@ -386,6 +391,58 @@ def test_command_smoke() -> None:
             assert "未知压缩模式" in _copy_whole_box(log)
             app._command("/thinking weird")
             assert "未知思考级别" in _copy_whole_box(log)
+
+    asyncio.run(run())
+
+
+def test_markdown_code_styles() -> None:
+    """Markdown 代码样式：深色变体走 Rich 原生（黑底青 + monokai 代码块），
+    浅色变体只改代码（去黑底）且代码块换浅色高亮主题。
+
+    背景：RichLog 用 App console 渲染，我们从没给 console 设 theme → 走 Rich 的
+    DEFAULT_STYLES（`markdown.code = bold cyan on black` + 代码块 monokai `#272822`），
+    浅色终端下像一块墨。
+    """
+    from pygments.styles import get_style_by_name
+    from rich.color import Color
+
+    fence_md = "```python\nprint(1)\n```\n"
+
+    def fence_bg(log):
+        segs = [seg for strip in log.lines for seg in strip if "print" in seg.text]
+        assert segs, [[seg.text for seg in strip] for strip in log.lines]
+        return segs[0].style.bgcolor
+
+    async def run() -> None:
+        # 深色变体：完全不动
+        mocha = PieApp(_dummy_session())
+        async with mocha.run_test(size=(78, 26)) as pilot:
+            await pilot.pause()
+            code = mocha.console.get_style("markdown.code")
+            assert code.bgcolor is not None and code.bgcolor.name == "black", code.bgcolor
+            assert "magenta" in str(mocha.console.get_style("markdown.h2"))
+            log = mocha.query_one("#log")
+            log.write(_box(mocha.palette, fence_md, role="assistant"))
+            await pilot.pause()
+            bg = fence_bg(log)
+            assert bg is not None and bg.triplet == Color.parse("#272822").triplet, bg
+        # 浅色变体：代码去黑底（值取自 palette.markdown_code），fence 换浅色主题
+        # （期望底色从 palette.code_theme 派生，不写死颜色：改主题不必改测试）
+        latte = PieApp(_dummy_session(theme="catppuccin-latte"))
+        async with latte.run_test(size=(78, 26)) as pilot:
+            await pilot.pause()
+            for key in ("markdown.code", "markdown.code_block"):
+                style = latte.console.get_style(key)
+                assert style.bgcolor is None, (key, style.bgcolor)
+            assert latte.palette.markdown_code in str(latte.console.get_style("markdown.code"))
+            # 未接管的元素仍是 Rich 默认
+            assert "magenta" in str(latte.console.get_style("markdown.h2"))
+            log = latte.query_one("#log")
+            log.write(_box(latte.palette, fence_md, role="assistant"))
+            await pilot.pause()
+            bg = fence_bg(log)
+            expected_bg = Color.parse(get_style_by_name(latte.palette.code_theme).background_color)
+            assert bg is not None and bg.triplet == expected_bg.triplet, bg
 
     asyncio.run(run())
 

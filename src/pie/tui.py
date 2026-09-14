@@ -28,6 +28,7 @@ from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from rich.markdown import Markdown
+from rich.theme import Theme as RichTheme
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -41,6 +42,7 @@ from .config import REASONING_LEVELS
 from .context import content_text
 from .loop import CANCEL_TEXT
 from .session import Session
+from .termbg import detect_dark_background
 from .textkit import install_cjk_wrap, rich_text, strip_escapes
 from .theme import Theme, build_css, get_theme
 
@@ -88,12 +90,13 @@ def _box(
     （palette.role_icon(role)）。icon="" 可强制去掉图标；tool 为空/未配置则走 role 默认。
     边框色始终按 role（palette.role_border）。
 
-    正文先做转义清洗：assistant 走 Markdown（样式由 Markdown 决定，SGR 一并剔除），
-    其余走 Text（SGR 解成样式）。否则转义字节会把盒子边框撑歪。
+    正文先做转义清洗：assistant 走 Markdown（样式由 Rich 默认主题 + 代码块高亮主题决定，
+    SGR 一并剔除），其余走 Text（SGR 解成样式）。否则转义字节会把盒子边框撑歪。
+    代码块（围栏）的高亮主题取自 palette（浅色变体换掉默认的 monokai，否则白底上一块黑）。
     """
     body = body or "(空回复)"
     content: Text | Markdown = (
-        Markdown(strip_escapes(body, keep_sgr=False))
+        Markdown(strip_escapes(body, keep_sgr=False), code_theme=palette.code_theme)
         if role == "assistant"
         else rich_text(body, palette.body_text)
     )
@@ -834,7 +837,9 @@ class PieApp(App):
         super().__init__()
         self.session = session
         self.initial_prompt = initial_prompt
-        self.palette = get_theme(session.config.theme)
+        # 终端背景明暗：主题族（如 catppuccin）据此选深/浅变体，Textual 主题也跟着选 ansi-dark/light
+        self.dark_bg = detect_dark_background()
+        self.palette = get_theme(session.config.theme, dark=self.dark_bg)
         # 简洁模式（Config.tui.lean）：只给 user / assistant 套盒子，工具调用/结果压成单行
         self.lean = bool(getattr(getattr(session.config, "tui", None), "lean", False))
         self.CSS = build_css(self.palette)
@@ -884,10 +889,15 @@ class PieApp(App):
         # yield Footer()
 
     def on_mount(self) -> None:
-        # 用 ansi-dark 主题：background=ansi_default + ansi=True（native ANSI），
+        # 浅色变体把 Markdown 代码的硬编码黑底换成浅色（最小覆盖；深色变体为空字典 → 不动）。
+        markdown_styles = self.palette.markdown_styles()
+        if markdown_styles:
+            self.console.push_theme(RichTheme(markdown_styles, inherit=True))
+        # 用 ansi-dark / ansi-light 主题：background=ansi_default + ansi=True（native ANSI），
         # 背景输出 `49`（终端默认背景）→ 透明，露出终端窗口背景色；
         # 默认主题 ansi=False 会经 ANSIToTruecolor 把 default 背景映射成主题色（不透明）。
-        self.theme = "ansi-dark"
+        # 浅色终端用 ansi-light（其 ansi-foreground/background 假定浅底），与 palette 保持一致。
+        self.theme = "ansi-light" if self.dark_bg is False else "ansi-dark"
         if self.session.windows:
             self._notify(f"已归档 {len(self.session.windows)} 个历史窗口块（~/.pie/windows/）")
         self._render_history()

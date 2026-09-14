@@ -222,7 +222,7 @@ class Config:
     max_retries: int = 2  # 请求重试次数
     max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
     verbose: bool = True
-    theme: str = DEFAULT_THEME_NAME  # TUI 主题名（见 theme.py 的 THEMES）
+    theme: str = DEFAULT_THEME_NAME  # TUI 主题：族名（如 catppuccin，按终端明暗自适应）或变体名（catppuccin-mocha / catppuccin-latte）
     # 按工具名设置默认私有参数（下划线开头，不进 schema）：如 read: {_max_lines, _max_bytes, _max_image_bytes}
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     tui: TuiConfig = field(default_factory=TuiConfig)  # TUI 渲染（[tui] lean = true → 简洁模式）
