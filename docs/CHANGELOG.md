@@ -4,6 +4,18 @@
 
 ## 2026-09-15
 
+- **`pie files list --all`：列出云端上传件**（用户要求，接上条）。`pie files list` 只看本地（各会话 `__meta__.files`），云端那份没有任何可见手段（`gc --all` 只能删）。现在 `list --all` 反向：调 Files API `GET /files`（自动翻页）列出**本账号下全部**上传件，每条打印 id / 文件名 / 大小 / 上传时间 / 过期时间，并用本地会话记录标出「这条是哪个会话记的」（`会话=未记录` = 本地没有引用它，多半是别的工具留下的或本地记录已随会话删掉）；云端为空时说「服务端没有上传件（云端为空）」。同样支持 `-c/--config`。
+  - `files.py`：抽出 `list_remote_files(client)`（`FileObject` → `{id, filename, bytes, created_at, expires_at}` 普通 dict，字段缺失给 None）+ `_remote_file_info()`；`purge_remote_files()` 改为复用它（先全部列出来、再逐个删，语义不变）。
+  - `cli.py`：两个 `--all` 共用一个 `_files_api_call(config_file, note, work)`（建客户端 → `aio.run(work(client))` → 用完 close → 网络/鉴权异常转成一句人话），省掉两边各写一份；新增 `_local_file_index()`（`file_id` → 会话名）与 `_fmt_ts()`（空值/坏值都给 default，服务端字段可能是 null）。
+  - 验证：`tests/test_files.py` 新增 5 例（`list_remote_files` 字段归一与缺字段不炸、`_fmt_ts` 容错、`list --all` 云端列表 + 会话标注 + 空云端、空 key 不建客户端）；真机：上传一个探针 → `pie files list --all` 打出 `file-api-… 76 B list-probe.png / 上传=… 过期=永久 会话=未记录` → `pie files gc --all` 删掉它；另实测带 `expires_after` 上传的文件在 `GET /files` 里确实带 `expires_at`（所以 pie 自己的上传会显示真过期日期）。全套 24/24。
+
+- **`pie files gc --all`：调 Files API 清空云端上传件**（用户要求）。此前 `pie files gc` 只管本地副本，服务端那份只能等上传时带的 `expires_after`（默认 30 天）自行过期 —— 过期前想立刻收回（误传了敏感图、想换账号重传）没有手段。
+  - `files.py` 新增 `purge_remote_files(client)`：`async for f in client.files.list()`（SDK 的 AsyncPaginator，自动翻页）→ 逐个 `await client.files.delete(f.id)`；**单个删除失败不中断**（记进返回的 `{file_id: 错误}` 表继续删下一个），返回 `(删除成功的文件信息列表, 失败表)`。
+  - `cli.py`：`gc` 子命令加 `--all`（与 `--delete` 正交，可同时用：一个清本地、一个清云端）与 `-c/--config`（file_id 属于 API key，多套配置时要能指定用哪份）；`_purge_remote_files()` 用 `OpenAILLM(api_key/base_url/timeout/max_retries 取自配置)` 建客户端（`llm.py` 新增 `files_client()` 公开访问器，就是按事件循环缓存的 `_client()`），跑在 `aio.run` 里，用完 `client.close()`；**无 api_key 直接报错返回 1**，列不出文件（网络/鉴权）也返回 1 —— 清空失败要能被脚本发现，不能假装成功；有删除失败同样退出码 1。
+  - 本地副本与 `__meta__.files` **不做修改**：旧 file_id 下次请求 400 → `loop._downgrade_file_blocks` 降级内联 + 重传，自愈链路本就存在（沙箱里没有可清理的会话记录，硬改会话文件风险更大）。
+  - 验证：`tests/test_files.py` 新增 5 例（`purge_remote_files` 全删 / 单个失败继续；CLI 接线：走 `-c` 的 key、用完 close、空 key 不建客户端、有失败退出码 1、列出失败退出码 1 —— 全部 stub 掉 LLM 与 purge，**不碰网络**）；真机 `pie files gc --all` 在远端为空时输出「已删除 0 个」退出 0；全套 19/19、`for t in tests/test_*.py` 全绿。
+  - ⚠️ 踩坑（值得记）：`Config()` 的 `api_key` 默认值是**本部署的真实 key**（`config.DEFAULT_API_KEY`），所以「配置里没写 api_key」≠ 空 key；写测试时若只 stub 一半，`--all` 会**真的**去删线上文件 —— 测试必须把 `cli.OpenAILLM` 与 `cli.purge_remote_files` 一起换掉，并用显式 `api_key = ""` 构造「无 key」场景。
+
 - **修 `pie -p 你好` 收尾时那段 `RuntimeError: generator didn't stop after athrow()` 噪音**（用户报告）：新模块 **`aio.py`**（`run()` / `close_asyncgens()` / `event_loop()`），把 CLI 所有同步入口的 `asyncio.run` 换成 `aio.run`（`session.turn` / `loop.run_agent` / `tools.dispatch` / cli 的两处 `fetch_models`），`run_tui` 也改为自建循环（`App.run(loop=…)`）以便退出前收尾。
   根因：openai 的流式响应读到 SSE `[DONE]` 就**就地 break**，httpx2/httpcore2 那串「响应字节流」异步生成器（`AsyncStream.__stream__` → `SSEDecoder.aiter_bytes` → `Response.aiter_bytes`/`aiter_raw` → `PoolByteStream.__aiter__` → `HTTP11ConnectionByteStream.__aiter__` → `safe_async_iterate` → `_receive_response_body`）会一直挂起在 yield 上；`asyncio.run` 收尾的 `loop.shutdown_asyncgens()` 按 `loop._asyncgens`（WeakSet，顺序随地址漂移）**一次性** aclose 它们，一旦「内层先关」httpcore2 的 `safe_async_iterate` 就抛这个 RuntimeError，被默认异常处理器打成一大段 Traceback（连接其实早已正确释放，纯噪音）。
   修法：收尾前自己关一遍——分多轮、每轮先摘空集合再逐个 `aclose()`、单个失败留给下一轮（实测 2 轮清空），与顺序无关；长驻循环（TUI）里这些生成器本来是 GC 逐个回收关闭的，所以只有一次性 `asyncio.run` 会犯。
@@ -42,7 +54,7 @@
   - 回退与自愈：上传失败 / 模型不支持 `file` 块 / `files_api=false` → **静默回退内联 base64**（行为与从前一致）；请求报 `400 … file_ids do not exist or are not created under your account` → `_downgrade_file_blocks()` 把历史里的 file 块**就地降级成内联**（字节从本地副本取）并重试一次（`is_stale_file_error` 认这个错）。
   - 配置：`files_api = true`、`files_ttl_days = 30`（上传时带 `expires_after`，走 `extra_body`；0 = 永久）；`Config.tool_defaults()` 派生 `read._max_image_bytes`（内联 32 MiB ↔ Files API 64 MiB），loop 改用它而不是裸 `cfg.tools`。
   - 顺手修一个独立问题：**图片 token 估算原先是 `min(12000, 800 + base64长度/256)`**——服务端规则是**单图 ≤1024**，大图被估成 1.2 万（上下文虚高、提前触发压缩）→ 现在封顶 1024（`context.IMAGE_TOKENS_MAX`），file 块也按同一上界估。
-  - CLI：`pie files list`（各会话记的图）/ `pie files gc [--delete]`（本地副本是无状态扫描回收：副本**跨会话共享**，所以删会话不会自动删副本；服务端那份由 `expires_after` 过期，本命令**不动服务端**）。
+  - CLI：`pie files list [--all]`（各会话记的图 / `--all` = 调 Files API 列云端全部上传件）/ `pie files gc [--delete] [--all]`（本地副本是无状态扫描回收：副本**跨会话共享**，所以删会话不会自动删副本；服务端那份默认由 `expires_after` 过期，`--all` 才主动清空）。
   - 验证：新增 `tests/test_files.py`（12 例：hash/幂等落盘/上传一次再复用/换 key·端点·过期·主动失效→重传/失败返回 None 且不写记录/关闭时不落副本/`is_stale_file_error`/parts 优先 file 块与回退 inline/降级重写历史/`gc` 只删未引用），`pytest tests/` 37/37；真机端到端：`pie -p "看 half.png 说颜色"` 后服务端多一个 `img-85fbd97740797558.png`（证明是**从本地副本上传**）、`~/.pie/files/` 出现副本、同一会话 resume 后再读同一张图**服务端文件数不变**（命中记录不重传）；另用裸 API 对拍 file 块与内联 base64 两种编码，回答一致（排除“传图变形”）。
 
 - **Session 字段改名：`.file` → `.path`、`.fs` → `.windows`**（用户提出这三个名字容易混）。起因是准备加第三个字段 `.files`（图片 id 表），三个名字挤在一起时 `.file` / `.fs` / `.files` 完全分不清。改成按语义命名：
