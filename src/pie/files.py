@@ -117,6 +117,51 @@ def is_stale_file_error(exc: BaseException) -> bool:
     return any(hint in text for hint in _STALE_FILE_HINTS)
 
 
+def _remote_file_info(item: Any) -> dict[str, Any]:
+    """把 Files API 的 `FileObject` 归一成普通 dict（字段缺失就给 None，别让展示层崩）。"""
+    return {
+        "id": str(item.id),
+        "filename": getattr(item, "filename", None),
+        "bytes": getattr(item, "bytes", None),
+        "created_at": getattr(item, "created_at", None),
+        "expires_at": getattr(item, "expires_at", None),
+    }
+
+
+async def list_remote_files(client: Any) -> list[dict[str, Any]]:
+    """列出**服务端本账号**的全部上传件（`GET /files`，SDK 的 AsyncPaginator 自动翻页）。
+
+    条目形如 `{id, filename, bytes, created_at, expires_at}`（都是服务端说了算的字段）。
+    与本地那份 `__meta__.files`（按会话存）是两件事，只能靠 `file_id` 对得上：`pie files
+    list --all` 会用它给每条标注是哪个会话记的。
+    """
+    return [_remote_file_info(item) async for item in client.files.list()]
+
+
+async def purge_remote_files(client: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """**清空服务端本账号的上传件**：`GET /files`（全列出来）→ 逐个 `DELETE /files/{id}`。
+
+    与 `collect_file_garbage` 的分工：那个只管本地副本，服务端那份默认交给上传时的
+    `expires_after`（默认 30 天）自行过期；这里是 `pie files gc --all` 的实现 —— 把云端
+    缓存**立刻**清空（删的是本账号下的**全部**上传件，可能包含别的会话/工具留下的）。
+
+    单个删除失败不中断（记进失败表、继续下一个），返回
+    `(删除成功的文件信息列表, {file_id: 错误})`。
+    本地副本与 `__meta__.files` 记录都不动：历史里的旧 file_id 下次请求会 400 →
+    `loop._downgrade_file_blocks` 就地降级成内联并重传，自愈。
+    """
+    deleted: list[dict[str, Any]] = []
+    failed: dict[str, str] = {}
+    for info in await list_remote_files(client):
+        try:
+            await client.files.delete(info["id"])
+        except Exception as e:  # noqa: BLE001 —— 一条删不掉不该拖垮整轮清理
+            failed[info["id"]] = f"{type(e).__name__}: {e}"
+            continue
+        deleted.append(info)
+    return deleted, failed
+
+
 async def upload_blob(client: Any, path: Path, *, ttl_days: int = TTL_MAX_DAYS) -> dict[str, Any]:
     """上传本地副本，返回 `{"file_id": ..., "expires_at": ...}`；失败抛原异常（调用方回退 inline）。
 

@@ -189,6 +189,13 @@ class OpenAILLM:
             self._clients[loop] = client
         return client
 
+    def files_client(self) -> AsyncOpenAI:
+        """底层 AsyncOpenAI 实例（Files API 维护命令 `pie files gc --all` 用）。
+
+        与 `_client()` 同一份按事件循环缓存的实例；**必须在事件循环内调用**。
+        """
+        return self._client()
+
     async def list_models(self) -> list[str]:
         """拉取端点可用模型 id 列表（OpenAI 兼容 GET /models，DeepSeek 亦支持）。
 

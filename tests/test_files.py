@@ -14,15 +14,20 @@
 - 功能关闭（`enabled=False` / 模型不支持）→ 连本地副本都不落；
 - `loop._build_image_parts`：有 file_id 出 `file` 块，否则出 `image_url` 内联；
 - `loop._downgrade_file_blocks`：file_id 失效时把历史里的 `file` 块降级成内联；
-- 本地副本回收：只删「没有被任何会话 `__meta__.files` 引用」的副本。
+- 本地副本回收：只删「没有被任何会话 `__meta__.files` 引用」的副本；
+- `purge_remote_files`（`pie files gc --all`）：服务端全部上传件逐个删除、单个失败不中断；
+  CLI 一侧的接线（stub 掉客户端与 purge，不碰网络）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import time
@@ -30,6 +35,7 @@ import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+from pie import cli as cli_mod  # noqa: E402
 from pie import files as files_mod  # noqa: E402
 from pie.context import AgentMessage, ImageMessage  # noqa: E402
 from pie.files import (  # noqa: E402
@@ -40,7 +46,9 @@ from pie.files import (  # noqa: E402
     hash_id,
     is_stale_file_error,
     key_fingerprint,
+    list_remote_files,
     model_supports_files,
+    purge_remote_files,
     store_blob,
 )
 from pie.loop import _build_image_parts, _downgrade_file_blocks  # noqa: E402
@@ -303,6 +311,251 @@ def test_collect_file_garbage_protects_recent_files() -> None:
         assert collect_file_garbage(sessions, protect_hours=0) == sorted([fresh, old])
 
 
+# ---------------------------------------------------------------- 服务端清空（gc --all）
+
+
+class _FakeFilesAPI:
+    """假的 `client.files`：`list()` 返回异步可迭代（对齐 SDK 的 AsyncPaginator）。"""
+
+    def __init__(self, items: list[dict], fail: set[str] | None = None) -> None:
+        self.items = items
+        self.fail = set(fail or ())
+        self.deleted: list[str] = []
+
+    def list(self):
+        async def _gen():
+            for item in self.items:
+                yield types.SimpleNamespace(**item)
+
+        return _gen()
+
+    async def delete(self, file_id: str):
+        if file_id in self.fail:
+            raise RuntimeError("delete failed")
+        self.deleted.append(file_id)
+        return types.SimpleNamespace(id=file_id, deleted=True)
+
+
+class _FakePurgeClient:
+    def __init__(self, items: list[dict], fail: set[str] | None = None) -> None:
+        self.files = _FakeFilesAPI(items, fail)
+
+
+def test_purge_remote_files_deletes_everything() -> None:
+    client = _FakePurgeClient(
+        [
+            {"id": "file-a", "filename": "a.png", "bytes": 10, "created_at": 1700000000},
+            {"id": "file-b", "filename": "b.png", "bytes": 20, "created_at": 1700000001},
+        ]
+    )
+    deleted, failed = asyncio.run(purge_remote_files(client))
+    assert [d["id"] for d in deleted] == ["file-a", "file-b"]
+    assert client.files.deleted == ["file-a", "file-b"]
+    assert failed == {}
+    assert deleted[0]["filename"] == "a.png" and deleted[0]["bytes"] == 10
+
+
+def test_purge_remote_files_keeps_going_after_failure() -> None:
+    client = _FakePurgeClient([{"id": "file-a"}, {"id": "file-b"}], fail={"file-a"})
+    deleted, failed = asyncio.run(purge_remote_files(client))
+    assert [d["id"] for d in deleted] == ["file-b"]  # 一条失败不拖垮整轮
+    assert client.files.deleted == ["file-b"]
+    assert list(failed) == ["file-a"] and "delete failed" in failed["file-a"]
+
+
+class _StubLLM:
+    """替身：记录构造参数，`files_client()` 给一个只记 `close()` 的空客户端。"""
+
+    def __init__(self, **kwargs) -> None:
+        _STUB_CALLS["llm"] = kwargs
+
+    def files_client(self):
+        class _Client:
+            async def close(self) -> None:
+                _STUB_CALLS["closed"] = True
+
+        return _Client()
+
+
+_STUB_CALLS: dict[str, object] = {}
+
+_CFG = 'api_key = "sk-test"\nbase_url = "https://api.deepseek.com"\n'
+
+
+def _run_cli_files(
+    argv: list[str],
+    cfg_text: str,
+    *,
+    purge=None,
+    remote_list=None,
+    sessions=None,
+) -> tuple[int, str, str]:
+    """在临时配置上跑 `files_main([*argv, "-c", cfg])`，stub 掉 LLM 与两个 Files API 调用。
+
+    ⚠️ 必须把 `cli.OpenAILLM` / `cli.purge_remote_files` / `cli.list_remote_files` 都换掉：
+    `Config()` 的 api_key 默认值是本部署的真实 key（`config.DEFAULT_API_KEY`），
+    配置里没有这一行 ≠ 空 key —— 漏了这点，测试会**真的**去调线上 Files API（删文件）。
+    踩过一次，别再踩。
+    """
+    _STUB_CALLS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        cfg = pathlib.Path(d) / "config.toml"
+        cfg.write_text(cfg_text, encoding="utf-8")
+        saved = (
+            cli_mod.OpenAILLM,
+            cli_mod.purge_remote_files,
+            cli_mod.list_remote_files,
+            cli_mod.iter_session_files,
+        )
+        cli_mod.OpenAILLM = _StubLLM
+        if purge is not None:
+            cli_mod.purge_remote_files = purge
+        if remote_list is not None:
+            cli_mod.list_remote_files = remote_list
+        if sessions is not None:
+            rows = list(sessions)
+            cli_mod.iter_session_files = lambda *a, **k: iter(rows)
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cli_mod.files_main([*argv, "-c", str(cfg)])
+        finally:
+            (
+                cli_mod.OpenAILLM,
+                cli_mod.purge_remote_files,
+                cli_mod.list_remote_files,
+                cli_mod.iter_session_files,
+            ) = saved
+    return rc, out.getvalue(), err.getvalue()
+
+
+# ---------------------------------------------------------------- list --all
+
+
+def test_list_remote_files_normalizes_fields() -> None:
+    """FileObject → 普通 dict；字段缺失给 None（展示层不用 getattr 猜）。"""
+    full = _FakePurgeClient(
+        [{"id": "file-a", "filename": "a.png", "bytes": 10, "created_at": 1700000000,
+          "expires_at": 4102444800}]
+    )
+    assert asyncio.run(list_remote_files(full)) == [
+        {"id": "file-a", "filename": "a.png", "bytes": 10, "created_at": 1700000000,
+         "expires_at": 4102444800}
+    ]
+    bare = _FakePurgeClient([{"id": "file-b"}])
+    assert asyncio.run(list_remote_files(bare)) == [
+        {"id": "file-b", "filename": None, "bytes": None, "created_at": None, "expires_at": None}
+    ]
+
+
+def test_fmt_ts_tolerates_junk() -> None:
+    """时间戳格式化：空值/0/坏值都给 default（服务端字段可能是 null 或缺）。"""
+    assert cli_mod._fmt_ts(None) == "?"
+    assert cli_mod._fmt_ts(0) == "?"
+    assert cli_mod._fmt_ts("bogus") == "?"
+    assert cli_mod._fmt_ts(0, default="永久") == "永久"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", cli_mod._fmt_ts(1700000000))
+
+
+def test_files_list_all_prints_cloud_rows() -> None:
+    """`--all` 列出云端全部上传件，并用本地会话记录标注「这条是谁记的」。"""
+
+    async def _fake_list(client):
+        _STUB_CALLS["client"] = client
+        return [
+            {"id": "file-a", "filename": "a.png", "bytes": 1024, "created_at": 1700000000,
+             "expires_at": None},
+            {"id": "file-b", "filename": "b.png", "bytes": 2048, "created_at": 1700000001,
+             "expires_at": 4102444800},
+        ]
+
+    sessions = [(pathlib.Path("chat-20260915-1.jsonl"), "img-x", {"file_id": "file-a"})]
+    rc, out, err = _run_cli_files(
+        ["list", "--all"], _CFG, remote_list=_fake_list, sessions=sessions
+    )
+    assert rc == 0, err
+    assert "服务端上传件 2 个" in out
+    assert "file-a" in out and "a.png" in out and "会话=chat-20260915-1" in out
+    assert "file-b" in out and "会话=未记录" in out
+    assert "过期=永久" in out and "过期=2100-" in out  # expires_at=None ↔ 有值的两种展示
+    assert _STUB_CALLS["llm"]["api_key"] == "sk-test" and _STUB_CALLS["closed"] is True
+
+
+def test_files_list_all_empty_cloud() -> None:
+    """云端为空时说清楚，不是默默什么都不打印。"""
+
+    async def _empty(client):
+        return []
+
+    rc, out, err = _run_cli_files(["list", "--all"], _CFG, remote_list=_empty)
+    assert rc == 0, err
+    assert "云端为空" in out
+
+
+def test_files_list_all_without_api_key_is_noop() -> None:
+    """api_key 为空：列表也调不动 Files API（返回 1，且不建客户端）。"""
+
+    async def _boom(client):  # pragma: no cover —— guard 没拦住才会走到
+        raise AssertionError("api_key 为空时不该调 Files API")
+
+    rc, out, err = _run_cli_files(["list", "--all"], 'api_key = ""\n', remote_list=_boom)
+    assert rc == 1
+    assert "api_key" in err and "llm" not in _STUB_CALLS
+    assert "服务端上传件" not in out
+
+
+# ---------------------------------------------------------------- gc --all
+
+
+def test_files_gc_all_calls_files_api() -> None:
+    """`--all` 用配置里的 key 建客户端 → 调 Files API 清空 → 关掉客户端。"""
+
+    async def _fake_purge(client):
+        _STUB_CALLS["purge"] = client
+        return (
+            [{"id": "file-a", "filename": "a.png", "bytes": 1024, "created_at": 1700000000}],
+            {},
+        )
+
+    rc, out, err = _run_cli_files(["gc", "--all"], _CFG, purge=_fake_purge)
+    assert rc == 0, err
+    assert "已删除 1 个" in out and "file-a" in out and "a.png" in out
+    assert _STUB_CALLS["llm"]["api_key"] == "sk-test"  # 走的是 -c 指定的配置
+    assert _STUB_CALLS["closed"] is True  # 用完关连接池（不留未关闭的 httpx client）
+
+
+def test_files_gc_all_without_api_key_is_noop() -> None:
+    """api_key 为空时不假装清空：返回 1，且连客户端都不建。"""
+
+    async def _boom_purge(client):  # pragma: no cover —— guard 没拦住才会走到
+        raise AssertionError("api_key 为空时不该调 Files API")
+
+    rc, out, err = _run_cli_files(["gc", "--all"], 'api_key = ""\n', purge=_boom_purge)
+    assert rc == 1
+    assert "api_key" in err and "llm" not in _STUB_CALLS
+    assert "已删除" not in out
+
+
+def test_files_gc_all_reports_delete_failures() -> None:
+    """有删不掉的文件 → 退出码 1（脚本能发现没清干净）。"""
+
+    async def _fake_purge(client):
+        return ([], {"file-a": "RuntimeError: delete failed"})
+
+    rc, _out, err = _run_cli_files(["gc", "--all"], _CFG, purge=_fake_purge)
+    assert rc == 1 and "file-a" in err
+
+
+def test_files_gc_all_survives_listing_failure() -> None:
+    """列不出文件（网络/鉴权挂了）→ 报错返回 1，不假装清空。"""
+
+    async def _boom_purge(client):
+        raise ConnectionError("network down")
+
+    rc, out, err = _run_cli_files(["gc", "--all"], _CFG, purge=_boom_purge)
+    assert rc == 1 and "network down" in err and "已删除" not in out
+
+
 def _main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = []
@@ -320,4 +573,3 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
-
