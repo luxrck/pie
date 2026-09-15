@@ -37,7 +37,7 @@ from .config import (
     parse_reserved_tokens,
 )
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
-from .files import FILES_DIR, collect_file_garbage, iter_session_files
+from .files import FILES_DIR, GC_PROTECT_HOURS, collect_file_garbage, iter_session_files
 from .input import read_input
 from .tools import default_tools, parse_image_marker, tools_from_spec
 
@@ -577,16 +577,19 @@ def context_main(argv: list[str]) -> int:
 
 
 def files_main(argv: list[str]) -> int:
-    """图片上传件维护：list（各会话记的图片）/ gc（清未被任何会话引用的本地副本）。
+    """图片上传件维护：list（各会话记的图片）/ gc（清可回收的本地副本）。
 
     上传结果按会话存在 `__meta__.files`（不做全局缓存），所以这里只是把会话里的记录
     读出来看看；本地副本 `~/.pie/files/` 是跨会话共享的，回收靠一次无状态扫描。
     服务端那份不在本命令职责内：它由上传时的 `expires_after`（默认 30 天）自行过期。
+
+    gc 的判据是「未被任何会话引用 **且** 已放了超过 GC_PROTECT_HOURS 小时」：
+    后者是给「刚粘贴进 files/、还没来得及 read」的图留的保护窗口（见 clipboard.py）。
     """
     parser = argparse.ArgumentParser(prog="pie files", description="图片上传件维护工具")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("list", help="列出各会话记录的图片（本地副本 + file_id + 过期时间）")
-    gc = sub.add_parser("gc", help="列出 / 删除未被任何会话引用的本地副本")
+    gc = sub.add_parser("gc", help=f"列出 / 删除可回收的本地副本（未被引用且超过 {GC_PROTECT_HOURS} 小时）")
     gc.add_argument("--delete", action="store_true", help="真正删除未引用副本")
     args = parser.parse_args(argv)
 
@@ -614,7 +617,7 @@ def files_main(argv: list[str]) -> int:
         return 0
 
     garbage = collect_file_garbage()
-    print(f"未被引用的本地副本 {len(garbage)} 个:")
+    print(f"可回收的本地副本 {len(garbage)} 个（未被任何会话引用、且已放置超过 {GC_PROTECT_HOURS} 小时）:")
     for path in garbage:
         print(" ", path)
     if args.delete:

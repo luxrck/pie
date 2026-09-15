@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +51,11 @@ _IMAGE_EXTS = {
 
 _STALE_FILE_HINTS = ("do not exist or are not created", "file_ids do not exist")
 
+# gc 保护窗口：比这新的文件一概先留着（小时）。理由见 collect_file_garbage：
+# 粘贴进 files/ 的图在「被某次 read 登记」之前还没有任何会话引用它，
+# 但它是活的（路径正躺在输入框里）→ 用 mtime 窗口挡住误删。
+GC_PROTECT_HOURS = 24
+
 
 def key_fingerprint(api_key: str | None) -> str:
     """API key 指纹（sha256 前 8 位）：用于判断缓存的 file_id 是否还属于当前 key。"""
@@ -69,6 +76,7 @@ def store_blob(data: bytes, *, mime: str = "") -> tuple[str, Path]:
     """把图片复制进 `~/.pie/files/`（内容寻址、幂等），返回 `(hash_id, 副本路径)`。
 
     先写临时文件再 rename：避免读到别人写了一半的副本（多进程同时 read 同一张图）。
+    权限固定 0o600：图是用户数据（截图/照片），没必要给同机其它用户看。
     """
     image_hash = hash_id(data)
     path = blob_path(image_hash, mime)
@@ -76,6 +84,7 @@ def store_blob(data: bytes, *, mime: str = "") -> tuple[str, Path]:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp-{datetime.now():%H%M%S%f}")
         tmp.write_bytes(data)
+        os.chmod(tmp, 0o600)
         tmp.replace(path)
     return image_hash, path
 
@@ -214,16 +223,31 @@ def referenced_blobs(sessions_dir: Path | None = None) -> set[Path]:
     return {Path(entry["local"]) for _, _, entry in iter_session_files(sessions_dir) if entry.get("local")}
 
 
-def collect_file_garbage(sessions_dir: Path | None = None) -> list[Path]:
-    """`~/.pie/files/` 下没有被任何会话引用的副本（可安全删除）。
+def collect_file_garbage(
+    sessions_dir: Path | None = None, protect_hours: int = GC_PROTECT_HOURS
+) -> list[Path]:
+    """`~/.pie/files/` 下没有被任何会话引用、且**已经放了 protect_hours 小时**的副本。
 
     注意：副本是**跨会话共享**的（同一内容一个文件），所以「删会话」不会自动删副本 ——
     回收靠这次无状态扫描；服务端那份由 `expires_after`（默认 30 天）自行过期。
+
+    为什么要 mtime 保护窗口：「未被引用」不等于「没人用」—— 刚剪贴板粘贴进 files/ 的图
+    （见 `clipboard.py`）在它被某次 `read` 登记进 `__meta__.files` 之前没有任何引用，
+    但路径可能正躺在输入框/某条命令里，删了就是死链接。
     """
     if not FILES_DIR.exists():
         return []
     referenced = referenced_blobs(sessions_dir)
-    return sorted(
-        p for p in FILES_DIR.iterdir() if p.is_file() and not p.name.startswith(".") and p not in referenced
-    )
+    fresh_after = time.time() - max(0, protect_hours) * 3600
+    garbage = []
+    for p in FILES_DIR.iterdir():
+        if not p.is_file() or p.name.startswith(".") or p in referenced:
+            continue
+        try:
+            if p.stat().st_mtime >= fresh_after:
+                continue  # 保护窗口内：可能是刚粘贴、还没被 read 的图
+        except OSError:
+            continue
+        garbage.append(p)
+    return sorted(garbage)
 

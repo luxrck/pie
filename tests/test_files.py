@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 import sys
 import tempfile
+import time
 import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -269,9 +271,13 @@ def test_downgrade_file_blocks_to_inline() -> None:
 
 
 def test_collect_file_garbage_keeps_referenced_blobs() -> None:
+    """被会话引用的副本无论多旧都不动；没被引用且过了保护窗口的才回收。"""
     with _TempBlobs() as blobs_dir, tempfile.TemporaryDirectory() as sessions_dir:
         kept = store_blob(PNG, mime="image/png")[1]
-        store_blob(PNG2, mime="image/png")
+        orphan = store_blob(PNG2, mime="image/png")[1]
+        stale = time.time() - (files_mod.GC_PROTECT_HOURS + 1) * 3600
+        os.utime(kept, (stale, stale))  # 两份都算 «旧»，只差在有没有被引用
+        os.utime(orphan, (stale, stale))
         session = pathlib.Path(sessions_dir) / "chat-x.jsonl"
         session.write_text(
             json.dumps(
@@ -283,6 +289,18 @@ def test_collect_file_garbage_keeps_referenced_blobs() -> None:
         garbage = collect_file_garbage(pathlib.Path(sessions_dir))
         assert garbage == [p for p in blobs_dir.iterdir() if p != kept]
         assert kept not in garbage
+
+
+def test_collect_file_garbage_protects_recent_files() -> None:
+    """保护窗口：未被引用但**很新**的副本先留着（刚粘贴进 files/、还没被 read 的图），旧的才回收。"""
+    with _TempBlobs() as blobs_dir, tempfile.TemporaryDirectory() as sessions_dir:
+        fresh = store_blob(PNG, mime="image/png")[1]
+        old = store_blob(PNG2, mime="image/png")[1]
+        stale = time.time() - (files_mod.GC_PROTECT_HOURS + 1) * 3600
+        os.utime(old, (stale, stale))
+        sessions = pathlib.Path(sessions_dir)
+        assert collect_file_garbage(sessions) == [old], "保护窗口没拦住新副本"
+        assert collect_file_garbage(sessions, protect_hours=0) == sorted([fresh, old])
 
 
 def _main() -> int:

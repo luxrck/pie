@@ -178,7 +178,7 @@ class TuiConfig:
     （`icon 工具名 摘要`，结果行尾带 ✅/❌，失败时下方缩进输出错误正文）。
     """
 
-    lean: bool = False
+    lean: bool = True
 
 
 @dataclass
