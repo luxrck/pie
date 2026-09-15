@@ -15,6 +15,8 @@ None，调用方回退成「普通文本粘贴」——绝不吞掉纯文本粘�
 - **Windows**：Win32 剪贴板，返回 `Image`（PNG / DIB）；剪贴板里是**文件**时返回路径列表（CF_HDROP）；
 - **macOS**：`osascript -e "get the clipboard as «class PNGf»"`，只认 PNG。截图到剪贴板多是 TIFF，
   但 macOS 的 pasteboard 在请求时会自动做 TIFF → PNG 转换，所以通常拿得到；读剪贴板不需要自动化权限；
+  **位图之外还接一个补丁**：Finder 里 `⌘C` 复制图片文件时剪贴板里是**文件引用**（`«class furl»`），
+  Pillow 那条路看不到 → 返回 None，于是 `_mac_file_path()` 再用 osascript 把 furl 读成路径（只认图片后缀）；
 - **Linux**：Pillow 内部转调 `wl-paste`（Wayland）或 `xclip`（X11）；**两个都没有时抛 NotImplementedError**
   → **只有这一种情况**才接着走 WSL 后备（下一条），仍未拿到就当「剪贴板里没有图片」返回 None；
 - **WSL 后备**：Pillow 的 Linux 分支要外部工具，没装时可剪贴板其实在 Windows 侧 → 用
@@ -33,6 +35,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -53,6 +56,17 @@ _PS_GRAB = (
 # 剪贴板里是文件（CF_HDROP）时，只认这些扩展名 —— 复制个 .txt 过来仍走普通文本粘贴。
 # 与 read 能吃的一致（PNG/JPEG/GIF/WebP/BMP），多收 TIFF（read 不吃，但用户可能自己再用）。
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+_IS_MAC = sys.platform == "darwin"
+_MAC_TIMEOUT = 5.0  # osascript 冷启动 ~0.05s；超时/报错都当没有文件引用
+# 读剪贴板里的**文件引用**（Finder ⌘C 一个图片文件）：拿到 POSIX 路径，没有则返回空串。
+_MAC_FURL_SCRIPT = (
+    "try\n"
+    'return POSIX path of (the clipboard as «class furl»)\n'
+    "on error\n"
+    'return ""\n'
+    "end try"
+)
 
 
 def _engine():
@@ -124,6 +138,26 @@ def _save(image) -> Path | None:
     return _store_png_bytes(buf.getvalue())
 
 
+def _mac_file_path() -> Path | None:
+    """macOS：剪贴板里放的是**文件引用**（Finder 里 ⌘C 一个图片文件）→ 直接用那个文件。
+
+    Pillow 的 macOS 分支只请求 `«class PNGf»`（位图），文件引用（`«class furl»`）拿不到 →
+    它返回 None，被当作「剪贴板里没有图片」。这里补一刀：用 osascript 把 furl 读成 POSIX 路径，
+    再交给 `_from_file_list`（只认图片后缀、且文件要存在）。读剪贴板不需要自动化权限。
+    """
+    if not _IS_MAC or shutil.which("osascript") is None:
+        return None
+    try:
+        done = subprocess.run(
+            ["osascript", "-e", _MAC_FURL_SCRIPT], capture_output=True, timeout=_MAC_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:  # 脚本自己包了 try，出错时返回空串 + 退出码 0；非 0 = osascript 本身失败
+        return None
+    return _from_file_list([done.stdout.decode(errors="replace").strip()])
+
+
 def grab_image_path() -> Path | None:
     """剪贴板里有图片 → 落成 `~/.pie/files/img-<hash16>.png` 返回路径；否则 None。
 
@@ -140,12 +174,10 @@ def grab_image_path() -> Path | None:
         # 再起一次 PowerShell 白等 0.4s——每次纯文本粘贴都要付这个钱。
         data = _wsl_png_bytes()
         return _store_png_bytes(data) if data else None
-    except OSError:  # 子进程异常（ChildProcessError 是 OSError 的子类）
-        return None
-    except Exception:  # 剪贴板状态异常（被别的进程锁住等）不该炸掉整个界面
-        return None
-    if result is None:  # 剪贴板里没有图片（或只有文本）
-        return None
+    except Exception:  # 子进程异常（OSError/ChildProcessError）/剪贴板被锁等 → 不当成崩溃
+        result = None
+    if result is None:  # 剪贴板里没有位图（或只有文本）
+        return _mac_file_path()  # macOS：也可能放的是文件引用（Finder ⌘C 的图）
     if isinstance(result, list):  # CF_HDROP：剪贴板里是文件而非位图
         return _from_file_list(result)
     return _save(result)

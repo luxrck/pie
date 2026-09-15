@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import time
 from bisect import bisect_right
 from pathlib import Path
@@ -69,6 +70,13 @@ PALETTE_COMMANDS: list[tuple[str, str]] = [
 
 
 STREAM_MAX_LINES = 8  # #stream 区最多显示的行数（!shell 实时输出）
+
+# 粘贴不到图时按平台补一句「能照做」的提示（macOS 的坑：⇧⌘4 是**存文件**，不进剪贴板）
+_NO_IMAGE_HINT = {
+    "darwin": "（macOS：截图要按 ⌃⇧⌘4 才会进剪贴板；⇧⌘4 是存成文件——"
+              "存成文件后在 Finder 里 ⌘C 复制也行，会直接插入那个路径）",
+    "linux": "（Linux 下还需装 wl-clipboard 或 xclip）",
+}.get(sys.platform, "（图片要先进系统剪贴板）")
 
 # 盒子的几何（Rich Panel）：round 边框固定 1 列/边，内边距见 _BOX_PADDING。
 # 简洁模式的工具单行要跟**盒内正文**对齐，缩进就从这里推——别在两边各写一份 2。
@@ -358,7 +366,8 @@ def _help_text() -> str:
         f"{rows}\n"
         "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，"
         "/stop 或 Esc 可终止）\n"
-        "Ctrl+V / Ctrl+G / /paste 把剪贴板里的图片存成文件并插入路径（终端截走 Ctrl+V 时用后两者）；"
+        "Ctrl+V / Ctrl+G / /paste 把剪贴板里的图片存成文件并插入路径（终端截走 Ctrl+V 时用后两者；"
+        "macOS 截图要 ⌃⇧⌘4 才进剪贴板，Finder 里 ⌘C 图片文件也可以）；"
         "以 / 开头但不是已知命令的输入按普通消息发出\n"
         "鼠标拖动日志可复制文本（按源文本复制，长行不会断行）"
     )
@@ -1309,11 +1318,7 @@ class PieApp(App):
         path = await asyncio.to_thread(clipboard.grab_image_path)
         if path is None:
             if notify:
-                self._notify(
-                    "剪贴板里没有图片"
-                    "（图片要先进系统剪贴板；Linux 下还需 wl-clipboard 或 xclip）",
-                    role="error",
-                )
+                self._notify("剪贴板里没有图片" + _NO_IMAGE_HINT, role="error")
             return
         inp = self.query_one("#input", PieTextArea)
         inp.insert(str(path))

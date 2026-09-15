@@ -99,7 +99,7 @@ def test_paste_and_read_share_one_blob() -> None:
 
 def test_file_list_returns_image_path_without_copying() -> None:
     """CF_HDROP（剪贴板里是文件）：图片文件直接用原路径，非图片一律不算。"""
-    with tempfile.TemporaryDirectory() as d, _TempBlobs() as blobs_dir, _wsl_off():
+    with tempfile.TemporaryDirectory() as d, _TempBlobs() as blobs_dir, _wsl_off(), _mac_off():
         root = pathlib.Path(d)
         shot = root / "shot.PNG"
         Image.new("RGB", (4, 4)).save(shot)
@@ -116,7 +116,7 @@ def test_file_list_returns_image_path_without_copying() -> None:
 
 def test_no_image_returns_none() -> None:
     """没有图片的各种形态都返回 None（不能抛错、不能吞掉调用方）。"""
-    with _TempBlobs() as blobs_dir, _wsl_off():
+    with _TempBlobs() as blobs_dir, _wsl_off(), _mac_off():
         for result in (
             None,  # 剪贴板空
             NotImplementedError("wl-paste or xclip is required"),  # Linux 缺工具
@@ -152,7 +152,7 @@ def test_ctrl_v_inserts_path_or_falls_back_to_text() -> None:
                 # 文本粘贴回退：剪贴板没有图片时行为与覆盖前一致
                 inp.text = ""
                 app.copy_to_clipboard("纯文本粘贴")
-                with _fake(None), _wsl_off():
+                with _fake(None), _wsl_off(), _mac_off():
                     await pilot.press("ctrl+v")
                     await pilot.pause()
                 assert inp.text == "纯文本粘贴", f"文本粘贴被吞了: {inp.text!r}"
@@ -179,7 +179,7 @@ def test_paste_command_reports_when_no_image() -> None:
                 assert any("已插入图片路径" in t for _, t in notes), notes
                 inp.text = ""
                 notes.clear()
-                with _fake(None), _wsl_off():
+                with _fake(None), _wsl_off(), _mac_off():
                     inp.text = "/paste"
                     await pilot.press("enter")
                     await pilot.pause()
@@ -231,6 +231,67 @@ def _wsl_off():
         yield calls
 
 
+@contextlib.contextmanager
+def _mac_env(path: str | None, enabled: bool = True):
+    """模拟 macOS：`_IS_MAC` 为真 + osascript 可用，返回给定的 POSIX 路径（None = 剪贴板里没有文件引用）。
+
+    `enabled=False` 时只把 `_IS_MAC` 置假、**不动** `subprocess.run`（给 `_mac_off()` 用，便于与 `_wsl_env` 叠）。
+    """
+    saved_flag = clipboard._IS_MAC
+    saved_run, saved_which = clipboard.subprocess.run, clipboard.shutil.which
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, (path or "").encode(), b"")
+
+    clipboard._IS_MAC = enabled
+    if enabled:
+        clipboard.subprocess.run = fake_run  # type: ignore[assignment]
+        clipboard.shutil.which = lambda name: "/usr/bin/osascript" if name == "osascript" else None  # type: ignore[assignment]
+    try:
+        yield calls
+    finally:
+        clipboard._IS_MAC = saved_flag
+        clipboard.subprocess.run, clipboard.shutil.which = saved_run, saved_which  # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def _mac_off():
+    """关掉 macOS 的「文件引用」分支（让「没有图片」的用例不去真起 osascript / 读真实剪贴板）。"""
+    with _mac_env(None, enabled=False) as calls:
+        yield calls
+
+
+def test_mac_file_reference_returns_path() -> None:
+    """macOS：Finder 里 ⌘C 复制的图片文件（«class furl»）→ 直接用原文件，不往 files/ 复制。
+
+    Pillow 的 macOS 分支只请求位图（«class PNGf»），文件引用拿不到 → 它返回 None；
+    没有这一刀，「截图存成文件、再从 Finder 复制」就永远粘不进来。
+    """
+    with tempfile.TemporaryDirectory() as d, _TempBlobs() as blobs_dir, _wsl_off():
+        shot = pathlib.Path(d) / "截屏.png"
+        Image.new("RGB", (4, 4)).save(shot)
+        note = pathlib.Path(d) / "notes.txt"
+        note.write_text("hi", encoding="utf-8")
+        with _fake(None), _mac_env(str(shot)) as calls:
+            assert clipboard.grab_image_path() == shot
+        assert calls and calls[0][0] == "osascript", calls
+        with _fake(None), _mac_env(str(note)):
+            assert clipboard.grab_image_path() is None, "复制的不是图片"
+        with _fake(None), _mac_env(str(pathlib.Path(d) / "gone.png")):
+            assert clipboard.grab_image_path() is None, "文件已不在"
+        with _fake(None), _mac_env(None):
+            assert clipboard.grab_image_path() is None, "剪贴板里是文本"
+        assert not list(blobs_dir.iterdir()), "文件引用分支不该往 files/ 复制东西"
+    saved_flag = clipboard._IS_MAC  # 非 macOS：连 osascript 都不查
+    clipboard._IS_MAC = False
+    try:
+        assert clipboard._mac_file_path() is None
+    finally:
+        clipboard._IS_MAC = saved_flag
+
+
 def test_wsl_fallback_reads_windows_clipboard() -> None:
     """WSL：Pillow 看不到剪贴板（没装 wl-paste/xclip）时才回退去问 Windows 剪贴板。"""
     no_tools = NotImplementedError("wl-paste or xclip is required")
@@ -243,10 +304,10 @@ def test_wsl_fallback_reads_windows_clipboard() -> None:
         assert Image.open(path).size == (3, 4)
         assert [p.name for p in blobs_dir.iterdir()] == [path.name], "留下了临时文件残留"
         assert [c[0] for c in calls] == ["wslpath", "powershell.exe"], calls
-        with _fake(no_tools), _wsl_env(None):  # Windows 剪贴板里也没图 → 乖乖返回 None
+        with _fake(no_tools), _wsl_env(None), _mac_off():  # Windows 剪贴板里也没图 → 乖乖返回 None
             assert clipboard.grab_image_path() is None
     # 工具在、只是剪贴板里没图：不该白起一次 PowerShell（0.5s 冷启动 × 每次文本粘贴）
-    with _fake(None), _wsl_env(b"x") as calls:
+    with _fake(None), _wsl_env(b"x"), _mac_off() as calls:
         assert clipboard.grab_image_path() is None
     assert calls == [], f"「没有图片」不该跑子进程: {calls}"
     # 非 WSL 环境也不该去起 PowerShell
