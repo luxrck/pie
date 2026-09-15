@@ -32,7 +32,7 @@ from textual.app import App, ComposeResult
 
 from pie.textkit import cjk_divide_line
 from pie.theme import get_theme
-from pie.tui import PieApp, SelectableRichLog, _box, _lean_line, _tool_result_box, _wide_text
+from pie.tui import PieApp, PieTextArea, SelectableRichLog, _box, _lean_line, _tool_result_box, _wide_text
 
 THEME = get_theme("catppuccin-mocha")
 
@@ -267,6 +267,28 @@ def test_pie_app_mount_and_copy() -> None:
             app.query_one("#input").text = "测试中文输入"
             await pilot.pause()
             assert app.query_one("#input").text == "测试中文输入"
+
+    asyncio.run(run())
+
+
+def test_slash_path_is_treated_as_plain_text() -> None:
+    """以 / 开头但**不是已知命令**的输入按普通消息发出去（粘贴进来的绝对路径常被误伤）。"""
+
+    async def run() -> None:
+        app = PieApp(_dummy_session())
+        async with app.run_test(size=(78, 26)) as pilot:
+            await pilot.pause()
+            submitted: list[str] = []
+            commands: list[str] = []
+            app._submit = lambda text: submitted.append(text)  # type: ignore[method-assign]
+            app._command = lambda text: commands.append(text)  # type: ignore[method-assign]
+            inp = app.query_one("#input", PieTextArea)
+            for text in ("/home/cc/.pie/files/img-1863cc4256104f41.png", "/help", "/nope"):
+                inp.text = text
+                await pilot.press("enter")
+                await pilot.pause()
+            assert submitted == ["/home/cc/.pie/files/img-1863cc4256104f41.png", "/nope"], submitted
+            assert commands == ["/help"], commands
 
     asyncio.run(run())
 

@@ -14,6 +14,7 @@ pie/
 │   ├── __init__.py    # 公开 API
 │   ├── __main__.py    # python -m pie 入口
 │   ├── cli.py         # CLI：新对话 / resume / sessions / setup / context + 一次性（子 agent）模式
+│   ├── clipboard.py   # 剪贴板图片 → ~/.pie/paste/<hash>.png（Pillow 后端，TUI 的 Ctrl+V / /paste 用）
 │   ├── config.py      # 配置持久化（~/.pie/config.toml）+ system prompt 组装
 │   ├── session.py     # 会话层：多轮对话 + JSONL 持久化 + 用量累计
 │   ├── loop.py        # 循环层：run_agent / aturn（工具调用编排 + 取消）
@@ -55,6 +56,8 @@ uv run python tests/test_tui.py            # TUI 回归：框选复制保真 + C
 - 新工具：普通函数 + `@tool()` 装饰器 + `registry.register()`。
 - 工具输出格式：统一为 `Headers\n\nBody`（仿 http）——headers 为一行一个 `[...]` 方括号行；body 非空时用空行分隔，body 为空（或仅 headers）则省略空行；状态/元数据放 header 区（如 shell 首行 `[exit=..]`、截断时 `[工具输出全文已保存: path]`、图片标记 `[图片已读取: ...]`、行号 `[行 a-b，共 N 行]`）。Header 值内不要含 `]`。
 - read 图片多模态：read 读图片（PNG/JPEG/GIF/WebP/BMP，魔数嗅探 + 头解析宽高）返回机器可读标记文本（`[图片已读取: path=..., mime=..., size=..., dim=...]`），offset/limit 对图片无意义被忽略；loop 层 `_inject_read_images` 解析标记（`tools.parse_image_marker`）后把图片 base64 成 data URI，作为 `ImageMessage`（context.py，多模态 user content parts）紧随工具结果注入——OpenAI 兼容 API 要求图片只能出现在 user 消息 content 里。ImageMessage 不是 UserMessage（synthetic 标记）→ 不构成轮次边界，不影响压缩轮次认定 / 轮数 / 标题 / 摘要，可随轮次级/会话级压缩一起落盘；from_dict 按 to_dict 的 cls 字段还原。图片字节上限为 `_max_image_bytes`（默认 32MB，可由配置注入覆盖），超限拒绝内联。
+- 粘贴图片：`clipboard.grab_image_path()`（Pillow `ImageGrab.grabclipboard()`，**同步阻塞**→ TUI 侧必须 `asyncio.to_thread`）把剪贴板里的图片编码成 PNG 后**直接交给 `files.store_blob(mime="image/png")`**，返回 `~/.pie/files/img-<sha256[:16]>.png`（= `read` 用的那份副本 → 回车后 read 命中同一文件，**零复制**，详见 clipboard.py 模块注释）；没有图片/未装 Pillow/Linux 缺 wl-paste+xclip → None。TUI 三个入口共用同一实现：`PieTextArea.action_paste`（覆盖 TextArea 的 ctrl+v/super+v 绑定，None 时回退 `super().action_paste()` 文本粘贴）、App 级 `ctrl+g`（`PieApp.action_paste_image`，终端截走 Ctrl+V 时的兜底）与 `/paste` 命令。剪贴板里是文件列表（Windows CF_HDROP）时只认图片扩展名、返回原路径不复制。回退判据：**只**在 Pillow 抛 NotImplementedError（根本看不到剪贴板）时才走 WSL 的 PowerShell 后端 `_wsl_png_bytes`；Pillow 返回 None（工具在、没图）不回退，否则每次文本粘贴白等 0.4s。
+- gc 与粘贴共用 `~/.pie/files/` 的代价：`collect_file_garbage` 的「未被引用」判据对**刚粘贴、还没 read** 的图不成立（它还是活的，只是没人引用）→ 加了 mtime 保护窗口 `files.GC_PROTECT_HOURS`（默认 24h，比这新的未引用副本一概不回收）；`store_blob` 落盘统一 0o600（图是用户数据）。
 - 新配置项：在 `src/pie/config.py` 的 `Config` dataclass 中加字段，配置文件为 ~/.pie/config.toml。
 - 配置只从 ~/.pie/config.toml 读取；首次运行由 `ensure_config()` 交互式写入，旧 config.json 自动迁移。
 - 会话每轮自动保存到 ~/.pie/sessions/，`pie resume` 恢复最新文件。
@@ -69,6 +72,7 @@ uv run python tests/test_tui.py            # TUI 回归：框选复制保真 + C
 
 ## 已知限制
 
+- 剪贴板图片粘贴（Ctrl+V / Ctrl+G / `/paste`）依赖 Pillow + 平台剪贴板：Windows/macOS 开箱可用；Linux 要装 `wl-clipboard` 或 `xclip`（WSLg 下 `wl-clipboard` 即可，剪贴板桥会转发图片）；两者都缺时回退 WSL 的 PowerShell 后端。Windows Terminal 会截走 Ctrl+V → 用 Ctrl+G 或 `/paste`。
 - resume 只能恢复最近一次会话，不支持选择历史会话。
 - 记忆文件靠 agent 主动更新，没有自动摘要。
 

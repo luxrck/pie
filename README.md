@@ -66,8 +66,9 @@ pie --session 20260831-103224   # 恢复指定会话（id / 文件名 / 路径�
 直接输入消息即可，每条消息都会走完整的工具循环（read / edit / write / shell），历史上下文在会话内持续保留。
 每轮对话自动保存到 `~/.pie/sessions/<时间戳>.jsonl`，所以 `pie resume` 能恢复当前目录最近的会话。
 真实终端下使用 **Textual TUI**（pi / tau 风格：消息流、工具调用日志、状态栏、底部输入；`/stop` 或 `Esc` 取消当前任务）；非 TTY（管道/脚本）自动回退 readline。
-对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 windows 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/thinking <none|low|high|max>` 设置思考深度（立即生效并写入配置）、`/model <id>` 切换模型（启动时自动拉取可用列表，重启仍生效；`/model` 查看列表、`/model refresh` 重新拉取）、`/stat` 查看 token 使用情况与当前会话文件、`/help` 查看帮助。
+对话内命令：`/exit` 退出、`/reset` 清空历史、`/clear` 当前窗口写入 windows 归档并开新窗口（新窗口带旧窗口的摘要 + 文件指针）、`/paste` 把剪贴板里的图片存成文件并把路径插进输入框（同 `Ctrl+V` / `Ctrl+G`）、`/compact [tools|turns]` 手动压缩、`/save [文件]` 保存为 JSONL、`/thinking <none|low|high|max>` 设置思考深度（立即生效并写入配置）、`/model <id>` 切换模型（启动时自动拉取可用列表，重启仍生效；`/model` 查看列表、`/model refresh` 重新拉取）、`/stat` 查看 token 使用情况与当前会话文件、`/help` 查看帮助。
 输入使用 prompt_toolkit 做 Unicode 安全行编辑：中文退格按字符删除，不会出现半个字符导致的 UTF-8 错误；管道/脚本输入时自动回退 `input()`。
+以 `/` 开头、但**不是已知命令**的输入按普通消息发出（粘进来的绝对路径 `/home/.../x.png` 不会被当成未知命令吞掉）。
 
 ## 一次性执行（子 agent / 摘要）
 
@@ -162,6 +163,19 @@ tail = 2
 
 ## 图片（Vision / Files API）
 
+**粘贴剪贴板里的截图**：输入框按 `Ctrl+V`（或 `Ctrl+G`，或输入 `/paste`）会把剪贴板里的图片落成
+`~/.pie/files/img-<sha256[:16]>.png` —— **就是 `read` 用的那份内容寻址副本**（同一个
+`files.store_blob()`，所以回车后 read 这张图时拿到的是同一个文件，不会多出一份重复字节；
+之后它被登记进会话 `__meta__.files`，与普通图片副本同命运），并把**路径**插进输入框。
+`Ctrl+G` 是给「终端把 `Ctrl+V` 截给自己」的场合准备的（Windows Terminal 默认如此，按键到不了应用）。
+剪贴板里没有图片时 `Ctrl+V` 照旧是文本粘贴；Windows 从资源管理器复制的图片文件
+（CF_HDROP）直接返回原路径，不复制。代价是「未被引用 = 垃圾」对刚粘贴还没 read 的图不成立
+→ `pie files gc` 另有 24 小时 mtime 保护窗口挡误删。
+读剪贴板走 Pillow `ImageGrab.grabclipboard()`：**Windows / macOS 开箱可用**；Linux 需要装
+`wl-clipboard`（Wayland）或 `xclip`（X11），**两个都没有时才**回退到 WSL 的 PowerShell 后端
+（`Clipboard::GetImage()`，~0.5s）；都没有就静默当作「没有图片」。WSLg 下装了 `wl-clipboard`
+就够（实测它的剪贴板桥会把 Windows 剪贴板里的图以 `image/png` 转发过来，0.035s）。
+
 `read` 读到图片时不把文本塞进历史，而是注入一条**多模态 user 消息**（图片只能出现在 user 消息里）。默认走 Files API：
 
 1. 图片先**复制**一份到 `~/.pie/files/<hash_id>`（`hash_id = img-<sha256[:16]>`，内容寻址、幂等）；
@@ -187,9 +201,12 @@ tail = 2
 
 ```bash
 pie files list                # 各会话记了哪些图（hash_id / file_id / 过期时间 / 本地副本）
-pie files gc                  # 列出没被任何会话引用的本地副本
+pie files gc                  # 列出可回收的本地副本（未被任何会话引用、且已放置超过 24 小时）
 pie files gc --delete         # 删掉它们（服务端那份由 expires_after 自行过期，本命令不动服务端）
 ```
+
+> 「超过 24 小时」是给**刚粘贴进 files/ 还没来得及 read** 的图留的保护窗口（`files.GC_PROTECT_HOURS`）：
+> 那种文件还没有任何会话引用它，但路径可能正躺在输入框里，删了就是死链接。
 
 > 隐私：图片本来就要发给服务端（内联 base64 也一样），区别是 Files API 会在服务端**留存一份** —— 所以上传时默认带 30 天过期（`files_ttl_days = 0` 则永久保留）。
 > token 计费**按尺寸**算，与哪种编码无关（单图 ≤1024）；换 Files API 省的是请求体、重复传输与上限，不是钱。
