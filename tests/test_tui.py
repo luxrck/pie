@@ -30,7 +30,8 @@ from rich._wrap import divide_line as rich_divide_line
 from rich.cells import cell_len
 from textual.app import App, ComposeResult
 
-from pie.textkit import cjk_divide_line
+from pie import textkit
+from pie.textkit import cjk_compute_wrap_offsets, cjk_divide_line
 from pie.theme import get_theme
 from pie.tui import PieApp, PieTextArea, SelectableRichLog, _box, _lean_line, _tool_result_box, _wide_text
 
@@ -143,6 +144,53 @@ def test_wrap_offsets_are_sane_on_fuzz() -> None:
         assert "".join(_split(text, width)) == text
     assert cjk_divide_line("", 10) == []
     assert cjk_divide_line("中文", 0) == []
+
+
+def _segments(text: str, offsets: list[int]) -> list[str]:
+    parts, prev = [], 0
+    for offset in [*offsets, len(text)]:
+        parts.append(text[prev:offset])
+        prev = offset
+    return parts
+
+
+def test_textarea_wrap_never_exceeds_width() -> None:
+    """输入框（TextArea）的显示行宽度不能超过可用宽度。
+
+    回归点：Textual 的 `compute_wrap_offsets` 把**行尾空白**也算进「放得下」判断，
+    而 Rich 的 `divide_line` 按 `rstrip()` 算。两者曾经共用同一实现 → 含中文的行
+    遇到尾随空格时会产出 width + 1 格（多出来的正是那个空格）的显示行，
+    输入框里光标/滚动位置会随之偏 1 格。
+    """
+    rng = random.Random(7)
+    pool = "中文测试全角（）；：，。！？abcXYZ019 -_/=."
+    for _ in range(3000):
+        text = "".join(rng.choice(pool) for _ in range(rng.randint(0, 60)))
+        width = rng.choice([4, 9, 13, 35, 80])
+        offsets = cjk_compute_wrap_offsets(text, width, tab_size=4)
+        assert offsets == sorted(set(offsets)), (text, width, offsets)
+        for seg in _segments(text, offsets):
+            assert cell_len(seg) <= width, (
+                f"{text!r} w={width} 行超宽 {cell_len(seg)}: {seg!r}"
+            )
+
+
+def test_textarea_wrap_breaks_ascii_at_char() -> None:
+    """输入框里英文也按字符断：长单词/长路径不会整块挪到下一行留一大片空白。"""
+    width = 35
+    for text in (
+        "a" * (width * 3),
+        "hello world 这是一段 mixed with english words 的混排文本用来测断行",
+        "/Users/luxrck/Projects/synthetic_phone/src/synthetic_phone/tools.py",
+        "wget --header='X-Token: abc' https://example.com/very/long/path?a=1&b=2 -O out.bin",
+    ):
+        segs = _segments(text, cjk_compute_wrap_offsets(text, width, 4))
+        assert "".join(segs) == text, (text, segs)
+        assert all(cell_len(seg) <= width for seg in segs), (text, segs)
+        # 行被填满（词级断行的老毛病：行尾动不动空十几格）
+        assert all(cell_len(seg) >= width - 1 for seg in segs[:-1]), (
+            f"{text!r} 行没填满：{[cell_len(s) for s in segs]}"
+        )
 
 
 # ---- 复制 ----

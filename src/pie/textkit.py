@@ -38,21 +38,31 @@ def _is_wide(ch: str) -> bool:
     return cell_len(ch) == 2
 
 
-def _wrap_tokens(text: str) -> Iterator[tuple[int, str]]:
+def _wrap_tokens(text: str, char_level: bool = False) -> Iterator[tuple[int, str]]:
     """切断行 token：单个全角字 / 一段非全角非空白；尾部空白贴在该 token 上。
 
     yield (start, token)，token 含其后空白（语义对齐 rich._wrap.words：断点落在 token 开头，
     尾部空白留在上一行）。
+
+    `char_level=True`：**非全角字也逐个成 token**（每个字符都是断点）——输入框用。
+    英文单词也会被拆开，换来「行被填满、不留大片空白」；连续空白单独成一个 token
+    （断点落在空白之前，行尾空白不会跑到下一行行首）。
     """
     i, n = 0, len(text)
     while i < n:
         start = i
+        if char_level and not text[i].isspace():
+            i += 1  # 单字符
+            while i < n and text[i].isspace():
+                i += 1  # 其后空白贴在它尾部
+            yield (start, text[start:i])
+            continue
         while i < n and text[i].isspace():
             i += 1
         if i >= n:  # 行尾空白
             yield (start, text[start:])
             return
-        if _is_wide(text[i]):
+        if char_level or _is_wide(text[i]):
             i += 1
         else:
             while i < n and not text[i].isspace() and not _is_wide(text[i]):
@@ -62,20 +72,37 @@ def _wrap_tokens(text: str) -> Iterator[tuple[int, str]]:
         yield (start, text[start:i])
 
 
-def cjk_divide_line(text: str, width: int, fold: bool = True) -> list[int]:
+def cjk_divide_line(text: str, width: int, fold: bool = True,
+                    count_trailing_space: bool = False,
+                    char_level: bool = False) -> list[int]:
     """CJK 友好版 divide_line（同契约：返回断点的字符下标列表）。
 
     与 Rich 原版只有分词不同：全角字各自成一个 token，于是「放不下就换行」对全角字
     等价于逐字折行（英文词仍是整词挪到下一行）；比整行宽的 token 硬折（chop_cells）。
+
+    `count_trailing_space`：判断「这个 token 放得下吗」时是否把它的**尾部空白也算进宽度**。
+    两家的原生语义不同，所以两种消费者各用各的：
+      - Rich 的 `divide_line`（#log 日志区）按 `word.rstrip()` 判宽 → 默认 False（逐字节对齐 Rich）；
+      - Textual 的 `compute_wrap_offsets`（#input 输入框）按**含尾空白**的 `chunk` 判宽 → True。
+        用 False 会算漏行尾空格，产出比可用宽度多 1 格（= 行尾空格数）的显示行。
+
+    `char_level`：**所有字符都可作断点**（英文单词也会被拆开）→ 行被填满、不留大片空白，
+    与终端「软换行」的观感一致。输入框用 True，Rich 日志区保持词级（代码/命令整词更好读）。
     """
     if width < 1 or not text:
         return []
-    if _rich_divide_line is not None and not any(_is_wide(ch) for ch in text):
+    if (
+        not count_trailing_space
+        and not char_level
+        and _rich_divide_line is not None
+        and not any(_is_wide(ch) for ch in text)
+    ):
         return _rich_divide_line(text, width, fold)
     breaks: list[int] = []
     cell_offset = 0  # 当前行已占单元格
-    for start, token in _wrap_tokens(text):
-        length = cell_len(token.rstrip())  # 尾部空白不计入“词宽”（同 Rich）
+    for start, token in _wrap_tokens(text, char_level):
+        # 尾部空白计不计入“词宽”：Rich 取 rstrip，Textual 把空白也算进去（见 docstring）
+        length = cell_len(token) if count_trailing_space else cell_len(token.rstrip())
         if width - cell_offset >= length:
             cell_offset += cell_len(token)
         elif length > width:  # token 比整行还宽 → 硬折
@@ -122,16 +149,21 @@ def cjk_compute_wrap_offsets(
     fold: bool = True,
     precomputed_tab_sections: list[tuple[str, int]] | None = None,
 ) -> list[int]:
-    """CJK 友好版 compute_wrap_offsets（TextArea 用；契约与 textual._wrap 同）。
+    """CJK 友好 + **逐字符**版 compute_wrap_offsets（TextArea 用；契约与 textual._wrap 同）。
 
-    含制表符的行直接交回 Textual 原实现：tab 宽度随列位置变化，原实现会用调用方预计算的
+    与 Textual 原生（词级：`\S+\s*` 不可断）的区别：所有字符都可作断点，于是
+    「英文长单词/长路径」也会在当前行剩余空间里继续填，而不是整块挪到下一行留一片空白。
+
+    含制表符的行仍交回 Textual 原实现：tab 宽度随列位置变化，原实现用调用方预计算的
     `precomputed_tab_sections`，本实现不重算。
     """
     if _textual_orig_wrap_offsets is not None and "\t" in text:
         return _textual_orig_wrap_offsets(
             text, width, tab_size, fold, precomputed_tab_sections
         )
-    return cjk_divide_line(text, width, fold)
+    return cjk_divide_line(
+        text, width, fold, count_trailing_space=True, char_level=True
+    )
 
 
 def install_cjk_wrap() -> bool:
