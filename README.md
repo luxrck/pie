@@ -201,14 +201,29 @@ tail = 2
 
 ```bash
 pie files list                # 各会话记了哪些图（hash_id / file_id / 过期时间 / 本地副本）
+pie files list --all          # 反过来看云端：调 Files API 列出本账号下的全部上传件
 pie files gc                  # 列出可回收的本地副本（未被任何会话引用、且已放置超过 24 小时）
 pie files gc --delete         # 删掉它们（服务端那份由 expires_after 自行过期，本命令不动服务端）
+pie files gc --all            # 清空云端：调 Files API 把本账号下的全部上传件删掉（立刻生效）
+pie files gc --all -c FILE    # 多套配置时指定用哪份配置的 key（file_id 属于 API key）
 ```
+
+默认**不主动上网**：本地副本靠上面这次无状态扫描回收，服务端那份交给上传时的
+`expires_after`（默认 30 天）自行过期。两个 `--all` 都直接调 Files API（都以「远端是本账号全局的」为前提）：
+
+- `list --all` → `files.list_remote_files()`：`GET /files`（自动翻页）列出云端全部上传件
+  （id / 文件名 / 大小 / 上传时间 / 过期时间），并用会话里的 `__meta__.files` 标出「这是哪个会话记的」
+  （`会话=未记录` = 本地没有任何会话引用它）；
+- `gc --all` → `files.purge_remote_files()`：把列出来的**全部**逐个 `DELETE /files/{id}`
+  （可能包含别的会话/工具留下的；单个删除失败不中断，有失败则退出码 1）。
+
+本地副本与会话里的 `__meta__.files` 记录**都不动** —— 那些 file_id 下次请求会遇到 400，
+由 `loop._downgrade_file_blocks` 就地降级成内联并重传（自愈），无需手工清理。
 
 > 「超过 24 小时」是给**刚粘贴进 files/ 还没来得及 read** 的图留的保护窗口（`files.GC_PROTECT_HOURS`）：
 > 那种文件还没有任何会话引用它，但路径可能正躺在输入框里，删了就是死链接。
 
-> 隐私：图片本来就要发给服务端（内联 base64 也一样），区别是 Files API 会在服务端**留存一份** —— 所以上传时默认带 30 天过期（`files_ttl_days = 0` 则永久保留）。
+> 隐私：图片本来就要发给服务端（内联 base64 也一样），区别是 Files API 会在服务端**留存一份** —— 所以上传时默认带 30 天过期（`files_ttl_days = 0` 则永久保留）；想立刻收回用 `pie files gc --all`。
 > token 计费**按尺寸**算，与哪种编码无关（单图 ≤1024）；换 Files API 省的是请求体、重复传输与上限，不是钱。
 
 ## 上下文压缩

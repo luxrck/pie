@@ -5,7 +5,7 @@
   pie -r | pie resume             恢复当前目录下最近的会话
   pie --session <id> [PROMPT]     恢复指定会话
   pie sessions                    列出历史会话
-  pie files                       图片上传件维护（list/gc）
+  pie files                       图片上传件维护（list/gc，各带 --all 走云端）
   pie setup                       交互式配置模型与网络参数
   pie context                     上下文压缩维护（info/verify/gc）
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import sys
@@ -21,7 +22,7 @@ import tempfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from . import aio
 from .session import Session
@@ -37,8 +38,16 @@ from .config import (
     parse_reserved_tokens,
 )
 from .context import CONTEXT_DIR, collect_context_garbage, referenced_raw_paths
-from .files import FILES_DIR, GC_PROTECT_HOURS, collect_file_garbage, iter_session_files
+from .files import (
+    FILES_DIR,
+    GC_PROTECT_HOURS,
+    collect_file_garbage,
+    iter_session_files,
+    list_remote_files,
+    purge_remote_files,
+)
 from .input import read_input
+from .llm import OpenAILLM
 from .tools import default_tools, parse_image_marker, tools_from_spec
 
 try:
@@ -577,23 +586,35 @@ def context_main(argv: list[str]) -> int:
 
 
 def files_main(argv: list[str]) -> int:
-    """图片上传件维护：list（各会话记的图片）/ gc（清可回收的本地副本）。
+    """图片上传件维护：list（各会话记的图片；`--all` 改列云端）/ gc（本地副本回收；`--all` 另清空云端）。
 
     上传结果按会话存在 `__meta__.files`（不做全局缓存），所以这里只是把会话里的记录
     读出来看看；本地副本 `~/.pie/files/` 是跨会话共享的，回收靠一次无状态扫描。
-    服务端那份不在本命令职责内：它由上传时的 `expires_after`（默认 30 天）自行过期。
+    服务端那份默认不主动动：它由上传时的 `expires_after`（默认 30 天）自行过期。
+    两个 `--all` 都直接调 Files API（见文件下部，都以「远端是本账号全局的」为前提）：
+    `list --all` 把云端那份列出来看看，`gc --all` 把云端那份立刻清空。
 
     gc 的判据是「未被任何会话引用 **且** 已放了超过 GC_PROTECT_HOURS 小时」：
     后者是给「刚粘贴进 files/、还没来得及 read」的图留的保护窗口（见 clipboard.py）。
     """
     parser = argparse.ArgumentParser(prog="pie files", description="图片上传件维护工具")
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("list", help="列出各会话记录的图片（本地副本 + file_id + 过期时间）")
-    gc = sub.add_parser("gc", help=f"列出 / 删除可回收的本地副本（未被引用且超过 {GC_PROTECT_HOURS} 小时）")
+    ls = sub.add_parser("list", help="列出各会话记录的图片（本地副本 + file_id + 过期时间）；加 --all 改列云端")
+    ls.add_argument("--all", action="store_true", help="调 Files API 列出服务端本账号的全部上传件")
+    ls.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
+    gc = sub.add_parser(
+        "gc", help=f"本地副本回收（未被引用且超过 {GC_PROTECT_HOURS} 小时）；加 --all 另清空云端"
+    )
     gc.add_argument("--delete", action="store_true", help="真正删除未引用副本")
+    gc.add_argument(
+        "--all", action="store_true", help="调 Files API 删除服务端本账号的全部上传件（云端缓存清零）"
+    )
+    gc.add_argument("-c", "--config", metavar="FILE", help="指定配置文件（默认 ~/.pie/config.toml）")
     args = parser.parse_args(argv)
 
     if args.action == "list":
+        if args.all:
+            return _files_remote_list(Path(args.config) if args.config else None)
         rows = list(iter_session_files())
         if not rows:
             print(f"暂无图片记录（会话 __meta__.files 为空；副本目录 {FILES_DIR}）")
@@ -624,7 +645,109 @@ def files_main(argv: list[str]) -> int:
         for path in garbage:
             path.unlink(missing_ok=True)
         print(f"已删除 {len(garbage)} 个文件")
+    if args.all:
+        return _files_gc_remote(Path(args.config) if args.config else None)
     return 0
+
+
+def _fmt_ts(value: Any, default: str = "?") -> str:
+    """unix 秒 → `%Y-%m-%d %H:%M`；空值/坏值给 `default`（服务端字段缺失时别崩）。"""
+    try:
+        if not value:
+            return default
+        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return default
+
+
+def _files_api_call(
+    config_file: Path | None, note: str, work: Callable[[Any], Awaitable[Any]]
+) -> tuple[Any, str | None]:
+    """按配置建 Files API 客户端 → `aio.run(work(client))` → 用完关闭。
+
+    返回 `(结果, 错误信息)`：没配 api_key、或调用本身抛异常时结果是 `None`、错误是一句
+    人话（调用方打印到 stderr 并返回 1 —— 云端没列出来/没清干净不能假装成功）。
+    这是不可逆操作，所以先把「打到哪个账号」写清楚（多套配置 / 默认 key 时看得出来）。
+    """
+    cfg = Config.load(config_file)
+    if not cfg.api_key:
+        return None, "未配置 api_key，无法调用 Files API（先跑 pie setup）"
+    print(f"Files API: {cfg.base_url}  key=…{cfg.api_key[-4:]}  （{note}）")
+    backend = OpenAILLM(
+        api_key=cfg.api_key,
+        base_url=cfg.base_url,
+        timeout=cfg.timeout_seconds,
+        max_retries=cfg.max_retries,
+    )
+
+    async def _call():
+        client = backend.files_client()
+        try:
+            return await work(client)
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
+
+    try:
+        return aio.run(_call()), None
+    except Exception as e:  # 网络 / 鉴权挂了就到此为止
+        return None, f"调用 Files API 失败: {type(e).__name__}: {e}"
+
+
+def _local_file_index() -> dict[str, list[str]]:
+    """`file_id` → 记着它的会话名（读各会话 `__meta__.files`），给 `list --all` 标注用。"""
+    index: dict[str, list[str]] = {}
+    for session_file, _image_hash, entry in iter_session_files():
+        file_id = entry.get("file_id")
+        if file_id:
+            index.setdefault(str(file_id), []).append(session_file.stem)
+    return index
+
+
+def _files_remote_list(config_file: Path | None = None) -> int:
+    """`pie files list --all`：列出服务端本账号的全部上传件（顺带标出哪个会话记着它）。"""
+    rows, error = _files_api_call(config_file, "列出本账号下的全部上传件", list_remote_files)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    if not rows:
+        print("服务端没有上传件（云端为空）")
+        return 0
+    local = _local_file_index()
+    print(f"服务端上传件 {len(rows)} 个（云端那份；本地记录见不带 --all 的 `pie files list`）:")
+    for info in rows:
+        sessions = local.get(str(info["id"]))
+        print(f"{info['id']}  {int(info.get('bytes') or 0):>10,} B  {info.get('filename') or '?'}")
+        print(
+            f"    上传={_fmt_ts(info.get('created_at'))}  "
+            f"过期={_fmt_ts(info.get('expires_at'), default='永久')}  "
+            f"会话={'、'.join(sessions) if sessions else '未记录'}"
+        )
+    return 0
+
+
+def _files_gc_remote(config_file: Path | None = None) -> int:
+    """`pie files gc --all`：调 Files API 清空服务端上传件（本地副本 / 会话记录不动）。"""
+    result, error = _files_api_call(
+        config_file, "被删的是本账号下的全部上传件", purge_remote_files
+    )
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    deleted, failed = result
+    for info in deleted:
+        size_txt = f"{int(info['bytes']):,} B" if info.get("bytes") else "?"
+        name = info.get("filename") or "?"
+        print(
+            f"  已删除 {info['id']}  {name:<24} {size_txt:>12}  "
+            f"上传={_fmt_ts(info.get('created_at'))}"
+        )
+    print(f"服务端上传件：已删除 {len(deleted)} 个")
+    for file_id, err in failed.items():
+        print(f"  删除失败 {file_id}: {err}", file=sys.stderr)
+    if failed:
+        print(f"{len(failed)} 个删除失败（见 stderr）", file=sys.stderr)
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
