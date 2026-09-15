@@ -38,7 +38,7 @@ from textual.strip import Strip
 from textual.widgets import Button, RichLog, Static, TextArea
 from textual.worker import Worker
 
-from . import aio
+from . import aio, clipboard
 from .config import REASONING_LEVELS
 from .context import content_text
 from .loop import CANCEL_TEXT
@@ -56,6 +56,7 @@ PALETTE_COMMANDS: list[tuple[str, str]] = [
     ("/stop", "取消当前正在执行的模型请求/工具（等价 Esc）"),
     ("/thinking", "查看/切换思考深度（/thinking <level>，Tab 补全）"),
     ("/model", "查看模型列表 / 切换模型（/model <id>，Tab 补全）"),
+    ("/paste", "剪贴板里的图片存成文件，把路径插进输入框"),
     ("/compact", "工具级 + 轮次级压缩"),
     ("/compact tools", "只做工具级压缩"),
     ("/compact turns", "只做轮次级压缩"),
@@ -357,6 +358,8 @@ def _help_text() -> str:
         f"{rows}\n"
         "!cmd 直接执行 shell（不经过 LLM，不进会话上下文；输入框变橙色即 shell 模式，"
         "/stop 或 Esc 可终止）\n"
+        "Ctrl+V / Ctrl+G / /paste 把剪贴板里的图片存成文件并插入路径（终端截走 Ctrl+V 时用后两者）；"
+        "以 / 开头但不是已知命令的输入按普通消息发出\n"
         "鼠标拖动日志可复制文本（按源文本复制，长行不会断行）"
     )
 
@@ -383,6 +386,24 @@ class PieTextArea(TextArea):
         # Esc：补全面板开着先收起，否则等价 /stop（取消当前回合 / !shell）
         Binding("escape", "palette_hide", "隐藏补全 / 取消当前任务", show=False),
     ]
+
+    async def action_paste(self) -> None:
+        """Ctrl+V：剪贴板里是图片 → 落盘后插入路径；否则走原本的文本粘贴。
+
+        覆盖 TextArea.action_paste（其绑定 ctrl+v/super+v 指向 "paste"），所以两种入口
+        （按键、程序化 run_action）行为一致。终端若自己截了 Ctrl+V（Windows Terminal
+        就把它绑到终端侧粘贴，图片内容到不了应用）→ 用 /paste 命令，见 PieApp._command。
+
+        grabclipboard() 是阻塞调用（Windows 本地 API / macOS 起 osascript / Linux 起子进程）
+        → 丢线程池，别冻住 UI。
+        """
+        if self.read_only:
+            return
+        path = await asyncio.to_thread(clipboard.grab_image_path)
+        if path is None:
+            super().action_paste()
+            return
+        self.insert(str(path))
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
@@ -832,6 +853,9 @@ class PieApp(App):
         # Esc 焦点在输入框时由 PieTextArea 的绑定处理（同一动作），
         # 焦点在别处（如日志区）时由这里兜底。
         Binding("escape", "escape", "取消当前任务", show=False),
+        # Ctrl+V 的兜底：终端把 ctrl+v 截给自己时（Windows Terminal 默认如此），
+        # 按键根本到不了应用 → ctrl+g 没被终端/Textual/本应用占用，拿它当第二入口。
+        Binding("ctrl+g", "paste_image", "粘贴剪贴板图片路径", show=False),
     ]
 
     def __init__(self, session: Session, initial_prompt: str | None = None) -> None:
@@ -1142,6 +1166,15 @@ class PieApp(App):
         """输入值是否已经是完整命令（此时回车应直接提交，不再替换）。"""
         return any(cmd == value for cmd, _ in PALETTE_COMMANDS)
 
+    def is_known_command(self, text: str) -> bool:
+        """首词是不是已知命令名 —— 不是就当**普通文本**发出去。
+
+        不能单凭 `/` 开头就认定是命令：粘贴进来的绝对路径（`/home/.../x.png`）
+        是最常见的误伤——那样只能收到一句「未知命令」而丢消息。
+        """
+        name = text.partition(" ")[0]
+        return any(name == cmd.partition(" ")[0] for cmd, _ in PALETTE_COMMANDS)
+
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         try:
             self._render_palette()
@@ -1221,6 +1254,10 @@ class PieApp(App):
         elif self._busy():
             self._stop()
 
+    async def action_paste_image(self) -> None:
+        """Ctrl+G：粘贴剪贴板图片（无图就提示）—— 与 `/paste` 同一个实现。"""
+        await self._paste_image(notify=True)
+
     # ---- 消息 ----
 
     async def on_message_submitted(self, event: MessageSubmitted) -> None:
@@ -1229,7 +1266,7 @@ class PieApp(App):
         self._update_input_border()
         if not text:
             return
-        if text.startswith("/"):
+        if text.startswith("/") and self.is_known_command(text):
             self._command(text)
         elif text.startswith("!"):
             self._run_shell(text[1:].strip())
@@ -1267,6 +1304,23 @@ class PieApp(App):
         self._cancel_event.set()
         self._notify("已请求取消，正在终止…")
 
+    async def _paste_image(self, notify: bool = False) -> None:
+        """把剪贴板里的图片落成文件，路径插进输入框（Ctrl+G / `/paste`；Ctrl+V 走 PieTextArea）。"""
+        path = await asyncio.to_thread(clipboard.grab_image_path)
+        if path is None:
+            if notify:
+                self._notify(
+                    "剪贴板里没有图片"
+                    "（图片要先进系统剪贴板；Linux 下还需 wl-clipboard 或 xclip）",
+                    role="error",
+                )
+            return
+        inp = self.query_one("#input", PieTextArea)
+        inp.insert(str(path))
+        inp.focus()
+        if notify:
+            self._notify(f"已插入图片路径: {path}")
+
     def _command(self, text: str) -> None:
         cmd, _, arg = text.partition(" ")
         if cmd in ("/exit", "/quit"):
@@ -1285,6 +1339,12 @@ class PieApp(App):
             self._notify(f"已切换新窗口（归档 {len(self.session.windows)} 个历史窗口块，文件在 ~/.pie/windows/）")
             self._safe_save()
             self._update_status()
+        elif cmd == "/paste":
+            # 终端可能截走 Ctrl+V（Windows Terminal 的粘贴绑定），所以给命令入口 + Ctrl+G
+            self.run_worker(
+                self._paste_image(notify=True), group="paste", exclusive=False,
+                exit_on_error=False,
+            )
         elif cmd == "/compact":
             mode = arg.strip() or "auto"
             if mode not in ("auto", "tools", "turns"):
