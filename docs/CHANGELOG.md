@@ -2,6 +2,58 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-17
+
+- **重试改成 pie 自己实现（不再用 openai SDK 自带的）；`max_retry_delay_seconds` 配置删除 → 常量**（用户要求：「手动实现 llm.py 里面的 retry 相关功能，不要使用 openai 自带的。相关可用参数：`max_retries`。移除 `max_retry_delay_seconds`，作为常量写进 llm.py」）。背景是上一轮查出 `max_retries=2` 实际会发 **6** 次请求（SDK 3 次 × pie 的 `stream_options` 回退又 3 次，`x-stainless-retry-count` 会归零）。
+  - `llm.py` 新增模块级常量与纯函数（**当日随后被本条目末尾的「（后续）」改动取代：常量搬进 config.py、指数退避改成随机等待**）：**`RETRY_DELAY_SECONDS=1.0`**（首次重试等待，即原 `max_retry_delay_seconds` 的值）、`RETRY_MAX_DELAY_SECONDS=8.0`（单次封顶）、`DEFAULT_MAX_RETRIES=2`、`_RETRYABLE_STATUS={408,409,429}`、`_TRANSIENT_MODULES=(openai, httpx, httpx2, httpcore, httpcore2, ssl)`；**`_retryable(exc)`**（408/409/429/5xx 或有 status_code 之外、来自网络栈的传输异常才重试；其余 4xx 与 pie 自己的异常立刻抛）、**`_retry_delay(attempt)=1s×2^(n-1)` 封顶**。
+  - `OpenAILLM`：`__init__` 存 `self.max_retries`（默认 `DEFAULT_MAX_RETRIES`，负数归一 0）并把 **`client_kwargs["max_retries"]` 硬置 0**（关掉 SDK 重试，跟 pie 那层叠加会翻倍）；新增 `_retry(factory, what)`（最多 `1+max_retries` 次，退避走 `_sleep_before_retry`，失败在 stderr 打一行 `[retry] …`），`complete()` / `list_models()` 改走它；`stream()` 把原来的 `while True` + 宽 catch 换成 **attempt 计数循环**：`emitted` 为真直接抛（吐过的内容不能重来），`with_usage` 且 **400** → 摘 `stream_options` 重来一次（continue，不计数不退避），否则 `_retryable` 才重试（并把上一轮残留的 `usage` 清掉）。
+  - 行为变化（实测）：连接类失败 `max_retries=2` → **3 次**请求（1 + 2），退避 1s/2s；`max_retries=0` → 1 次；`stream_options` 摘参数不再被连接错误触发（只 400 触发）；流中途断线只在「还没吐过块」时重试。
+  - 清理：`Config.max_retry_delay_seconds` 字段、CLI `--max-retry-delay-seconds`（含 `--help` 里那句「暂不生效」）、README 配置示例里的同名键一起删；`--max-retries` help 改成「只重试连接/超时/408/409/429/5xx」。旧配置里残留该键无害——`Config.load` 只挑 dataclass 认识的键。
+  - **（后续，用户要求）退回并重定义等待策略**：恢复 `Config.max_retry_delay_seconds`（CLI `--max-retry-delay-seconds` 一并恢复），`OpenAILLM` 同名参数透传（session / loop / `pie files` 三个构造点都传），`_retry_delay(max_delay_seconds)` 改成 **`max(1.0, random.uniform(0, max_delay_seconds))`**（去掉指数退避；随机是为了避免一批请求同时撞回来，1.0 是下限 → 默认上限 1.0 时恒等 1s）；`DEFAULT_MAX_RETRIES` 与 `RETRY_MAX_DELAY_SECONDS`（改名 **`DEFAULT_MAX_RETRY_DELAY_SECONDS`**）两个常量从 llm.py **搬进 config.py**（`RETRY_DELAY_SECONDS` 删）。测试跟着改：`_FastRetry` 替身改成按 `llm._retry_delay`（不再是模块常量），新增「默认上限 → 恒 1s / 上限 8 → 落在 [1,8] 且确实在随机」断言。
+  - **（后续 2，用户要求）`OpenAILLM` 不再带默认重试值**：`max_retries` / `max_retry_delay_seconds` 不传就是 **0**（组件层面默认不重试；应用里 session / loop / cli 三个构造点都显式传 `Config` 侧的值），并把 `DEFAULT_MAX_RETRIES` 常量整个去掉——`Config.max_retries` 回到字面量 `2`，config.py 只留 `DEFAULT_MAX_RETRY_DELAY_SECONDS = 1.0`（字段默认值）。测试：`test_sdk_retries_are_disabled` → `test_retry_defaults_and_sdk_disabled`（断言裸 `OpenAILLM` 两个字段都是 0 + `client_kwargs["max_retries"]==0`，`Config` 侧才是 2 / 1.0）。
+  - 验证：新增 **`tests/test_llm.py`（11 例，零网络）**：判据分类、等待随机+1s 下限、`client_kwargs["max_retries"]==0`、`complete()` 重试/放弃/不重试硬错/`max_retries=0`、`stream()` 首块前重试、**吐过块不重试**、400 摘 `stream_options`（且无退避）、重试上限；跑真配置的流式冒烟（`deepseek-flash`，7 prompt + 1 completion tokens）正常；全套测试 **84/84** + `self_check()` OK。
+
+- **出错盒显示异常链；`BOX_BODY_LINES` 100 → 24**（用户要求：先去问「遇到异常信息的时候，在 tui 里面可以显示多一点吗？」，看完第一版后说「移除 `_exc_hint`。BOX_BODY_LINES 设为 24」）。
+  - 新增模块级纯函数 **`_error_body(exc)`** = 首行 `类名: 消息` + `↳` 异常链，接在 `_fail_turn`（回合失败）与 `!cmd` worker 兜底异常两处。动机：`APIConnectionError: Connection error.` 这种被 SDK 包过的报错只显示最外层等于没说——真原因（DNS / 连接 / TLS）在 `__cause__` 里（`raise APIConnectionError(request=request) from err`），用户据此看不出到底是哪一层、也无法判断「是不是我连接 API 出问题了」。
+  - **`_exc_chain(exc)`**：走 `__cause__` / 未被抑制的 `__context__`（`raise ... from None` 不算真原因），每层带模块前缀（`httpx2.` / `openai.`，`builtins` / `__main__` 不加）以区分是谁抛的，压成单行（`APIStatusError` 的 `str()` 带多行 body），最多 `_EXC_CHAIN_MAX=4` 层，用 `id()` 去重（链成环也不转死）。
+  - **按用户要求删掉 `_exc_hint`**：先写过一版按类名 / `status_code` 给「能照做的动作」（`APIConnectionError`→端点+DNS/代理、`APITimeoutError`→`timeout_seconds`、httpx `ReadError`/`RemoteProtocolError`→流中途断开、`401`/`429`/`400` 上下文超窗），用户看过之后要求移除 → 现在只留首行 + 链，**不解释、不提建议**（`_error_body` 也随之去掉 `cfg` 参数；若日后想恢复，判据本就不用 import openai）。
+  - **`BOX_BODY_LINES` 100 → 24**（用户指定）：盒子模式的工具正文（read 大文件 / shell 长输出 / resume 回放）与 `_lean` 的失败正文块共用这一条截断规则，随之都变短。测试里两处「`line299` 不在显示里」的断言本来就绑着常量，实际已失效 → 改成 `line{BOX_BODY_LINES}` 那一行必须不在（否则 24 行时旧断言恒真）。
+  - 验证：`tests/test_tui.py` **18/18**（新增/改名为 `test_error_box_shows_cause_chain`：首行、链、长度=2、无链时只剩首行、`from None` 不算、成环不转死，并真挂 `PieApp` 走 `_fail_turn` 后框选复制核对），`test_theme/config/session/files` 全过，`self_check()` OK；headless 渲染确认两行盒子形态正常。
+
+## 2026-09-16
+
+- **死代码清理（tui.py）**（用户问「有没有死代码」）：删了最近几轮重构留下的残留——
+  - `MESSAGE_ROLES` 常量：上一轮把 `_box` 的分派改成白名单（`tool_call` / `tool_result`）后，全仓库代码零引用（只在 `_panel` 的 docstring 里被当文字提到）。现在 `role` 的合法取值直接写在两处分派里。
+  - **手动 `!cmd` 的 120s 超时残留**：`started = time.monotonic()`（赋值未用）+ `timed_out`（恒 False）+ 注释掉的超时块 + `code = ... "timeout(120s)" if timed_out ...` 死分支 + 与代码不符的 docstring（还写着「保留 120s 超时」）全删——**行为不变**（那个分支本就永远走不到）；`import time` 随之成为未使用 import，一并删。
+  - `_finish_turn(self, answer: str)` 的 `answer` 参数未使用（回合正文已由 `answer` 事件固化到 #log）→ 改成无参，`_run_turn` 里的 `answer` 局部变量也去掉。
+  - 注释掉的旧代码：`# yield Header()` / `# yield Footer()`（compose 里）、`# compact = lines[3]…`（`_update_status`）、`# f" · [{len(self.session.windows)}]"`（`_update_meta`，docstring 里的「归档窗口数」一并修正）。
+  - 保留不动的「看起来像死代码」：`on_text_area_changed(self, event)` 的 `event`（Textual 消息处理器签名，注解中还声明了触发消息类型）、`_slice_of_row` 的 `_end` 与几处 `for _, x` 的 `_`（故意的占位）、`_wide_text`（测试入口）、以及 vulture 报的框架钩子（`compose` / `on_mount` / `action_*` / `CSS` / `TITLE` / `run_tui` / `self.theme`）。
+  - 验证：`vulture --min-confidence 60` 只剩上述误报；自写的 AST 扫描（模块级零引用 / 未用参数 / 赋值未用的局部）只剩占位符；headless 渲染快照与清理前**逐字节一致**（历史回放 × 盒子/简洁、手动 !cmd 三态、notify 盒）；另冒烟了「回合收尾链路」（`_run_turn` → `_finish_turn`）与其余测试文件 59/59 + `self_check()`。
+
+- **tui 渲染：单一出口 `_notify` + 单一决策点 `_box`**（用户要求：把 boxed/lean 都藏进 `_box`，且值保留 `body / role / border_role / lean` 四个参数——title、icon、tool、summary、manual、code 都去掉）。原先「往 #log 写东西」散在 6 处（各自 `query_one("#log")`、各自决定写盒子还是简洁单行，`log` 还当参数层层传递）。
+  - **`_box(palette, body, *, role="system", border_role="", lean=False) -> list[Panel | Padding]`**：`role` 兼做角色与工具。消息类（`MESSAGE_ROLES`）⇒ 文本盒，标题查 `ROLE_TITLES`（user→你、assistant→pie）；`tool_call` ⇒ 调用（body = `{"name", "arguments"}`）；**其余一律当工具名** ⇒ 该工具的结果（body = 正文）。图标/标题/边框/成败全从 role + body 推，不再靠参数传。
+  - **`_notify(body, role="system", **kw)` = #log 的唯一写入口**（tui.py 里唯一的 `log.write`），`lean` 默认取 App 的开关；`_render_tool_call/_render_tool_result` 只负责组装 body 转交（不再接 log 参数）。
+  - **盒子模式新增行数封顶**：工具正文超 `BOX_BODY_LINES`（100）行只显示前 N 行（标题标总行数 + 末尾一行 `...[已省略 K 行，共 M 行]...`）。原行为是「实时全量、只在 resume 回放时 head50/tail50」→ 统一成一条规则（`truncate` 参数随之删除，`_shell_result_box` 不再自己做 >200 行的 head/tail）。消息正文不截。
+  - **（后续）lean 的失败正文块也统一到同一条截断规则**（用户要求）：**删除 `LEAN_DETAIL_HEAD` / `LEAN_DETAIL_TAIL`**，`_lean` 改成**只显示前 `BOX_BODY_LINES` 行** + **与 `_panel` 完全同一句** `...[已省略 K 行，共 M 行]...`（原先自留 head12/tail7、中间省略，与盒子模式两套规则）。
+  - **两个参数推不出来的地方**（已向用户标明）：① **结果行摘要**（lean 下 `✓ read a.txt` 里的 `a.txt` 来自配对的 tool_call 参数，结果正文里没有）→ 放进 body：`{"content", "summary"}`，`_render_tool_result` 的 `summary=` 签名不变（测试与行为都保住）；② **手动 !cmd 的豁免**（不吃 lean / 成功框灰边框 / 取消补 `[用户手动终止]`）→ 拆到调用方：`_notify(..., lean=False)` + `border_role=MANUAL_SHELL_ROLE`（仅成功）+ 自行补 `[exit=code]` 头与取消说明。
+  - **改成「两个自包含叶子 + 一个分派器」**（用户要求）：**`_lean(palette, body, *, role, border_role)`**（简洁单行）/ **`_panel(palette, body, *, role, border_role)`**（盒子）**参数与 body/role 语义完全一致**，**两者内部各自 inline 所需逻辑，不调任何中间小函数**——删掉 `_raw_panel` / `_tool_result_box` / `_cap_body` / `_tool_call_args` / `_tool_result_parts` / `_split_shell_exit` / `_shell_result_box` / `_tool_failed_role` / `_single_line` / `_oneline` / `_lean_line` / `_lean_detail` / `_lean_tool_result`。`_box` 缩成几行分派（lean 且工具活动 → `_lean`，否则 `[_panel]`），tui.py 净减 ~50 行。
+  - **body 形式同步调整为「显示载荷」**：`tool_call` 的 body 从 `{"name", "arguments"}` 改为 `{"name", "text", "summary"}`（text = `_format_tool_args(args)`，App 渲染；摘要仍由 App 的 `_tool_summary` 按 `LEAN_SUMMARY_KEYS` 取）——于是两个叶子都不再需要碰工具参数结构；工具结果 body 不变（正文或 `{"content", "summary"}`）。
+  - **代价（已在两处 docstring 里互相注明）**：成败判定 + `[exit=]` 头解析在 `_panel` 与 `_lean` 各有一份；要收敛的话要么提回一个小纯函数（就破坏了「叶子自包含」），要么让 App 先把结果解析成 `{text, status, code}`（那样叶子就只剩画）。
+  - **再一次按用户要求收拢**：`_panel` 也返回 `list[Panel]`（以 `_box` 直接 `return _panel(...)`）；**工具名从 role 移到 body**——`role` 只剩消息类（system/user/assistant/error/cancelled）∪ `{tool_call, tool_result}`，`tool_call` body = `{"name", "arguments"}`、`tool_result` body = `{"name", "arguments", "content"}`（arguments = 配对那次调用的参数）；**摘要（read/write/edit→path、shell→command）改在 `_lean` 里从 `arguments` 推**，于是 App 侧的 `_format_tool_args` / `_tool_summary` 两个 helper 也删了——**工具参数的解析/展示全在渲染层**，App 只组装名字+参数+正文；`_render_tool_result(name, content, *, arguments=None)`。
+  - 真 bug 一起修了：`_lean` 把 role 名（`error`）当成 lean 状态词传给 `palette.lean_mark`，而它只认 `ok/fail/cancelled`（未知静默退回 ok）——已加 status→词的小映射表。
+  - 验证：headless 渲染快照与上一版**逐字节一致**（历史回放 × 盒子/简洁、手动 !cmd 三态、notify 盒），另用独立脚本复刻了原测试的 lean/盒子断言（单行、失败正文块、超长摘要压单行、首尾行截断、复制不带留白）全过；另抽查了摘要推导：dict 参数、JSON 串参数（历史）、断 JSON、空参数、消息盒全部符合预期；test_aio/config/files/session/theme **59/59** + `self_check()` OK。（后续：**test_tui / test_clipboard 已按新 API 更新完毕**——`_lean_line` / `_tool_result_box` / `title=` / `tool=` / `summary=` / `manual=` / `code=` 全部换成 `_lean` / `_panel` 的 body 形式，全部测试 **87/87 通过**。另：lean 失败正文块的首行前缀 **`→` → `↳` 是有意改动**（用户改的），上文“逐字节一致”仅指盒子/单行布局；测试与 MEMORY 已按新契约同步。）
+
+- **手动 `!cmd` 改为「始终套盒子 + 默认灰边框」（不再吃简洁模式）**（用户要求，附运行截图）：简洁模式下 `!cmd` 原先跟 agent 工具活动一样压成单行（`✛ shell ls` / `✓ shell ls` + `→` 缩进输出块），用户希望它回到 box 且边框用默认灰。
+  - `tui.py`：`_run_shell` / `_show_shell_result` 删掉 `self.lean` 分支，改走既有盒子 helper（命令行框 `✛ shell` / `$ cmd`，结果框 `✓ shell [0]` + 输出）；新增模块常量 **`MANUAL_SHELL_ROLE = "system"`**（= `role_border` 的兑底色、与命令反馈盒同色的「默认灰」）——!cmd 不是 agent 的工具调用，不占 `tool_call` 的橙棕身份色（输入框的 shell 模式边框已经是橙棕，两者分开）；执行失败仍染红（`error`）、被 /stop 终止仍低调灰（`cancelled`），标题里的状态图标 ✓/✗/■ 因而不受影响。
+  - `_box()` / `_tool_result_box()` 新增可选 **`border_role`**（默认空 = 按 `role`）——唯一用途是把**边框色与状态图标解耦**：结果框的 role 仍按执行结果取（决定 ✓/✗/■），只把边框换成默认灰；没有它就只能改 role，而 `icon_system=""` 会把 ✓ 一起弄丢。顺带把 `!cmd` 输出末尾的换行 rstrip 掉（lean 那条路径本来就是，盒子底部不再多一行空白）。
+  - 删除随之失效的 `_lean_shell_result()` / `LEAN_SHELL_HEAD` / `LEAN_SHELL_TAIL`（lean 侧只剩 `_lean_tool_result` 给 agent 工具用；!cmd 的截断额度改用 `_shell_result_box` 的 200 行 head/tail，比原来更宽）。
+  - 验证：`tests/test_tui.py` 新增 `test_manual_shell_is_boxed_even_in_lean_mode`（lean 下命令行/结果框都是盒子、灰/红色按渲染后的 Strip segment 取色断言、✓/✗/■ 保留、agent 回合的 shell 结果仍是棕框）；真机 headless 跑 `!ls`（含失败用例 `ls /nope/nope` → `✗ shell [2]` 红框）；全套 74 例（test_tui 15/15）+ `self_check()` OK。
+
+- **移除未使用的 `numpy` 依赖**（依赖精简审查）。`numpy` 声明在 `[project].dependencies` 里但**全仓库零引用**（src / tests / docs / README 全 grep 无 `import numpy` / `np.`；唯一匹配是 pyproject 自身与 `inp.text` 之类误报），也**不是任何包的传递依赖**（`uv tree` 里只有 pie 直接依赖它）。
+  - `pyproject.toml` 删掉该行 → `uv lock` 29 → 27 包 → `uv sync` 卸载 numpy，`.venv` 体积 123M → 68M（numpy 29M + numpy.libs 27M）。
+  - 验证：先做「numpy 被 `sys.meta_path` 阻断」下的导入/自测（`import pie` + `cli.self_check()` + test_session/files/theme/config 全通过），确认无隐藏动态导入；删后全套 73 例通过（test_aio 4 / test_session 5 / test_files 24 / test_theme 6 / test_config 10 / test_clipboard 10 / test_tui 14）。
+  - 保留但**不要**再当成可精简项的两个「看起来没用到」的依赖：`pillow`（仅 `clipboard.py` 里 try-import，缺了就静默禁用剪贴板图片功能）与 `prompt_toolkit`（仅 `input.py` 里 try-import，缺失回退内置 `input()`）。两者都是**刻意的软依赖**，删了会让功能悄悄失效。（另：测试用到 `pygments`，靠 rich/textual 传递引入，未显式声明。）
+
 ## 2026-09-15
 
 - **`pie files list --all`：列出云端上传件**（用户要求，接上条）。`pie files list` 只看本地（各会话 `__meta__.files`），云端那份没有任何可见手段（`gc --all` 只能删）。现在 `list --all` 反向：调 Files API `GET /files`（自动翻页）列出**本账号下全部**上传件，每条打印 id / 文件名 / 大小 / 上传时间 / 过期时间，并用本地会话记录标出「这条是哪个会话记的」（`会话=未记录` = 本地没有引用它，多半是别的工具留下的或本地记录已随会话删掉）；云端为空时说「服务端没有上传件（云端为空）」。同样支持 `-c/--config`。

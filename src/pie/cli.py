@@ -224,12 +224,17 @@ def _parser() -> argparse.ArgumentParser:
         help="上下文 token 估算超过该值即自动压缩（覆盖软阈值，不持久化）",
     )
     parser.add_argument("--timeout-seconds", type=float, metavar="SECONDS", help="HTTP 超时（默认 60.0）")
-    parser.add_argument("--max-retries", type=int, metavar="N", help="请求重试次数（默认 2）")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        metavar="N",
+        help="请求重试次数（默认 2；只重试连接/超时/408/409/429/5xx）",
+    )
     parser.add_argument(
         "--max-retry-delay-seconds",
         type=float,
         metavar="SECONDS",
-        help="重试间隔秒数（默认 1.0；OpenAI 兼容客户端内部退避，暂不生效）",
+        help="重试等待上限秒数（默认 1.0；实际等待 = max(1.0, random(0, 该值))）",
     )
     parser.add_argument("-v", "--version", action="version", version=f"pie {__version__}")
     return parser
@@ -678,6 +683,7 @@ def _files_api_call(
         base_url=cfg.base_url,
         timeout=cfg.timeout_seconds,
         max_retries=cfg.max_retries,
+        max_retry_delay_seconds=cfg.max_retry_delay_seconds,
     )
 
     async def _call():

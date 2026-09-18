@@ -27,7 +27,7 @@ pie/
 │   ├── termbg.py      # 终端背景明暗探测（OSC 11 → COLORFGBG）：供主题族自动选深/浅变体
 │   ├── textkit.py     # 显示层文本处理：CJK 友好断行 + 控制符/ANSI 转义清洗（纯函数）
 │   └── tui.py         # TUI 应用：布局/命令/回合 worker/流式渲染 + 日志区控件与框选复制
-├── tests/             # 回归测试（无 pytest 依赖）：test_theme / test_tui / test_config / test_session / test_files
+├── tests/             # 回归测试（无 pytest 依赖）：test_theme / test_tui / test_config / test_session / test_files / test_clipboard / test_llm
 ├── AGENTS.md          # 项目说明（本文件）
 ├── MEMORY.md          # 项目持久记忆
 ├── SYSTEM.md          # agent 运行时 system prompt
@@ -47,6 +47,7 @@ pie -c FILE "任务"                          # 指定配置文件
 pie context gc                              # 压缩维护：info / verify / gc
 uv run python -c "from pie.cli import self_check; self_check()"  # 工具自测
 uv run python tests/test_tui.py            # TUI 回归：框选复制保真 + CJK 断行（约 15s，不调模型）
+uv run python tests/test_llm.py            # 重试回归：判据/等待/次数/流式不重复（替身客户端，不联网）
 ```
 
 ## 约定
@@ -68,9 +69,17 @@ uv run python tests/test_tui.py            # TUI 回归：框选复制保真 + C
 - system prompt 分层：SYSTEM.md（角色/原则）+ AGENTS.md（项目）+ MEMORY.md（记忆），由 `build_system_prompt(config)` 组装。
 - 提示词文件按“当前目录向上找项目根”解析，支持在任意目录运行 `pie`。
 - 用户偏好与重要决策写入 MEMORY.md，而不是散落在代码注释里。
+- 请求重试由 **pie 自己实现**（`llm.py`），不用 SDK 自带那套：`_retryable` 只认 408/409/429/5xx 与网络栈异常（连接/超时/流中断），其余 4xx 与我们自己的异常立刻抛；次数 = `1 + Config.max_retries`，单次等待 = `max(1.0, random(0, Config.max_retry_delay_seconds))`（`_retry_delay` 是纯函数）。**`OpenAILLM` 的 `max_retries` / `max_retry_delay_seconds` 不传就是 0（组件层面默认不重试）**，应用里由 session / loop / cli 三个构造点显式传 `Config` 侧的值（`Config.max_retries=2`、`Config.max_retry_delay_seconds=DEFAULT_MAX_RETRY_DELAY_SECONDS=1.0`，在 config.py）。**SDK 自带重试必须关掉**（`client_kwargs["max_retries"] == 0`），否则两层叠加、实际请求数不可预期。流式**只在还没吐过任何增量时**重试（吐过再重来会重复内容）；端点以 400 拒 `stream_options` → 摘掉该参数重来一次，不占重试额度、不退避。
 - 主题（theme.py）分两层：**族**（`THEME_FAMILIES`，如 `catppuccin` = 深色 `catppuccin-mocha` + 浅色 `catppuccin-latte`）与**具体变体**（`THEMES`）。`get_theme(name, dark=None)` 对族名按终端背景明暗自适应（`termbg.detect_dark_background()`：OSC 11 → COLORFGBG → None 按深色）；`Config.theme` 默认是族名。Markdown **不做全量接管**（走 Rich 默认）；只有浅色变体通过 `Theme.markdown_styles()`（字段 `markdown_code`，完整样式串）覆盖代码两键、并通过 `Theme.code_theme`（pygments 主题名）给 `Markdown(code_theme=...)` 换代码块高亮，`tui.on_mount` 非空时才 `console.push_theme(...)`。
 - TUI 分层：显示层文本处理（CJK 断行 / 转义清洗）在 `textkit.py`（纯函数、无 Textual 依赖），配色与 CSS 在 `theme.py`；其余全在 `tui.py`（应用编排 + 控件 + 日志区框选复制 `SelectableRichLog`，文件内用 `# ---- xxx ----` 分区）。`tui.py` 导入时调用 `textkit.install_cjk_wrap()` 替换 `rich.text.divide_line`（全角字逐字可断、英文词不断，纯 ASCII 走 Rich 原实现）。
-- 渲染 live 事件与 resume 历史共用同一套盒子 helper（`PieApp._render_tool_call/_render_tool_result/_notify`）与 `_format_tool_args`——要改工具盒样式改一处即可，别在事件分支里另写一份。
+- 渲染分层：**唯一入口是模块级纯函数 `_box(palette, body, *, role="system", border_role="", lean=False)`**（不碰 App，返回 `list[Panel | Padding]`），它只做一件事：**分派**——`lean=True` 且 role 是工具活动（`tool_call` / `tool_result`）→ **`_lean(...)`**（单行，返回 `list[Padding]`），否则 **`_panel(...)`**（盒子，返回 `list[Panel]`）。
+  - **`_panel` / `_lean` 参数完全一致**（`palette, body, *, role, border_role`），**且都是自包含叶子**：所需逻辑（参数→文本 / 参数→摘要 / 状态判定 / `[exit=N]` 头解析 / 标题与图标推导 / 截断 / 转义清洗）全部 **inline 在函数体内，不调任何中间小函数**（`_raw_panel` / `_cap_body` / `_split_shell_exit` / `_shell_result_box` / `_tool_failed_role` / `_lean_line` / `_lean_tool_result` / App 侧的 `_format_tool_args`·`_tool_summary` 一整串都删了）。代价：**「参数→文本」「状态判定 + `[exit=]` 解析」在 `_panel` 与 `_lean` 各有一份**（两函数 docstring 里互相注明了）。
+  - `role` 只有三类取值，**工具名一律写在 body 里**：**消息类**（system / user / assistant / error / cancelled）→ body 就是正文，标题查 `ROLE_TITLES`（user→「你」、assistant→「pie」）；**`tool_call`** → body = `{"name": <工具名>, "arguments": <参数>}`（实时给 dict、历史给 JSON 串，渲染层自己归一）；**`tool_result`** → body = `{"name": <工具名>, "arguments": <参数>, "content": <结果正文>}`（`arguments` 是配对的那次调用参数）。
+  - **摘要（lean 单行的「一句话」）在 `_lean` 里从 `arguments` 推**：`LEAN_SUMMARY_KEYS`（read/write/edit→path、shell→command）命中就用那个值，没命中退回参数文本；`_lean` 还负责把它压成单行可打印文本。
+  - `border_role` 只用于**显式覆盖边框色**（唯一用途：手动 `!cmd` **成功**框用默认灰 `MANUAL_SHELL_ROLE`，同时保住 ✓/✗/⏹ 图标）；工具正文超过 `BOX_BODY_LINES`（24）行时盒子只显示前 N 行，消息正文不截。
+- **出错盒的正文由 `_error_body(exc)` 组装**（纯函数；`_fail_turn` 与 `!shell` worker 兜底共用）：首行 `类名: 消息` + `↳` 异常链。链由 `_exc_chain` 走 `__cause__` / 未被抑制的 `__context__`（`raise ... from None` 不算），带模块前缀、压单行、最多 4 层——SDK 的包装异常真原因都在这里（`APIConnectionError` 裹着 httpx 的 DNS / 连接 / TLS 错误）。不按异常类型另加提示（试过 `_exc_hint`，已按用户要求删）。
+- `PieApp` 侧**只有一个渲染出口 `_notify(body, role="system", **kw)`**（把 `_box` 的产物写进 #log，也是 tui.py 里唯一的 `log.write(`；`lean` 默认取 App 的开关，可显式传 `lean=False`）。`_render_tool_call(name, args)` / `_render_tool_result(name, content, *, arguments=None)` 只负责把名字/参数/正文装成 body（摘要、参数文本、成败都归渲染层），live 事件、resume 历史回放、命令反馈全走同一条路。
+- **手动 `!cmd`**（`PieApp._run_shell/_show_shell_result`）不吃简洁模式（用户主动执行、输出本身就是要看的），两个盒子都靠现有机制表达、不占用 `_box` 的额外参数：命令行回显 = `tool_call` 形状（`arguments` 位置放 `$ cmd` 原文）+ `border_role=MANUAL_SHELL_ROLE` + `lean=False`；结果框 = `role="tool_result"` + 自行把退出码补成 `[exit=N]` 正文 + `border_role=""`（失败红 / 取消灰，由状态推；只有成功用灰）。
 
 ## 已知限制
 
