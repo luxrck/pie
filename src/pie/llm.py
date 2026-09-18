@@ -10,10 +10,11 @@ asyncio.run() 包装（见 session.Session.turn）。
 from __future__ import annotations
 
 import asyncio
+import random
 import sys
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
 from openai import AsyncOpenAI
 
@@ -91,6 +92,37 @@ class UsageTracker:
         self.calls += 1
 
 
+# ---- 重试（自己实现，不用 SDK 自带的那套）----
+# 为什么不用 SDK 的：它的重试只在「发请求 + 拿响应头」阶段生效（读 body 中途断了不重试），
+# 且跟 pie 自己的兼容回退叠在一起后，实际请求次数不可预期（max_retries=2 会发 3~6 次）。
+# 次数/等待上限、以及对应的「没传就 0（不重试）」归一都在下面；config 里只放等待上限的默认值。
+_RETRYABLE_STATUS = frozenset({408, 409, 429})  # 另外 5xx 一律重试
+_TRANSIENT_MODULES = (  # 无 status_code 时，只有网络栈的异常才算「可恢复」
+    "openai", "httpx", "httpx2", "httpcore", "httpcore2", "ssl",
+)
+
+
+def _retryable(exc: BaseException) -> bool:
+    """这个异常值不值得重试。
+
+    值得：408/409/429/5xx，以及网络栈的传输层异常（连接 / 超时 / 流中断）。
+    不值得：其它 4xx（参数、鉴权、file_id…重试也一样错），以及我们自己代码的类型错。
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status in _RETRYABLE_STATUS or status >= 500
+    return type(exc).__module__.split(".")[0] in _TRANSIENT_MODULES
+
+
+def _retry_delay(max_delay_seconds: float) -> float:
+    """本次重试前等待的秒数：`max(1.0, random.uniform(0, max_delay_seconds))`。
+
+    随机是为了避免一批请求同时退避、又同时撞回来；1.0 是下限（不然退避形同虚设）。
+    默认 `max_retry_delay_seconds = 1.0` 时恒等于 1.0（随机值不可能超过上限）。
+    """
+    return max(1.0, random.uniform(0.0, float(max_delay_seconds)))
+
+
 class LLM(Protocol):
     """任何实现 complete() 的对象都可以作为 agent 的模型后端。
 
@@ -158,6 +190,7 @@ class OpenAILLM:
         max_tokens: int | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        max_retry_delay_seconds: float | None = None,
         **client_kwargs: Any,
     ) -> None:
         self.model = model or DEFAULT_MODEL
@@ -167,11 +200,19 @@ class OpenAILLM:
         self.max_tokens = max_tokens
         self.api_key = api_key
         self.base_url = base_url or None
+        # 重试自己实现（见 _retry / _retryable）：SDK 自带那套必须关掉，否则两层叠加、
+        # 实际请求次数不可预期（max_retries=2 会变成 3~6 次）。
+        self.max_retries = (
+            0 if max_retries is None else max(0, int(max_retries))
+        )
+        self.max_retry_delay_seconds = (
+            0.0
+            if max_retry_delay_seconds is None
+            else float(max_retry_delay_seconds)
+        )
         if timeout is not None:
             client_kwargs["timeout"] = timeout
-        if max_retries is not None:
-            client_kwargs["max_retries"] = max_retries
-        self.client_kwargs = client_kwargs
+        self.client_kwargs = {**client_kwargs, "max_retries": 0}
         self._clients: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, AsyncOpenAI
         ] = weakref.WeakKeyDictionary()
@@ -203,7 +244,7 @@ class OpenAILLM:
         交互启动拉取失败只提示、不阻塞，/model 仍可手动指定任意 id）。
         """
         client = self._client()
-        resp = await client.models.list()
+        resp = await self._retry(client.models.list, "模型列表请求")
         return sorted(str(m.id) for m in (resp.data or []))
 
     def _request_kwargs(
@@ -223,6 +264,28 @@ class OpenAILLM:
             kwargs["max_tokens"] = int(self.max_tokens)
         return kwargs
 
+    async def _sleep_before_retry(self, attempt: int, what: str) -> None:
+        """退避等待（`_retry_delay`：随机 + 1s 下限），并在 stderr 报一行。"""
+        delay = _retry_delay(self.max_retry_delay_seconds)
+        print(
+            f"[retry] {what}失败，{delay:.1f}s 后第 {attempt}/{self.max_retries} 次重试",
+            file=sys.stderr,
+        )
+        await asyncio.sleep(delay)
+
+    async def _retry(self, factory: Callable[[], Awaitable[Any]], what: str) -> Any:
+        """跑一个请求工厂，失败的按 `max_retries` 重试（只重試 `_retryable` 认可的失败）。
+
+        总共最多 `1 + max_retries` 次尝试；不可恢复的失败立刻往上抛。
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await factory()
+            except Exception as e:
+                if attempt >= self.max_retries or not _retryable(e):
+                    raise
+                await self._sleep_before_retry(attempt + 1, what)
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -230,10 +293,10 @@ class OpenAILLM:
         model: str | None = None,
     ) -> LLMResult:
         """非流式完整请求（一次返回 LLMResult，带 usage）。"""
+        client = self._client()
+        kwargs = self._request_kwargs(messages, tools, model)
         try:
-            resp = await self._client().chat.completions.create(
-                **self._request_kwargs(messages, tools, model)
-            )
+            resp = await self._retry(lambda: client.chat.completions.create(**kwargs), "请求")
         except Exception:
             _diagnose(messages)
             raise
@@ -268,8 +331,11 @@ class OpenAILLM:
     ) -> AsyncIterator[StreamChunk]:
         """流式请求：增量 yield reasoning / content / tool_call，最后 yield done。
 
-        usage 尽量通过 stream_options.include_usage 获取；个别兼容端点不认
-        该参数时自动去掉重试一次（仅丢失 usage 统计，不影响流式本身）。
+        usage 尽量通过 stream_options.include_usage 获取；端点以 400 拒该参数时
+        自动摘掉重来一次（只丢 usage 统计，不影响流式本身）。
+
+        请求失败重试：`max_retries` 次（等待 = `max(1.0, random(0, max_retry_delay_seconds))`，
+        见 `_retry_delay`），但**只在还没 yield 过任何增量时**——已经吐出去的内容没法撤回，重来会重复。
         """
         kwargs = self._request_kwargs(messages, tools, model)
         kwargs["stream"] = True
@@ -293,6 +359,7 @@ class OpenAILLM:
         usage: Any = None
         emitted = False
         with_usage = True
+        attempt = 0
         while True:
             try:
                 async for chunk in _iterate(with_usage):
@@ -332,11 +399,21 @@ class OpenAILLM:
                             arguments=fn.arguments if fn else "",
                         )
                 break
-            except Exception:
-                if not (with_usage and not emitted):
+            except Exception as e:
+                if emitted:  # 已吐过增量 → 重来会重复内容，原样往上抛
                     _diagnose(messages)
                     raise
-                with_usage = False  # 兼容端点不认 stream_options → 去掉重试一次
+                if with_usage and getattr(e, "status_code", None) == 400:
+                    # 兼容端点不认 stream_options → 摘掉该参数重来一次（不占重试额度）
+                    with_usage = False
+                    usage = None
+                    continue
+                if attempt >= self.max_retries or not _retryable(e):
+                    _diagnose(messages)
+                    raise
+                attempt += 1
+                usage = None  # 上一轮没有交付任何内容，它带回的 usage 不算数
+                await self._sleep_before_retry(attempt, "流式请求")
 
         calls = [
             ToolCall(id=s["id"], name=s["name"], arguments=s["arguments"])

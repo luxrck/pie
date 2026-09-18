@@ -113,6 +113,7 @@ class Session:
             max_tokens=cfg.reserved_tokens,
             timeout=cfg.timeout_seconds,
             max_retries=cfg.max_retries,
+            max_retry_delay_seconds=cfg.max_retry_delay_seconds,
         )
         messages = AgentMessage(
             [SystemMessage(build_system_prompt(cfg))],

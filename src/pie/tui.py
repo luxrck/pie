@@ -16,7 +16,6 @@ import json
 import os
 import signal
 import sys
-import time
 from bisect import bisect_right
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -84,279 +83,272 @@ _BOX_BORDER = 1
 _BOX_PADDING = (0, 1)
 BOX_INSET = _BOX_BORDER + _BOX_PADDING[1]  # 盒内正文相对日志区左边的列偏移（= 2）
 
+# 盒子模式（lean=False）下工具正文最多显示的行数：read 大文件 / shell 长输出 / resume 回放
+# 一口气几百行会把消息流刷没 → **只显示前 N 行**（末尾一行省略提示、标题里标总行数）。
+# 消息正文（user / assistant / 命令反馈）不截：那些本来就是用户要看的内容。
+BOX_BODY_LINES = 24
 
-def _box(
-    palette: Theme,
-    body: str,
-    *,
-    title: str = "",
-    role: str = "system",
-    icon: str | None = None,
-    tool: str = "",
-) -> Panel:
-    """把一条输出装进带边框的盒子；边框颜色与标题图标都取自 palette。
+# 手动 !cmd 的盒子边框色：role_border 的兑底色 = 默认灰（与命令反馈盒同色）。
+# !cmd 不是 agent 的工具调用 → 不占 tool_call 的橙棕身份色；失败/取消仍走各自的 role。
+MANUAL_SHELL_ROLE = "system"
 
-    图标优先级：显式 icon > 工具名（palette.tool_icon(tool)）> role 默认
-    （palette.role_icon(role)）。icon="" 可强制去掉图标；tool 为空/未配置则走 role 默认。
-    边框色始终按 role（palette.role_border）。
-
-    正文先做转义清洗：assistant 走 Markdown（样式由 Rich 默认主题 + 代码块高亮主题决定，
-    SGR 一并剔除），其余走 Text（SGR 解成样式）。否则转义字节会把盒子边框撑歪。
-    代码块（围栏）的高亮主题取自 palette（浅色变体换掉默认的 monokai，否则白底上一块黑）。
-    """
-    body = body or "(空回复)"
-    content: Text | Markdown = (
-        Markdown(strip_escapes(body, keep_sgr=False), code_theme=palette.code_theme)
-        if role == "assistant"
-        else rich_text(body, palette.body_text)
-    )
-    if icon is None:
-        icon = palette.tool_icon(tool) if tool else palette.role_icon(role)
-    return Panel(
-        content,
-        title=f"{icon} {title}".strip() or None,
-        title_align="left",
-        border_style=palette.role_border(role),
-        padding=_BOX_PADDING,
-    )
+# 异常盒正文的组装（回合失败 `_fail_turn` / !shell 兜底共用）：首行 `类名: 消息`（= 以前显示的
+# 全部内容），后面再补 `↳ mod.Type: 消息` 异常链——SDK 会把真实原因包一层（openai 的
+# APIConnectionError 裹着 httpx 的 DNS / 连接 / TLS 错误），只显示最外层等于没说。
+_EXC_CHAIN_MAX = 4  # 异常链最多展开几层：够定位，又不至于把消息流刷没
+_EXC_MODULE_SKIP = {"builtins", "__main__"}  # 这些模块前缀加在类名前没意义
 
 
-def _tool_result_box(
-    palette: Theme, body: str, *, title: str, role: str, tool: str = ""
-) -> Panel:
-    """工具结果盒子：边框色按 role（失败染红），图标按 role 取**执行结果**字形（✅/❌/⏹）。
+# 文本盒的标题从 role 推（工具盒的标题是工具名，由 body 里的 name 推）
+ROLE_TITLES = {"user": "你", "assistant": "pie"}
 
-    图标与简洁模式的单行标记是同一套（icon_ok / icon_error / icon_cancelled，见 role_icon）；
-    role 由调用方按执行结果判定（_shell_result_box / _tool_failed_role）。
-    """
-    return _box(palette, body, title=title, role=role, icon=palette.result_icon(role, tool))
-
-
-def _tool_failed_role(text: str) -> str:
-    """工具结果 role：执行失败 → error（红框）、被 /stop 终止 → cancelled（低调灰），
-    其余保持 tool_result（成功）。
-
-    判定：内容就是 /stop 的取消文本（CANCEL_TEXT）；或 shell 返回以 [exit=N] 开头
-    且 N ≠ 0（命令执行失败）；或以工具调用层失败前缀开头（超时 [shell] / [工具错误] /
-    [工具异常] / [参数解析失败]）。
-    """
-    if text.strip() == CANCEL_TEXT:
-        return "cancelled"
-    if text.startswith("[exit="):
-        rc = text[6:].split("]", 1)[0]
-        if rc.lstrip("-").isdigit() and rc != "0":
-            return "error"
-    elif text.startswith(("[工具错误]", "[工具异常]", "[参数解析失败]", "[shell] ")):
-        return "error"
-    return "tool_result"
-
-
-def _split_shell_exit(text: str) -> tuple[str | None, str]:
-    """shell 工具返回文本：解析首行 [exit=N] → (code, 去掉首行后的正文)。
-
-    非 shell 文本（read/edit/write 结果、[工具错误] 等失败前缀、取消文本）原样
-    返回 (None, text)，由调用方按普通工具结果渲染。
-    """
-    if text.startswith("[exit="):
-        code = text[6:].split("]", 1)[0]
-        rest = text.split("\n\n", 1)[1].lstrip() if "\n" in text else ""
-        return code, rest
-    return None, text
-
-
-def _shell_result_box(body: str, code: Any) -> tuple[str, str, str]:
-    """按 !shell 结果（_show_shell_result）的样式生成 (title, body, role)：
-    exit code 进标题 `shell [{code}]`，正文不带 [exit=] 头；超长 (>200 行) head/tail
-    截断。agent 回合里 shell 工具的结果与用户直接 !cmd 执行保持同一套视觉。"""
-    lines = body.splitlines()
-    if len(lines) > 200:
-        preview = "\n".join(lines[:100] + ["...[输出过长，已截断]..."] + lines[-50:])
-        title = f"shell [{code}]（共 {len(lines)} 行，显示前 100 后 50）"
-    else:
-        preview = body
-        title = f"shell [{code}]" if body else f"shell [{code}]（无输出）"
-    if str(code) == "0":
-        role = "tool_result"
-    elif code == "cancelled":
-        role = "cancelled"  # 用户主动 /stop，非错误，低调灰（图标 ⏹）
-    else:  # 非 0 退出码 / 超时 / 异常 → 红框
-        role = "error"
-    return title, preview or "(无输出)", role
-
-
-def _format_tool_args(args: Any) -> str:
-    """工具调用参数 → 展示文本（实时事件与历史回放共用）。
-
-    实时事件给 dict、历史回放给 JSON 字符串（function.arguments），两者归一：
-    空参 → "(无参数)"，解析不了（截断 / 手写）就原样显示。
-    """
-    if isinstance(args, str):
-        raw = args.strip()
-        if not raw:
-            return "(无参数)"
-        try:
-            args = json.loads(raw)
-        except ValueError:
-            return args
-    try:
-        return json.dumps(args, ensure_ascii=False) if args else "(无参数)"
-    except TypeError:
-        return str(args) or "(无参数)"
-
-
-# ---- 简洁模式（Config.tui.lean）：工具活动不套盒子，压成单行 ----
-#
-# 只有 user / assistant 消息保留盒子，工具调用与工具结果一律单行（状态标记在行首）：
-#   调用  ❯ shell ls src
-#   成功  ✅ shell ls src
-#   失败  ❌ edit src/a.py
-#         → 错误正文（缩进续行，超长取首尾）
-# 单行摘要：read / write / edit 取文件 path，shell 取 command，其余退回参数 JSON。
-# 状态标记（✅/❌/⏹）的字形在主题里（Theme.icon_ok / icon_error / icon_cancelled，
-# 与盒子模式结果框的标题图标同一套，见 palette.lean_mark / palette.role_icon），
-# 这里只负责按执行结果选 status。
-LEAN_DETAIL_HEAD = 12  # 工具错误正文最多显示的开头行数（超出时中间省略）
-LEAN_DETAIL_TAIL = 7   # ...以及结尾行数
-LEAN_SHELL_HEAD = 50   # !cmd 的输出是用户主动要看的，给更宽的额度
-LEAN_SHELL_TAIL = 20
-
-# 单行摘要取哪个参数（未列出的工具退回完整参数 JSON）
-LEAN_SUMMARY_KEYS = {"read": "path", "write": "path", "edit": "path", "shell": "command"}
-
-# C0 控制字符（含 \x7f）：单行摘要里不允许出现
+# 简洁模式（lean=True）失败/取消时下方的正文块：**截断规则与 `_panel` 完全一致**
+# （只显示前 BOX_BODY_LINES 行 + 省略提示），不再自留一套 head/tail 额度。
+# C0 控制字符（含 \x7f）：单行工具行的摘要/工具名里不允许出现
 _CONTROL_CHARS = frozenset(map(chr, range(0x20))) | {"\x7f"}
 
 
-def _single_line(text: str) -> str:
-    """把摘要压成**单行可打印文本**（工具单行承诺恒为一行，摘要里混进真换行
-    会把一行撑成多行——Rich 的 no_wrap 只管「不按空白回绕」，`\n` 仍强制断行）。
+def _exc_chain(exc: BaseException, limit: int = _EXC_CHAIN_MAX) -> list[str]:
+    """异常链（`__cause__` / `__context__`）→ 一行一条，**不含**最外层那条。
 
-    - 换行 / 回车 → 字面 `\\n` 两个字符（与参数 JSON 的写法一致，一眼看出原来换过行）；
-    - tab → 一个空格（Rich 渲染时会把 tab 按制表位展开成变宽空格，会让宽度计算
-      与标记位置失准）；
-    - 其余控制字符直接丢掉（终端转义字节等不该出现在工具行里）。
+    只走真原因：`raise ... from None` 抑制掉的 `__context__` 不算。每层压成单行
+    （`APIStatusError` 的 `str()` 带多行 body，直接塞进盒子会很难看）。
     """
-    if not text:
-        return text
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
-    text = text.replace("\n", "\\n")
-    return "".join(ch for ch in text if ch not in _CONTROL_CHARS)
-
-
-def _tool_summary(name: str, args: Any) -> str:
-    """简洁模式的工具摘要：read/write/edit 取 path、shell 取 command，
-    其余工具或参数缺失时退回完整参数（_format_tool_args）。
-    实时事件给 dict、历史回放给 JSON 字符串，两种形态都接受。"""
-    data = args
-    if isinstance(data, str):
-        raw = data.strip()
-        if not raw:
-            return "(无参数)"
+    out: list[str] = []
+    seen = {id(exc)}
+    cur = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    while cur is not None and len(out) < limit and id(cur) not in seen:
+        seen.add(id(cur))
         try:
-            data = json.loads(raw)
-        except ValueError:
-            return raw
-    key = LEAN_SUMMARY_KEYS.get(name)
-    if key and isinstance(data, dict):
-        value = data.get(key)
+            msg = " ".join(str(cur).split())
+        except Exception:  # 自定义 __str__ 可能抛
+            msg = ""
+        text = f"{type(cur).__name__}: {msg}" if msg else type(cur).__name__
+        mod = type(cur).__module__.split(".")[0]
+        out.append(text if mod in _EXC_MODULE_SKIP else f"{mod}.{text}")
+        cur = cur.__cause__ or (None if cur.__suppress_context__ else cur.__context__)
+    return out
+
+
+def _error_body(exc: BaseException) -> str:
+    """异常盒的正文：首行 `类名: 消息` + `↳` 异常链（链取不到就只剩首行）。"""
+    return "\n".join([f"{type(exc).__name__}: {exc}"] + [f"↳ {line}" for line in _exc_chain(exc)])
+
+
+def _panel(palette: Theme, body: Any, *, role: str = "system", border_role: str = "") -> list[Panel]:
+    """**盒子形态**：把一条输出画成带边框的盒子（与 `_lean` 平级、参数和它一致）。
+
+    `role` 只有三类取值，**工具名一律写在 body 里**（不再当 role 用）：
+
+    - **消息类**（system / user / assistant / error / cancelled）：body 就是正文；
+      标题查 `ROLE_TITLES`（user→「你」、assistant→「pie」），图标 `role_icon(role)`。
+    - **`tool_call`**：body = `{"name": <工具名>, "arguments": <参数>}` → 正文是参数文本、
+      标题/图标取工具名（标题里不另加修饰）。
+    - **`tool_result`**：body = `{"name": <工具名>, "arguments": <参数>, "content": <结果正文>}
+      → 退出码 / 失败前缀 / 取消文本定边框色与 ✓/✗/⏹，shell 的退出码进标题。
+
+    `border_role` 显式覆盖边框色（不填就按上面推）：唯一用途是手动 `!cmd` **成功**的结果框用默认灰
+    （MANUAL_SHELL_ROLE），同时保住 role 带来的 ✓/✗/⏹ 图标。工具正文超过 BOX_BODY_LINES 行时
+    只显示前 N 行；消息正文不截。
+    """
+    tool_body, shell = False, False
+    if role == "tool_call":
+        data = body if isinstance(body, dict) else {}
+        name = str(data.get("name") or "")
+        args = data.get("arguments")
+        # 参数 → 展示文本：解析不了的字符串（截断/手写）原样显示，空参数标一下
+        text = ""
+        if isinstance(args, str):
+            raw = args.strip()
+            if not raw:
+                text = "(无参数)"
+            else:
+                try:
+                    args = json.loads(raw)
+                except ValueError:
+                    text = args
+        if not text:
+            try:
+                text = json.dumps(args, ensure_ascii=False) if args else "(无参数)"
+            except TypeError:
+                text = str(args) or "(无参数)"
+        title, icon, tool_body = name, palette.tool_icon(name), True
+    elif role == "tool_result":
+        data = body if isinstance(body, dict) else {}
+        name = str(data.get("name") or "")
+        text = str((data.get("content") if data else body) or "")
+        code: Any = None
+        if text.startswith("[exit="):  # shell 风格：退出码进标题、正文去掉 [exit=] 头
+            shell = True
+            code = text[6:].split("]", 1)[0]
+            text = text.split("\n\n", 1)[1].lstrip() if "\n" in text else ""
+        # 成败判定：退出码（0 成功 / cancelled 取消 / 其余失败）或工具层的失败前缀
+        if shell:
+            status = "tool_result" if str(code) == "0" else (
+                "cancelled" if code == "cancelled" else "error"
+            )
+        elif text.strip() == CANCEL_TEXT:
+            status = "cancelled"
+        elif text.startswith(("[工具错误]", "[工具异常]", "[参数解析失败]", "[shell] ")):
+            status = "error"
+        else:
+            status = "tool_result"
+        title = f"{name} [{code}]" if shell else name
+        icon, tool_body = palette.result_icon(status, name), True
+        role = status  # 边框色/下标靠状态
+    else:
+        text, title, icon = str(body or ""), ROLE_TITLES.get(role, ""), palette.role_icon(role)
+    if tool_body and len(text.splitlines()) > BOX_BODY_LINES:  # 工具正文只显示前 N 行
+        lines = text.splitlines()
+        omitted = len(lines) - BOX_BODY_LINES
+        text = "\n".join(
+            lines[:BOX_BODY_LINES] + [f"...[已省略 {omitted} 行，共 {len(lines)} 行]..."]
+        )
+        title += f"（共 {len(lines)} 行，只显示前 {BOX_BODY_LINES} 行）"
+    if shell:
+        title += "" if text else "（无输出）"
+        text = text or "(无输出)"
+    else:
+        text = text or "(空回复)"
+    content: Text | Markdown = (
+        Markdown(strip_escapes(text, keep_sgr=False), code_theme=palette.code_theme)
+        if role == "assistant"
+        else rich_text(text, palette.body_text)
+    )
+    return [
+        Panel(
+            content,
+            title=f"{icon} {title}".strip() or None,
+            title_align="left",
+            border_style=palette.role_border(border_role or role),
+            padding=_BOX_PADDING,
+        )
+    ]
+
+
+def _lean(
+    palette: Theme, body: Any, *, role: str = "system", border_role: str = ""
+) -> list[Padding]:
+    """**简洁形态**：把一条输出画成单行（工具结果失败/取消时再跟一个缩进正文块）。
+
+    参数与 `_panel` 一致、body/role 语义也一样（见它的说明），只是画成紧凑形态：
+
+    - `tool_call` → `图标 工具名 摘要` 一行；
+    - `tool_result` → `状态标记 工具名 摘要`（**标记放行首**，向右裁天然保住它）+ 失败/取消时
+      的正文块（超过 BOX_BODY_LINES 行时只显示前 N 行——与 `_panel` 同一条规则）。
+
+    单行用的是「一句话摘要」而不是完整参数：**read / write / edit 取 path、shell 取 command**
+    （`LEAN_SUMMARY_KEYS`），没命中就退回参数文本——摘要就在这一层从 `arguments` 推出来。
+    消息类 role 没有单行形态 → 由 `_box` 交给 `_panel`，不会走到这里。
+    """
+    data = body if isinstance(body, dict) else {}
+    name = str(data.get("name") or "")
+    args = data.get("arguments")
+    # 摘要：read/write/edit 取 path、shell 取 command；没命中退回参数文本（实时给 dict、
+    # 历史回放给 JSON 串，两种形态都接受）。与 _panel 的「参数→文本」是同一套规则。
+    parsed = args
+    summary = ""
+    if isinstance(args, str):
+        raw = args.strip()
+        if not raw:
+            summary = "(无参数)"
+        else:
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                summary = raw  # 截断 / 手写的参数：原样当摘要
+    if not summary and isinstance(parsed, dict):
+        key = LEAN_SUMMARY_KEYS.get(name)
+        value = parsed.get(key) if key else None
         if isinstance(value, str) and value:
-            return value
-    return _format_tool_args(args)
+            summary = value
+    if not summary:
+        try:
+            summary = json.dumps(parsed, ensure_ascii=False) if parsed else "(无参数)"
+        except TypeError:
+            summary = str(parsed) or "(无参数)"
+    # 压成**单行可打印文本**：no_wrap 只管「不按空白回绕」，真换行照样断行；tab 会被摊成
+    # 变宽空格，让宽度计算与标记位置失准 → 换行/回车写字面 \n、tab 换空格、其余控制符丢掉
+    summary = summary.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    summary = "".join(ch for ch in summary.replace("\n", "\\n") if ch not in _CONTROL_CHARS)
 
+    if role == "tool_call":
+        icon, status = palette.tool_icon(name), None
+        color = palette.role_border(border_role or "tool_call")
+    else:
+        text = str((data.get("content") if isinstance(data, dict) else body) or "")
+        # 成败与 _panel 同一套：退出码定成败、正文去掉 [exit=] 头；否则看取消文本/失败前缀
+        if text.startswith("[exit="):
+            code: Any = text[6:].split("]", 1)[0]
+            body_text = text.split("\n\n", 1)[1].lstrip() if "\n" in text else ""
+            status = (
+                "tool_result" if str(code) == "0" else "cancelled" if code == "cancelled" else "error"
+            )
+        else:
+            body_text = text
+            status = (
+                "cancelled"
+                if text.strip() == CANCEL_TEXT
+                else "error"
+                if text.startswith(("[工具错误]", "[工具异常]", "[参数解析失败]", "[shell] "))
+                else "tool_result"
+            )
+        # 行首标记只认 ok/fail/cancelled（见 palette.lean_mark），状态→它的映射就在这里
+        icon = palette.lean_mark({"tool_result": "ok", "error": "fail", "cancelled": "cancelled"}[status])
+        color = palette.role_border(border_role or status)
 
-def _lean_line(palette: Theme, name: str, summary: str, *, role: str, mark: str = "") -> Padding:
-    """构造简洁模式的一行工具记录：`[状态标记|工具图标] 工具名 摘要`——单行、向右截断。
-
-    **状态标记放行首**是关键：Text 向右裁天然保住它，于是不需要「先按可用宽度截摘要、
-    再把标记贴到行尾」那套自定义宽度预算（原来的 _LeanLine 就是为这件事存在的）。
-    截断与 `…` 都交给 `Text(no_wrap=True, overflow="ellipsis")`（CJK 不会切出半个字，
-    见 textkit.install_cjk_wrap）。摘要先过 `_single_line`：真换行在 no_wrap 下仍会断行。
-
-    没有盒子，所以边框色在这里退化成前景色：标记/工具名用 role 色、成功时摘要用次级色、
-    失败（error）整行同色（与下方错误正文一致，一眼看出这次调用失败了）。结果行的图标就是
-    状态标记本身（✅/❌/⏹，与盒子模式结果框同一套字形），不再另配工具身份图标。
-
-    左右留白用 Padding（不画边框），列数取 BOX_INSET（= 盒边框 + 盒内边距），与盒内正文对齐；
-    留白不进源文本 → 框选复制拿到的仍是干净的一行。
-    """
-    color = palette.role_border(role)
-    fail = role == "error"
-    icon = mark or palette.tool_icon(name)
-    text = Text(no_wrap=True, overflow="ellipsis")
+    # 单行（无盒子）：`[标记|图标] 工具名 摘要`；左右留白用 Padding（不进源文本）
+    line = Text(no_wrap=True, overflow="ellipsis")
     if icon:
-        text.append(f"{icon} ", style=color)
-    text.append(name, style=f"bold {color}")
+        line.append(f"{icon} ", style=color)
+    line.append(name, style=f"bold {color}")
     if summary:
-        text.append(f" {_single_line(summary)}", style=color if fail else palette.muted)
-    return Padding(text, (0, BOX_INSET))
+        line.append(f" {summary}", style=color if status == "error" else palette.muted)
+    out = [Padding(line, (0, BOX_INSET))]
+
+    if status not in (None, "tool_result") and body_text.strip():
+        # 失败/取消才在下方输出正文：首行 `↳ `、续行两格对齐；截断与 _panel 同一条规则
+        style = palette.role_error if status == "error" else palette.muted
+        lines = body_text.rstrip("\n").splitlines()
+        total = len(lines)
+        if total > BOX_BODY_LINES:          # 只显示前 N 行（不再自留 head/tail）
+            lines = lines[:BOX_BODY_LINES] + [
+                f"...[已省略 {total - BOX_BODY_LINES} 行，共 {total} 行]..."
+            ]
+        block = Text()
+        for i, ln in enumerate(lines):
+            if i:
+                block.append("\n")
+            block.append(("↳ " if i == 0 else "  ") + ln, style=style)
+        out.append(Padding(block, (0, BOX_INSET)))
+    return out
 
 
-def _lean_detail(
-    text: str, style: str, *, head: int = LEAN_DETAIL_HEAD, tail: int = LEAN_DETAIL_TAIL
-) -> Padding:
-    """简洁模式的续行块：首行 `→ `、后续行对齐缩进（失败正文 / !cmd 输出共用）。
+def _box(
+    palette: Theme,
+    body: Any,
+    *,
+    role: str = "system",
+    border_role: str = "",
+    lean: bool = False,
+) -> list[Panel | Padding]:
+    """渲染一条输出 → 要写进消息流的 renderable（**整个视图层唯一的样式决策点**）。
 
-    超过 head+tail 行时只显示首尾并标注省略行数，避免一次输出几十上百行冲掉消息流。
-    块内缩进（首行 `→ `、续行两格）留在文本里（它是块自己的对齐），左右留白与工具行同源
-    （BOX_INSET）→ 首行的 `→` 正好落在工具行图标记的下一列。长行仍交给 Rich 回绕。
+    `body` / `role` / `border_role` 的语义见 `_panel`；`lean=True` 且是**工具活动**
+    （`role` 为 `tool_call` / `tool_result`）→ `_lean` 压成单行，其余（消息类）恒套盒子；
+    手动 !cmd 由调用方传 `lean=False` 显式豁免（见 PieApp._notify）。
     """
-    lines = text.rstrip("\n").splitlines()
-    if len(lines) > head + tail + 1:
-        omitted = len(lines) - head - tail
-        lines = lines[:head] + [f"\n...（中间省略 {omitted} 行）...\n"] + lines[-tail:]
-    block = Text()
-    for i, line in enumerate(lines):
-        if i:
-            block.append("\n")
-        block.append(("→ " if i == 0 else "  ") + line, style=style)
-    return Padding(block, (0, BOX_INSET))
+    if lean and role in ("tool_call", "tool_result"):
+        return _lean(palette, body, role=role, border_role=border_role)
+    return _panel(palette, body, role=role, border_role=border_role)
 
 
-def _lean_tool_result(
-    palette: Theme, name: str, summary: str, content: str
-) -> tuple[Padding, Padding | None]:
-    """简洁模式的工具结果：一行 `状态标记 工具名 摘要`（+ 可选的错误正文续行块）。
-
-    成败判定与盒子模式一致：shell 按 `[exit=N]`（非 0 = 失败）、其余按 _tool_failed_role
-    的失败前缀；正文里 shell 的 [exit=] 头已被 _split_shell_exit 剥掉。
-    被 /stop 终止的工具结果（CANCEL_TEXT / exit=cancelled）既不算成功也不算失败，用 ⏹。
-    返回 (行, 正文块)：正文块为 None 时只写一行（成功时不显示输出）。
-    """
-    code, body = _split_shell_exit(content)
-    if code == "cancelled" or content.strip() == CANCEL_TEXT:
-        # /stop：既非成功也非失败（role=cancelled → 低调灰 + ⏹）
-        mark, role, detail = palette.lean_mark("cancelled"), "cancelled", True
-    elif _tool_failed_role(content) == "error":
-        mark, role, detail = palette.lean_mark("fail"), "error", True
-    else:
-        mark, role, detail = palette.lean_mark("ok"), "tool_result", False
-    line = _lean_line(palette, name, summary, role=role, mark=mark)
-    if not detail or not body.strip():
-        return line, None
-    style = palette.role_error if role == "error" else palette.muted
-    return line, _lean_detail(body, style)
-
-
-def _lean_shell_result(
-    palette: Theme, cmd: str, out: str, code: Any
-) -> tuple[Padding, Padding | None]:
-    """简洁模式的 !shell 结果：一行 `状态标记 shell <cmd>` + 缩进输出块。
-
-    与 agent 回合里的工具结果不同：!cmd 是用户主动执行，输出本身就是要看的东西，
-    所以成功也显示（额度也更宽）；退出码由行首标记表达。
-    """
-    if code == "cancelled":
-        mark, role = palette.lean_mark("cancelled"), "cancelled"
-    elif str(code) == "0":
-        mark, role = palette.lean_mark("ok"), "tool_result"
-    else:
-        mark, role = palette.lean_mark("fail"), "error"
-    line = _lean_line(palette, "shell", cmd, role=role, mark=mark)
-    body = out.rstrip("\n")
-    if not body:
-        return line, None
-    style = palette.role_error if role == "error" else palette.body_text
-    return line, _lean_detail(body, style, head=LEAN_SHELL_HEAD, tail=LEAN_SHELL_TAIL)
+# ---- 简洁单行（lean）----
+#
+# 单行摘要取哪个参数（未列出的工具退回参数文本）：规则用在 _lean 里，不在 App 侧。
+# 状态标记（✅/❌/⏹）的字形在主题里（Theme.icon_ok / icon_error / icon_cancelled，
+# 与盒子模式结果框的标题图标同一套，见 palette.lean_mark / palette.role_icon）。
+LEAN_SUMMARY_KEYS = {"read": "path", "write": "path", "edit": "path", "shell": "command"}
 
 
 def _help_text() -> str:
@@ -893,7 +885,6 @@ class PieApp(App):
         self._content_streaming = False  # 当前回合是否已进入 content 阶段（首次时清 reasoning）
 
     def compose(self) -> ComposeResult:
-        # yield Header()
         yield SelectableRichLog(
             selection_style=Style(bgcolor=self.palette.accent, color=self.palette.accent_text),
             highlight=True,
@@ -920,7 +911,6 @@ class PieApp(App):
         with Horizontal(id="foot-bar"):
             yield Static("", id="meta")
             yield Static("", id="status")
-        # yield Footer()
 
     def on_mount(self) -> None:
         # 浅色变体把 Markdown 代码的硬编码黑底换成浅色（最小覆盖；深色变体为空字典 → 不动）。
@@ -1001,11 +991,10 @@ class PieApp(App):
             pass  # 预热失败静默：真实请求自带重试，不受影响
 
     def _update_meta(self) -> None:
-        """顶栏元信息：模型 / 思考深度 / 目录 / 归档窗口数（/thinking / /model 切换后刷新）。"""
+        """顶栏元信息：模型 / 思考深度 / 目录（/thinking / /model 切换后刷新）。"""
         self.query_one("#meta", Static).update(
             f"{self.session.config.model} {self.session.config.reasoning_effort}"
             f" · {Path.cwd()}"
-            # f" · [{len(self.session.windows)}]"
         )
 
     def _update_status(self) -> None:
@@ -1013,68 +1002,44 @@ class PieApp(App):
         # 跳过“会话文件”行（路径长，不适合状态栏），仍取首/尾两行摘要
         lines = [ln for ln in rep if not ln.startswith("会话文件")]
         context = lines[0].split("：", 1)[-1].strip()
-        # compact = lines[3].split("：", 1)[-1].strip().split("(")[0].strip()
         self.query_one("#status", Static).update(f"{context}")
 
-    # ---- 渲染：盒子（resume 历史与实时事件共用同一套） ----
+    # ---- 渲染：所有输出都经 _notify 落到 #log ----
+    #
+    # 分层：**样式决策全在模块级纯函数 `_box`**（它再分派到 _panel / _lean），
+    # PieApp 侧只有一个出口 `_notify`（把 _box 的产物写进 #log，
+    # 也是 tui.py 里唯一的 `log.write`）。实时事件、resume 历史回放、命令反馈全走它，
+    # 所以不存在「某个入口另写一份样式」。
 
-    def _notify(self, text: str, role: str = "system", **kwargs: Any) -> None:
-        """往消息流写一条提示盒（命令反馈、状态说明等）。"""
-        self.query_one("#log", RichLog).write(_box(self.palette, text, role=role, **kwargs))
+    def _notify(self, body: Any, role: str = "system", **kwargs: Any) -> None:
+        """往消息流写一条内容（#log 的**唯一写入口**）。
 
-    def _render_tool_call(self, log: RichLog, name: str, args: Any) -> None:
-        """渲染一条工具调用（历史传 JSON 字符串，实时事件传 dict）。
-
-        简洁模式：一行 `icon 工具名 摘要`（read/write/edit 取 path、shell 取 command）。
+        盒子还是简洁单行、图标、正文截断全在 _box 里定（role 兼做角色与工具）；这里只负责落写。
+        `lean` 默认取 App 的简洁模式开关，手动 !cmd 传 `lean=False` 显式豁免（它是用户主动执行，
+        输出本身就是要看的，任何模式都套盒子）。
         """
-        if self.lean:
-            log.write(_lean_line(self.palette, name, _tool_summary(name, args), role="tool_call"))
-            return
-        log.write(
-            _box(
-                self.palette,
-                _format_tool_args(args),
-                title=name,
-                role="tool_call",
-                tool=name,
-            )
-        )
+        kwargs.setdefault("lean", self.lean)
+        log = self.query_one("#log", RichLog)
+        for r in _box(self.palette, body, role=role, **kwargs):
+            log.write(r)
 
-    def _render_tool_result(
-        self, log: RichLog, name: str, content: str, *, summary: str = "", truncate: bool = False
-    ) -> None:
+    def _render_tool_call(self, name: str, args: Any) -> None:
+        """渲染一条工具调用（历史传 JSON 字符串，实时事件传 dict，渲染层自己归一）。"""
+        self._notify({"name": name, "arguments": args}, role="tool_call")
+
+    def _render_tool_result(self, name: str, content: str, *, arguments: Any = None) -> None:
         """渲染一条工具结果（实时事件与 resume 历史共用）。
 
-        shell 结果（以 `[exit=N]` 开头）解析 exit code 进标题、正文去掉头部，失败染红框；
-        truncate=True（历史回放）时超长结果截断显示 head/tail，避免 resume 一次性撑爆 TUI。
-        简洁模式：单行 `状态标记 工具名 摘要`（标记在行首：✅/❌/⏹），只有失败才在下方
-        缩进输出正文（summary 为调用时的参数摘要，历史回放与实时事件都从对应 tool_call 拿）。
+        `arguments` 是配对的那次调用参数——简洁模式的结果行要从中推出摘要（正文里没有它，
+        所以随 body 一起交给渲染层）。
         """
-        if self.lean:
-            line, detail = _lean_tool_result(self.palette, name, summary, content)
-            log.write(line)
-            if detail is not None:
-                log.write(detail)
-            return
-        code, body = _split_shell_exit(content)
-        if code is not None:  # shell：标题带 exit code，正文不带 [exit=] 头
-            title, body, role = _shell_result_box(body, code)
-        else:
-            title, role = name, _tool_failed_role(content)
-            if truncate:
-                lines = body.splitlines()
-                if len(lines) > 200:
-                    body = "\n".join(
-                        lines[:50] + ["...[中间省略，全文见原始文件]..."] + lines[-50:]
-                    )
-                    title = f"{name}（共 {len(lines)} 行，显示前后 50 行）"
-        log.write(_tool_result_box(self.palette, body, title=title, role=role, tool=name))
+        self._notify({"name": name, "arguments": arguments, "content": content}, role="tool_result")
 
-    def _flush_assistant_text(self, log: RichLog) -> None:
+    def _flush_assistant_text(self) -> None:
         """把流式累积的正文固化成 #log 盒子（content 与 tool_call 并存时先固化）。"""
         if not self._assistant_text:
             return
-        log.write(_box(self.palette, self._assistant_text, title="pie", role="assistant"))
+        self._notify(self._assistant_text, role="assistant")
         self._assistant_text = ""
         self._content_streaming = False  # 下一轮模型输出时重新清 reasoning
         self._render_assistant_stream()
@@ -1088,7 +1053,6 @@ class PieApp(App):
         简洁模式下工具行需要「调用摘要」，用 tool_call_id 把工具结果与它对应的
         调用参数配起来（历史里结果按调用顺序排在后面）。
         """
-        log = self.query_one("#log", RichLog)
         calls: dict[str, tuple[str, Any]] = {}  # tool_call_id → (工具名, 参数)，供结果行取摘要
         for d in self.session.full_history():
             role = d.get("role")
@@ -1096,33 +1060,27 @@ class PieApp(App):
                 continue
             content = content_text(d.get("content"))
             if role == "user":
-                log.write(_box(self.palette, content, title="你", role="user"))
+                self._notify(content, role="user")
             elif role == "assistant":
                 tool_calls = d.get("tool_calls")
                 if tool_calls:
                     if content:  # content+tool_call 并存：先固化正文再写工具调用框
-                        log.write(_box(self.palette, content, title="pie", role="assistant"))
+                        self._notify(content, role="assistant")
                     for tc in tool_calls:
                         fn = tc.get("function") or {}
                         name = fn.get("name") or "工具"
                         args = fn.get("arguments") or ""
                         calls[tc.get("id") or ""] = (name, args)
-                        self._render_tool_call(log, name, args)
+                        self._render_tool_call(name, args)
                 else:
-                    log.write(_box(self.palette, content, title="pie", role="assistant"))
+                    self._notify(content, role="assistant")
             elif role == "tool":
                 name, args = calls.pop(
                     d.get("tool_call_id") or "", (d.get("tool_name") or "工具", None)
                 )
-                self._render_tool_result(
-                    log,
-                    name,
-                    d.get("content") or "",
-                    summary=_tool_summary(name, args) if args is not None else "",
-                    truncate=True,
-                )
+                self._render_tool_result(name, d.get("content") or "", arguments=args)
             else:
-                log.write(_box(self.palette, content, role="system"))
+                self._notify(content, role="system")
 
     # ---- 命令补全 ----
 
@@ -1398,7 +1356,7 @@ class PieApp(App):
                         f"当前: {cur}",
                         "（可用模型列表未获取到：输入 /model <id> 直接切换，或 /model refresh 重新拉取）",
                     ]
-                self._notify("\n".join(lines), title="可用模型")
+                self._notify("\n".join(["可用模型"] + lines))
             elif name == "refresh":  # 重新拉取模型列表（异步 worker，不阻塞 UI）
                 self._notify("正在重新拉取可用模型列表…")
                 # notify=True：用户主动触发，成功/失败都要给反馈
@@ -1492,17 +1450,23 @@ class PieApp(App):
             box.display = False
 
     # ---- shell 模式（! 前缀）：直接执行，不经过 LLM、不进会话上下文 ----
+    #
+    # 手动 !cmd **不吃简洁模式**：它是用户主动执行、输出本身就是要看的东西（不是可折叠的
+    # 工具活动），所以任何时候都套盒子，边框用**默认灰**（role_border 的兜底色 system，与
+    # 命令反馈盒同色）——它不是 agent 的工具调用，不占 tool_call 的橙棕身份色，也跟输入框
+    # 的橙棕 shell 模式边框区分开；执行失败仍染红、状态图标（✓/✗/■）照旧。
 
     def _run_shell(self, cmd: str) -> None:
         if not cmd:
             return
-        log = self.query_one("#log", RichLog)
-        if self.lean:
-            log.write(_lean_line(self.palette, "shell", cmd, role="tool_call"))
-        else:
-            log.write(
-                _box(self.palette, f"$ {cmd}", title="shell", role="tool_call", tool="shell")
-            )
+        # 命令行回显：借工具调用的形状（图标/标题自然取 shell），“参数文本”位置放 $ 原文；
+        # 手动 !cmd 永远是灰边框（不占 tool_call 的橙棕身份色）、不吃简洁模式。
+        self._notify(
+            {"name": "shell", "arguments": f"$ {cmd}"},
+            role="tool_call",
+            border_role=MANUAL_SHELL_ROLE,
+            lean=False,
+        )
         self._cancel_event = asyncio.Event()
         self._shell_worker = self.run_worker(
             self._exec_shell_async(cmd), group="shell", exclusive=True, exit_on_error=False
@@ -1510,7 +1474,7 @@ class PieApp(App):
         self._update_send_button()
 
     async def _exec_shell_async(self, cmd: str) -> None:
-        """asyncio 子进程逐行执行：/stop（或 Esc）时 kill 整个进程组；保留 120s 超时。
+        """asyncio 子进程逐行执行：/stop（或 Esc）时 kill 整个进程组。
         每行输出经 tool_progress 实时显示到 #stream。"""
         lines: list[str] = []
         code: Any = 0
@@ -1521,18 +1485,12 @@ class PieApp(App):
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,  # 独立进程组，取消时可 killpg 连子进程一起杀
             )
-            started = time.monotonic()
-            timed_out = False
             cancelled = False
             while True:
                 if self._cancel_event is not None and self._cancel_event.is_set():
                     cancelled = True
                     self._kill_proc(proc)
                     break
-                # if time.monotonic() - started > 120:
-                #     timed_out = True
-                #     self._kill_proc(proc)
-                #     break
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), 0.2)
                 except asyncio.TimeoutError:
@@ -1548,12 +1506,12 @@ class PieApp(App):
                 rc = await asyncio.wait_for(proc.wait(), 3)
             except asyncio.TimeoutError:
                 rc = "uninterruptible"  # 进程组内仍有不可中断(D-state)进程，SIGKILL 排队；不再阻塞 UI
-            code = "cancelled" if cancelled else ("timeout(120s)" if timed_out else rc)
+            code = "cancelled" if cancelled else rc
             out = "".join(lines)
         except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
-            out = f"{type(e).__name__}: {e}"
+            out = _error_body(e)
             code = "error"
-        self._show_shell_result(cmd, out, code)
+        self._show_shell_result(out, code)
 
     @staticmethod
     def _kill_proc(proc: asyncio.subprocess.Process) -> None:
@@ -1566,20 +1524,22 @@ class PieApp(App):
             except OSError:
                 pass
 
-    def _show_shell_result(self, cmd: str, out: str, code: Any) -> None:
-        log = self.query_one("#log", RichLog)
-        if code == "cancelled":
-            out = (out.rstrip() + "\n[用户手动终止]").strip()
-        if self.lean:
-            line, detail = _lean_shell_result(self.palette, cmd, out, code)
-            log.write(line)
-            if detail is not None:
-                log.write(detail)
-        else:
-            title, body, result_role = _shell_result_box(out, code)
-            log.write(
-                _tool_result_box(self.palette, body, title=title, role=result_role, tool="shell")
-            )
+    def _show_shell_result(self, out: str, code: Any) -> None:
+        """!cmd 的结果框（cmd 本身已经写在上面那个命令行盒子里，这里不再要）。
+
+        与 agent 的 shell 结果共用 `role="tool_result"` 的渲染，区别只有两点：退出码由这里补进
+        `[exit=]` 头（手动执行没有工具返回格式）、成功框的边框用默认灰
+        （border_role=MANUAL_SHELL_ROLE）+ 不吃简洁模式（lean=False）。
+        """
+        body = f"[exit={code}]\n\n{out}".rstrip("\n")
+        if code == "cancelled":  # agent 那条路是循环层写取消文本，这里自己补一句
+            body += f"\n[{CANCEL_TEXT}]"
+        self._notify(
+            {"name": "shell", "arguments": "", "content": body},
+            role="tool_result",
+            border_role=MANUAL_SHELL_ROLE if str(code) == "0" else "",
+            lean=False,
+        )
         self._cancel_event = None
         self._shell_worker = None
         self._clear_stream()
@@ -1589,9 +1549,7 @@ class PieApp(App):
     # ---- 回合（Textual worker 内 await session.aturn） ----
 
     def _submit(self, text: str) -> None:
-        self.query_one("#log", RichLog).write(
-            _box(self.palette, text, title="你", role="user")
-        )
+        self._notify(text, role="user")
         # 输入框保持可用：等待期间用户仍可输入 /stop 或按 Esc 取消当前回合
         self._cancel_event = asyncio.Event()
         self._clear_stream()
@@ -1602,7 +1560,7 @@ class PieApp(App):
 
     async def _run_turn(self, text: str) -> None:
         try:
-            answer = await self.session.aturn(
+            await self.session.aturn(
                 text, on_event=self._append_event, cancel_event=self._cancel_event
             )
         except asyncio.CancelledError:
@@ -1610,11 +1568,10 @@ class PieApp(App):
         except Exception as e:  # 兜底：异常显示为红色盒子，不让 worker 静默死亡
             self._fail_turn(e)
             return
-        self._finish_turn(answer)
+        self._finish_turn()
 
     def _append_event(self, ev: dict[str, Any]) -> None:
         """回合事件回调：worker 与 UI 同事件循环，直接更新组件（无需跨线程）。"""
-        log = self.query_one("#log", RichLog)
         ev_type = ev.get("type")
         if ev_type == "reasoning_delta":
             self._push_reasoning(ev.get("text", ""))
@@ -1634,29 +1591,27 @@ class PieApp(App):
                 self._render_stream()
         elif ev_type == "tool_call":
             # 修复 content+tool_call 并存：先把已累积的正文固化到 #log，再写工具调用框
-            self._flush_assistant_text(log)
-            self._render_tool_call(log, ev.get("name", "工具"), ev.get("arguments", {}))
+            self._flush_assistant_text()
+            self._render_tool_call(ev.get("name", "工具"), ev.get("arguments", {}))
         elif ev_type == "tool_result":
             # arguments 与 tool_call 事件同源：简洁模式的结果行要拿它取摘要（path / 命令）
             name = ev.get("name", "工具")
             self._render_tool_result(
-                log,
-                name,
-                ev.get("text", ""),
-                summary=_tool_summary(name, ev.get("arguments") or {}),
+                name, ev.get("text", ""), arguments=ev.get("arguments")
             )
             self._stream_tool.clear()  # agent 工具逐行不显示，结果落地后清空
         elif ev_type == "answer":
             # 正文流式显示已在 #assistant-stream 完成：此处把最终内容（以 answer 为准）
             # 固化为 #log 的 assistant 盒子，并清掉流式框。
             self._assistant_text = ev.get("text", "")
-            self._flush_assistant_text(log)
+            self._flush_assistant_text()
             self._clear_stream()
-        log.scroll_end(animate=False, force=True)
+        self.query_one("#log", RichLog).scroll_end(animate=False, force=True)
         self._update_status()
 
     def _fail_turn(self, exc: Exception) -> None:
-        self._notify(f"{type(exc).__name__}: {exc}", role="error", title="出错")
+        # 异常链由 _error_body 组装（首行仍是 `类名: 消息`，与以前一致）
+        self._notify(_error_body(exc), role="error")
         self._cancel_event = None
         self._turn_worker = None
         self._clear_stream()
@@ -1664,7 +1619,8 @@ class PieApp(App):
         self._update_status()
         self._update_send_button()
 
-    def _finish_turn(self, answer: str) -> None:
+    def _finish_turn(self) -> None:
+        """回合正常结束：清 worker 状态、存会话、刷新状态栏（正文已由 answer 事件固化）。"""
         self._cancel_event = None
         self._turn_worker = None
         self._safe_save()

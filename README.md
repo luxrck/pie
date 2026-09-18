@@ -103,7 +103,7 @@ pie [OPTIONS] [PROMPT]
     --append-system-prompt TEXT_OR_PATH  追加到 system prompt（可重复）
     --reserved-tokens N       每次请求为输出预留的 token（即 API 的 max_tokens；别名 --max-tokens）
     --auto-compact-threshold TOKENS   上下文超过该 token 估算即自动压缩
-    --timeout-seconds / --max-retries / --max-retry-delay-seconds  HTTP 与重试
+    --timeout-seconds / --max-retries / --max-retry-delay-seconds   HTTP 超时与请求重试（次数 / 等待上限）
 -v, --version                 显示版本
 ```
 
@@ -125,8 +125,8 @@ files_api = true               # 图片走 Files API（上传一次拿 file_id�
 files_ttl_days = 30            # 上传件在服务端的保留天数（1~30；0 = 永久保留）
 keep_last_steps = 5
 timeout_seconds = 60.0
-max_retries = 2
-max_retry_delay_seconds = 1.0
+max_retries = 2                # 请求重试次数（只重试连接/超时/408/409/429/5xx）
+max_retry_delay_seconds = 1.0  # 重试等待上限：本次等待 = max(1.0, random(0, 该值))
 [compaction]
 # turn 为 bool：true 开启轮次级（摘要只保留用户输入 + 模型最终输出），false 关闭
 # turn = false

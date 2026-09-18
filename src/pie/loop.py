@@ -481,6 +481,7 @@ def run_agent(
         max_tokens=cfg.reserved_tokens,
         timeout=cfg.timeout_seconds,
         max_retries=cfg.max_retries,
+        max_retry_delay_seconds=cfg.max_retry_delay_seconds,
     )
 
     messages = AgentMessage(

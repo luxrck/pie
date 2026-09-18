@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import inspect
 import os
 import re
@@ -462,7 +463,57 @@ def read(
     return _format_output(headers, body)
 
 
+def _norm_ws(s: str) -> str:
+    """去掉所有空白后的字符串（用于判断“只差缩进/换行”）。"""
+    return re.sub(r"\s+", "", s)
+
+
+def _nearest_fragment(content: str, old: str, *, max_diff_lines: int = 16) -> str:
+    """oldText 在文件里找不到时，找出原文里**最接近**的片段，并给出一段简版 diff。
+
+    目的：让模型一次就能看出差在哪（缩进？空行？某行写错了？），不必再 read 一遍。
+    做法：拿 oldText 里**最长的一行**当锚（最可能是唯一标识），在原文里找字符级最相似的那一行，
+    再以它为基准取一个同长度的窗口做 diff。返回多行文本；不够相似时返回空串（宁可不给，不给误导）。
+    """
+    old_lines = old.splitlines()
+    if not old_lines or not content:
+        return ""
+    c_lines = content.splitlines()
+    anchor_idx = max(range(len(old_lines)), key=lambda k: len(old_lines[k].strip()))
+    anchor = old_lines[anchor_idx].strip()
+    if not anchor:
+        return ""
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(anchor)                             # 字符级比对（不是拿“行列表”当元素比）
+    best_i, best_r = -1, 0.0
+    for i, ln in enumerate(c_lines):
+        sm.set_seq1(ln.strip())
+        r = sm.ratio()
+        if r > best_r:
+            best_i, best_r = i, r
+    if best_i < 0 or best_r < 0.5:                  # 太不相似，给了反而误导
+        return ""
+    start = max(0, best_i - anchor_idx)
+    window = c_lines[start:start + len(old_lines)]
+    diff = list(difflib.unified_diff(
+        old_lines, window,
+        fromfile="你的 oldText", tofile=f"原文实际内容（第 {start + 1} 行起）",
+        lineterm="", n=1,
+    ))
+    body = "\n".join(f"    {ln}" for ln in diff[:max_diff_lines])
+    more = "" if len(diff) <= max_diff_lines else f"\n    …（diff 已截断，共 {len(diff)} 行）"
+    return f"原文里最接近的位置在第 {start + 1} 行（锚行相似度 {best_r:.0%}）：\n{body}{more}"
+
+
 @tool(
+    description=(
+        "一次调用做多个精确替换：每个 oldText 必须**唯一**且互不重叠，且都按**同一份原文**匹配（不是逐条叠加）。\n"
+        "编辑纪律（不做很容易白花一次往返）：\n"
+        "- oldText 从刚 read 到的内容里**整段复制**（含缩进与空行）；\n"
+        "- 同一次调用的多条 edits **互不依赖**：不能引用另一条 edit 的新文本（要级联就分两次调用）；\n"
+        "- 任何一条报错，**整次调用什么都不写入**（原子）→ 重新 read 再改，不要接着用旧内容；\n"
+        "- 改动较大或相邻，就用**一条** edit 覆盖整块，不要拆成多条挨着的 edits。"
+    ),
     parameters={
         "path": {"type": "string", "description": "Path to the file to edit (relative or absolute)"},
         "edits": {
@@ -491,7 +542,12 @@ def read(
     }
 )
 def edit(path: str, edits: list[dict[str, str]]) -> str:
-    """一次调用做多个精确替换：每个 oldText 在原文中必须唯一且互不重叠，按原文一次性应用。"""
+    """一次调用做多个精确替换：每个 oldText 在原文中必须唯一且互不重叠，按原文一次性应用。
+
+    失败时**不写入任何内容**，并尽量给出可自纠的诊断：究竟是「引用了同一次调用里另一条 edit 的
+    产物」「只差空白/缩进」「出现多次」还是「原文实际长这样」（附一段简版 diff）；
+    所有问题**一次报完**，省一次往返。
+    """
     p = Path(path)
     if not p.exists():
         raise ToolError(f"文件不存在: {path}")
@@ -501,15 +557,43 @@ def edit(path: str, edits: list[dict[str, str]]) -> str:
 
     replacements: list[tuple[int, int, str]] = []  # (start, end, newText)，基于原文位置
     labels: list[str] = []
+    problems: list[str] = []
     for i, e in enumerate(edits):
         old, new = e.get("oldText"), e.get("newText", "")
         if not isinstance(old, str) or old == "":
-            raise ToolError(f"edits[{i}].oldText 必须是非空字符串")
+            problems.append(f"edits[{i}].oldText 必须是非空字符串")
+            continue
+        if not isinstance(new, str):
+            problems.append(f"edits[{i}].newText 必须是字符串")
+            continue
         matched = content.count(old)
         if matched == 0:
-            raise ToolError(f"edits[{i}].oldText 在 {path} 中找不到（区分大小写）：{old[:200]!r}")
+            msg = [f"edits[{i}].oldText 在 {path} 中找不到（区分大小写）：{old[:120]!r}"]
+            # 诊断 1：级联——引用了同一次调用里另一条 edit 的产物（本工具对**原文**一次性应用）
+            for j, other in enumerate(edits):
+                other_new = other.get("newText") if isinstance(other, dict) else None
+                if j != i and isinstance(other_new, str) and other_new and old in other_new:
+                    msg.append(
+                        f"    提示：这段文本出现在 edits[{j}].newText 里 —— edits 是对**原文**一次性应用的，"
+                        f"不能引用同一次调用中另一条 edit 产生的文本；请拆成两次调用（先改前一处，再改后一处）。"
+                    )
+                    break
+            # 诊断 2：只差空白 / 缩进 / 换行
+            if _norm_ws(old) and _norm_ws(old) in _norm_ws(content):
+                msg.append("    提示：忽略空白/换行后能匹配上 → 多半是缩进或空行与原文不完全一致"
+                           "（请从刚读到的内容里整段复制）。")
+            # 诊断 3：最接近的片段 + 简版 diff
+            hint = _nearest_fragment(content, old)
+            if hint:
+                msg.append("    " + hint)
+            problems.append("\n".join(msg))
+            continue
         if matched > 1:
-            raise ToolError(f"edits[{i}].oldText 在 {path} 中出现 {matched} 次，必须唯一：{old[:200]!r}")
+            problems.append(
+                f"edits[{i}].oldText 在 {path} 中出现 {matched} 次，必须唯一：{old[:120]!r}"
+                f"\n    提示：把 oldText 加长到能唯一确定位置（多带几行上下文），或与相邻改动合并成一个 edit。"
+            )
+            continue
         start = content.index(old)
         replacements.append((start, start + len(old), new))
         labels.append(f"edits[{i}]")
@@ -517,9 +601,15 @@ def edit(path: str, edits: list[dict[str, str]]) -> str:
     order = sorted(range(len(replacements)), key=lambda k: replacements[k][0])
     for a, b in zip(order, order[1:]):
         if replacements[b][0] < replacements[a][1]:
-            raise ToolError(
+            problems.append(
                 f"edits 存在重叠：{labels[a]} 与 {labels[b]}（相邻/重叠改动请合并成一个 edit）"
             )
+
+    if problems:
+        raise ToolError(
+            f"edits 有 {len(problems)} 处问题，**未写入任何内容**（本工具的 edits 对原文一次性应用）：\n"
+            + "\n".join(f"- {m}" for m in problems)
+        )
 
     parts: list[str] = []
     pos = 0
