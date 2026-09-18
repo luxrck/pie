@@ -28,12 +28,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rich._wrap import divide_line as rich_divide_line
 from rich.cells import cell_len
+from rich.padding import Padding
+from rich.panel import Panel
 from textual.app import App, ComposeResult
 
 from pie import textkit
 from pie.textkit import cjk_compute_wrap_offsets, cjk_divide_line
 from pie.theme import get_theme
-from pie.tui import PieApp, PieTextArea, SelectableRichLog, _box, _lean_line, _tool_result_box, _wide_text
+from pie.tui import (
+    PieApp,
+    PieTextArea,
+    SelectableRichLog,
+    _box,
+    _error_body,
+    _lean,
+    _panel,
+    _wide_text,
+)
 
 THEME = get_theme("catppuccin-mocha")
 
@@ -81,6 +92,16 @@ def _copy_whole_box(log: SelectableRichLog) -> str:
     log._sel_start = (entry.row, 0)
     log._sel_end = (entry.row + entry.count - 1, 10**6)
     return log._selected_text()
+
+
+def _box_border_colors(log: SelectableRichLog, entry=None) -> set[str]:
+    """取某条日志（默认最近一次写入）**标题行**出现的样式串集合。
+
+    盒子标题行整行都是边框样式（`╭─ 标题 ─╮`）→ 集合里含哪个 role 色，就知道这条盒子用的哪个
+    role 的边框（`str(Style)` 即 CSS 色字符串，如 `#585b70`）。
+    """
+    entry = entry if entry is not None else log._entries[-1]
+    return {str(seg.style) for seg in log.lines[entry.row] if seg.text.strip()}
 
 
 def _normalize_first_line(text: str) -> str:
@@ -196,9 +217,18 @@ def test_textarea_wrap_breaks_ascii_at_char() -> None:
 # ---- 复制 ----
 
 
+def _write_box(log: SelectableRichLog, body, *, palette=None, **kwargs) -> None:
+    """把 `_box` 产出的 renderable 逐个写进日志区（_box 返回列表：简洁模式可能是两行）。
+
+    palette 默认用测试的 mocha 主题（THEME）。
+    """
+    for r in _box(palette or THEME, body, **kwargs):
+        log.write(r)
+
+
 async def _check_boxes(log: SelectableRichLog, expect_truncate: bool = True) -> None:
     for name, md in MARKDOWN_CASES.items():
-        panel = _box(THEME, md, role="assistant", title="pie")
+        panel = _box(THEME, md, role="assistant")[0]
         want = _wide_text(panel.renderable).strip("\n")
         log.write(panel)
         entry = log._entries[-1]
@@ -208,10 +238,11 @@ async def _check_boxes(log: SelectableRichLog, expect_truncate: bool = True) -> 
             f"{name}:\n  got ={got!r}\n  want={want!r}"
         )
     for name, body in TEXT_CASES.items():
+        # 长行用 shell 结果盒（正文就是那一行长路径）；其余用普通文本盒（只考换行/复制）
         box = (
-            _tool_result_box(THEME, body, title="shell [0]", role="tool_result", tool="shell")
+            _panel(THEME, {"name": "shell", "content": body}, role="tool_result")[0]
             if name == "长行"
-            else _box(THEME, body, tool="read")
+            else _box(THEME, body)[0]
         )
         log.write(box)
         entry = log._entries[-1]
@@ -231,7 +262,7 @@ def test_copy_matches_source_at_many_widths() -> None:
                 await _check_boxes(log)
                 # 回退路径：分隔线（随宽度铺满）应当优雅回退，不报错、不崩
                 for md in FALLBACK_CASES.values():
-                    log.write(_box(THEME, md, role="assistant", title="pie"))
+                    _write_box(log, md, role="assistant")
                     assert _copy_whole_box(log)
 
     asyncio.run(run())
@@ -245,7 +276,7 @@ def test_copy_partial_rows_has_no_break() -> None:
         async with app.run_test(size=(46, 20)) as pilot:
             await pilot.pause()
             log = app.query_one("#log", SelectableRichLog)
-            log.write(_box(THEME, LONG_CMD_PATH * 2, tool="read"))
+            _write_box(log, LONG_CMD_PATH * 2)
             entry = log._entries[-1]
             log._sel_start = (entry.row + 1, 5)
             log._sel_end = (entry.row + entry.count - 2, 7)
@@ -264,7 +295,7 @@ def test_copy_real_mouse_drag() -> None:
         async with app.run_test(size=(60, 20)) as pilot:
             await pilot.pause()
             log = app.query_one("#log", SelectableRichLog)
-            log.write(_box(THEME, LONG_CMD_PATH, tool="shell", title="shell"))
+            _write_box(log, {"name": "shell", "content": LONG_CMD_PATH}, role="tool_result")
             entry = log._entries[-1]
             region = log.scrollable_content_region
             await pilot.mouse_down(log, offset=(region.x - log.region.x, region.y - log.region.y))
@@ -310,7 +341,7 @@ def test_pie_app_mount_and_copy() -> None:
             await pilot.pause()
             log = app.query_one("#log")
             body = "这是一句没有空格的中文长句，用来确认全角字可以逐字折行，而英文单词 keep-intact-token 不会被切开。"
-            log.write(_box(app.palette, body, title="pie", role="assistant"))
+            _write_box(log, body, role="assistant", palette=app.palette)
             assert _copy_whole_box(log) == body
             app.query_one("#input").text = "测试中文输入"
             await pilot.pause()
@@ -350,29 +381,179 @@ def test_tool_render_helpers() -> None:
             await pilot.pause()
             log = app.query_one("#log")
             # 参数归一：dict（实时）与 JSON 串（历史）一样，空参/坏 JSON 有兜底
-            app._render_tool_call(log, "read", {"path": "a.txt"})
+            app._render_tool_call("read", {"path": "a.txt"})
             assert _copy_whole_box(log) == '{"path": "a.txt"}'
-            app._render_tool_call(log, "read", '{"path": "a.txt"}')
+            app._render_tool_call("read", '{"path": "a.txt"}')
             assert _copy_whole_box(log) == '{"path": "a.txt"}'
-            app._render_tool_call(log, "shell", "")
+            app._render_tool_call("shell", "")
             assert _copy_whole_box(log) == "(无参数)"
-            app._render_tool_call(log, "edit", "{半截 JSON")
+            app._render_tool_call("edit", "{半截 JSON")
             assert _copy_whole_box(log) == "{半截 JSON"
             # shell 结果：exit code 进标题、正文去掉 header；失败框染红（role）
-            app._render_tool_result(log, "shell", "[exit=1]\n\nboom")
+            app._render_tool_result("shell", "[exit=1]\n\nboom")
             entry = log._entries[-1]
             assert "shell [1]" in log.lines[entry.row].text
             assert _copy_whole_box(log) == "boom"
-            app._render_tool_result(log, "read", "[工具错误] 文件不存在: x")
+            app._render_tool_result("read", "[工具错误] 文件不存在: x")
             assert _copy_whole_box(log) == "[工具错误] 文件不存在: x"
-            # 超长：实时原样，历史回放截断 head/tail
-            long_text = "\n".join(f"line{i}" for i in range(300))
-            app._render_tool_result(log, "read", long_text)
-            assert _copy_whole_box(log) == long_text
-            app._render_tool_result(log, "read", long_text, truncate=True)
-            truncated = _copy_whole_box(log)
-            assert "[中间省略，全文见原始文件]" in truncated and "line299" in truncated
-            assert "共 300 行" in log.lines[log._entries[-1].row].text
+            # 超长：盒子模式也只显示前 N 行（实时与 resume 回放同一条路，不再“历史才截”）
+            from pie.tui import BOX_BODY_LINES
+
+            long_text = "\n".join(f"line{i}" for i in range(BOX_BODY_LINES + 200))
+            app._render_tool_result("read", long_text)
+            shown = _copy_whole_box(log)
+            assert f"line{BOX_BODY_LINES - 1}" in shown and f"line{BOX_BODY_LINES}" not in shown
+            assert "已省略 200 行" in shown
+            assert f"共 {BOX_BODY_LINES + 200} 行" in log.lines[log._entries[-1].row].text
+
+    asyncio.run(run())
+
+
+def test_error_box_shows_cause_chain() -> None:
+    """出错盒：首行仍是 `类名: 消息`，另加 `↳` 异常链。
+
+    没这两行时，连接类错误只能看到一个被 SDK 包过的 `APIConnectionError: Connection error.`
+    ——真实原因（httpx 的 DNS / 连接 / TLS 错误）全在 `__cause__` 里，等于没说。
+    """
+
+    class ConnectError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
+
+    exc = APIConnectionError("Connection error.")
+    exc.__cause__ = ConnectError("[Errno -3] Temporary failure in name resolution")
+
+    lines = _error_body(exc).splitlines()
+    assert lines[0] == "APIConnectionError: Connection error."
+    assert lines[1].startswith("↳ ") and "ConnectError" in lines[1]
+    assert "name resolution" in lines[1]
+    assert len(lines) == 2  # 只首行 + 链，不再多拼提示
+
+    # 链取不到就只剩首行
+    assert _error_body(ValueError("随便一个错")) == "ValueError: 随便一个错"
+
+    # `raise ... from None` 抑制掉的 context 不算真原因；异常链成环也不会转不出来
+    suppressed = RuntimeError("外层")
+    suppressed.__context__ = ValueError("被抑制的")
+    suppressed.__suppress_context__ = True
+    assert _error_body(suppressed) == "RuntimeError: 外层"
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert _error_body(a) == "RuntimeError: a\n↳ RuntimeError: b"
+
+    async def run() -> None:
+        app = PieApp(_dummy_session())
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#log")
+            app._fail_turn(exc)
+            shown = _copy_whole_box(log)
+            assert shown.splitlines()[0] == "APIConnectionError: Connection error."
+            assert "name resolution" in shown
+
+    asyncio.run(run())
+
+
+def _panel_body(renderable) -> str:
+    """盒子（Panel）内的正文纯文本（Text / Markdown 都归一）。"""
+    body = renderable.renderable
+    return body.plain if hasattr(body, "plain") else str(body)
+
+
+def test_box_dispatch_and_single_writer() -> None:
+    """渲染分层约束：盒子/简洁的分派全在 _box（纯函数，不碰 App），#log 只有 _notify 一个写入口。
+
+    这两条保证「实时事件 / resume 历史回放 / 命令反馈」不可能各自写一份样式——
+    新增写入路径（绕过 _notify）或把样式决策塞回 App 方法里，这条用例就红。
+    """
+    from pie.tui import BOX_BODY_LINES, MANUAL_SHELL_ROLE, _box
+
+    def call(*args, **kwargs):
+        return _box(THEME, *args, **kwargs)
+
+    # 工具调用：盒子 vs 简洁单行（body 与 _panel 同构：{"name", "arguments"}）
+    read_call = {"name": "read", "arguments": {"path": "a.txt"}}
+    assert isinstance(call(read_call, role="tool_call")[0], Panel)
+    assert isinstance(call(read_call, role="tool_call", lean=True)[0], Padding)
+    # 工具结果：盒子（shell exit code 进标题）；简洁模式成功 1 行、失败 2 行（单行 + 正文块）
+    shell_box = call({"name": "shell", "content": "[exit=1]\n\nboom"}, role="tool_result")[0]
+    assert isinstance(shell_box, Panel) and "shell [1]" in str(shell_box.title)
+    assert len(call({"name": "read", "arguments": {"path": "a.txt"}, "content": "ok"},
+                    role="tool_result", lean=True)) == 1
+    assert len(call({"name": "read", "content": "[工具错误] x"}, role="tool_result", lean=True)) == 2
+    # 手动 !cmd：由**调用方**显式 lean=False（_box 不再特判 manual）→ 仍套盒子、边框默认灰
+    manual_box = call({"name": "shell", "arguments": "", "content": "[exit=1]\n\nout"},
+                      role="tool_result", border_role=MANUAL_SHELL_ROLE, lean=False)[0]
+    assert isinstance(manual_box, Panel)
+    # 超长正文：盒子模式也只显示前 N 行（实时与 resume 回放同一条路，不再分实时/历史）
+    long_text = "\n".join(f"line{i}" for i in range(BOX_BODY_LINES + 200))
+    hot = call({"name": "read", "content": long_text}, role="tool_result")[0]
+    shown = _panel_body(hot)
+    assert f"line{BOX_BODY_LINES - 1}" in shown and f"line{BOX_BODY_LINES}" not in shown
+    assert "已省略 200 行" in shown and f"只显示前 {BOX_BODY_LINES} 行" in str(hot.title)
+    # 消息正文（user/assistant）不截：那是用户要看的内容（title 由 role 推，不再手传）
+    assert _panel_body(call(long_text, role="user")[0]) == long_text
+
+    # #log 的唯一写入口是 _notify（tui.py 里唯一的 `log.write(`）
+    src = (Path(__file__).resolve().parents[1] / "src" / "pie" / "tui.py").read_text(
+        encoding="utf-8"
+    )
+    assert src.count("log.write(") == 1, "出现了绕过 _notify 的 #log 写入"
+
+
+def test_resume_history_uses_same_renderers() -> None:
+    """resume 回放走的就是实时事件那套渲染（盒子 / 简洁单行都要跑通）。
+
+    覆盖两个入口的共用关系：user → "你"、assistant+tool_calls → 工具调用、tool → 结果，
+    且简洁模式下结果行的摘要靠 tool_call_id 与调用参数配对（历史里结果排在调用后面）。
+    """
+    from pie.context import AssistantMessage, ToolMessage, UserMessage
+
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"command": "ls src"}'},
+        }
+    ]
+
+    def _seed(session) -> None:
+        session.messages.messages.extend(
+            [
+                UserMessage("看看 src"),
+                AssistantMessage("好的", tool_calls=tool_calls),
+                ToolMessage("[exit=0]\n\npie\ntests", tool_call_id="call_1", tool_name="shell"),
+                AssistantMessage("两个目录。"),
+            ]
+        )
+
+    async def run() -> None:
+        # 盒子模式：三个盒子（你 / pie / shell[0]）+ 工具调用盒子；工具结果用 tool_result 棕框
+        app = PieApp(_dummy_session())
+        _seed(app.session)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#log")
+            text = "\n".join(s.text for s in log.lines)
+            assert "你" in text and "看看 src" in text and "好的" in text
+            assert "shell [0]" in text and "pie" in text
+            # 工具结果框用 tool_result 棕框（倒数第二条写入；最后一条是末尾的 assistant 回复）
+            assert app.palette.role_border("tool_result") in _box_border_colors(log, log._entries[-2])
+            assert "两个目录。" in text
+
+        # 简洁模式：回放的工具行也要带摘要（ls src），而不是退化成参数 JSON
+        app = PieApp(_dummy_session(lean=True))
+        _seed(app.session)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#log")
+            text = "\n".join(s.text.rstrip() for s in log.lines)
+            assert f"{app.palette.tool_icon('shell')} shell ls src" in text
+            assert f"{app.palette.lean_mark('ok')} shell ls src" in text
+            assert "{\"command\"" not in text, "回放丢了 tool_call_id 配对，摘要退成参数 JSON"
 
     asyncio.run(run())
 
@@ -391,9 +572,9 @@ def test_lean_tool_lines_are_padded() -> None:
             assert app.lean
 
             first = len(log.lines)          # 下面 4 行的起始下标（留白不污染源文本的断言要用）
-            app._render_tool_call(log, "read", {"path": "a.txt"})
-            app._render_tool_result(log, "read", "内容", summary="a.txt")
-            app._render_tool_result(log, "read", "[工具错误] 文件不存在: x", summary="a.txt")
+            app._render_tool_call("read", {"path": "a.txt"})
+            app._render_tool_result("read", "内容", arguments={"path": "a.txt"})
+            app._render_tool_result("read", "[工具错误] 文件不存在: x", arguments={"path": "a.txt"})
             await pilot.pause()
             call_icon = pal.tool_icon("read")
             ok_mark, fail_mark = pal.lean_mark("ok"), pal.lean_mark("fail")
@@ -403,10 +584,10 @@ def test_lean_tool_lines_are_padded() -> None:
             # 结果行：状态标记接管行首（不再用 tool_result 图标），标记不会被截断
             assert texts[-3] == " " * BOX_INSET + f"{ok_mark} read a.txt"
             assert texts[-2] == " " * BOX_INSET + f"{fail_mark} read a.txt"
-            assert texts[-1] == " " * BOX_INSET + "→ [工具错误] 文件不存在: x"
+            assert texts[-1] == " " * BOX_INSET + "↳ [工具错误] 文件不存在: x"
             # 工具行不画盒子：没有边框字符；正文列与盒内正文列一致
             assert not any(ch in "".join(texts[-4:]) for ch in "│╭╰╮╯")
-            log.write(_box(pal, "回复", title="pie", role="assistant"))
+            _write_box(log, "回复", role="assistant", palette=pal)
             await pilot.pause()
             box_body = log.lines[-2].text.rstrip()
             assert box_body[0] == "│" and box_body[1] == " " and box_body[2] == "回"
@@ -415,29 +596,87 @@ def test_lean_tool_lines_are_padded() -> None:
             # 框选复制：留白是表现层的，不进源文本（不再多出前导空格）
             log._sel_start, log._sel_end = (first, 0), (first + 3, 200)
             assert log._selected_text() == (f"{call_icon} read a.txt\n{ok_mark} read a.txt"
-                                            f"\n{fail_mark} read a.txt\n→ [工具错误] 文件不存在: x")
+                                            f"\n{fail_mark} read a.txt\n↳ [工具错误] 文件不存在: x")
 
             # 超长行：恒为一行、行首标记保留、行尾省略号、不超出内容区宽度
-            log.write(_lean_line(pal, "shell", "x" * 500, role="tool_call"))
-            log.write(_lean_line(pal, "shell", "y", role="tool_result", mark=ok_mark))
-            log.write(_lean_line(pal, "shell", "cancel", role="tool_result",
-                                 mark=pal.lean_mark("cancelled")))
+            # （`_lean` 现在返回**元素列表**：调用/成功 1 个，失败/取消会多一个正文块 → 取 [0] 这一行）
+            from pie.loop import CANCEL_TEXT
+
+            row0 = len(log.lines)
+            log.write(_lean(pal, {"name": "shell", "arguments": {"command": "x" * 500}},
+                            role="tool_call")[0])
+            log.write(_lean(pal, {"name": "shell", "arguments": {"command": "y"}, "content": "y"},
+                            role="tool_result")[0])
+            log.write(_lean(pal, {"name": "shell", "arguments": {"command": "cancel"},
+                                  "content": CANCEL_TEXT}, role="tool_result")[0])
             await pilot.pause()
-            long_row, short_row = log.lines[-3].text, log.lines[-2].text.rstrip()
+            long_row = log.lines[row0].text
+            short_row = log.lines[row0 + 1].text.rstrip()
             assert long_row.startswith(" " * BOX_INSET) and long_row.rstrip().endswith("…")
             assert "\n" not in long_row and cell_len(long_row.rstrip()) <= log.scrollable_content_region.width
             assert short_row == " " * BOX_INSET + f"{ok_mark} shell y"
-            assert log.lines[-1].text.rstrip() == " " * BOX_INSET + f"{pal.lean_mark('cancelled')} shell cancel"
+            assert log.lines[row0 + 2].text.rstrip() == " " * BOX_INSET + f"{pal.lean_mark('cancelled')} shell cancel"
 
             # 窄宽下标记也不能丢（这是状态标记放行首的全部意义）
             narrow = PieApp(_dummy_session(lean=True))
             async with narrow.run_test(size=(24, 12)) as p2:
                 await p2.pause()
                 nlog = narrow.query_one("#log")
-                nlog.write(_lean_line(narrow.palette, "shell", "z" * 200, role="error",
-                                     mark=narrow.palette.lean_mark("fail")))
+                nlog.write(_lean(narrow.palette, {"name": "shell", "arguments": {"command": "z" * 200},
+                                                  "content": "[工具错误] " + "z" * 200},
+                                 role="tool_result")[0])
                 await p2.pause()
-                assert nlog.lines[-1].text.startswith(" " * BOX_INSET + narrow.palette.lean_mark("fail"))
+                fail_mark_n = narrow.palette.lean_mark("fail")
+                assert any(ln.text.startswith(" " * BOX_INSET + fail_mark_n) for ln in nlog.lines)
+
+    asyncio.run(run())
+
+
+def test_manual_shell_is_boxed_even_in_lean_mode() -> None:
+    """手动 !cmd 不吃简洁模式：始终套盒子，边框用**默认灰**（成功/取消）/ 红（失败）。
+
+    题目：!cmd 是用户主动执行、输出本身就是要看的东西，不是可折叠的工具活动，所以 lean 只压
+    agent 回合里的工具行；同时它不该占 tool_call 的橙棕身份色（那是 agent 工具调用的），
+    用 role_border 的兑底色 system 灰，状态图标 ✓/✗/■ 照旧。
+    """
+
+    async def run() -> None:
+        app = PieApp(_dummy_session(lean=True))
+        async with app.run_test(size=(70, 30)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#log")
+            pal = app.palette
+            assert app.lean, "本用例的前提是简洁模式已开"
+
+            async def _noop(cmd: str) -> None:  # 只验渲染，不起真进程
+                return None
+
+            app._exec_shell_async = _noop  # type: ignore[method-assign]
+            app._run_shell("ls")
+            entry = log._entries[-1]
+            head = log.lines[entry.row].text
+            assert head.startswith(f"╭─ {pal.tool_icon('shell')} shell"), head
+            assert "$ ls" in log.lines[entry.row + 1].text
+            assert pal.role_border("system") in _box_border_colors(log)
+
+            # 结果框：成功/取消 = 默认灰，失败 = 红；状态字形保留（与简洁模式同一套）
+            cases = (
+                (0, pal.lean_mark("ok"), pal.role_border("system")),
+                (1, pal.lean_mark("fail"), pal.role_border("error")),
+                ("cancelled", pal.lean_mark("cancelled"), pal.role_border("system")),
+            )
+            for code, mark, color in cases:
+                app._show_shell_result("out\n", code)
+                entry = log._entries[-1]
+                head = log.lines[entry.row].text
+                assert head.startswith("╭") and f"{mark} shell" in head, head
+                assert color in _box_border_colors(log, entry), head
+                assert "out" in log.lines[entry.row + 1].text
+
+            # 不外溢到 agent 回合：shell 工具结果仍是棕框 tool_result
+            app._render_tool_result("shell", "[exit=0]\n\nhi")
+            entry = log._entries[-1]
+            assert pal.role_border("tool_result") in _box_border_colors(log, entry)
 
     asyncio.run(run())
 
@@ -492,7 +731,7 @@ def test_markdown_code_styles() -> None:
             assert code.bgcolor is not None and code.bgcolor.name == "black", code.bgcolor
             assert "magenta" in str(mocha.console.get_style("markdown.h2"))
             log = mocha.query_one("#log")
-            log.write(_box(mocha.palette, fence_md, role="assistant"))
+            _write_box(log, fence_md, role="assistant", palette=mocha.palette)
             await pilot.pause()
             bg = fence_bg(log)
             assert bg is not None and bg.triplet == Color.parse("#272822").triplet, bg
@@ -508,7 +747,7 @@ def test_markdown_code_styles() -> None:
             # 未接管的元素仍是 Rich 默认
             assert "magenta" in str(latte.console.get_style("markdown.h2"))
             log = latte.query_one("#log")
-            log.write(_box(latte.palette, fence_md, role="assistant"))
+            _write_box(log, fence_md, role="assistant", palette=latte.palette)
             await pilot.pause()
             bg = fence_bg(log)
             expected_bg = Color.parse(get_style_by_name(latte.palette.code_theme).background_color)
