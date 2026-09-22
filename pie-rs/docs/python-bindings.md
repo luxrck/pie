@@ -1,6 +1,10 @@
 # pie-rs：Python 绑定规划（PyO3 / maturin）
 
-> 状态：**规划稿**（尚未动代码）。目标是把 `pie-rs` 的 harness 能力以原生扩展的形式给 Python 程序调用，
+> **进度**：M0 ✅（`src/lib.rs` + `tui` feature，118 单测全绿）·M1 ✅（`bindings/pie-py`：
+> `Config`/`LlmClient`/`ToolRegistry`/`Session`/`Cancel` + 事件回调 + 异常层级，10 个 pytest 全绿）
+> ·M2–M5 ⬜。实现时定的东西见 §11。
+>
+> 目标：把 `pie-rs` 的 harness 能力以原生扩展的形式给 Python 程序调用，
 > 与已有的纯 Python 包 `pie`（Textual TUI 那套）**并存**，不是替换它。
 >
 > 相关：`README.md`（迁移进度）、`../MEMORY.md`（决策记录）。
@@ -62,12 +66,18 @@ s = pie_rs.Session.new(cfg, llm, tools)          # 或 Session.load(path, ...) /
 # s = pie_rs.Session.ephemeral(cfg, llm, tools)  # 不落盘、不写 manifest（服务 / notebook 用）
 
 # ① 回调式（阻塞到回合结束，返回最终答复）
-s.aturn("读一下 README 的前 20 行", on_event=lambda ev: print(ev.type, ev))
+s.aturn("读一下 README 的前 20 行", on_event=lambda ev: print(ev["type"], ev))
 
 # ② 迭代器式（生成器，边跑边取事件；底层同一个 channel）
 for ev in s.aturn_stream("同样的问题"):
-    if ev.type == "assistant_text":
-        print(ev.text, end="")
+    if ev["type"] == "assistant_text":
+        print(ev["text"], end="")
+
+# ③ 原生 async（M5 起，feature gate；见 §5.2）
+async with pie_rs.Session.new(cfg, llm, tools) as s:
+    answer = await s.aturn_async("同样的问题", on_event=print)
+    async for ev in s.events():
+        ...
 
 print(s.messages[-1]["content"])     # 历史是 dict 列表（字段名 = JSONL 字段名）
 print(s.usage_report())              # /stat 那段文本
@@ -162,14 +172,49 @@ crates/pie-py     # cdylib：PyO3 绑定
 代价：Rust 侧要 `allow_threads` 包住 recv（否则阻塞 Python 线程的同时还持 GIL → 别的线程全停）。
 即：`py.allow_threads(|| rx.recv())` → 拿到事件 → 回 GIL → 调回调 → 再 `allow_threads`。循环体小、直白。
 
-### 5.2 异步模型：**Phase 1 只做同步**（`block_on`），asyncio 放 M5
+### 5.2 异步模型：**同步是默认入口，原生 async 是第二个入口**（不二选一，asyncio 放 M5）
 
-- `LlmClient` 内部持一个**进程级、常驻的 tokio runtime**（`OnceLock<Runtime>`，`rt-multi-thread`），
-  入口统一 `py.allow_threads(|| RUNTIME.block_on(fut))`。
-- 好处：不用把 Python 事件循环与 tokio 绑一起（`pyo3-async-runtimes` 那套：每个 asyncio loop 要配一个
-  runtime、跨 loop 复用会炸、取消语义要对齐）。这一层最容易出难查的 bug，先不引。
-- asyncio 用户的第一版出路：`await asyncio.to_thread(s.aturn, ...)`（文档里给示例）。
-- M5 若真要原生 async：`aturn_async()` → `future_into_py`，**feature gate**，不破坏同步路径。
+**结论：能导出异步方法，而且两套入口不冲突**——核心本来就是 `async fn`，同步入口只是套一层 `block_on`。
+现成方案是 `pyo3-async-runtimes`（`pyo3-asyncio` 的维护续作；当前 **0.29.0**，与 **pyo3 0.29.2** 配套）：
+`future_into_py(py, async { … })` 把 tokio future 变成 Python 侧可 `await` 的对象。
+
+```rust
+#[pyfunction]
+fn aturn_async(
+    py: Python<'_>,
+    session: PyRef<'_, Session>,
+    input: String,
+) -> PyResult<Bound<'_, PyAny>> {
+    let sess = session.shared();                       // 内部 Arc<Mutex<Session>>
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        sess.lock().await.aturn(&input, &mut |_| {}, &Cancel::new()).await.map_err(to_py_err)
+    })
+}
+```
+
+**但 async 入口会新引入三个同步版没有的问题**——这才是把它放 M5 的真正原因：
+
+| # | 问题 | 说明 | 做法 |
+|---|---|---|---|
+| ① | 事件流怎么给 | `on_event` 回调会在 tokio 线程上跑 → 又回到 §5.1 里被否掉的「跨线程 attach GIL 调 Python」，且回调抛异常要跨 FFI 边界处理 | 事件推给一个 Python `asyncio.Queue`（从 tokio 线程 `loop.call_soon_threadsafe(queue.put_nowait, ev)`），Python 侧 `async for ev in s.events()` —— **channel 的 async 版**，用户代码仍不在 tokio 线程里跑 |
+| ② | 取消语义 | **`task.cancel()` 不会停 Rust 侧的 future**（tokio 任务照跑到结束）→ 用户以为停了、模型还在烧 token | 显式桥接：`tokio::select!` 监听 `Cancel`；另给 `s.stop()`，并让 `aturn_async` 的 awaitable 在收到 `CancelledError` 时触发同一个 `Cancel`（需要一层自定义 awaitable / `__del__`，是这块最容易错的地方） |
+| ③ | loop / runtime 生命周期 | `future_into_py` 要求调用时处于运行中的 asyncio loop；同一进程两个 loop、或 `asyncio.run()` 跑两次 → runtime 与 loop 配对、退出时残留任务（`coroutine was never awaited` / loop closed 后才 resolve）都是常见故障 | 用 `pyo3_async_runtimes::tokio::get_runtime()`（**进程级** runtime，不随 loop 生死），而不是每个 loop 建一个；并文档化「一个进程一个 loop 最稳」 |
+
+**为什么示例默认写同步**（不是因为做不到）：
+
+1. 跑 agent 是「发起 → 等结果 → 期间没别的活」的形状，同步 + 回调就够；要并发就 `await asyncio.to_thread(s.aturn, …)`（一行），照样不冻解释器（§5.4 的 `allow_threads` 已放 GIL）。
+2. 上面三条每条做错都是**挂死或静默失效**（取消不生效、事件丢），比同步版的 bug 难查一个量级。先把主链跑通、API 定形，再上 async。
+3. 同步入口的实现（channel pump）在 async 版里**仍然是基础**（`asyncio.Queue` 就是它换了个出口）—— 先做不白干。
+
+**M5 的目标形态**（feature gate `asyncio`，不影响同步路径）：
+
+```python
+async with pie_rs.Session.new(cfg, llm, tools) as s:
+    task = asyncio.create_task(s.aturn_async("写一篇长文"))   # 事件走 asyncio.Queue
+    async for ev in s.events():
+        print(ev["type"])
+    answer = await task
+    # task.cancel() / s.stop() 都能真的停住 shell 子进程与模型请求
 
 ### 5.3 借用与重入：`#[pyclass]` 内用 `Mutex`，锁不上就报错
 
@@ -280,7 +325,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | **M2 API 补齐** | `run()`、`Cancel`、`compact`/`compression_history`/`full_history`/`usage_report`/`reset`、`list_sessions`、`Config` 属性 + `to_dict`/`update`、`PIE_DIR` 支持 | 能力对齐 CLI；上述对象都有回归用例 | 1–2d |
 | **M3 Python 工具** | `Entry` 动态变体 + `register()` + `@tool`（签名→schema）+ 返回值/异常桥接 + 线程语义文档 | Python 工具被模型调用、结果回传、异常文本化；与内置工具同列表 | 2d |
 | **M4 打包** | maturin + abi3 + `py.typed` / `.pyi` + README 示例 + `__version__` | 干净 venv 里 `pip install` wheel 可用 | 1–2d |
-| **M5 可选** | `aturn_async`（`pyo3-async-runtimes`，feature gate）；free-threading wheel；PyPI/CI | `await` 版本可用且不破坏同步路径 | 2–3d |
+| **M5 可选** | `aturn_async` + `events()`（`pyo3-async-runtimes 0.29`，feature gate `asyncio`；三个坑见 §5.2）；free-threading wheel；PyPI/CI | `await` 版本可用、**`task.cancel()` 真能停住**、不破坏同步路径 | 2–4d |
 
 依赖顺序：M1 之后（M2 与 M3 可并行）；M4 最早在 M1 后可先做（便于分发试用）。
 
@@ -302,10 +347,72 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 ## 10. 待拍板的点
 
+**M1 已按推荐默认开工**（括号里是实际采取的选项，要改现在改最便宜）：
+
 1. **包名 / 模块名**：`pie_rs`（扩展模块 `pie_rs._pie_rs`）？还是叫 `pie.rust` / 别的？
-2. **异步**：先只做同步（推荐）+ `to_thread` 示例，还是一上来就做 asyncio？
-3. **事件形态**：回调 + 迭代器都给（草案），还是只给回调？
+   → 已用 **`pie_rs`**。
+2. **异步**：同步为主 + M5 补原生 async（推荐，见 §5.2；两者共用同一个内部实现，不冲突），
+   还是 M1 就直接上 asyncio（少一轮 API 定形，但前面三周的 bug 面更大）？ → 已按 **同步为主**。
+3. **事件形态**：回调 + 迭代器都给（草案），还是只给回调？ → 已只给 **`on_event` 回调**（迭代器 / `async for` 留给 M5）。
 4. **Config 形态**：dict-first（`to_dict`/`update` + 少量属性）还是逐字段属性？
-5. **M3（Python 自定义工具）是否进第一版**？不进的话 M1+M2+M4 ≈ 一周内可用。
-6. **结构**：方案 A（lib.rs + feature，最小侵入）还是直接上方案 B（三分 workspace）？
-7. **分发范围**：本机 `maturin develop` 自用，还是要 wheel 分发 / 进 CI？
+   → 已用 **常用字段属性**（`to_dict`/`update` 放 M2；核心 `Config` 没实现 Serialize，做它要先给核心加）。
+5. **M3（Python 自定义工具）是否进第一版**？ → 暂不进（M1 只内置四件套）。
+6. **结构**：方案 A（lib.rs + feature，最小侵入）还是直接上方案 B（三分 workspace）？ → 已用 **方案 A**。
+7. **分发范围**：本机 `maturin develop` 自用，还是要 wheel 分发 / 进 CI？ → 暂本机自用（abi3 wheel 是 M4）。
+
+---
+
+## 11. 实现时定的东西（M0 / M1，写完才知道的）
+
+### 结构（方案 A 落地）
+
+- `Cargo.toml`：`[lib] name = "pie_rs"`；`[[bin]] required-features = ["cli", "tui"]`；
+  `default = ["cli", "tui"]`。`cli` = `dep:clap`（只有 bin 用）；`tui` = ratatui / crossterm /
+  ratatui-textarea / tui-markdown / arboard / unicode-width 这 6 个 **optional** 依赖。
+- **TUI 依赖必须一起转 optional**（光 gate 模块不够：依赖仍会进解析图）→ 验收方式：
+  `cargo build --no-default-features` 后 `cargo tree -e normal` 里搜不到 ratatui / crossterm / arboard / tui-markdown。
+- `main.rs` 改成 `use pie_rs::{…}`（**别再写 `mod xxx;`** —— 那会变成第二份独立的编译单元，
+  两边的类型不兼容）。
+- `bindings/pie-py`：自己的 workspace，被父级 `exclude = ["macros", "bindings"]` 排除；
+  cdylib、`[lib] name = "_pie_rs"`（maturin 的 `module-name = "pie_rs._pie_rs"`），
+  `pie-rs = { path = "../..", default-features = false }`。
+- 核心为绑定加的两处：`tools::Entry` / `tools::ToolRegistry` 加 `#[derive(Clone)]`
+  （绑定要拿副本建会话；`LlmClient` / `Config` 本来就 Clone）。
+
+### PyO3 0.29 的 API 坑（都是编译期踩出来的）
+
+1. `Python::with_gil` / `allow_threads` 现在叫 **`Python::attach` / `py.detach`**。
+2. `detach` 的闭包要 `Ungil`。stable 下 `Ungil` 就是 `Send`，但**按引用捕获**的闭包还要被捕获类型
+   是 `Sync` —— 而 `mpsc::Receiver` 是 `Send + !Sync` → `py.detach(|| rx.recv())` **编译不过**。
+   写法：把 receiver **按值**进闭包再带出来：
+   `let mut rx = rx; loop { let (next, ev) = py.detach(move || { let e = rx.recv(); (rx, e) }); rx = next; … }`。
+3. `bool::into_pyobject` 给的是 `Borrowed<PyBool>`（Python 里 bool 是单例）→ 要 `.to_owned()`
+   再 `.into_any().unbind()`；`i64` / `f64` / `&str` 直接给 `Bound`。
+4. 给异常实例挂属性（如 `.status`）：`PyErr::new_err` **拿不到实例** → 用
+   `py.get_type::<LlmError>().call1((msg,))` 造实例 → `setattr` → `PyErr::from_value(inst)`。
+5. **`cargo build` 直接编 cdylib 在 macOS 会报一堆 `_PyBaseObject_Type` undefined**（扩展模块本来就该
+   留着符号不解析）→ 用 `maturin develop` / `maturin build`，别手搓 cargo 产物去当扩展模块。
+
+### 回合 pump 的形状（§5.1 的落地）
+
+- 会话锁 = `Arc<tokio::sync::Mutex<Session>>`；`aturn` 开始时 `try_lock_owned()`（拿到就移进
+  `spawn` 的任务里跨 await 持有，所以必须 tokio 的锁，不是 `std::sync::Mutex`）。
+- 忙 → 直接 `RuntimeError("session 正忙")`（**不排队**：排队会在「回调里碰同一个 session」时死锁）。
+- 事件：`mpsc` + 调用线程 pump（`py.detach` 等事件、回 GIL 调用户回调）——**用户代码永远不在 tokio 线程上跑**。
+- 回调抛异常：记下来，**让回合跑完**再抛回去（半路撤会把历史写坏）；这条要有用例。
+- `s.stop()`：把当前回合的 `Cancel` 存在 `current: Mutex<Option<Cancel>>` 里供别的线程触发。
+
+### 与 Python 版不一致的地方（照实暴露，不偷偷改）
+
+- 核心 **`Config::default()` 里 compaction 是开着的**（`Some(CompactionConfig::default())`）
+  → 绑定的 `cfg.compaction` 布尔属性默认 **True**；Python 版是「不写 `[compaction]` 就不压」。
+  绑定照实反映默认值（要一致就让核心默认改 `None`，但那是另一件事）。
+- `CompactStats` **没有实现 Serialize**（核心只在内部用）→ 绑定里手工拼 dict；**加字段要两处都改**。
+- `Config` **没实现 Serialize** → `to_dict()` 要等给核心加上（或手写每个字段），所以 M1 只给了常用属性。
+
+### 测试与环境
+
+- 绑定回归 = pytest + **本地假 SSE 端点**（`http.server`，按 `messages[-1].role` 决定回工具调用还是最终答复）；
+  一条不联网。`PIE_DIR` 指到 tmp 目录 → 不碰真实 `~/.pie`（`ephemeral` 不落盘另有断言）。
+- `.gitignore` 加了 `pie-rs/bindings/*/target/`（这个 crate 有自己的 target/）。
+- 绑定侧 dev 环境：`bindings/pie-py/.venv`（maturin + pytest）。
