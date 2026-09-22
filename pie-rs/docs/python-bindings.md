@@ -373,7 +373,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
   `cargo build --no-default-features` 后 `cargo tree -e normal` 里搜不到 ratatui / crossterm / arboard / tui-markdown。
 - `main.rs` 改成 `use pie_rs::{…}`（**别再写 `mod xxx;`** —— 那会变成第二份独立的编译单元，
   两边的类型不兼容）。
-- `bindings/pie-py`：自己的 workspace，被父级 `exclude = ["macros", "bindings"]` 排除；
+- `bindings/pie-py`：自己的 workspace，被父级 `exclude = ["bindings"]` 排除；
   cdylib、`[lib] name = "_pie_rs"`（maturin 的 `module-name = "pie_rs._pie_rs"`），
   `pie-rs = { path = "../..", default-features = false }`。
 - 核心为绑定加的两处：`tools::Entry` / `tools::ToolRegistry` 加 `#[derive(Clone)]`
