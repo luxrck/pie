@@ -33,6 +33,9 @@ from typing import Any, Iterator
 
 from .config import PIE_DIR
 
+# 内部模块：图片 Files API（上传/复用/降级）+ 本地副本与上传件维护（`pie files` 命令用）。
+__all__: list[str] = []
+
 FILES_DIR = PIE_DIR / "files"  # 本地内容寻址副本（与 context/ 分开：那是压缩落盘的文本）
 
 # 支持 `file` 内容块的模型（文档：上传的文件与 deepseek-flash 配套；旧名同源）

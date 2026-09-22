@@ -18,12 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pie.termbg import parse_colorfgbg, parse_osc11
 from pie.theme import (
     CATPPUCCIN_LATTE,
     CATPPUCCIN_MOCHA,
     DEFAULT_THEME_NAME,
     get_theme,
+    parse_colorfgbg,
+    parse_osc11,
 )
 
 

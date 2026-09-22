@@ -46,9 +46,12 @@ from .files import (
     list_remote_files,
     purge_remote_files,
 )
-from .input import read_input
 from .llm import OpenAILLM
 from .tools import default_tools, parse_image_marker, tools_from_spec
+
+# 内部模块：命令行入口（`pie` / `pie -p` / resume / sessions / files / setup / context）。
+# console script 是 `pie = pie.cli:main` —— 入口点解析走显式 import，不受 __all__ 影响。
+__all__: list[str] = []
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -56,6 +59,31 @@ try:
     __version__ = _pkg_version("pie")
 except Exception:
     __version__ = "0.1.0"
+
+# ---- 非 TTY 行编辑（原 input.py，2026-09-20 并入本文件）----
+# 内置 input() 依赖 readline，在部分终端（WSL/mintty 等）退格按字节删，删中文可能截断一个
+# UTF-8 字符 → 交互式聊天用 prompt_toolkit（按字素编辑）；装不上时静默回退 input()。
+# （首次运行向导 config._prompt 不用这个：那里的答案都是 ASCII，直接用内置 input()。）
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+
+    _HAS_PROMPT_TOOLKIT = True
+except ImportError:  # prompt_toolkit 缺失时静默回退 input()
+    _HAS_PROMPT_TOOLKIT = False
+
+_history: FileHistory | None = None
+
+
+def read_input(prompt: str = "", history_file: str | Path | None = None) -> str:
+    """读取一行输入；交互终端用 prompt_toolkit，管道/非交互回退 input()。"""
+    global _history
+    if _HAS_PROMPT_TOOLKIT and sys.stdin.isatty():
+        if history_file is not None and _history is None:
+            _history = FileHistory(str(history_file))
+        return PromptSession(history=_history).prompt(prompt)
+    return input(prompt)
+
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 

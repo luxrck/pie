@@ -14,7 +14,7 @@ pie/
 │   ├── context.py     # 上下文管理：三级压缩 + 全文落盘 + 摘要指针
 │   ├── tools.py       # 工具层：内置工具 + 注册表 + @tool 装饰器
 │   ├── llm.py         # 模型层：LLM 协议 + OpenAI 兼容实现
-│   ├── loop.py        # 循环层：run_agent + Config
+│   ├── loop.py        # 循环层：run / aturn（工具调用编排 + 取消）
 │   └── cli.py         # CLI：pie（新对话）/ pie resume（恢复当前目录最近的会话）
 ├── AGENTS.md          # 项目说明（面向 agent/协作者）
 ├── MEMORY.md          # 项目持久记忆
@@ -261,7 +261,7 @@ uv run python -c "from pie.cli import self_check; self_check()"
 `@tool()` 装饰器会根据函数签名自动生成参数 schema，注册进 `ToolRegistry` 即可：
 
 ```python
-from pie import default_tools, run_agent, tool
+from pie import default_tools, run, tool
 
 @tool()
 def add(a: int, b: int) -> str:
@@ -270,7 +270,7 @@ def add(a: int, b: int) -> str:
 
 tools = default_tools()
 tools.register(add)
-run_agent("1 + 1 = ?", tools=tools)
+run("1 + 1 = ?", tools=tools)
 ```
 
 也支持 `name=`、`description=`、`parameters=` 覆盖自动生成的元数据。
@@ -280,14 +280,14 @@ run_agent("1 + 1 = ?", tools=tools)
 实现 `complete(messages, tools, model=None) -> LLMResult` 即可，协议见 `pie/llm.py`：
 
 ```python
-from pie import Config, run_agent
+from pie import Config, run
 
 class MyLLM:
     def complete(self, messages, tools, model=None):
         ...
 
 cfg = Config(model="my-model")  # 或编辑 ~/.pie/config.toml
-run_agent("...", llm=MyLLM(), config=cfg)
+run("...", llm=MyLLM(), config=cfg)
 ```
 
 

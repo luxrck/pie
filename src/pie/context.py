@@ -20,9 +20,25 @@ import sys
 from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import PIE_DIR
+
+# 公共面：消息模型 + content 归一（压缩落盘/GC 等属实现细节，不在内）。
+__all__ = [
+    "MultiMediaContent",
+    "MessageContent",
+    "Message",
+    "SystemMessage",
+    "UserMessage",
+    "AssistantMessage",
+    "ToolMessage",
+    "ImageMessage",
+    "AgentMessage",
+    "content_text",
+    "maybe_compact",
+    "compact",
+]
 
 CONTEXT_DIR = PIE_DIR / "context"
 WINDOWS_DIR = PIE_DIR / "windows"  # 历史窗口块（在 context/ 外，GC 不碰）
@@ -105,6 +121,7 @@ def write_raw(blob: str, prefix: str) -> Path:
 
 
 def write_manifest(manifest: Path, entry: dict[str, Any]) -> None:
+    """把一条压缩事件追加进 manifest（jsonl）。Session 用它实现 on_compact 回调。"""
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -211,13 +228,22 @@ def build_window_summary(path: Path, head: int, tail: int) -> str:
 
 # ---------------------------------------------------------------- 消息模型
 
+# 消息 content 有两种形态：纯文本，或多模态 parts（图片 user 消息用，见 ImageMessage）。
+# 基类必须声明成联合类型——content 是可变属性，子类收窄声明会触发 Pyright 的
+# reportIncompatibleVariableOverride（可变类型不协变，覆盖类型必须与基类完全一致）。
+MultiMediaContent = list[dict[str, Any]]
+MessageContent = MultiMediaContent | str | None
+
 
 @dataclass
 class Message:
-    """叶子消息：System/User/Assistant/Tool/Image 的公共基类。"""
+    """叶子消息：System/User/Assistant/Tool/Image 的公共基类。
+
+    content 为联合类型：一般消息是 str；ImageMessage 是多模态 parts（list）。
+    """
 
     role: str
-    content: str | list[dict[str, Any]] | None = None
+    content: MessageContent = None
     compress_level: int = 0  # 0=原始 1=工具级 2=轮次级 3=会话级（只升不降）
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -280,7 +306,7 @@ class Message:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Message":
         """按 cls（新格式）/ role（旧格式兼容）还原子类。"""
-        ctor = _MESSAGE_CLASSES.get(d.get("cls")) or {
+        ctor = _MESSAGE_CLASSES.get(d.get("cls", "")) or {
             "system": SystemMessage,
             "user": UserMessage,
             "assistant": AssistantMessage,
@@ -291,9 +317,9 @@ class Message:
             kwargs["synthetic"] = False
         return ctor(**kwargs)
 
-    def compact(self, **kwargs: Any) -> Any:
+    def compact(self, **kwargs: Any) -> bool:
         """叶子默认不可压缩（ToolMessage 覆盖为工具级文本落盘）。"""
-        return 0
+        return False
 
     def tokens(self) -> int:
         """token 估算：压缩过的消息用（当前长度/原始长度 × 原始 tokens）比例；
@@ -348,9 +374,10 @@ class ImageMessage(Message):
     （旧写法为内联 `{"type":"image_url","image_url":{"url":"data:…"}}`，不支持 Files API 时回退到它）
     """
 
-    def __init__(self, content: list[dict[str, Any]] | None = None, **kwargs: Any) -> None:
+    def __init__(self, content: MultiMediaContent | None = None, **kwargs: Any) -> None:
         kwargs.setdefault("synthetic", True)  # 图片恒为注入消息（from_dict 还原时用存档值）
-        super().__init__(role="user", content=content, **kwargs)
+        super().__init__(role="user", content=None, **kwargs)
+        self.content = content  # 不加注解：基类已是联合类型，再声明就是覆盖
 
 
 class AssistantMessage(Message):
@@ -390,25 +417,35 @@ class ToolMessage(Message):
             **kwargs,
         )
 
-    def compact(self, tool_cfg: Any = None, manifest: Path | None = None, **kwargs: Any) -> int:
+    def compact(
+        self,
+        tool_cfg: Any = None,
+        on_compact: Callable[[dict[str, Any]], None] | None = None,
+        **kwargs: Any,
+    ) -> bool:
         """工具级压缩：行数 > head+tail 时全文落盘，消息保留。
-        tool_cfg 为 None（工具压缩关闭）时不做任何事。"""
+        tool_cfg 为 None（工具压缩关闭）时不做任何事；on_compact 为压缩事件回调（None = 不通知）。
+
+        返回**本次是否真的落盘压缩了一个消息**（调用方按 True 计数）：
+        已经压过、内容不是文本、或短输出（行数 <= head+tail）不值得落盘 → False。
+        """
         if self.compress_level >= 1 or not self.content or tool_cfg is None:
-            return 0
+            return False
         head = max(0, int(tool_cfg.head))
         tail = max(0, int(tool_cfg.tail))
         content = self.content
+        if not isinstance(content, str):  # 工具消息恒为文本（同时是给类型检查器的收窄）
+            return False
         lines = content.splitlines()
         if len(lines) <= head + tail:
-            return 0
+            return False
         path = write_raw(content, self.tool_name or "tool")
         preview = lines[:head] + ["...[中间省略]..."] + (lines[-tail:] if tail else [])
         self.content = f"[工具输出全文已保存: {path}]\n\n" + "\n".join(preview)
         self.compress_level = 1
         self._set_raw(path, content)  # raw 记录原始文本
-        if manifest is not None:
-            write_manifest(
-                manifest,
+        if on_compact is not None:
+            on_compact(
                 {
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "level": 1,
@@ -416,9 +453,9 @@ class ToolMessage(Message):
                     "tool": self.tool_name,
                     "raw_path": str(path),
                     "raw_hash": path.stem.split("-")[-1],
-                },
+                }
             )
-        return 1
+        return True
 
 
 # ---------------------------------------------------------------- 容器
@@ -495,18 +532,20 @@ class AgentMessage:
         turn_cfg: Any = None,
         session_cfg: Any = None,
         target: int | None = None,
-        manifest: Path | None = None,
+        on_compact: Callable[[dict[str, Any]], None] | None = None,
         windows: list[Path] | None = None,
     ) -> Any:
         if tools:
-            return self._compact_tools(tool_cfg, manifest)
+            return self._compact_tools(tool_cfg, on_compact)
         if turns:
-            return self._compact_turns(turn_cfg, target, manifest)
+            return self._compact_turns(turn_cfg, target, on_compact)
         if session:
-            return self._compact_session(session_cfg, manifest, windows)
+            return self._compact_session(session_cfg, on_compact, windows)
         return self
 
-    def _compact_tools(self, tool_cfg: Any, manifest: Path | None) -> "AgentMessage":
+    def _compact_tools(
+        self, tool_cfg: Any, on_compact: Callable[[dict[str, Any]], None] | None
+    ) -> "AgentMessage":
         """工具级压缩：保护最近 keep_last_steps 个 step 批次（跨轮次滚动，
         每批 = 一次 assistant(tool_calls) + 其后的 tool 结果），窗口外的
         未压缩 ToolMessage（从最老开始）全文落盘成指针。"""
@@ -515,15 +554,15 @@ class AgentMessage:
         n = 0
         for i, m in enumerate(flat):
             if isinstance(m, ToolMessage) and m.compress_level == 0 and i not in protected:
-                m.compact(tool_cfg=tool_cfg, manifest=manifest)
-                n += 1
+                # bool：True（真的落盘了）才计 1 条；短输出不值得压 → 不计
+                n += m.compact(tool_cfg=tool_cfg, on_compact=on_compact)
         self.compact_counts["tools"] = n
         if n:
             self.compacted_since_api = True
         return self
 
     def _compact_turns(
-        self, turn_cfg: Any, target: int | None, manifest: Path | None
+        self, turn_cfg: Any, target: int | None, on_compact: Callable[[dict[str, Any]], None] | None
     ) -> "AgentMessage":
         """从最老开始压缩已完成的轮次（最后一个 UserMessage 之后为进行中，不压），
         直到低于目标或无可压缩。每轮 = [UserMessage, assistant/tool 叶子...]，
@@ -557,7 +596,7 @@ class AgentMessage:
             u, end = victim
             span = self.messages[u + 1:end]
             self.messages[u + 1:end] = [
-                self._compact_turn_span(span, manifest)
+                self._compact_turn_span(span, on_compact)
             ]
             count += 1
         self.compact_counts["turns"] = count
@@ -568,7 +607,7 @@ class AgentMessage:
     def _compact_turn_span(
         self,
         span: list[Message],
-        manifest: Path | None,
+        on_compact: Callable[[dict[str, Any]], None] | None,
     ) -> AssistantMessage:
         """轮次级（规则式）：把一轮的 assistant/tool 叶子压成摘要 assistant
         （user 保留在 AgentMessage 中，不重复写入摘要）+ 指针；摘要只保留
@@ -584,9 +623,8 @@ class AgentMessage:
             lines.append("...[中间过程省略]...")
         lines.append(f"{final}" if final else "[该轮次无最终文本，原文已保存]")
         body = "\n".join(lines)
-        if manifest is not None:
-            write_manifest(
-                manifest,
+        if on_compact is not None:
+            on_compact(
                 {
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "level": 2,
@@ -594,14 +632,17 @@ class AgentMessage:
                     "raw_path": str(path),
                     "raw_hash": content_hash(raw),
                     "summary": body[:200],
-                },
+                }
             )
         msg = AssistantMessage(content=f"[轮次原文已保存: {path}]\n\n{body}", compress_level=2)
         msg._set_raw(path, raw)
         return msg
 
     def _compact_session(
-        self, session_cfg: Any, manifest: Path | None, windows: list[Path] | None
+        self,
+        session_cfg: Any,
+        on_compact: Callable[[dict[str, Any]], None] | None,
+        windows: list[Path] | None,
     ) -> "AgentMessage":
         """当前轮之前的历史整段落盘成新窗口，保留所有既有窗口摘要，
         插入新窗口的“摘要 + 指针”SystemMessage；新窗口块追加进 windows。"""
@@ -633,9 +674,8 @@ class AgentMessage:
             windows.append(path)
         sc = session_cfg
         summary = build_window_summary(path, sc.head, sc.tail)
-        if manifest is not None:
-            write_manifest(
-                manifest,
+        if on_compact is not None:
+            on_compact(
                 {
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "level": 3,
@@ -643,7 +683,7 @@ class AgentMessage:
                     "raw_path": str(path),
                     "raw_hash": content_hash(raw),
                     "summary": summarize_turns(load_window_dicts(path), sc.head, sc.tail)[:200],
-                },
+                }
             )
         ptr = SystemMessage(content=summary, compress_level=3)
         ptr._set_raw(path, raw)
@@ -697,20 +737,23 @@ def message_raw_path(m: Message) -> Path | None:
 # ---------------------------------------------------------------- 压缩驱动
 
 
+def _empty_stats() -> dict[str, Any]:
+    """压缩统计的空形状（maybe_compact / compact 共用，免得两处各写一份字面量）。"""
+    return {"saved_tokens": 0, "turns": 0, "tools": 0, "session": False}
+
+
 def maybe_compact(
     agent: AgentMessage,
     cfg: Any,
     current_tokens: int | None = None,
-    manifest: Path | None = None,
+    on_compact: Callable[[dict[str, Any]], None] | None = None,
     windows: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """按需压缩：软阈值触发，tools → turns → session（各级受对应子配置 None 门控）。"""
-    stats: dict[str, Any] = {
-        "saved_tokens": 0,
-        "turns": 0,
-        "tools": 0,
-        "session": False,
-    }
+    """按需压缩：**软阈值触发**，tools → turns → session（各级受对应子配置 None 门控）。
+
+    与 compact()（手动 /compact）的分工：这个看水位，那个用户说了就压。
+    """
+    stats = _empty_stats()
     limit = cfg.context_window
     if limit <= 0 or cfg.compaction is None:  # compaction 未配置 = 不做任何压缩
         return stats
@@ -725,11 +768,11 @@ def maybe_compact(
     turn_cfg = cfg.compaction.turn
     session_cfg = cfg.compaction.session
     if tool_cfg is not None:
-        agent.compact(tools=True, tool_cfg=tool_cfg, manifest=manifest)
+        agent.compact(tools=True, tool_cfg=tool_cfg, on_compact=on_compact)
     if turn_cfg and agent.tokens() > target:
-        agent.compact(turns=True, turn_cfg=turn_cfg, target=target, manifest=manifest)
+        agent.compact(turns=True, turn_cfg=turn_cfg, target=target, on_compact=on_compact)
     if session_cfg is not None and agent.tokens() > target:
-        agent.compact(session=True, session_cfg=session_cfg, manifest=manifest, windows=windows)
+        agent.compact(session=True, session_cfg=session_cfg, on_compact=on_compact, windows=windows)
     stats["tools"] = agent.compact_counts["tools"]
     stats["turns"] = agent.compact_counts["turns"]
     stats["session"] = agent.compact_counts["session"]
@@ -740,6 +783,38 @@ def maybe_compact(
             f"（turns={stats['turns']}, tools={stats['tools']}, session={stats['session']}）",
             file=sys.stderr,
         )
+    return stats
+
+
+def compact(
+    agent: AgentMessage,
+    cfg: Any,
+    *,
+    mode: str = "auto",
+    on_compact: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """**手动**压缩（`/compact`）：不看水位，按 mode 压——auto = 工具级 + 轮次级，
+    tools / turns = 只要那一级。返回与 maybe_compact 同形状的统计 dict
+    （未配置 `[compaction]` 时多一个 `skipped`）。
+
+    与 maybe_compact 的分工：那个是「超软阈值才压」，这个是「用户说了就压」（轮次级 target=None，
+    一路压到不能再压）。会话级（整窗口归档）不在【手动】范围内——那是 `/clear` 的事。
+    """
+    stats = _empty_stats()
+    if cfg.compaction is None:
+        stats["skipped"] = "compaction disabled (未配置 [compaction])"
+        return stats
+    before = agent.tokens()
+    agent.compact_counts = {"turns": 0, "tools": 0, "session": False}
+    tool_cfg = cfg.compaction.tool
+    turn_cfg = cfg.compaction.turn
+    if mode in ("auto", "tools") and tool_cfg is not None:
+        agent.compact(tools=True, tool_cfg=tool_cfg, on_compact=on_compact)
+    if mode in ("auto", "turns") and turn_cfg:
+        agent.compact(turns=True, turn_cfg=turn_cfg, target=None, on_compact=on_compact)
+    stats["tools"] = agent.compact_counts["tools"]
+    stats["turns"] = agent.compact_counts["turns"]
+    stats["saved_tokens"] = max(0, before - agent.tokens())
     return stats
 
 

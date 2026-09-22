@@ -2,6 +2,89 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-22
+
+- **`aturn` / `run` 新增 `stream: bool | None = None`**（用户要求：给外部嵌入方手动控制流式）：
+  - **None（默认）= 原行为**（后端实现了 `stream()` 就走流式，否则 `complete()`）；`False` = 强制一次性 `complete()`（此时 `on_event` 不再收到 `reasoning_delta` / `content_delta`，其余事件不变）；`True` = 强制流式。
+  - 后端**没有** `stream()` 时 `stream=True` 不报错，仍回退 `complete()`（嵌入方不用先探测后端能力）。
+  - 实现只动一处：`_model_call(..., stream=...)` 的判据从 `inspect.isasyncgenfunction(backend.stream)` 改成 `can_stream and stream is not False`（file_id 失效后的那次重试同样带上该参数）。
+  - 回归：新增 `tests/test_loop.py`（替身后端记录走的是 `stream` 还是 `complete`，覆盖三态 + 无 stream 后端回退 + `run()` 签名透传；`Config(api_key="", compaction=None, files_api=False)` 保证零网络、不碰 `~/.pie`）。
+
+## 2026-09-21
+
+- **输入框滚动条样式与 `#log` 统一**（用户提出：输入框的滚动条又宽又蓝，和 #log 的不是一个东西）：`build_css` 里那份 `scrollbar`（`scrollbar-size: 0 1` + 半透明灰轨道 + `muted` 滑块）以前只写在 `#log` / `#assistant-stream` 上，现在也写进 `#input`。
+  - 机制：`TextArea` 是 `ScrollView`，它的 `ScrollBar` 子控件渲染时读的是**父控件**（即 `#input`）的 `scrollbar-*` 样式（`scrollbar.py` 的 `ScrollBar.render` 取 `self.parent.styles`）→ 不需要给滚动条控件单独写规则，写在哪一层都行。
+  - 顺带把宽度从默认 2 cell 收成 1（文本框可用宽度 +1），轨道底色与 #log 完全一致（两边背景都是 `transparent`）。
+  - 回归：`tests/test_tui.py::test_input_scrollbar_matches_log`（八个 `scrollbar-*` 属性逐项比 #log，#log 是基准）。
+
+- **换行键多收一个 `Ctrl+Enter`**（用户提问：「输入框现在好像是 ctrl+enter 是换行？」）：换行 = `Shift+Enter` / `Ctrl+J` / `Ctrl+Enter`，`Enter` 一律提交。
+  - 原行为：只认 `shift+enter` / `ctrl+j`；`ctrl+enter` 是**意外**能换行的——多数终端把 Ctrl+Enter 编码成 LF（= `Ctrl+J`），而支持修饰键上报的终端（kitty 键盘协议）会送来独立的 `ctrl+enter`，那种终端里它原来是个**死键**（不提交也不换行：`TextArea._on_key` 只管裸 `enter`）。现在两种来源都收，行为不再因终端而异。
+  - 回归：`tests/test_tui.py::test_input_newline_keys`。
+
+- **`read` 的容量上限截断不再落盘**（用户提出：「read 为什么自己要落盘？模型还没看到呢就落盘？」）：截断时改成只补一行 `[已截断：可用 offset=N 继续读]`。
+  - 判据（已写进 `AGENTS.md`「谁该落盘」）：工具输出**不可再生** → 落盘 + `[工具输出全文已保存: path]` 指针（`shell` 的 stdout：进程结束就没了，副本是唯一取回途径）；**可再生** → 只报进度、不落盘（`read` 的文件还在原地，且自带 offset 分页，续读拿到的是完整内容）。
+  - 原实现是「谁截断谁落盘」这条通用规则的无脑套用（截断发生在工具内部 → harness 看不到全文 → 只能自己落）。实测那份副本**没有任何消费者**：`extract_spill_path` 的唯一调用点被 `call.name == "shell"` gate 住（注释里的理由仍成立：read/edit/write 的结果文本可能含该格式的**字面量**）、`full_history()` 只按消息自身 `raw_path` 字段展开（read 从不设它）。
+  - 顺带修掉一个隐蔽 bug：该副本不在 `referenced_raw_paths()`（manifest ∪ 消息 `raw_path`）里 → `pie context gc --delete` 把它当垃圾删掉，而消息里的指针还留着 → **死链**（实测 `collect_context_garbage()` 返回 `['tool-d90d26c1e5dd37cf.txt']`）。不落盘后此问题自然消失。
+  - 影响面：`tools.read` 的 `omitted > 0` 分支（2 行）+ docstring；`shell` 一字未动（实测仍落盘 + 指针）；`tests/` 对 read 落盘的覆盖为 0。另：`_max_lines` / `_max_bytes` 的**默认值都是 None**（不设上限），要限得在 `[tools.read]` 里配。
+
+## 2026-09-20
+
+- **公共面收敛：每个模块声明 `__all__`（新增）/ 运行时属性改字段形式 / `ToolMessage.compact` 返回 bool** —— 三项都是为了让「对外契约」在类型检查器与 `import *` 两个层面都可见。
+  - **`__all__`**：内部模块（`aio` / `cli` / `clipboard` / `files` / `input` / `textkit` / `theme` / `tui` / `__main__`）写 `__all__: list[str] = []`；公共模块（`config` / `context` / `llm` / `loop` / `session` / `tools`）列出真正对外的名字（**按用户要求划定**：TUI、主题、CLI 都不算对外 API——`pie` 对外就是命令行本身；`loop.CANCEL_TEXT` 虽是模块级常量但也不进公共面）。`pie/__init__.py` 的 `__all__`（31 个）事先就有，是唯一入口契约。实例：`from pie.aio import *` 以前会带出 `['Any','Coroutine','Generator','TypeVar','asyncio','close_asyncgens','contextlib','event_loop','gc','run']`（一半是依赖名），现在为空。**边界要知道**：`__all__` 只约束 `import *`，挡不住显式 `from pie.aio import run`（功能不失——console script `pie = pie.cli:main` 与内部显式 import 都不受影响）；实测（pyright 1.1.414 + ruff）`py.typed` 也只拦 `from pie import <未重导出名>`，拦不住 `from pie.internal import x`；`_` 前缀的静态拦截要 ruff 的 `SLF001`（成员访问）/ `PLC2701`（私有名 import，需 `--preview`）。所以内部模块改名 `_xxx`、或实现拆成独立发行包（物理隔离）是后续可选项。
+  - **`Config` 的两个运行时属性 `config_file` / `auto_compact_threshold` 改成 dataclass 字段**（`field(default=None, repr=False, compare=False)`），配 `RUNTIME_ONLY_FIELDS`：`save()` 里从 `asdict` 摘掉、`load()` 里跳过——保留「不落盘、也不从配置文件读回」的原语义，同时消掉 Pyright 的 `reportAttributeAccessIssue`（动态属性对类型系统不可见）；`soft_limit()` / `session._persist_note()` 两处 `getattr` 兜底随之去掉。新增回归 `test_runtime_attrs_are_not_persisted`。
+  - **`Message.content` 声明成联合类型**（`MultiMediaContent | str | None`，别名在 `context.py`）：`ImageMessage` 原来用带注解的赋值把 `content` 收窄成 `list|None`，触发 Pyright 的 `reportIncompatibleVariableOverride`（可变属性不协变，覆盖类型必须与基类完全一致）→ 基类放宽 + 子类去掉注解；连带把两处下游收窄点补上（`ToolMessage.compact` 里 `isinstance(content, str)`、`Session.full_history` 的兜底）。
+  - **`ToolMessage.compact` 返回值 `int(0/1)` → `bool`**，调用点 `_compact_tools` 改成 `n += m.compact(...)`（bool 是 int 子类）：以前返回值被丢弃、计数是无条件 `n += 1` → `tools=N` 统计的是「扫过的条数」而不是「真正落盘的条数」（短输出不值得压也被算进去）。现在与 `_compact_turns` 的口径一致，`/compact` 与 `[context] 压缩节省…（tools=N）` 都准了。
+  - 顺手：`textkit.py:157` 文档字符串里的 `` `\S+\s*` `` 是非法转义（每次 import 报 `SyntaxWarning`），写成 `` `\\S+\\s*` ``（`__doc__` 不变，`compileall -W error::SyntaxWarning` 已干净）。
+
+- **公共入口改名（用户要求）：`loop.acomplete_turn` → `aturn`、`loop.run_agent` → `run`**（对外即 `pie.aturn(...)` / `pie.run(task, tools=/llm=/config=)`）。
+  - 依据：`AGENTS.md` 目录树早就写着 `loop.py # 循环层：run_agent / aturn`——代码回到文档的名字；`aturn` 与 `Session.aturn` 同名同义（都是「跑一轮」，只是层级不同：模块函数收 `AgentMessage`，方法收用户串）。
+  - `session.py` 内部由 `from .loop import acomplete_turn` 改为 `from . import loop` + `loop.aturn(...)`：模块限定调用，避免在 `Session.aturn` 方法体里出现同名调用看着像递归（解析到全局其实没问题，但读起来误导）。
+  - `aio.run`（内部件，不在公共面）名字未动，所以 `run()` 体内是 `aio.run(aturn(...))`；`run()` 的 docstring 里注明了二者无关。
+  - 验证：替身 LLM 实跑 `pie.run()` 与 `Session.turn()`（都返回最终答复）；`rg 'acomplete_turn|run_agent' src/` 无残留（docs 的历史条目保留旧名）；全套 78 例 + `self_check()` OK。
+
+- **重试日志带上异常摘要；429 尊重 `Retry-After`**（用户报告：synthetic_rl 那边批量跑出一堆 `[retry] 流式请求失败`，无法归因——「是不是 pie 的 bug？」）：
+  - `[retry]` 行改成 `[retry] <what>失败（<异常摘要>），Nd 后第 a/b 次重试`，摘要走新的 **`_exc_brief(exc)`**（`类型: 消息`，最多两层 `__cause__` —— SDK 的 `APIConnectionError: Connection error.` 真原因在 `__cause__` 里）；`_sleep_before_retry(attempt, what, exc)` 多收一个异常参数（两个调用点都传）。
+  - 新增 **`_retry_after_seconds(exc)`**（读 `exc.response.headers["retry-after"]`，只认秒数形式）；**`_retry_delay(max_delay_seconds, exc=None)`** 优先用它、夹在 `[1.0, 60.0]`，没有才退回原来的随机退避。
+  - 背景与结论：实测 53 次真调用（含 8 并发 + 10KB 大 prompt）**0 次重试**，所以那些重试是**间歇性**的（代理抖动 / 429 / 首包超时），不是 pie 的代码错误；`emitted` 那道闸保证重试不会重复内容。这次改动不改行为，只把「原因」打出来，并让限流退避变准。
+  - 验证：`_retry_delay` 对 429+`Retry-After` 的四种取值（无头 / 5 / 0 / 100 / date 形式）逐个实测；`_exc_brief` 对嵌套异常输出两段；`_sleep_before_retry` 实打一行；全套 78 例 + `self_check()` OK。
+  - 验证：全套 **78 例全过**（config 11 / session 5 / files 24 / clipboard 10 / theme 6 / aio 4 / tui 18）+ `self_check()` OK；另外脚本校验「每个 `__all__` 里的名字都真实存在」。
+
+- **`aturn` 去掉 `user_turn` 参数**（用户指出「感觉没必要」——核实确实冗余）：它唯一的作用是 stderr 日志标签 `[t{user_turn}s{step}]`（仅 `cfg.verbose` 时）与 `tool_call` 事件的 `turn` 字段，而后者**没有任何消费方**（tui 的 `_append_event` 只读 name/arguments；cli 根本不传 `on_event`）。现在 loop 内部按 `sum(isinstance(m, UserMessage)) or 1` 派生（这行本来就在 `user_turn is None` 分支里）。
+  - 与 `Session.turn_count` 的差异实测：**只**在同一次运行里 `/clear` 或 `/reset` 之后分叉（`turn_count` 连续、派生值从 1 重数）；而 `turn_count` **不落盘**（`__meta__` 里没有它），`Session.load()` 也是从 UserMessage 数重算（session.py:236）→ 重启后两者本来就一致，所以「连续编号」这点收益跨不过一次重启。
+  - 保留：`tool_call` 事件的 `turn` 字段（对外事件 schema，嵌入方有用，值改用派生）、`Session.turn_count`（还喂 `pie -p --mode json` 的 `"turns"`，cli.py:328）。
+  - 验证：替身 LLM 实跑——历史里 2 条 `UserMessage` → 事件 `(turn, step)=(2, 1)`、stderr `[t2s1] echo({"text": "hi"})`；单条 → `[t1s1]`；`rg user_turn src/ tests/` 无残留；全套 78 例 + `self_check()` OK。
+
+- **`aturn` 的 `manifest: Path` 改成 `on_compact` 回调**（用户要求）：loop / context 不再认识「manifest 文件路径」这种实现细节，压缩事件（工具级 / 轮次级 / 会话级 + shell spill）统一经 **`on_compact` 回调**（类型就是 `Callable[[dict[str, Any]], None]`，与 `on_event` 同型；一开始起的别名 `CompactHook` 已按用户要求删掉）交给调用方，`None` = 不通知。CLI 侧由新增的 `Session._record_compact(entry)` 实现（内部仍是 `write_manifest`，**行为一字不变**：manifest 文件、`/stat` 计数、`pie context info/verify`、`full_history` 全照旧）；`Session.clear_window` 也改走同一回调。
+  - 嵌入方收益：公共签名不再暴露磁盘路径；想观测压缩就直接接回调（RL 侧能知道「什么时候被压了、省了多少」）。与 `on_event` / `on_progress` 一样属于 loop → 调用方的**出站通知**。
+  - ⚠️ 澄清一个易踩的点（本轮实测）：**不传 `on_compact` ≠ 不落盘**——三级压缩里的 `write_raw()` 都是无条件调用，正文照样写 `~/.pie/context/`；嵌入方要完全不碰 `~/.pie` 必须 `Config(compaction=None)`。
+  - 同时**否决**了「把 `cancel_event` 也改成回调」：方向相反（`on_*` 是 loop → 调用方的通知；`cancel_event` 是调用方 → loop 的控制信号），且调用方需要「可等待 / 可立即唤醒」的语义——现在靠 `await cancel_event.wait()` 与请求 task 一起 `asyncio.wait(FIRST_COMPLETED)` 实现「真打断」；换成 `Callable[[], bool]` 只能轮询（延迟 + 白白调度）。`asyncio.Event` 是标准件，保持不变。
+  - 验证：替身 LLM 实跑——触发压缩时 `on_compact` 收到 `{level: 1, kind: 'tool', tool: 'big', …}`；不传也不报错；`Session` 侧 manifest 文件与 `/stat` 段照常；`pie context info` 正常；全套 78 例 + `self_check()` OK。
+
+- **参数改名 `cancel_event` → `cancel`**（用户提议、确认）：它是调用方 → loop 的**入站控制信号**（`asyncio.Event`，类型不变）。用户先提的 `cancelled` 被否——名字像布尔状态，而 `if cancelled:` 对非 None 的 Event **恒真**（能写出 bug 的命名）；且调用方是在它上调 `wait()` / `is_set()`，只有名词读得通（`cancel.wait()` ✅ / `cancelled.wait()` ❌）。改动只碰参数名：`aturn` / `Session.turn` / `Session.aturn` / `_wait_cancellable` / `_model_call` / `_tool_call` / `_run_tool_call` + tui 的调用点；`PieApp._cancel_event`（TUI 私有属性）未动。
+  - 同时定下：**`on_event` 名字保留、暂不拆两路**（用户决定）。被否的候选与理由：`on_delta`（名不副实—— 6 种 `type` 里只有 reasoning/content/tool_progress 3 种是增量，`answer` 是回合终止信号）、`on_data`（与 `on_delta` 不成对照，且 IO 语境里 `on_data` 惯例指原始分片，反而更像增量那一路）、`on_recv`（socket 动词、未描述内容、暗示不存在的双向信道）。→ 命名原则记下：**名字要名词化，并且跟它的类型 / 调用方式读得通**。
+  - 验证：取消语义实跑——① 飞行途中 `cancel.set()` → 返回 `用户手动终止`、历史末尾一致；② 进回合前已 set → 同样立即终止；③ 不传 `cancel` → 不可取消、照常返回；全套 78 例 + `self_check()` OK。
+
+- **`termbg.py` 整并进 `theme.py`**（用户要求）：`theme.py` 现在既管主题数据、也管「探测终端背景」——`detect_dark_background` / `query_osc11` / `parse_osc11` / `parse_colorfgbg` + `_OSC11_RE`，只用标准库。依据：`theme.py` 的 `get_theme(name, dark=None)` **本来就在运行时调它**（「探测背景 → 选族变体」本属主题这件事），所以合并**零行为变化**。改动：`theme.py` 搬入 109 行、头部 docstring 改成「两类内容（展示数据 / 终端背景探测）」；`tui.py` 的 import 并进 `from .theme import Theme, build_css, detect_dark_background, get_theme`；`tests/test_theme.py` 的 `from pie.termbg import ...` 并进 `from pie.theme import ...`；`src/pie/termbg.py` 删除。
+  - 同期评估并**否决**了「`textkit.py` 并进 `tui.py`」：会毁掉「textkit 只依赖 Rich、不 import Textual」这个性质（合并后 import `pie.tui` 就会执行 `install_cjk_wrap()` 的全局 monkeypatch），也推翻 AGENTS.md / MEMORY.md 里已定的「显示层文本处理独立成模块」约定，且 `textkit` 与 `tui` 在两份源码树里都已分叉、合并只会加重收敛成本。
+  - 验证：`parse_osc11` / `parse_colorfgbg` / `detect_dark_background` / `get_theme` 行为不变（含族名 `dark=True` → `catppuccin-mocha`、`dark=False` → `catppuccin-latte`）；`rg termbg src/ tests/` 无残留；全套 78 例 + `self_check()` + `pie --help` OK。
+
+- **`input.py` 整并进 `cli.py`；`config._prompt` 改用内置 `input()`**（用户要求）：`read_input`（prompt_toolkit 行编辑 + 非 TTY 回退）搬进 `cli.py`（它唯一的消费者就是交互式聊天循环），放在 `__version__` 之后带一段说明；`src/pie/input.py` 删除（模块 15 → **14**）。
+  - `config._prompt`（首次运行向导：模型名 / 端点 URL / API key）不再经 `read_input` —— **答案都是 ASCII**，直接 `input()` 就够，也省得 `config.py`（配置层）去依赖行编辑层；`EOFError → 默认值` 的容错保留。中英退格截断那个坑（WSL/mintty）只影响聊天输入，由 `cli.read_input` 负责。
+  - 验证：管道模拟首次运行向导（`printf 'my-model\nhttps://example.com/v1\nsk-test-123\n' | PIE_DIR=<tmp> python -c 'ensure_config()'`）→ 三项正确写入 config.toml；`rg 'pie\.input|from \.input' src/ tests/` 无残留；全套 78 例 + `self_check()` + `pie --help` OK。
+
+- **`Session.compact` 的编排搬进 `context.compact`**（用户要求；函数名就叫 `compact`，不用 `compact_now`）：它本来只碰 `self.config` / `self.messages` / `self._record_compact`，是 `maybe_compact` 的**手动姊妹版**（同样是「agent + cfg + on_compact → 同形状统计 dict」）。`Session.compact` 留下做薄包装（公共 API 不变），`session.py` 从 26 行变 4 行。
+  - 顺带消掉一处重复：两个驱动入口的统计空形状原本各写一份字面量 → 抽出 `context._empty_stats()` 共用。
+  - 切分原则写进注释/文档：**纯编排 → context.py；改会话状态 → 留 Session**。所以同类的 `Session.clear_window`（会重建 messages、追加 windows、写 `~/.pie/windows/`）**不搬**。
+  - mode 校验（`mode not in ("auto","tools","turns")`）**没搬**：它现在在 cli/tui 各写一遍，但那是 UI 层输入校验（tui 那条走红色错误提示，塞进 `skipped` 通道会丢样式）——保持本次为纯搬迁、零行为变化。
+  - 调用点：`session.py` 用 `from . import context` + `context.compact(...)`（模块限定，避免在 `Session.compact` 方法体里出现同名调用）；依赖方向不变（session → context）。
+  - 验证（压缩编排此前零测试覆盖，所以逐条实跑）：`tools` → `{tools:1, turns:0}` 1 条事件；`turns` → `{turns:1, tools:0}` 1 条；`auto` → 两条都有、2 条事件；`compaction=None` → `skipped`；`Session.compact("auto")` → manifest 落两条（level 1 tool + level 2 turn）、`/stat` 显示 `1 / 1 / 0`；全套 78 例 + `self_check()` OK。
+
+- **`aturn` / `run` 新增 `max_steps` 与 `parallel_tools`（并给 `Config` 加 `parallel_tools = True`）**（用户要求，为 synthetic_rl 的接入补齐两个硬缺口）：
+  - **`max_steps: int | None = None`**：限「最多问模型几次」。达到上限时不再调模型，把**历史里最后一段非空 assistant 文本**当最终答复返回，并推一个 `answer` 事件；**不额外追加消息** —— 所以历史末尾可能停在 tool 结果上（`assistant(tool_calls)` + 对应的 tool 消息是合法序列，下一条 user 接上也没问题）。之所以不追加，是为了让 `answer_turns` / `final_answer` 的口径与旧实现（synthetic_rl 的 `for _ in range(max_steps)` + `answers[-1]`）完全一致（追加会多出一条重复文本）。None = 不限（CLI 就是 None，行为零变化）。
+  - **`parallel_tools: bool | None = None`**：同批 tool_calls 是否并发。**None（默认）= 跟随 `Config.parallel_tools`**（新字段，默认 `True` = 保持原行为）；`False` = 按模型返回顺序**串行**执行（`await` 逐个），给「工具改同一份可变状态」的嵌入方用（例：synthetic_rl 的工具都在改同一个 `S`，并行会竞态）。两条路径都按模型返回顺序回填 ToolMessage，所以 `_step_batches` / `keep_last_steps` / 压缩认定不受影响；串行时 `_cancel_tools` 的收尾逻辑与并行完全一致（每个后续工具因 cancel 已置位而立即返回 None）。
+  - `run()` 同样透传这两个参数（`run(task, max_steps=..., parallel_tools=...)`）。
+  - 验证（替身 backend，零网络）：`max_steps=None` + 两步替身 → 2 次调用、返回 `做完了`、历史末条 assistant；`max_steps=3` + 永不收工替身 → **恰好 3 次调用**、返回 `step3`、历史末条 tool、`answer` 事件 = `step3`；`max_steps=1` → 1 次调用（工具不跑）；三个 tool_call 一批（每个 sleep 0.15s）：`parallel_tools=True` → 耗时 0.16s、有重叠；`False` → 0.45s、无重叠、顺序 = 模型返回顺序；`None` + `cfg.parallel_tools=False` → 同样串行。`Config` 落盘/读回 `parallel_tools = false` 正常；全套 78 例 + `self_check()` OK。
+
 ## 2026-09-17
 
 - **重试改成 pie 自己实现（不再用 openai SDK 自带的）；`max_retry_delay_seconds` 配置删除 → 常量**（用户要求：「手动实现 llm.py 里面的 retry 相关功能，不要使用 openai 自带的。相关可用参数：`max_retries`。移除 `max_retry_delay_seconds`，作为常量写进 llm.py」）。背景是上一轮查出 `max_retries=2` 实际会发 **6** 次请求（SDK 3 次 × pie 的 `stream_options` 回退又 3 次，`x-stainless-retry-count` 会归零）。

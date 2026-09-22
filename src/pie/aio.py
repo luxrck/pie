@@ -29,6 +29,10 @@ import contextlib
 import gc
 from typing import Any, Coroutine, Generator, TypeVar
 
+# 内部模块：事件循环收尾（run / close_asyncgens / event_loop）。
+# 不属公共 API —— `from pie.aio import *` 不暴露任何东西（否则会带出 asyncio/gc/Any 等依赖名）。
+__all__: list[str] = []
+
 _T = TypeVar("_T")
 
 _ROUNDS = 4  # 收尾尝试轮数（实测 2 轮足够，留余量）
@@ -77,7 +81,7 @@ def run(coro: Coroutine[Any, Any, _T]) -> _T:
     """`asyncio.run` 的替代：收尾前关干净残留异步生成器。
 
     其余语义与 `asyncio.run` 一致（执行完取消残留任务、`shutdown_asyncgens()`、
-    `shutdown_default_executor()`、关闭循环）。同步入口（CLI / `run_agent` /
+    `shutdown_default_executor()`、关闭循环）。同步入口（CLI / `run` /
     `ToolRegistry.dispatch`）统一用它，避免那种随机的收尾 Traceback。
     """
     return asyncio.run(_with_cleanup(coro))
