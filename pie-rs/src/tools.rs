@@ -837,7 +837,9 @@ impl Tool for Shell {
 // ---------------------------------------------------------------- 注册表
 
 /// 注册表里的一条：名字 + 描述 + schema + 「JSON → 调用」的函数指针（类型擦除的产物）。
-#[derive(Debug)]
+///
+/// `Clone` 是给嵌入方用的（Python 绑定要能拿一份副本建会话，见 `bindings/pie-py`）。
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub name: &'static str,
     pub description: String,
@@ -845,7 +847,7 @@ pub struct Entry {
     pub call: fn(Value, ToolCtx) -> BoxFuture<ToolResult>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolRegistry {
     entries: Vec<Entry>,
     defaults: HashMap<String, toml::Table>,
