@@ -138,6 +138,31 @@ def test_save_round_trip_keeps_auto() -> None:
         assert cfg2.reserved_tokens is None
 
 
+def test_runtime_attrs_are_not_persisted() -> None:
+    """运行时属性（config_file / auto_compact_threshold）不落盘，也不从配置文件读回。
+
+    这两个是字段形式声明的动态属性（只为类型检查器可见）：save() 从 asdict 里摘掉，
+    load() 跳过——否则 config.toml 会多出两行，且 auto_compact_threshold 能被人
+    在文件里静默覆盖掉压缩水位。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / "config.toml"
+        cfg = Config()
+        cfg.config_file = str(path)
+        cfg.auto_compact_threshold = 1234
+        cfg.save(path)
+        text = path.read_text(encoding="utf-8")
+        assert "config_file" not in text
+        assert "auto_compact_threshold" not in text
+        cfg2 = Config.load(config_file=path)
+        assert cfg2.config_file == str(path)  # load 仍记录来源路径
+        assert cfg2.auto_compact_threshold is None  # 只由 CLI 一次性设置
+    # 手写在配置文件里的同名键也不生效（保持原有行为）
+    cfg3 = _load_toml('auto_compact_threshold = 1234\n')
+    assert cfg3.auto_compact_threshold is None
+    assert cfg3.soft_limit() == int(cfg3.context_budget() * cfg3.soft_ratio)
+
+
 def test_real_server_window_compacts_before_overflow() -> None:
     """回归：实测窗口 1,048,576 / 预留 256,000 下，793,513 的输入必须触发压缩，
     且软阈值 <= 窗口 - 预留（否则又会把请求发到 400）。"""

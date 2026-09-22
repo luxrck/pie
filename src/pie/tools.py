@@ -22,6 +22,27 @@ from typing import Any, Awaitable, Callable, Union, get_args, get_origin, get_ty
 from . import aio
 from .context import write_raw
 
+# 公共面：工具抽象 + 注册表 + 四个内置工具（含 schema 生成与输出清洗工具）。
+__all__ = [
+    "BUILTIN_TOOLS",
+    "DEFAULT_MAX_IMAGE_BYTES",
+    "ImageRef",
+    "MAX_TOOL_OUTPUT",
+    "Tool",
+    "ToolError",
+    "ToolRegistry",
+    "clip_output",
+    "default_tools",
+    "edit",
+    "parse_image_marker",
+    "read",
+    "register_builtins",
+    "shell",
+    "tool",
+    "tools_from_spec",
+    "write",
+]
+
 
 MAX_TOOL_OUTPUT = 20_000  # 单个工具返回给模型的最大字符数
 DEFAULT_MAX_IMAGE_BYTES = 32 * 1024 * 1024  # read 内联图片的默认字节上限（可由配置注入 _max_image_bytes 覆盖）
@@ -419,7 +440,9 @@ def read(
     从 offset 起点向后取连续段，行数 ≤ min(limit, _max_lines, 字节预算行数)，字节预算行数 =
     使所选行累计字节尽可能接近 _max_bytes（不超，至少 1 行）。
     图片（PNG/JPEG/GIF/WebP/BMP）返回图像引用，图像内容随多模态请求发送给模型，
-    文本容量上限（offset/limit/_max_lines/_max_bytes）对图片不适用，图片只看 _max_image_bytes。"""
+    文本容量上限（offset/limit/_max_lines/_max_bytes）对图片不适用，图片只看 _max_image_bytes。
+    被容量上限截断时**不落盘**：read 的内容可再生（原文件还在，按 offset 续读即可），
+    只补一行 `[已截断：可用 offset=N 继续读]`；落盘只留给不可再生的输出（shell 的 stdout）。"""
     p = Path(path)
     if not p.exists():
         raise ToolError(f"文件不存在: {path}")
@@ -459,7 +482,9 @@ def read(
     body = "\n".join(picked)
     headers = [f"[行 {start + 1}-{start + len(picked)}，共 {total} 行]"]
     if omitted > 0:
-        headers.append(f"[工具输出全文已保存: {write_raw(content, 'tool')}]")
+        # 不落盘：read 的内容可再生（原文件还在），续读拿到的是完整内容。
+        # 落盘只属于**不可再生**的输出（shell 的 stdout，进程结束就没了）→ 见 AGENTS.md「谁该落盘」。
+        headers.append(f"[已截断：可用 offset={start + len(picked) + 1} 继续读]")
     return _format_output(headers, body)
 
 

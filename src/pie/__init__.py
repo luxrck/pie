@@ -1,6 +1,6 @@
 """pie 极简 agent harness 的公开 API。
 
-用法：from pie import run_agent, tool, default_tools, Config, ...
+用法：from pie import run, aturn, tool, default_tools, Config, ...
 """
 
 from .config import (
@@ -24,7 +24,7 @@ from .context import (
 )
 from .session import Session
 from .llm import LLM, LLMResult, OpenAILLM, StreamChunk, ToolCall, UsageTracker
-from .loop import acomplete_turn, run_agent
+from .loop import aturn, run
 from .tools import (
     MAX_TOOL_OUTPUT,
     Tool,
@@ -38,9 +38,7 @@ from .tools import (
 __all__ = [
     "AgentMessage",
     "AssistantMessage",
-    "CONFIG_FILE",
     "Config",
-    "DEFAULT_MODEL",
     "GLOBAL_MEMORY_FILE",
     "ImageMessage",
     "LLM",
@@ -48,7 +46,6 @@ __all__ = [
     "MAX_TOOL_OUTPUT",
     "Message",
     "OpenAILLM",
-    "PIE_DIR",
     "SYSTEM_PROMPT",
     "Session",
     "StreamChunk",
@@ -60,12 +57,12 @@ __all__ = [
     "ToolMessage",
     "UsageTracker",
     "UserMessage",
-    "acomplete_turn",
+    "aturn",
     "build_system_prompt",
     "default_tools",
     "register_builtins",
     "resolve_config",
-    "run_agent",
+    "run",
     "tool",
 ]
 

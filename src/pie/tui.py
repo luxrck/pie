@@ -43,9 +43,12 @@ from .config import REASONING_LEVELS
 from .context import content_text
 from .loop import CANCEL_TEXT
 from .session import Session
-from .termbg import detect_dark_background
 from .textkit import install_cjk_wrap, rich_text, strip_escapes
-from .theme import Theme, build_css, get_theme
+from .theme import Theme, build_css, detect_dark_background, get_theme
+
+# 内部模块：TUI 应用编排 + 控件（PieApp / run_tui / SelectableRichLog / 命令面板…）。
+# 对外入口是命令行 `pie` 本身，不是这个模块；`from pie.tui import *` 不暴露任何东西。
+__all__: list[str] = []
 
 install_cjk_wrap()  # 显示层断行改成 CJK 友好（Rich 正文 + TextArea 输入框）
 
@@ -378,8 +381,13 @@ class MessageSubmitted(Message):
 
 
 class PieTextArea(TextArea):
-    """多行消息输入框：Enter 提交，Shift+Enter 换行（支持多行粘贴）；
-    Tab 接受命令补全，↑/↓ 切换候选，Esc 隐藏面板 / 取消当前任务。"""
+    """多行消息输入框：Enter 提交，换行有三种按键（支持多行粘贴）；
+    Tab 接受命令补全，↑/↓ 切换候选，Esc 隐藏面板 / 取消当前任务。
+
+    换行 = `Shift+Enter` / `Ctrl+J` / `Ctrl+Enter`：前两个是通用按键；`Ctrl+Enter` 只在
+    支持修饰键上报的终端（kitty 键盘协议等）才作为独立键送到应用，多数终端把它编码成
+    LF = `Ctrl+J`（所以按下时看着就像换行）——两种来源都收，行为才一致。
+    """
 
     BINDINGS = [
         *TextArea.BINDINGS,
@@ -417,7 +425,7 @@ class PieTextArea(TextArea):
                 app.palette_hide()
             self.post_message(MessageSubmitted(self.text))
             return
-        if event.key in ("shift+enter", "ctrl+j"):
+        if event.key in ("shift+enter", "ctrl+j", "ctrl+enter"):
             event.stop()
             event.prevent_default()
             self.insert("\n")
@@ -902,7 +910,7 @@ class PieApp(App):
         yield CommandPalette("", id="palette")
         with Horizontal(id="input-bar"):
             yield PieTextArea(
-                placeholder="输入消息（! 开头直接执行 shell，/stop 或 Esc 取消当前任务，/ 显示命令补全，Shift+Enter 换行）",
+                placeholder="输入消息（! 开头直接执行 shell，/stop、Esc 取消，/ 命令补全，换行 Ctrl+J / Ctrl+Enter）",
                 id="input",
                 tab_behavior="focus",
                 highlight_cursor_line=False,
@@ -1561,7 +1569,7 @@ class PieApp(App):
     async def _run_turn(self, text: str) -> None:
         try:
             await self.session.aturn(
-                text, on_event=self._append_event, cancel_event=self._cancel_event
+                text, on_event=self._append_event, cancel=self._cancel_event
             )
         except asyncio.CancelledError:
             raise
