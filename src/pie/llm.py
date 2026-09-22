@@ -20,6 +20,9 @@ from openai import AsyncOpenAI
 
 from .config import DEFAULT_MODEL, REASONING_NONE
 
+# 公共面：LLM 协议（注入点）+ 请求/流式/用量数据类。
+__all__ = ["LLM", "LLMResult", "StreamChunk", "ToolCall", "UsageTracker", "OpenAILLM"]
+
 
 @dataclass
 class ToolCall:
@@ -114,12 +117,56 @@ def _retryable(exc: BaseException) -> bool:
     return type(exc).__module__.split(".")[0] in _TRANSIENT_MODULES
 
 
-def _retry_delay(max_delay_seconds: float) -> float:
-    """本次重试前等待的秒数：`max(1.0, random.uniform(0, max_delay_seconds))`。
+def _exc_brief(exc: BaseException, depth: int = 2) -> str:
+    """异常摘要（`类型: 消息`，最多 depth 层 `__cause__`）—— 只给 `[retry]` 日志用。
 
-    随机是为了避免一批请求同时退避、又同时撞回来；1.0 是下限（不然退避形同虚设）。
-    默认 `max_retry_delay_seconds = 1.0` 时恒等于 1.0（随机值不可能超过上限）。
+    SDK 的包装异常（`APIConnectionError: Connection error.`）真原因在 `__cause__` 里
+    （httpx2 的连接 / 代理 / TLS 错误），所以带一层链：命中重试时能直接看出是什么失败。
     """
+    parts: list[str] = []
+    cur: BaseException | None = exc
+    while cur is not None and len(parts) < depth:
+        msg = " ".join(str(cur).split())[:120]
+        parts.append(f"{type(cur).__name__}: {msg}" if msg else type(cur).__name__)
+        cur = cur.__cause__ or cur.__context__
+    return " ↳ ".join(parts)[:240]
+
+
+_RETRY_AFTER_MAX = 60.0  # `Retry-After` 的等待上限（再长也不把一个回合卡死）
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """取服务端给的 `Retry-After`（429/503 常见）；没有 / 解析不了 → None。
+
+    只认秒数形式（HTTP-date 形式少见，先不解析）。异常不带 response / headers 也返回 None。
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:  # noqa: BLE001 —— 头部对象千奇百怪，取不到就当没有
+        return None
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _retry_delay(max_delay_seconds: float, exc: BaseException | None = None) -> float:
+    """本次重试前等待的秒数：**优先服务端 `Retry-After`**，否则 `max(1.0, random.uniform(0, max_delay_seconds))`。
+
+    - 429/503 常带 `Retry-After`（服务端告诉你多久后再来，比瞎退避准），夹在 `[1.0, 60.0]`：
+      太短的限流等待没意义，太长会把一个回合卡死；
+    - 没有该头时退回随机退避：随机是为了避免一批请求同时退避、又同时撞回来；1.0 是下限
+      （不然退避形同虚设）。默认 `max_retry_delay_seconds = 1.0` 时恒等于 1.0。
+    """
+    retry_after = _retry_after_seconds(exc) if exc is not None else None
+    if retry_after is not None:
+        return min(_RETRY_AFTER_MAX, max(1.0, retry_after))
     return max(1.0, random.uniform(0.0, float(max_delay_seconds)))
 
 
@@ -264,11 +311,14 @@ class OpenAILLM:
             kwargs["max_tokens"] = int(self.max_tokens)
         return kwargs
 
-    async def _sleep_before_retry(self, attempt: int, what: str) -> None:
-        """退避等待（`_retry_delay`：随机 + 1s 下限），并在 stderr 报一行。"""
-        delay = _retry_delay(self.max_retry_delay_seconds)
+    async def _sleep_before_retry(self, attempt: int, what: str, exc: BaseException) -> None:
+        """退避等待（429/503 优先 `Retry-After`，否则随机 + 1s 下限），并在 stderr 报一行。
+
+        那行**带上异常摘要**：命中重试时一眼能看出是超时 / 429 / 代理抖动，不用猜。
+        """
+        delay = _retry_delay(self.max_retry_delay_seconds, exc)
         print(
-            f"[retry] {what}失败，{delay:.1f}s 后第 {attempt}/{self.max_retries} 次重试",
+            f"[retry] {what}失败（{_exc_brief(exc)}），{delay:.1f}s 后第 {attempt}/{self.max_retries} 次重试",
             file=sys.stderr,
         )
         await asyncio.sleep(delay)
@@ -284,7 +334,7 @@ class OpenAILLM:
             except Exception as e:
                 if attempt >= self.max_retries or not _retryable(e):
                     raise
-                await self._sleep_before_retry(attempt + 1, what)
+                await self._sleep_before_retry(attempt + 1, what, e)
 
     async def complete(
         self,
@@ -334,8 +384,9 @@ class OpenAILLM:
         usage 尽量通过 stream_options.include_usage 获取；端点以 400 拒该参数时
         自动摘掉重来一次（只丢 usage 统计，不影响流式本身）。
 
-        请求失败重试：`max_retries` 次（等待 = `max(1.0, random(0, max_retry_delay_seconds))`，
-        见 `_retry_delay`），但**只在还没 yield 过任何增量时**——已经吐出去的内容没法撤回，重来会重复。
+        请求失败重试：`max_retries` 次（等待优先用服务端 `Retry-After`，否则
+        `max(1.0, random(0, max_retry_delay_seconds))`，见 `_retry_delay`），但**只在还没 yield
+        过任何增量时**——已经吐出去的内容没法撤回，重来会重复。
         """
         kwargs = self._request_kwargs(messages, tools, model)
         kwargs["stream"] = True
@@ -413,7 +464,7 @@ class OpenAILLM:
                     raise
                 attempt += 1
                 usage = None  # 上一轮没有交付任何内容，它带回的 usage 不算数
-                await self._sleep_before_retry(attempt, "流式请求")
+                await self._sleep_before_retry(attempt, "流式请求", e)
 
         calls = [
             ToolCall(id=s["id"], name=s["name"], arguments=s["arguments"])

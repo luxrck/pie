@@ -31,8 +31,11 @@ from .context import (
     write_manifest,
 )
 from .llm import LLM, OpenAILLM, UsageTracker
-from .loop import acomplete_turn
+from . import context, loop
 from .tools import ToolRegistry, default_tools
+
+# 公共面：多轮会话对象。
+__all__ = ["Session"]
 
 
 @dataclass
@@ -90,7 +93,7 @@ class Session:
     def _persist_note(cfg: Config) -> str:
         """持久化当前 config 到来源文件；失败时返回提示（仅本次会话生效）。"""
         try:
-            cfg.save(getattr(cfg, "config_file", None))
+            cfg.save(cfg.config_file)
             return "已写入配置"
         except OSError as e:
             return f"配置写入失败: {e}（仅本次会话生效）"
@@ -280,23 +283,22 @@ class Session:
         self,
         user_input: str,
         on_event: Callable[[dict[str, Any]], None] | None = None,
-        cancel_event: asyncio.Event | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> str:
-        """异步主路径：追加用户消息后跑完整工具循环。cancel_event 可手动取消当前回合。"""
+        """异步主路径：追加用户消息后跑完整工具循环。cancel 可手动取消当前回合。"""
         self.messages.add(UserMessage(user_input))
         self.turn_count += 1
         if self.title is None:
             self.title = (user_input.strip().splitlines() or [""])[0]
-        return await acomplete_turn(
+        return await loop.aturn(
             self.messages,
             self.config,
             self.tools,
             self.llm,
-            manifest=self.manifest,
-            user_turn=self.turn_count,
+            on_compact=self._record_compact,
             usage=self.usage,
             on_event=on_event,
-            cancel_event=cancel_event,
+            cancel=cancel,
             image_files=self.files,
         )
 
@@ -341,55 +343,35 @@ class Session:
                     raw += line
                     f.write(line)
             self.windows.append(block)
-            if self.manifest is not None:
-                sc = self.config.compaction.session if self.config.compaction else None
-                head, tail = (
-                    (sc.head, sc.tail) if sc is not None else (SessionCompaction.head, SessionCompaction.tail)
-                )
-                write_manifest(
-                    self.manifest,
-                    {
-                        "ts": datetime.now().isoformat(timespec="seconds"),
-                        "level": 3,
-                        "kind": "session",
-                        "raw_path": str(block),
-                        "raw_hash": content_hash(raw),
-                        "summary": summarize_turns(
-                            [json.loads(l) for l in raw.splitlines() if l.strip()],
-                            head,
-                            tail,
-                        )[:200],
-                    },
-                )
+            sc = self.config.compaction.session if self.config.compaction else None
+            head, tail = (
+                (sc.head, sc.tail) if sc is not None else (SessionCompaction.head, SessionCompaction.tail)
+            )
+            self._record_compact(
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "level": 3,
+                    "kind": "session",
+                    "raw_path": str(block),
+                    "raw_hash": content_hash(raw),
+                    "summary": summarize_turns(
+                        [json.loads(l) for l in raw.splitlines() if l.strip()],
+                        head,
+                        tail,
+                    )[:200],
+                }
+            )
         self.messages = AgentMessage(
             [SystemMessage(build_system_prompt(self.config))] + self._window_summaries(),
             keep_last_steps=self.config.keep_last_steps,
         )
 
     def compact(self, mode: str = "auto") -> dict[str, Any]:
-        """手动压缩：/compact [auto|tools|turns]。返回统计 dict。"""
-        cfg = self.config
-        stats: dict[str, Any] = {
-            "saved_tokens": 0,
-            "turns": 0,
-            "tools": 0,
-            "session": False,
-        }
-        if cfg.compaction is None:
-            stats["skipped"] = "compaction disabled (未配置 [compaction])"
-            return stats
-        before = self.messages.tokens()
-        self.messages.compact_counts = {"turns": 0, "tools": 0, "session": False}
-        tool_cfg = cfg.compaction.tool
-        turn_cfg = cfg.compaction.turn
-        if mode in ("auto", "tools") and tool_cfg is not None:
-            self.messages.compact(tools=True, tool_cfg=tool_cfg, manifest=self.manifest)
-        if mode in ("auto", "turns") and turn_cfg:
-            self.messages.compact(turns=True, turn_cfg=turn_cfg, target=None, manifest=self.manifest)
-        stats["tools"] = self.messages.compact_counts["tools"]
-        stats["turns"] = self.messages.compact_counts["turns"]
-        stats["saved_tokens"] = max(0, before - self.messages.tokens())
-        return stats
+        """手动压缩（`/compact [auto|tools|turns]`）：编排在 `context.compact`，
+        这里只把自己的历史、配置和自己的 manifest 回调接上去。返回统计 dict。"""
+        return context.compact(
+            self.messages, self.config, mode=mode, on_compact=self._record_compact
+        )
 
     def usage_report(self) -> str:
         reported = self.usage.prompt_tokens
@@ -453,6 +435,11 @@ class Session:
         parts.append("API 用量：\n" + json.dumps(asdict(self.usage), ensure_ascii=False, indent=2))
         return "\n".join(parts)
 
+    def _record_compact(self, entry: dict) -> None:
+        """on_compact 回调：把一条压缩事件追加到本会话的 manifest（没配 manifest 就丢弃）。"""
+        if self.manifest is not None:
+            write_manifest(self.manifest, entry)
+
     def compression_history(self) -> list[dict]:
         if self.manifest is None or not self.manifest.exists():
             return []
@@ -482,7 +469,7 @@ class Session:
                     try:
                         full = p.read_text(encoding="utf-8")
                     except OSError:
-                        full = m.content or ""
+                        full = m.content if isinstance(m.content, str) else ""
                     out.append(
                         ToolMessage(
                             content=full,

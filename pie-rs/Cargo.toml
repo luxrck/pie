@@ -1,0 +1,71 @@
+[package]
+name = "pie-rs"
+version = "0.1.0"
+edition = "2021"
+description = "pie 的 Rust 重构：极简 agent harness（YOLO，内置 read/edit/write/shell）"
+license = "MIT"
+
+[workspace]
+# `macros/` 是上一版 `#[tool]` 属性宏的遗留（方案已废弃）。
+# 先排除出 workspace，免得 cargo 去构建它；确认后可以把目录删掉。
+exclude = ["macros"]
+
+[[bin]]
+name = "pie-rs"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "fs", "time", "signal", "sync"] }
+# TLS 用 rustls（provider = ring），不用 native-tls/OpenSSL：
+#   - 不依赖系统的 libssl-dev / pkg-config，跨平台行为一致；
+#   - native-roots = 读系统信任库（和 Python 那版一致，能认系统里装的企业 CA）。
+# default-features = false 很关键：否则会同时拉进 native-tls(OpenSSL)。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "multipart",
+    "rustls-tls-native-roots",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 工具的参数 schema 由结构体 + doc 注释自动派生（替代之前那个手写 JSON / 自己写 derive 的方案）
+schemars = "0.8"
+# 图片识别（魔数 + 只读头部拿尺寸）：用 image 而不是手写解析。
+# 不开默认特性（省掉 rayon/avif/exr/tiff…），只要读的那五种格式。
+# 将来 clipboard 模块也要靠它把 raw RGBA 编码成 PNG（Python 那边是 Pillow 干的）。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+# shell 工具要 dup2 合并 stderr + killpg 杀进程组（std 不暴露这两个）
+libc = "0.2"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+# ratatui 0.30（widget/backend 已拆成 ratatui-core / ratatui-widgets，facade 仍是 `ratatui`）。
+# 滚动偏移不再靠 `Paragraph::line_count`（那个 feature 已不需要）：消息流由 `history::layout`
+# 自己折行，显示行数就是 `rows.len()`。
+ratatui = "0.30"
+# `event-stream` 才给 `EventStream`（与 tokio select! 搭配用）；默认 features 里没有它。
+# 0.29：ratatui 0.30 的 crossterm backend（ratatui-crossterm 默认开 crossterm_0_29）与
+# ratatui-textarea 都用它 → 全树只有一个 crossterm，事件类型才对得上。
+crossterm = { version = "0.29", features = ["event-stream"] }
+# 输入框：官方接手 tui-textarea 后的 crate（github.com/ratatui/ratatui-textarea）。老的
+# tui-textarea 0.7 已停更且**没有软换行**；0.9 起有 `set_wrap_mode`（长行不再水平滚动）。
+ratatui-textarea = "0.9"
+# 自己折行（history.rs）算字符显示宽度：与 ratatui 内部同一份 unicode-width（已是其传递依赖）。
+unicode-width = "0.2"
+# 剪贴板：粘贴文本 / 图片路径（图片本体走 session::store_blob）
+arboard = "3"
+# markdown → ratatui Text。0.3.7+ 已迁到 ratatui 0.30 的 `ratatui-core`，与上面配套；
+# 不开默认特性：`highlight-code` 会拉 syntect（默认 oniguruma = C 库）。
+tui-markdown = { version = "0.3.9", default-features = false }
+
+[profile.release]
+opt-level = 2

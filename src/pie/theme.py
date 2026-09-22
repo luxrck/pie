@@ -1,20 +1,131 @@
 """Textual TUI 主题：集中管理界面配色与图标（按 role / 按工具 / 按执行结果），支持按名字切换。
 
-只做「展示数据」：theme.py 不依赖 Textual / Rich，纯粹是颜色常量 + 图标常量 + 注册表。
+两类内容：
+- **展示数据**（纯常量 + 查表，不依赖 Textual / Rich）：颜色常量 + 图标常量 + 注册表；
+- **终端背景明暗探测**（`detect_dark_background`，只用标准库）：OSC 11 查询 → COLORFGBG → None，
+  供主题族自动选深/浅变体。
+
 界面结构与样式生成（build_css / _box）保留在 tui.py，便于与控件布局绑定。
 
 主题分两层：
 - **主题族**（THEME_FAMILIES，如 `catppuccin`）：一个族 = 深色 + 浅色两个变体，取主题时按
-  终端背景明暗（termbg.detect_dark_background）自动选一个——这就是「一套主题同时适应
+  终端背景明暗（detect_dark_background）自动选一个——这就是「一套主题同时适应
   深色/浅色终端」；
 - **具体变体**（THEMES，如 `catppuccin-mocha` / `catppuccin-latte`）：固定明暗，不探测。
 """
 
 from __future__ import annotations
 
+import os
+import re
+import select
+import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 
-from .termbg import detect_dark_background
+# 内部模块：配色/图标数据 + 终端背景探测 + 主题查表（config.py 取默认族名、tui.py 取 palette 与 CSS）。
+__all__: list[str] = []
+
+
+try:  # pragma: no cover - 非 Unix 平台没有 termios
+    import termios
+except ImportError:  # pragma: no cover
+    termios = None  # type: ignore[assignment]
+
+
+# ---- 终端背景明暗探测（OSC 11 → COLORFGBG → None）----
+# 只用标准库；任何不确定都返回 None，由调用方回退到默认变体（探不到按深色）。
+
+# OSC 11 响应：``ESC ] 11 ; rgb:RRRR/GGGG/BBBB ST``（分量 2 或 4 位十六进制；部分终端带 alpha）
+_OSC11_RE = re.compile(
+    r"\x1b\]11;rgba?:([0-9a-fA-F]{2,4})/([0-9a-fA-F]{2,4})/([0-9a-fA-F]{2,4})"
+)
+
+
+def parse_osc11(reply: str) -> bool | None:
+    """解析 OSC 11 响应里的背景色 → 背景是否深色；解析不了返回 None。"""
+    match = _OSC11_RE.search(reply)
+    if match is None:
+        return None
+    channels = [int(part, 16) / (16 ** len(part) - 1) for part in match.groups()]
+    luma = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+    return luma < 0.5
+
+
+def parse_colorfgbg(value: str | None) -> bool | None:
+    """解析 COLORFGBG（``"fg;bg"``，颜色索引 0-15）→ 背景是否深色；解析不了返回 None。
+
+    背景索引 0-7 是暗色、8-15 是亮色（xterm/rxvt/WezTerm 等会设置这个变量）。
+    """
+    if not value:
+        return None
+    parts = value.split(";")
+    try:
+        background = int(parts[-1])
+    except (ValueError, IndexError):
+        return None
+    return background < 8
+
+
+def query_osc11(timeout: float = 0.2) -> str | None:
+    """向控制终端发 OSC 11 查询并读回响应；无控制终端 / 超时 / 出错返回 None。
+
+    直接读写 ``/dev/tty``（不碰 stdin/stdout），所以在管道的 shell 里也能工作；
+    读前临时关掉规范模式与回显，读完恢复。响应超时是必要的——不支持该查询的终端
+    不会有任何回复，不能无限等。
+    """
+    if termios is None:  # pragma: no cover - 非 Unix
+        return None
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+    original = None
+    try:
+        original = termios.tcgetattr(fd)
+        raw = termios.tcgetattr(fd)
+        raw[3] &= ~(termios.ICANON | termios.ECHO)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+        os.write(fd, b"\x1b]11;?\x1b\\")
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(fd, 256)
+            if not chunk:
+                break
+            buf += chunk
+            if buf.endswith(b"\x1b\\") or buf.endswith(b"\x07"):
+                break
+        return buf.decode("utf-8", "replace") or None
+    except termios.error:  # type: ignore[union-attr]
+        return None
+    finally:
+        if original is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, original)  # type: ignore[union-attr]
+            except termios.error:  # type: ignore[union-attr]  # pragma: no cover
+                pass
+        os.close(fd)
+
+
+@lru_cache(maxsize=1)
+def detect_dark_background() -> bool | None:
+    """探测终端背景是否深色：OSC 11 查询 → COLORFGBG → None（未知）。
+
+    进程内只探测一次（结果缓存）：OSC 查询最多阻塞 timeout，别在每次取主题时都做。
+    """
+    dark = parse_osc11(query_osc11() or "")
+    if dark is not None:
+        return dark
+    return parse_colorfgbg(os.environ.get("COLORFGBG"))
+
+
+# ---- 主题数据与查表 ----
 
 # 默认主题名（config.theme 缺省值）：主题族 → 按终端明暗自适应
 DEFAULT_THEME_NAME = "catppuccin"
@@ -271,7 +382,7 @@ def get_theme(name: str | None = None, dark: bool | None = None) -> Theme:
     """按名字取主题（支持「族名」与「具体变体名」两种），未知/为空时回退默认。
 
     - **族名**（如 ``catppuccin``）：按 `dark` 选深/浅变体；`dark` 为 None 时探测终端背景
-      （termbg），探测不到按深色处理——这就是「一套主题适应深色/浅色终端」。
+      （`detect_dark_background`），探测不到按深色处理——这就是「一套主题适应深色/浅色终端」。
     - **具体变体名**（如 ``catppuccin-mocha``）：固定返回，`dark` 不参与。
 
     名字匹配忽略首尾空白与大小写；未知主题名不打断界面启动。
@@ -371,6 +482,10 @@ CommandPalette {{
     background: {palette.screen_bg};
     color: {palette.body_text};
     border: round {palette.border};
+    /* 输入框（TextArea = ScrollView）自带滚动条，默认是 Textual 的 2 cell 黑底蓝条，
+       与 #log / #assistant-stream 不一致 → 用同一份 scrollbar 样式（TextArea 的
+       ScrollBar 子控件读的是**父控件**的 scrollbar-* 样式，所以写在 #input 上即可）。 */
+    {scrollbar}
     & .text-area--placeholder {{
         color: {palette.faint};
     }}

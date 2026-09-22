@@ -41,6 +41,9 @@ from pathlib import Path
 
 from .files import store_blob
 
+# 内部模块：剪贴板图片 → 路径（TUI 的 Ctrl+V / Ctrl+G / /paste 用）。
+__all__: list[str] = []
+
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _WSL_TIMEOUT = 15.0  # PowerShell 冷启动 ~0.5s，给足余量；超时/报错都当没图
 

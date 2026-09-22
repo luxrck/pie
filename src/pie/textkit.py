@@ -19,6 +19,9 @@ from typing import Iterator
 from rich.cells import cell_len, chop_cells
 from rich.text import Text
 
+# 内部模块：显示层文本处理（CJK 友好断行 + 控制符/ANSI 清洗），TUI 专用。
+__all__: list[str] = []
+
 # ---- CJK 友好断行：把 Rich 的词级换行换成「全角字也可断」----
 #
 # Rich 只在空白处断行（rich.text.divide_line → rich._wrap.divide_line 用 `\s*\S+\s*`
@@ -151,7 +154,7 @@ def cjk_compute_wrap_offsets(
 ) -> list[int]:
     """CJK 友好 + **逐字符**版 compute_wrap_offsets（TextArea 用；契约与 textual._wrap 同）。
 
-    与 Textual 原生（词级：`\S+\s*` 不可断）的区别：所有字符都可作断点，于是
+    与 Textual 原生（词级：`\\S+\\s*` 不可断）的区别：所有字符都可作断点，于是
     「英文长单词/长路径」也会在当前行剩余空间里继续填，而不是整块挪到下一行留一片空白。
 
     含制表符的行仍交回 Textual 原实现：tab 宽度随列位置变化，原实现用调用方预计算的

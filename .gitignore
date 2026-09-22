@@ -6,3 +6,6 @@ build/
 scripts/
 *.egg-info/
 .pytest_cache/
+
+# Rust 重构（pie-rs）的构建产物
+pie-rs/target/

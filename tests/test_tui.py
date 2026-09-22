@@ -372,6 +372,36 @@ def test_slash_path_is_treated_as_plain_text() -> None:
     asyncio.run(run())
 
 
+def test_input_newline_keys() -> None:
+    """换行只认 Shift+Enter / Ctrl+J / Ctrl+Enter，裸 Enter 一律提交。
+
+    Ctrl+Enter 只在支持修饰键上报的终端（kitty 协议）才独立送达；多数终端把它编码成
+    LF（= Ctrl+J）→ 两者都收，行为才不因终端而异。
+    """
+
+    async def run() -> None:
+        app = PieApp(_dummy_session())
+        async with app.run_test(size=(78, 26)) as pilot:
+            await pilot.pause()
+            submitted: list[str] = []
+            app._submit = lambda text: submitted.append(text)  # type: ignore[method-assign]
+            inp = app.query_one("#input", PieTextArea)
+            inp.text = "a"
+            inp.cursor_location = (0, 1)  # 程序化设 text 后光标在行首，移到末尾更像真人输入
+            for key in ("shift+enter", "ctrl+j", "ctrl+enter"):
+                await pilot.press(key)
+                await pilot.pause()
+                assert inp.text == "a\n", (key, inp.text)
+                assert submitted == [], (key, submitted)
+                inp.text = "a"
+                inp.cursor_location = (0, 1)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert submitted == ["a"], submitted
+
+    asyncio.run(run())
+
+
 def test_tool_render_helpers() -> None:
     """工具调用/结果渲染：实时与历史共用一套（参数 dict/JSON 串归一、历史才截断超长）。"""
 
@@ -677,6 +707,46 @@ def test_manual_shell_is_boxed_even_in_lean_mode() -> None:
             app._render_tool_result("shell", "[exit=0]\n\nhi")
             entry = log._entries[-1]
             assert pal.role_border("tool_result") in _box_border_colors(log, entry)
+
+    asyncio.run(run())
+
+
+def test_input_scrollbar_matches_log() -> None:
+    """输入框的滚动条样式必须与 #log 一致（默认是 Textual 的 2 cell 黑底蓝条，很跳）。
+
+    TextArea 是 ScrollView：它的 ScrollBar 子控件渲染时读的是**父控件**（即 #input）的
+    scrollbar-* 样式 → 把 build_css 里那份 `scrollbar` 也写进 #input 即可，无需另起一套。
+    """
+
+    props = (
+        "scrollbar_size_vertical",
+        "scrollbar_size_horizontal",
+        "scrollbar_background",
+        "scrollbar_background_hover",
+        "scrollbar_background_active",
+        "scrollbar_color",
+        "scrollbar_color_hover",
+        "scrollbar_color_active",
+    )
+
+    async def run() -> None:
+        app = PieApp(_dummy_session())
+        async with app.run_test(size=(78, 26)) as pilot:
+            await pilot.pause()
+            log = app.query_one("#log")
+            inp = app.query_one("#input", PieTextArea)
+            for prop in props:
+                assert getattr(inp.styles, prop) == getattr(log.styles, prop), (
+                    prop,
+                    getattr(log.styles, prop),
+                    getattr(inp.styles, prop),
+                )
+            # 内容溢出时确实用的是 1 cell 窄条（不是默认的 2 cell）
+            inp.text = "\n".join(f"line{i}" for i in range(20))
+            await pilot.pause()
+            assert inp.vertical_scrollbar.display
+            assert inp.vertical_scrollbar.thickness == 1
+            assert inp.vertical_scrollbar.size.width == 1
 
     asyncio.run(run())
 

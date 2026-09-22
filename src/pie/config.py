@@ -13,8 +13,18 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
 
-from .input import read_input
 from .theme import DEFAULT_THEME_NAME
+
+# 公共面：配置对象 + 默认值常量 + 提示词文件路径。
+# 不含 RUNTIME_ONLY_FIELDS（Config 的实现细节：那两个键不落盘也不从文件读）。
+__all__ = [
+    # 配置对象与入口
+    "Config",
+    "CompactionConfig",
+    "ToolCompaction",
+    "SessionCompaction",
+    "build_system_prompt",
+]
 
 # 可通过 PIE_DIR 环境变量重定向（测试/多环境），默认 ~/.pie
 PIE_DIR = Path(os.environ.get("PIE_DIR") or Path.home() / ".pie")
@@ -35,7 +45,7 @@ REASONING_NONE = REASONING_LEVELS[0]  # none = 关闭思考：请求时不发 re
 # reserved_tokens = 每次请求为输出预留的 token（就是发给 API 的 max_tokens）。
 # 于是「可用输入预算 = context_window - reserved_tokens」。
 DEFAULT_CONTEXT_WINDOW = 1024 * 1024
-DEFAULT_KEEP_LAST_STEPS = 5
+DEFAULT_KEEP_LAST_STEPS = 7
 # 压缩水位比例：相对「可用输入预算」（不是整个窗口）
 DEFAULT_SOFT_RATIO = 0.8
 DEFAULT_TARGET_RATIO = 0.55
@@ -207,6 +217,12 @@ def _resolve_config_file(path: str | Path | None = None) -> Path:
     return CONFIG_FILE
 
 
+# 运行时属性（不是配置项）：只由进程内逻辑写入，**不落盘、也不从配置文件读回**。
+# 声明成 dataclass 字段只是为了类型检查器可见（不声明就是动态属性 → Pyright 报 unknown）；
+# save() 会把它们从 asdict 里摘掉，load() 也会跳过它们。
+RUNTIME_ONLY_FIELDS = ("config_file", "auto_compact_threshold")
+
+
 @dataclass
 class Config:
     model: str = DEFAULT_MODEL
@@ -216,10 +232,10 @@ class Config:
     reserved_tokens: int | None = DEFAULT_RESERVED_TOKENS  # 每次请求为输出预留的 token（= API 的 max_tokens；None = 不发该参数、用服务端默认）
     context_window: int = DEFAULT_CONTEXT_WINDOW  # 模型最大上下文长度（输入 + 输出一起算）
     keep_last_steps: int = DEFAULT_KEEP_LAST_STEPS  # 工具级压缩保护窗口：最近 N 个 step 批次（跨轮次滚动）
-    compaction: CompactionConfig | bool | None = field(default_factory=CompactionConfig)  # None = 不做任何上下文压缩
+    compaction: CompactionConfig | None = field(default_factory=CompactionConfig)  # None = 不做任何上下文压缩
     timeout_seconds: float = 60.0  # HTTP 超时（OpenAI 兼容客户端）
-    max_retries: int = 2  # 请求重试次数
-    max_retry_delay_seconds: float = 1.0  # 重试间隔（客户端内部退避时保留字段）
+    max_retries: int = 5  # 请求重试次数
+    max_retry_delay_seconds: float = 3.0  # 重试间隔（客户端内部退避时保留字段）
     verbose: bool = True
     theme: str = DEFAULT_THEME_NAME  # TUI 主题：族名（如 catppuccin，按终端明暗自适应）或变体名（catppuccin-mocha / catppuccin-latte）
     # 按工具名设置默认私有参数（下划线开头，不进 schema）：如 read: {_max_lines, _max_bytes, _max_image_bytes}
@@ -227,6 +243,12 @@ class Config:
     tui: TuiConfig = field(default_factory=TuiConfig)  # TUI 渲染（[tui] lean = true → 简洁模式）
     files_api: bool = DEFAULT_FILES_API  # 图片走 Files API（上传一次拿 file_id，失败回退内联）
     files_ttl_days: int = DEFAULT_FILES_TTL_DAYS  # 上传件在服务端的保留天数（1~30；0 = 永久）
+    # 同一批 tool_calls 是否并发执行（aturn 的 parallel_tools 不传时跟随它）：
+    # True = asyncio.gather 并发；False = 按模型返回顺序串行 —— 工具共享可变状态时必须 False。
+    parallel_tools: bool = True
+    # —— 运行时属性：见 RUNTIME_ONLY_FIELDS（不写进 config.toml，也不从它读）
+    config_file: str | None = field(default=None, repr=False, compare=False)  # 配置来源路径（Config.load 记录）
+    auto_compact_threshold: int | None = field(default=None, repr=False, compare=False)  # CLI --auto-compact-threshold 的一次性覆盖
 
     def __post_init__(self) -> None:
         # 归一化旧 bool 写法（compaction = true / false），保证下游只见到
@@ -272,9 +294,8 @@ class Config:
 
     def soft_limit(self) -> int:
         """软阈值：触发自动压缩的 token 水位；--auto-compact-threshold 覆盖。"""
-        override = getattr(self, "auto_compact_threshold", None)
-        if override:
-            return int(override)
+        if self.auto_compact_threshold:
+            return int(self.auto_compact_threshold)
         return max(1, int(self.context_budget() * self.soft_ratio))
 
     def target_limit(self) -> int:
@@ -297,7 +318,7 @@ class Config:
             if old in data and new not in data:
                 data[new] = data[old]
         for f in fields(cls):
-            if f.name not in data:
+            if f.name not in data or f.name in RUNTIME_ONLY_FIELDS:
                 continue
             if f.name == "tui":
                 td = data["tui"]
@@ -389,6 +410,8 @@ class Config:
         path = _resolve_config_file(config_file)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = asdict(self)
+        for key in RUNTIME_ONLY_FIELDS:  # 运行时属性不写进配置文件
+            data.pop(key, None)
         # TOML 没有 null：reserved_tokens = None（不发送 max_tokens）写成 "auto"，load 时再解析回去
         if data.get("reserved_tokens", 0) is None:
             data["reserved_tokens"] = "auto"
@@ -430,8 +453,13 @@ def _toml_dump(data: dict[str, Any]) -> str:
 
 
 def _prompt(label: str, default: str) -> str:
+    """读一行配置输入（首次运行向导）。
+
+    答案都是 ASCII（模型名 / 端点 URL / API key），所以直接用内置 input()——
+    不为了它把 cli.py 那套 prompt_toolkit 行编辑（防中文退格截断）引到这里。
+    """
     try:
-        value = read_input(f"{label} [{default}]: ").strip()
+        value = input(f"{label} [{default}]: ").strip()
     except EOFError:
         return default
     return value or default
@@ -525,8 +553,8 @@ def build_system_prompt(
     )
     parts: list[str] = [
         base or SYSTEM_PROMPT,
-        _context_line(config),
-        f"当前工作目录：{os.getcwd()}",
+        # _context_line(config),
+        # f"当前工作目录：{os.getcwd()}",
     ]
 
     agents = _read_text(_resolve_prompt_file(AGENTS_FILE))
@@ -536,7 +564,7 @@ def build_system_prompt(
     memories: list[tuple[str, str]] = []
     global_memory = _read_text(GLOBAL_MEMORY_FILE)
     if global_memory:
-        memories.append(("全局记忆（~/.pie/memory.md）", global_memory))
+        memories.append((f"全局记忆（{GLOBAL_MEMORY_FILE}）", global_memory))
     project_memory = _read_text(_resolve_prompt_file(MEMORY_FILE))
     if project_memory:
         memories.append((f"项目记忆（{MEMORY_FILE}）", project_memory))

@@ -1,6 +1,6 @@
 """循环层：把任务、模型、工具编排成“想 → 做 → 看 → 总结”的 agent 循环（包名 pie）。
 
-异步主路径：acomplete_turn() 是唯一实现；run_agent() 是同步薄包装
+异步主路径：aturn() 是唯一实现；run() 是同步薄包装
 （内部 aio.run，须在无事件循环的线程调用）。流式模型输出
 （reasoning/content 增量）与工具实时输出（shell 逐行）通过 on_event 推送，
 供 TUI 边生成边显示。
@@ -28,7 +28,6 @@ from .context import (
     UserMessage,
     extract_spill_path,
     maybe_compact,
-    write_manifest,
 )
 from .files import ImageStore, is_stale_file_error, key_fingerprint, model_supports_files
 from .llm import LLM, LLMResult, OpenAILLM, ToolCall, UsageTracker
@@ -40,6 +39,11 @@ from .tools import (
     parse_image_marker,
 )
 
+# 公共面：跑一轮 agent 的两个入口。
+# CANCEL_TEXT（/stop 后写入历史 / 返回 UI 的哨兵文本）仍是模块级常量，但**不进公共面**——
+# 它由本模块与 tui 内部消费，不是对外契约。
+__all__ = ["aturn", "run"]
+
 MAX_LOG_OUTPUT = 300  # 控制台日志中展示的结果长度
 
 CANCEL_GRACE = 3.0  # /stop 后等待工具清理的宽限秒数：超时则让清理在后台继续，先终止回合
@@ -49,17 +53,17 @@ CANCEL_TEXT = "用户手动终止"  # /stop 手动取消后写入历史 / 返回
 
 async def _wait_cancellable(
     coro: Awaitable[Any],
-    cancel_event: asyncio.Event | None,
+    cancel: asyncio.Event | None,
 ) -> Any:
-    """await coro；cancel_event 触发时取消它并返回 None。
+    """await coro；cancel 触发时取消它并返回 None。
 
     用于模型请求与工具执行：UI 侧 set() 事件即可让当前回合/工具优雅终止
     （工具内部会被 CancelledError 打断并做清理，如 shell kill 子进程）。
     """
-    if cancel_event is None:
+    if cancel is None:
         return await coro
     task = asyncio.ensure_future(coro)
-    cancel_task = asyncio.ensure_future(cancel_event.wait())
+    cancel_task = asyncio.ensure_future(cancel.wait())
     done, _ = await asyncio.wait(
         {task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
     )
@@ -83,11 +87,13 @@ async def _model_call(
     messages: AgentMessage,
     registry: ToolRegistry,
     cfg: Config,
-    cancel_event: asyncio.Event | None,
+    cancel: asyncio.Event | None,
     on_event: Callable[[dict[str, Any]], None] | None,
+    stream: bool | None = None,
 ) -> LLMResult | None:
-    """调用模型。优先流式（增量经 on_event 推送）；后端无 stream 则回退 complete。
-    被取消时返回 None。"""
+    """调用模型。stream=None 按后端能力自动选（能流式就流式，增量经 on_event 推送；
+    否则 complete）；stream=False 强制一次性（on_event 不再收到 reasoning/content 增量）；
+    stream=True 强制流式（后端没实现 stream() 则仍回退 complete）。被取消时返回 None。"""
     api = messages.to_api()
     tools = registry.definitions()
     model = cfg.model
@@ -108,25 +114,26 @@ async def _model_call(
             return await backend.complete(api, tools, model=model)
         return await asyncio.to_thread(backend.complete, api, tools, model)  # 同步自定义后端
 
-    if inspect.isasyncgenfunction(getattr(backend, "stream", None)):
-        return await _wait_cancellable(_consume_stream(), cancel_event)
-    return await _wait_cancellable(_call_complete(), cancel_event)
+    can_stream = inspect.isasyncgenfunction(getattr(backend, "stream", None))
+    if can_stream and stream is not False:
+        return await _wait_cancellable(_consume_stream(), cancel)
+    return await _wait_cancellable(_call_complete(), cancel)
 
 
 async def _tool_call(
     registry: ToolRegistry,
     name: str,
     args: dict[str, Any],
-    cancel_event: asyncio.Event | None,
+    cancel: asyncio.Event | None,
     on_event: Callable[[dict[str, Any]], None] | None,
     tool_defaults: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
     """执行工具；被取消时返回 None（工具内部已做清理）。"""
-    if cancel_event is None:
+    if cancel is None:
         return await registry.adispatch(name, args, on_event=on_event, tool_defaults=tool_defaults)
     return await _wait_cancellable(
         registry.adispatch(name, args, on_event=on_event, tool_defaults=tool_defaults),
-        cancel_event,
+        cancel,
     )
 
 
@@ -135,7 +142,7 @@ async def _run_tool_call(
     call: ToolCall,
     cfg: Config,
     tag: str,
-    cancel_event: asyncio.Event | None,
+    cancel: asyncio.Event | None,
     on_event: Callable[[dict[str, Any]], None] | None,
 ) -> str | None:
     """并行执行单个 tool_call：解析参数 → 执行 → 错误文本化 + 实时日志/事件。
@@ -157,12 +164,12 @@ async def _run_tool_call(
         )
     try:
         text = await _tool_call(
-            registry, call.name, args, cancel_event, on_event, tool_defaults=cfg.tool_defaults()
+            registry, call.name, args, cancel, on_event, tool_defaults=cfg.tool_defaults()
         )
     except ToolError as e:
         text = f"[工具错误] {e}"
     except asyncio.CancelledError:
-        raise  # 整体取消（非 cancel_event），保持传播
+        raise  # 整体取消（非 cancel），保持传播
     except Exception as e:  # YOLO：任何异常都回传模型，让它自己修复
         text = f"[工具异常] {type(e).__name__}: {e}"
     if text is None:  # /stop 取消该工具：on_event 由 _cancel_tools 统一补 CANCEL_TEXT
@@ -185,21 +192,20 @@ async def _run_tool_call(
 def _finalize_tool_message(
     call: ToolCall,
     text: str,
-    manifest: Path | None,
+    on_compact: Callable[[dict[str, Any]], None] | None,
 ) -> ToolMessage:
-    """按 call 构造 ToolMessage；shell 自带落盘的结果把 spill 指针同步进 manifest。"""
+    """按 call 构造 ToolMessage；shell 自带落盘的结果把 spill 指针同步给 on_compact。"""
     tool_msg = ToolMessage(content=text, tool_call_id=call.id, tool_name=call.name)
     # 仅 shell 会在 loop 层落盘（超 _max_lines/_max_bytes 时写“全文已保存”指针）。
     # read/edit/write 的结果文本里可能恰好含该格式字符串（如读取的源码中的字面量），
     # 若对所有工具全局搜索会误判成 spill 指针、产生假的压缩事件 → 按工具名 gate。
-    if manifest is not None and call.name == "shell":
+    if on_compact is not None and call.name == "shell":
         path = extract_spill_path(text)
         if path is not None:
             tool_msg.compress_level = 1
             tool_msg.raw_path = str(path)
             tool_msg.raw_hash = path.stem.split("-")[-1]
-            write_manifest(
-                manifest,
+            on_compact(
                 {
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "level": 1,
@@ -207,7 +213,7 @@ def _finalize_tool_message(
                     "tool": call.name,
                     "raw_path": str(path),
                     "raw_hash": path.stem.split("-")[-1],
-                },
+                }
             )
     return tool_msg
 
@@ -323,17 +329,19 @@ def _downgrade_file_blocks(messages: AgentMessage, store: Any) -> bool:
     return changed
 
 
-async def acomplete_turn(
+async def aturn(
     messages: AgentMessage,
     cfg: Config,
     registry: ToolRegistry,
     backend: LLM,
-    manifest: Path | None = None,
-    user_turn: int | None = None,
-    usage: UsageTracker | None = None,
-    on_event: Callable[[dict[str, Any]], None] | None = None,
-    cancel_event: asyncio.Event | None = None,
     image_files: dict[str, dict[str, Any]] | None = None,
+    usage: UsageTracker | None = None,
+    on_compact: Callable[[dict[str, Any]], None] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    cancel: asyncio.Event | None = None,
+    max_steps: int | None = None,
+    parallel_tools: bool | None = None,
+    stream: bool | None = None,
 ) -> str:
     """处理一条用户消息：反复调用工具直到模型给出最终回复，并把回合追加进 messages。
 
@@ -341,22 +349,36 @@ async def acomplete_turn(
     image_files 是会话级的图片记录（`Session.files`）：read 到的图片先落本地副本、
     再上传拿 `file_id`（命中则不重传），历史里只留几十字节的 `file` 块；
     传 None 则完全不碰上传（如不需要跨轮复用的场景）。
+    on_compact 回调（可选）：每次压缩落盘 / shell spill 时收到一条事件 dict
+    （level / kind / raw_path / raw_hash / summary…）；CLI 侧据此写会话 manifest。
+    不传 = 不通知，但**压缩照常落盘**（要完全不落盘得 `Config(compaction=None)`）。
     on_event 回调（可选）实时推送：
       reasoning_delta / content_delta（流式生成增量）
       tool_call / tool_result / tool_progress（工具调用与实时输出；tool_result 带
         name / text / arguments，arguments 供 UI 取“这次调的是哪个文件 / 命令”的摘要，
         因为结果文本本身不一定含路径，且结果按真实完成顺序回推、与调用顺序不一定一致）
       answer（最终回复）
-    同一批 tool_calls 用 asyncio.gather 并行执行；全部收尾后按模型返回顺序回填
-    ToolMessage（历史扁平序列与串行一致，compaction 的 step 批次认定不受影响），
-    tool_result 事件则按真实完成顺序实时推送。
-    cancel_event 非 None 时：请求模型 / 执行工具期间可被外部 set() 手动取消——
+    tool_call 事件另带 turn / step：turn = 历史里的 UserMessage 数（本函数派生，不由调用方传）、
+    step = 本回合内第几次模型调用。
+    max_steps 非 None 时最多问模型这么多次（达到上限：不再调模型，把历史里最后一段
+    assistant 文本当最终答复返回，并推一个 answer 事件；不额外追加消息，所以历史末尾
+    可能停在 tool 结果上——这是合法的 API 序列）。None = 不限（默认）。
+    parallel_tools：同一批 tool_calls 是否并发执行。None（默认）= 跟随 `cfg.parallel_tools`
+    （Config 默认 True）；False = 按模型返回顺序**串行**（工具共享可变状态时必须）。
+    两种路径都按模型返回顺序回填 ToolMessage（历史扁平序列一致，compaction 的 step
+    批次认定不受影响）；并行时 tool_result 事件按真实完成顺序实时推送。
+    stream：是否走流式请求。None（默认）= 后端实现了 stream() 就流式（保持原行为）；
+    False = 强制一次性 complete()（此时 on_event 不再收到 reasoning_delta / content_delta
+    增量，其余事件不变）；True = 强制流式（后端没实现 stream() 时仍回退 complete）。
+    cancel 非 None 时：请求模型 / 执行工具期间可被外部 set() 手动取消——
     模型请求被取消则回合终止并返回 CANCEL_TEXT；工具执行被取消则该工具结果
     填充为 CANCEL_TEXT（未执行的 tool_calls 同样补 CANCEL_TEXT，保证 API 序列合法），
     回合随之终止。
     """
-    if user_turn is None:
-        user_turn = sum(1 for m in messages.messages if isinstance(m, UserMessage)) or 1
+    # 回合号（用于 stderr 日志标签 [tNsM] 与 tool_call 事件的 turn 字段）：从历史里的
+    # UserMessage 数派生。ImageMessage 不是 UserMessage（synthetic）→ 不计入；
+    # /clear 换窗口后从 1 重新数（Session.turn_count 另有用途：`pie -p --mode json` 的 turns）。
+    turn = sum(1 for m in messages.messages if isinstance(m, UserMessage)) or 1
     # 图片记录：entries 就是 Session.files（就地更新 → 下次 save 自然带上）
     store = (
         ImageStore(
@@ -369,15 +391,22 @@ async def acomplete_turn(
         if image_files is not None
         else None
     )
+    use_parallel = cfg.parallel_tools if parallel_tools is None else parallel_tools
     step = 0
     while True:
-        step += 1
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel is not None and cancel.is_set():
             return _cancel_turn(messages, on_event)
-        maybe_compact(messages, cfg, messages.tokens(), manifest)
+        if max_steps is not None and step >= max_steps:
+            # 达到步数上限：不再问模型，把最后一段 assistant 文本当最终答复
+            final = _last_assistant_text(messages)
+            if on_event is not None:
+                on_event({"type": "answer", "text": final})
+            return final
+        step += 1
+        maybe_compact(messages, cfg, messages.tokens(), on_compact)
         try:
             llm_out = await _model_call(
-                backend, messages, registry, cfg, cancel_event, on_event
+                backend, messages, registry, cfg, cancel, on_event, stream
             )
         except Exception as e:
             # file_id 失效（服务端删了/中途换了 key）：把历史里的 file 块降级成内联、
@@ -386,7 +415,7 @@ async def acomplete_turn(
                 raise
             print(f"[warn] file_id 已失效，已把历史里的图片降级为内联 base64 并重试：{e}", file=sys.stderr)
             llm_out = await _model_call(
-                backend, messages, registry, cfg, cancel_event, on_event
+                backend, messages, registry, cfg, cancel, on_event, stream
             )
         if llm_out is None:  # 用户 /stop 取消了模型请求
             return _cancel_turn(messages, on_event)
@@ -402,7 +431,7 @@ async def acomplete_turn(
             messages.last_api_tokens = llm_out.prompt_tokens
             messages.dirty = False
             messages.compacted_since_api = False
-            maybe_compact(messages, cfg, llm_out.prompt_tokens, manifest)
+            maybe_compact(messages, cfg, llm_out.prompt_tokens, on_compact)
 
         if not llm_out.tool_calls:
             final = llm_out.content or ""
@@ -424,7 +453,7 @@ async def acomplete_turn(
                         "type": "tool_call",
                         "name": c.name,
                         "arguments": parsed_args,
-                        "turn": user_turn,
+                        "turn": turn,
                         "step": step,
                     }
                 )
@@ -445,32 +474,41 @@ async def acomplete_turn(
         # 并行执行一批 tool_calls：全部收尾后按原顺序回填 ToolMessage（历史扁平
         # 序列与串行一致 → compaction 的 step 批次 / keep_last_steps 认定不受影响）
         calls = llm_out.tool_calls
-        results: list[str | None] = await asyncio.gather(
-            *(
-                _run_tool_call(
-                    registry, c, cfg, f"[t{user_turn}s{step}] ", cancel_event, on_event
-                )
-                for c in calls
+        tag = f"[t{turn}s{step}] "
+        if use_parallel:
+            results: list[str | None] = await asyncio.gather(
+                *(_run_tool_call(registry, c, cfg, tag, cancel, on_event) for c in calls)
             )
-        )
+        else:  # 串行：按模型返回顺序执行（共享可变状态的工具必须这样）
+            results = [
+                await _run_tool_call(registry, c, cfg, tag, cancel, on_event)
+                for c in calls
+            ]
         if any(r is None for r in results):  # /stop 取消了部分工具 → 收尾后终止回合
-            return _cancel_tools(messages, llm_out, results, manifest, on_event)
+            return _cancel_tools(messages, llm_out, results, on_compact, on_event)
         for call, text in zip(calls, results):
-            messages.add(_finalize_tool_message(call, text, manifest))
+            messages.add(_finalize_tool_message(call, text, on_compact))
         # 工具结果全部回填后，统一注入 read 读取的图片（多模态 user 消息，紧随本批结果）
         await _inject_read_images(
             messages, calls, results, store=store, client=_files_client(backend) if store else None
         )
 
 
-def run_agent(
+def run(
     task: str,
     *,
     llm: LLM | None = None,
     tools: ToolRegistry | None = None,
     config: Config | None = None,
+    max_steps: int | None = None,
+    parallel_tools: bool | None = None,
+    stream: bool | None = None,
 ) -> str:
-    """一次性任务：一条用户消息 → 工具循环 → 最终回复。"""
+    """一次性任务：一条用户消息 → 工具循环 → 最终回复（异步主路径 aturn 的同步包装）。
+
+    须在无事件循环的线程调用。内部走 aio.run —— 那是 aio.py 的收尾包装（内部件），
+    与本文件这个 run() 无关。
+    """
     cfg = config or resolve_config()
     registry = tools or default_tools()
     backend = llm or OpenAILLM(
@@ -489,8 +527,17 @@ def run_agent(
         keep_last_steps=cfg.keep_last_steps,
     )
     return aio.run(
-        acomplete_turn(messages, cfg, registry, backend, user_turn=1, image_files={})
+        aturn(messages, cfg, registry, backend, image_files={},
+              max_steps=max_steps, parallel_tools=parallel_tools, stream=stream)
     )
+
+
+def _last_assistant_text(messages: AgentMessage) -> str:
+    """历史里最后一段非空 assistant 文本（达到 max_steps 时拿来当“最终答复”）。"""
+    for m in reversed(messages.messages):
+        if isinstance(m, AssistantMessage) and m.content:
+            return m.content
+    return ""
 
 
 def _cancel_turn(
@@ -508,7 +555,7 @@ def _cancel_tools(
     messages: AgentMessage,
     llm_out: LLMResult,
     results: list[str | None],
-    manifest: Path | None,
+    on_compact: Callable[[dict[str, Any]], None] | None,
     on_event: Callable[[dict[str, Any]], None] | None,
 ) -> str:
     """并行工具执行被 /stop 取消：真实执行完的结果保留、被取消（None）的填充
@@ -525,7 +572,7 @@ def _cancel_tools(
                     "arguments": call.arguments,
                 }
             )
-        messages.add(_finalize_tool_message(call, content, manifest))
+        messages.add(_finalize_tool_message(call, content, on_compact))
     return _cancel_turn(messages, on_event)
 
 
