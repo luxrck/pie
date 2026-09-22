@@ -10,23 +10,17 @@
 //!   ✅ 图片   —— read 图 → Files API 上传（`file` 块注入，不回退内联）+ `files list|gc`
 //!   ⬜ 并行工具 / TUI
 
-mod cancel;
-mod config;
-mod context;
-mod llm;
-mod log;
-mod session;
-mod tools;
-mod tui;
-
+// 这里换成对 lib 的引用（M0：核心层已提成 `pie_rs` 库，CLI 只是它的一个消费者）。
+// ⚠ 模块声明在 `src/lib.rs`，别在这里再写 `mod xxx;`——那会变成两份独立的编译单元。
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-use llm::LlmClient;
-use session::{Session, TurnEvent};
-use tools::{tools_from_spec, ToolRegistry};
+use pie_rs::llm::LlmClient;
+use pie_rs::session::{Session, TurnEvent};
+use pie_rs::tools::{tools_from_spec, ToolRegistry};
+use pie_rs::{cancel, config, context, session, tui};
 
 #[derive(Parser, Debug)]
 #[command(name = "pie-rs", version, about = "pie 的 Rust 重构")]
