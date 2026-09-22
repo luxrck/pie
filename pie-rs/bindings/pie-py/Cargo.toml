@@ -1,0 +1,24 @@
+[package]
+name = "pie-py"
+version = "0.1.0"
+edition = "2021"
+description = "pie-rs 的 Python 绑定（PyO3）：把 agent harness 暴露给 Python"
+license = "MIT"
+publish = false
+
+# 自己的 workspace root：它被父级 `pie-rs/Cargo.toml` 的 `exclude` 排除在外，
+# 免得 `cargo test` 在 pie-rs 里连带去建这个 cdylib（那要 Python 环境）。
+[workspace]
+
+[lib]
+# 模块名 `pie_rs._pie_rs`（Python 侧的外壳包是 `pie_rs`）。
+name = "_pie_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+# 核心库：**default-features = false** → 不把 TUI（ratatui / crossterm / arboard…）编进来。
+pie-rs = { path = "../..", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
+serde = "1"
+serde_json = "1"

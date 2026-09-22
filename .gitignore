@@ -9,3 +9,8 @@ scripts/
 
 # Rust 重构（pie-rs）的构建产物
 pie-rs/target/
+
+# Python 绑定的构建产物（扩展模块自己的 target/）
+pie-rs/bindings/*/target/
+# maturin develop 会把编好的扩展模块放回 python-source 目录
+pie-rs/bindings/*/python/*/*.so

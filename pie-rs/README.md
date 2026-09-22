@@ -17,7 +17,7 @@
 | context | ✅ | 三级压缩（工具/轮次/会话级）+ 落盘指针 + manifest + `context info\|verify\|gc` |
 | 图片 | ✅ | read 标记 → 本地副本 → Files API 上传（`file` 块注入）；`files list\|gc [--all]`；**无 base64 回退** |
 | TUI | ✅ | ratatui 重写，`src/tui/`（app / render 在 app 内 / status / input / history / markdown / theme / clipboard）：流式渲染、思考计时、滚动、`/` 命令、`Esc` 取消 |
-| **Python 绑定** | ⬜ | 规划稿见 [`docs/python-bindings.md`](docs/python-bindings.md)（PyO3 + maturin；把核心层暴露给 Python，**TUI 不进绑定**）。动手前要先做 M0：提 `src/lib.rs` + `tui` feature |
+| **Python 绑定** | 🚧 | M0+M1 已落地（PyO3 + maturin，`bindings/pie-py`）：`Config` / `LlmClient` / `ToolRegistry` / `Session` / `Cancel` + 事件回调 + 异常层级；规划与进度见 [`docs/python-bindings.md`](docs/python-bindings.md)（**TUI 不进绑定**） |
 
 ## 怎么定义一个工具
 
@@ -156,6 +156,46 @@ TUI 按键：`Enter` 发送、`Shift+Enter`/`Ctrl+J` 换行（输入框是多行
 `image` crate（只为图片识别）用 `default-features = false` + `png/jpeg/gif/webp/bmp`：
 23 个纯 Rust crate、**零 C 编译**、冷构建 +7.5s。将来 `clipboard` 模块还靠它把 raw RGBA 编码成 PNG
 （Python 那边是 Pillow 干的）。
+
+## Python 绑定（`pie_rs`）
+
+把核心层（config / llm / tools / session / context）以**原生扩展**的形式给 Python 用；**TUI 不进绑定**。
+规划稿（含「为什么这样设计」与不要踩的坑）见 [`docs/python-bindings.md`](docs/python-bindings.md)。
+
+```bash
+cd pie-rs/bindings/pie-py
+export PATH="$HOME/.cargo/bin:$PATH"                       # maturin 要调 cargo
+uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python maturin pytest
+VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop          # 构建 + 装进 .venv（editable）
+.venv/bin/python -m pytest tests -q                        # 不联网：本地假 SSE 端点回放
+```
+
+```python
+import pie_rs
+
+cfg = pie_rs.Config.load()                          # ~/.pie/config.toml
+cfg.model = "deepseek-flash"                        # 只改内存，不写盘
+llm = pie_rs.LlmClient(cfg)
+tools = pie_rs.ToolRegistry.builtins(cfg)
+session = pie_rs.Session.ephemeral(cfg, llm, tools)  # 不落盘；要留档就用 Session.new(...) + save()
+
+answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
+print(answer)
+```
+
+已实现（M1）：`Config`（load/save + 常用字段 + `context_budget`）、`LlmClient`（`list_models`）、
+`ToolRegistry`（`builtins` / `from_spec`）、`Session`（`new` / `ephemeral` / `load` / `resume` / `aturn` /
+`save` / `messages` / `full_history` / `usage` / `usage_report` / `compact` / `compression_history` /
+`reset` / `stop`）、`Cancel`、异常层级（`PieError` → `ConfigError` / `LlmError`（带 `.status`）/ `ToolError`）。
+还没做：从 Python 注册工具（M3）、`run()` 一次性入口、原生 `await`（M5）、abi3 wheel + 类型存根（M4）。
+
+三条约定（错了会挂或者不生效，理由在规划稿里）：
+
+- **同步外观**：`aturn` 阻塞到回合结束，但**期间释放 GIL**（别的 Python 线程照常跑）；要并发就用
+  `asyncio.to_thread`。
+- **一个 Session 同时只跑一个回合**：回合进行中再调 `aturn` / 读属性会抛 `RuntimeError("session 正忙")`
+  —— **事件回调里不要碰同一个 Session**（想中途停：别的线程调 `s.stop()` 或传入 `Cancel`）。
+- **`messages` / 事件都是 dict**：字段名与 JSONL / Python 版 `to_dict()` 一致 → 两边写下的会话可以互读。
 
 ## 与 Python 版的已知差异
 
