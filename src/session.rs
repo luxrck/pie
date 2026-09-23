@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
@@ -44,12 +44,10 @@ pub enum TurnEvent {
     AssistantText(String),
     /// 思考增量
     Reasoning(String),
-    /// 即将执行某个工具（`turn` = 历史里的用户轮数，`step` = 本回合第几次模型调用）
+    /// 即将执行某个工具
     ToolCall {
         name: String,
         arguments: String,
-        turn: usize,
-        step: usize,
     },
     /// 工具执行完毕（按真实完成顺序推；`content` 是**原样**文本，不再截断——
     /// 少显示是展示层的事，见 `Session::tool_call`）
@@ -363,13 +361,6 @@ impl Session {
         let use_stream = stream.unwrap_or(true);
         // `parallel_tools: None` = 跟随配置（Python `config.parallel_tools if x is None else x` 同义）
         let use_parallel = parallel_tools.unwrap_or(self.config.parallel_tools);
-        // 回合号（事件里的 `turn` 字段）：历史里的用户消息数（图片消息是 synthetic，不计）
-        let turn = self
-            .messages
-            .iter()
-            .filter(|m| m.role == "user" && !m.synthetic)
-            .count()
-            .max(1);
         let mut steps = 0usize;
         let mut answer: Option<String> = None;
         let mut done = false;
@@ -457,7 +448,7 @@ impl Session {
 
             // —— 一批工具调用：并发（默认）或按模型返回顺序串行
             let outcomes = self
-                .tool_call(&tool_calls, use_parallel, cancel, turn, steps, on_event)
+                .tool_call(&tool_calls, use_parallel, cancel, on_event)
                 .await;
             // 全部收尾后**按原顺序**回填 ToolMessage（并发/串行都是这个顺序 → 历史扁平序列一致，
             // compaction 的 step 批次 / keep_last_steps 认定不受影响）
@@ -625,16 +616,12 @@ impl Session {
         calls: &[ToolCall],
         parallel: bool,
         cancel: &Cancel,
-        turn: usize,
-        step: usize,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Vec<Option<String>> {
         for call in calls {
             on_event(TurnEvent::ToolCall {
                 name: call.function.name.clone(),
                 arguments: call.function.arguments.clone(),
-                turn,
-                step,
             });
         }
         // ⚠ `on_event` **不能**进 future：`&mut dyn FnMut` 没实现 `Sync`，一旦被 future 捕获，
@@ -779,7 +766,7 @@ impl Session {
                 "file_id": uploaded.id,
                 "base_url": base_url,
                 "key_fp": key_fp,
-                "uploaded_at": config::iso_utc(config::now_unix()),
+                "uploaded_at": config::now().as_secs() as i64,
                 "expires_at": uploaded.expires_at,
             }),
         );
@@ -955,7 +942,7 @@ impl Session {
             record_compact(
                 self.manifest.as_deref(),
                 &json!({
-                    "ts": config::iso_utc(config::now_unix()),
+                    "ts": config::now().as_secs() as i64,
                     "level": 3,
                     "kind": "session",
                     "raw_path": path.display().to_string(),
@@ -1310,7 +1297,7 @@ pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
     let Some(expires_at) = entry.get("expires_at").and_then(Value::as_f64) else {
         return true; // 未记有效期 = 永久
     };
-    (config::now_unix() as f64) < expires_at - 60.0 // 留 1 分钟余量，别卡在过期边缘
+    config::now().as_secs_f64() < expires_at - 60.0 // 留 1 分钟余量，别卡在过期边缘
 }
 
 /// 遍历所有会话记录里的图片条目：`(会话文件, hash_id, 条目)`。
@@ -1381,7 +1368,7 @@ pub fn collect_file_garbage(protect_hours: u64) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|(_, _, e)| e.get("local").and_then(Value::as_str).map(PathBuf::from))
         .collect();
-    let now = std::time::SystemTime::now();
+    let now = config::now();
     let mut garbage: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -1397,8 +1384,8 @@ pub fn collect_file_garbage(protect_hours: u64) -> Vec<PathBuf> {
             p.metadata()
                 .and_then(|m| m.modified())
                 .ok()
-                .and_then(|mtime| now.duration_since(mtime).ok())
-                .is_some_and(|age| age.as_secs() >= protect_hours * 3600)
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|mtime| now.saturating_sub(mtime).as_secs() >= protect_hours * 3600)
         })
         .collect();
     garbage.sort();
@@ -1435,10 +1422,8 @@ fn resolve_path(id: Option<&str>) -> PathBuf {
 
 /// `<unix 秒>-<微秒 6 位>`：可排序、同秒不撞车。
 fn timestamp() -> String {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => format!("{}-{:06}", d.as_secs(), d.subsec_micros()),
-        Err(_) => "0-000000".to_string(),
-    }
+    let now = config::now();
+    format!("{}-{:06}", now.as_secs(), now.subsec_micros())
 }
 
 /// 目录里最新的会话文件；`cwd` 匹配的优先（没有 cwd 的旧文件算不匹配）。
@@ -1574,7 +1559,7 @@ mod tests {
             {
                 let mut sink = |e: TurnEvent| events.push(e);
                 let outcomes = session()
-                    .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                    .tool_call(&calls, true, &Cancel::new(), &mut sink)
                     .await;
                 // 结果与入参等长同序：慢的那两条仍占下标 0 / 1
                 let texts = texts(&outcomes);
@@ -1615,7 +1600,7 @@ mod tests {
             {
                 let mut sink = |e: TurnEvent| events.push(e);
                 session()
-                    .tool_call(&calls, false, &Cancel::new(), 1, 1, &mut sink)
+                    .tool_call(&calls, false, &Cancel::new(), &mut sink)
                     .await;
             }
             let elapsed = started.elapsed().as_secs_f64();
@@ -1644,7 +1629,7 @@ mod tests {
             let mut events: Vec<TurnEvent> = Vec::new();
             let mut sink = |e: TurnEvent| events.push(e);
             let outcomes = session()
-                .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                .tool_call(&calls, true, &Cancel::new(), &mut sink)
                 .await;
             let text = texts(&outcomes)[0].clone();
             assert!(text.starts_with("[参数解析失败]"), "{text}");
@@ -1728,7 +1713,7 @@ mod tests {
             let mut events: Vec<TurnEvent> = Vec::new();
             let mut sink = |e: TurnEvent| events.push(e);
             let outcomes = session()
-                .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                .tool_call(&calls, true, &Cancel::new(), &mut sink)
                 .await;
             let text = outcomes[0].clone().expect("跑成功了");
             assert!(text.len() > 500, "工具输出本来就很长：{} 字", text.len());
@@ -1752,7 +1737,7 @@ mod tests {
             let mut events: Vec<TurnEvent> = Vec::new();
             let mut sink = |e: TurnEvent| events.push(e);
             let outcomes = session()
-                .tool_call(&calls, true, &cancel, 1, 1, &mut sink)
+                .tool_call(&calls, true, &cancel, &mut sink)
                 .await;
             assert!(outcomes.iter().all(|o| o.is_none()));
             // 被取消的也要各推一条 `CANCEL_TEXT` 结果事件（每个 `tool_call_id` 都要有交代）
@@ -1849,13 +1834,13 @@ mod tests {
         )); // 换 key
         assert!(!entry_is_usable(&ok, "https://other", &fp)); // 换 base_url
         assert!(!entry_is_usable(&json!({}), base, &fp)); // 没有 file_id
-        let soon = config::now_unix() as f64 + 30.0; // 不足 1 分钟余量
+        let soon = config::now().as_secs_f64() + 30.0; // 不足 1 分钟余量
         assert!(!entry_is_usable(
             &json!({"file_id": "f1", "base_url": base, "key_fp": fp, "expires_at": soon}),
             base,
             &fp
         ));
-        let later = config::now_unix() as f64 + 3600.0;
+        let later = config::now().as_secs_f64() + 3600.0;
         assert!(entry_is_usable(
             &json!({"file_id": "f1", "base_url": base, "key_fp": fp, "expires_at": later}),
             base,

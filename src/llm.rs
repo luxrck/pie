@@ -846,10 +846,7 @@ pub fn retry_delay(max_delay_seconds: f64, retry_after: Option<f64>) -> f64 {
         return RETRY_AFTER_MAX.min(1.0f64.max(ra));
     }
     // 不引 rand 依赖：拿当前时间的小数部分当 jitter 源足够（目的只是打散同时重试）
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as f64 / 1e9)
-        .unwrap_or(0.0);
+    let nanos = crate::config::now().subsec_nanos() as f64 / 1e9;
     1.0f64.max(nanos * max_delay_seconds.max(0.0))
 }
 

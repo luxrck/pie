@@ -256,7 +256,7 @@ print(answer)
   压缩元数据字段名与 Python `to_dict()` 逐字对齐（`compress_level` / `raw_path` / `raw_hash` / `raw_len` /
   `raw_tokens` / `synthetic`），但**绝不能进 API 请求体**——发给模型前统一过 `Message::to_api()`
   （与 Python 同规则：tool 的 content 兜空串、assistant 带 tool_calls 必须带 `reasoning_content`）。
-  另外：manifest 的 `ts` 是**本地时间**的 ISO（`localtime_r` 拿时区偏移，不引日期库）、落盘原文用 `indent=1` 的 JSON（对齐 Python
+  另外：manifest 的 `ts` 是 **unix 秒（数字）**（落盘时间统一数字、不带时区口径）、落盘原文用 `indent=1` 的 JSON（对齐 Python
   `json.dumps(..., indent=1)`）、**自动**会话级压缩的窗口块落在 `~/.pie/context/session-*.txt`
   （而 `/clear` 主动归档的块落在 `~/.pie/windows/`，与 Python 同一分工：`context gc` 只扫前者）。
 - **bash 的退出码头**（2026-09-23 用户定稿）：**失败才给头，成功只给结果**。
@@ -311,7 +311,8 @@ print(answer)
   → 上传拿 `file_id` → 注入一条 `synthetic` 的 user 消息（`parts = [文本说明, {"type":"file","file_id":…}]`）。
   **分层**：协议在 `LlmClient`（`upload_file`/`list_files`/`delete_file` + `FileObject` + 模型能力/ key 指纹），
   本地文件管理（副本、`__meta__.files` 记录、GC 清单、`files list|gc` 的数据源）在 `session.rs`；
-  时间换算（`now_unix`/`iso_utc`/`fmt_unix_ts`）统一在 `config.rs`。
+  时间统一在 `config.rs`：只有一个时钟出口 `config::now() -> Duration`（秒 / `subsec_micros` / `subsec_nanos` 都从它取），
+  其余都是纯函数（`fmt_local` 展示、`civil` 是 Hinnant 的 civil_from_days）；**落盘一律 unix 秒数字**，不写 ISO。
   与 Python 的**有意差异**：那边上传失败/模型不支持时**回退内联 base64**，这边不回退 —— 拿不到 `file_id`
   就不注入图片（read 的标记文本仍在工具结果里）；`file_id` 失效时也不降级 base64，而是把历史里的
   `file` 块换成文本占位重试一次（`Session::downgrade_file_blocks`），记录标失效 → 下次同图重传。

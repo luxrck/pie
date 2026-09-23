@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Deserializer};
 
@@ -57,19 +58,33 @@ pub fn default_config_file() -> PathBuf {
 }
 
 // ---------------------------------------------------------------- 时间（没日期库，自己换算）
+//
+// 只有一个时钟出口 `now()`，其余都是**纯函数**（unix 秒 → 文本）。落盘的 unix 时间戳一律取
+// `now().as_secs()`：数字没有「带不带时区后缀」「T 还是空格」这类歧义，跨版本也比大小省事。
 
-/// 当前 unix 秒。
-pub fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// 当前时刻——**唯一碰 `SystemTime` 的地方**。
+///
+/// 秒与纳秒都从这一个 `Duration` 取：落盘的 unix 时间戳用 `now().as_secs()`、文件名要微秒用
+/// `now().subsec_micros()`、退避 jitter 用 `now().subsec_nanos()`。系统时钟早于 1970（实际
+/// 不会发生）→ 0。
+pub fn now() -> Duration {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
 }
 
-/// unix 秒 → `YYYY-MM-DDTHH:MM:SS`（**UTC**）。
+/// unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`（`pie sessions` / `files list` 的时间列）。
 ///
-/// 用 Howard Hinnant 的 civil_from_days（不引日期库）；对外的展示请用 [`iso_local`]。
-pub fn iso_utc(secs: i64) -> String {
+/// 只给人看、不参与任何判断。本地偏移来自 `localtime_r`（含夏令时）；非 unix 没这套 → 显示成 UTC。
+pub fn fmt_local(secs: i64) -> String {
+    let t = civil(secs + local_utc_offset(secs)); // "YYYY-MM-DDTHH:MM:SS"
+    format!("{} {}", &t[..10], &t[11..16])
+}
+
+/// unix 秒 → `YYYY-MM-DDTHH:MM:SS`（**纯函数**；Howard Hinnant 的 civil_from_days，不引日期库）。
+///
+/// `div_euclid`/`rem_euclid` 向下取整，负值（1970 前）也对。
+fn civil(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let z = days + 719_468;
@@ -90,7 +105,7 @@ pub fn iso_utc(secs: i64) -> String {
     )
 }
 
-/// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。
+/// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。只服务展示。
 ///
 /// 用 `localtime_r`（POSIX，线程安全）拿到带 DST 的 `struct tm`，取 `tm_gmtoff`。
 /// 非 unix 平台没这套东西 → 回退 0（显示成 UTC）：比引一个带时区库的依赖划算。
@@ -110,21 +125,6 @@ fn local_utc_offset(secs: i64) -> i64 {
 #[cfg(not(unix))]
 fn local_utc_offset(_secs: i64) -> i64 {
     0
-}
-
-/// unix 秒 → 本地时间的 ISO 串（`2026-09-23T12:37:04`，**不带时区后缀**）。
-///
-/// 与 Python `datetime.now().isoformat(timespec="seconds")` 同形：manifest 的 `ts` 用这个。
-pub fn iso_local(secs: i64) -> String {
-    iso_utc(secs + local_utc_offset(secs))
-}
-
-/// unix 秒 → `YYYY-MM-DD HH:MM`（**本地时间**；`pie sessions` / `files list` 的时间列）。
-///
-/// 只是给人看的时间戳，不参与任何判断。
-pub fn fmt_unix_ts(secs: i64) -> String {
-    let iso = iso_local(secs);
-    format!("{} {}", &iso[..10], &iso[11..16])
 }
 
 /// 千分位（`1234567` → `1,234,567`）：Rust 的 format 没有 Python 的 `{:,}`，只能自己加。
@@ -320,7 +320,6 @@ pub struct Config {
     pub timeout_seconds: f64,
     pub max_retries: usize,
     pub max_retry_delay_seconds: f64,
-    pub verbose: bool,
     pub theme: String,
     /// 按工具名设默认私有参数（下划线开头，不进 schema）。
     pub tools: HashMap<String, toml::Value>,
@@ -359,7 +358,6 @@ impl Default for Config {
             timeout_seconds: 60.0,
             max_retries: 5,
             max_retry_delay_seconds: 3.0,
-            verbose: true,
             theme: "catppuccin".to_string(),
             tools: HashMap::new(),
             tui: TuiConfig::default(),
@@ -545,11 +543,7 @@ impl Config {
         );
         put("timeout_seconds", V::Float(self.timeout_seconds));
         put("max_retries", V::Integer(self.max_retries as i64));
-        put(
-            "max_retry_delay_seconds",
-            V::Float(self.max_retry_delay_seconds),
-        );
-        put("verbose", V::Boolean(self.verbose));
+        put("max_retry_delay_seconds", V::Float(self.max_retry_delay_seconds));
         put("theme", V::String(self.theme.clone()));
         put(
             "tools",
@@ -741,6 +735,18 @@ pub fn build_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `civil` 是纯函数（unix 秒 → 文本，不碰时区）；`fmt_local` 只断言形状
+    /// （不硬编码跑测试的机器时区）。
+    #[test]
+    fn civil_matches_known_instants() {
+        assert_eq!(civil(0), "1970-01-01T00:00:00");
+        assert_eq!(civil(1_700_000_000), "2023-11-14T22:13:20");
+        assert_eq!(civil(-1), "1969-12-31T23:59:59"); // 负值（1970 前）不炸
+        let local = fmt_local(0);
+        assert_eq!(local.len(), 16, "{local}");
+        assert!(local[10..].starts_with(' '), "{local}");
+    }
 
     #[test]
     fn parse_reserved_tokens_variants() {

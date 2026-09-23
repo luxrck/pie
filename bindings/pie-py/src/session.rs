@@ -543,19 +543,12 @@ fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
             dict.set_item("type", "reasoning_delta")?;
             dict.set_item("text", text)?;
         }
-        TurnEvent::ToolCall {
-            name,
-            arguments,
-            turn,
-            step,
-        } => {
+        TurnEvent::ToolCall { name, arguments } => {
             dict.set_item("type", "tool_call")?;
             dict.set_item("name", name)?;
             // `arguments` 给解析后的 dict（与 Python 版一致），另附原文备查
             dict.set_item("arguments", crate::json_to_py(py, &args_value(arguments))?)?;
             dict.set_item("arguments_raw", arguments)?;
-            dict.set_item("turn", *turn)?;
-            dict.set_item("step", *step)?;
         }
         TurnEvent::ToolResult {
             name,
