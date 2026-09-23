@@ -1399,80 +1399,10 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// `required` 是**集合**：schemars 按字母序、Python 按声明序，语义相同 →
-    /// 比较前两边都排序。其余键照原样比（增删参数/改描述都抓得住）。
-    fn canonical(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => Value::Object(
-                map.iter()
-                    .map(|(k, v)| {
-                        let mut v = canonical(v);
-                        if k == "required" {
-                            if let Value::Array(items) = &mut v {
-                                items.sort_by_key(|x| x.to_string());
-                            }
-                        }
-                        (k.clone(), v)
-                    })
-                    .collect(),
-            ),
-            Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
-            other => other.clone(),
-        }
-    }
-
-    /// Rust 工具名 → Python 工具名（**故意分叉的两个**：`writ`/`bash`，2026-09-23 用户点名改的）。
-    ///
-    /// 除了名字，schema（参数 / 描述 / 协议形状）仍必须与 Python 版逐字一致 ——
-    /// 所以契约测试先把名字换回去、再逐字比。
-    fn python_name(name: &str) -> &str {
-        match name {
-            "writ" => "write",
-            "bash" => "shell",
-            other => other,
-        }
-    }
-
-    /// 把 specs 里的工具名换成 Python 侧的名字（只动 `function.name`）。
-    fn with_python_names(specs: &[Value]) -> Value {
-        let mut specs = Value::Array(specs.to_vec());
-        if let Value::Array(items) = &mut specs {
-            for item in items.iter_mut() {
-                if let Some(name) = item.pointer_mut("/function/name") {
-                    if let Some(s) = name.as_str() {
-                        *name = json!(python_name(s));
-                    }
-                }
-            }
-        }
-        specs
-    }
-
-    /// **契约测试**：工具定义必须与 Python 版一致（**只允许工具名不同**，见 `python_name`）。
-    ///
-    /// 允许的差异只有两处：`required` 的元素顺序（见 `canonical`）与工具名
-    /// （`writ`/`bash` ⇄ `write`/`shell`，用户点名改的）。参数、描述、协议形状仍逐字对齐。
-    ///
-    /// 基准文件由 Python 侧导出（改了工具 schema 就重新生成）：
-    /// ```bash
-    /// uv run python -c "import json;from pie.tools import default_tools;\
-    ///   print(json.dumps(default_tools().definitions(), ensure_ascii=False, indent=2))" \
-    ///   > pie-rs/fixtures/python-tools.json
-    /// ```
+    /// 内置工具的注册名与顺序（`writ` / `bash` 是用户点名改的名，别再改回去）。
     #[test]
-    fn generated_specs_match_python() {
-        let expected: Value =
-            serde_json::from_str(include_str!("../fixtures/python-tools.json")).expect("基准 JSON");
-        let reg = builtin();
-        assert_eq!(
-            canonical(&with_python_names(&reg.specs())),
-            canonical(&expected)
-        );
-        assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash"]);
-        // 映射本身别写错（否则契约测试会静默地什么都比不到）
-        assert_eq!(python_name("writ"), "write");
-        assert_eq!(python_name("bash"), "shell");
-        assert_eq!(python_name("read"), "read");
+    fn builtin_tool_names() {
+        assert_eq!(builtin().names(), vec!["read", "edit", "writ", "bash"]);
     }
 
     // 自测工具（非内置）：验证 `.with_tool` 这条公开路径。

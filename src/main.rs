@@ -131,6 +131,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// 生成默认配置文件与全局记忆（已存在则原样保留）
+    Setup,
     /// 上下文压缩维护
     Context {
         #[command(subcommand)]
@@ -196,6 +198,12 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> i32 {
+    // `pie setup`：只补缺的默认文件，**不读也不改**已有配置（配置缺失/坏掉正是它要处理的情形），
+    // 所以要在 `Config::load` 之前、也在启动时那发记忆种子之前接住它。
+    if matches!(cli.command.as_ref(), Some(Cmd::Setup)) {
+        return setup_main(&cli);
+    }
+
     // 首次运行写入全局记忆的种子文件（已存在则跳过）：对齐 Python 每次启动先
     // `_ensure_global_memory()`——它会被拼进 system prompt，没文件就白白少一层记忆。
     config::ensure_global_memory();
@@ -223,6 +231,9 @@ async fn run(cli: Cli) -> i32 {
     // 维护类子命令（不需要模型）；files 要 cfg（建 Files API 客户端）
     if let Some(cmd) = &cli.command {
         return match cmd {
+            // 正常走不到（`run()` 开头已提前返回）——但这条臂留着：万一提前返回被挪掉，
+            // `setup` 依旧是对的（它对已有文件一律不动，与启动时那发种子同级）。
+            Cmd::Setup => setup_main(&cli),
             Cmd::Context { action } => context_main(action),
             Cmd::Files { action } => files_main(&cfg, action).await,
             Cmd::Sessions { limit, all, json } => {
@@ -428,6 +439,47 @@ async fn run(cli: Cli) -> i32 {
             1
         }
     }
+}
+
+/// `pie setup`：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子。
+///
+/// **非交互**（Python 版那个会逐个问模型 / 地址 / key；这边只写默认值，之后自己改），
+/// 已存在的文件**一律不覆盖**（里面可能有用户自己的 key 与记忆）→ 重复跑安全、幂等。
+fn setup_main(cli: &Cli) -> i32 {
+    let mut code = 0;
+    let mut created_config = false;
+
+    match config::ensure_config_file(cli.config.as_deref()) {
+        Ok((path, created)) => {
+            created_config = created;
+            let label = if created { "已创建" } else { "已存在" };
+            println!("配置文件  {label}  {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            code = 1;
+        }
+    }
+    match config::ensure_global_memory_file() {
+        Ok((path, created)) => {
+            let label = if created { "已创建" } else { "已存在" };
+            println!("全局记忆  {label}  {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("写入全局记忆失败（{}）: {e}", config::global_memory_file().display());
+            code = 1;
+        }
+    }
+
+    if code != 0 {
+        return code;
+    }
+    if created_config {
+        println!("接着：按需改上面的 model / base_url / api_key，再跑 `pie \"任务\"`。");
+    } else {
+        println!("两份文件都在，未改动。");
+    }
+    0
 }
 
 /// `pie-rs sessions`：列出历史会话（文案对齐 Python `pie sessions`）。
