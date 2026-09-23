@@ -4,6 +4,11 @@
 
 ## 2026-09-24
 
+- **TUI 代码块开语法高亮**（用户：选 A）：恢复 `tui-markdown` 的默认特性 `highlight-code`（此前为躲 C 依赖而 `default-features = false`）。fence 代码块交给 syntect 高亮，主题用内置 Base16 Ocean Dark。
+  - **代价（实测，有意接受）**：依赖树 584 → 619 节点（+35）；debug 二进制 50.0 → 53.7 MB。syntect 的 oniguruma 后端是**默认特性**（`default-onig` → `onig_sys`，C，靠 `cc` 编译），且 Cargo 特性是**并集**——即使我们自己再写一行 `default-features = false, features = ["default-fancy"]` 也躲不掉。构建只需 `cc`（本机有）。
+  - **流式成本**：`MarkdownCache` 按内容失效 → 每个 delta 都整段重渲染（含 syntect）；release 下 300 行代码块 ≈ 8ms/次（短块可忽略）。
+  - 想回到零 C 依赖：要么改成自写极简高亮（`palette.code_bg` 早就在等这条路），要么 fork tui-markdown 把它的 syntect 依赖改成 `default-fancy`（fancy-regex，纯 Rust）。
+
 - **时间子系统坍缩成一个时钟出口 `fn now() -> Duration`**（用户：选 A）。前提：全仓**没有任何一处把时间串解析回时间**（唯一「读」是原样打印 / 转发），所以统一成数字几乎零风险。
   - `config` 里 `now_unix` / `iso_utc` / `iso_local` / `fmt_unix_ts` 四个函数塌缩成：`now() -> Duration`（**唯一碰 `SystemTime` 的地方**，秒 / `subsec_micros` / `subsec_nanos` 都从它取）+ `fmt_local(secs)`（展示，分钟精度）+ 私有的 `civil`（纯函数，Hinnant 的 civil_from_days）与 `local_utc_offset`（只服务展示）。`session::timestamp()` 收编进 `now()`，`llm::retry_delay` 的 jitter、`collect_file_garbage` 的 age 比较也改用它（原先各自裸调 `SystemTime::now()`）。
   - **落盘时间统一 unix 秒数字**（用户上一轮点名要的）：manifest 的 `ts`、`__meta__.files[].uploaded_at` 由 ISO 串改成 `now().as_secs() as i64`，`iso_utc` / `iso_local` 随之删除。旧 manifest 里的 ISO 串**不解析**，`pie context info` 原样打印。

@@ -114,7 +114,7 @@
 
 - **工具 panic 未文本化**（只捕 `Err(ToolError)`，panic 会带崩整个回合）。
 - **工具执行进度未做**（TUI 看不到 bash 跑到一半的输出；`Tool::call` 已有 `ToolCtx`，加进度就在那里挂回调）。
-- TUI 代码块无语法高亮；`Config.theme` 未接线（无浅色变体/明暗自适应）。
+- TUI 代码块**有**语法高亮（`tui-markdown` 默认特性 `highlight-code`，2026-09-24 开；主题用内置 Base16 Ocean Dark）——代价是带回 syntect → oniguruma（C 库）；`Config.theme` 仍未接线（无浅色变体/明暗自适应）。
 - 绑定 M4（abi3 wheel）未做（`setup` 的问答向导没迁，也不需要：`pie setup` 只写默认值）。
 - 工具 schema 与 Python 版的**逐字对拍契约测试已删**（2026-09-23 用户要求，连同 `fixtures/`），只留 `builtin_tool_names` 钉住注册名与顺序 → 描述/参数再分叉就没有自动拦网了。
 - 旧的 `git show b188058^:src/pie/…` 是查 Python 旧实现的入口（仓库里已经没有 `.py` 实现，只剩绑定外壳与测试）。

@@ -142,6 +142,6 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **无工具执行进度**：bash 跑到一半看不到输出（丢的只是实时性，结果本身完整）；`Tool::call` 已有
   `ToolCtx`，要加就在那里挂回调。
 - 没有交互式配置向导：`pie setup` 只把缺的默认件补上（`~/.pie/config.toml` + `~/.pie/memory.md`，非交互、已存在不覆盖），模型/地址/key 靠手改。
-- TUI 代码块**无语法高亮**（`tui-markdown` 关掉了 `highlight-code`，否则会拉 syntect → oniguruma 的 C 依赖）。
+- TUI 代码块**有**语法高亮（`tui-markdown` 的 `highlight-code`，2026-09-24 开）：代价是带回 syntect → oniguruma（C 库，要 `cc`）。
 - `Config.theme` 目前**只写不读**：TUI 恒用近似 Catppuccin Mocha 的静态色板，没有浅色变体与明暗自适应。
 - Python 绑定 M4（abi3 wheel 分发）未做；`docs/python-bindings.md` 是它的规划与进度。
