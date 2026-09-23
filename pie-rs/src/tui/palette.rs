@@ -3,6 +3,9 @@
 //! 对应 Python 版 `tui.py` 的 `PALETTE_COMMANDS` / `_palette_matches` / `_render_palette`：
 //! **候选表是唯一事实来源**（`/help` 文案也从它生成，避免两处漂移）。
 //!
+//! `@` 文件路径补全（候选是扫出来的、不在这个表里）在 [`super::files`]；它只是**共用**
+//! 这里的 [`panel_lines`] 画面板，匹配与接受都是另一条路（见 `App::completions`）。
+//!
 //! 匹配规则（三条，与 Python 同序）：
 //!   1. `/model ` 前缀 → 端点可用模型列表（「← 当前」标注现用那个）；
 //!   2. `/thinking ` 前缀 → 思考级别（`REASONING_LEVELS`，同上标注）；
@@ -20,26 +23,35 @@ use super::theme::Palette;
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "显示帮助"),
     ("/status", "查看 token 用量"),
-    ("/stop", "取消当前回合（等价 Esc）"),
     ("/thinking", "查看思考深度 / /thinking <level> 切换"),
     ("/model", "查看模型 / /model <id> 切换"),
-    ("/paste", "剪贴板里的图片 → 路径插进输入框"),
+    ("/balance", "查一次账号余额（结果也显示在状态栏右下角）"),
     ("/compact", "工具级 + 轮次级压缩（/compact [tools|turns|auto]）"),
     ("/compact tools", "只做工具级压缩"),
     ("/compact turns", "只做轮次级压缩"),
-    ("/clear", "清空对话历史（窗口归档未接）"),
+    ("/clear", "归档当前窗口，开新窗口"),
     ("/save", "保存会话"),
     ("/reset", "清空对话历史"),
     ("/exit", "退出"),
-    ("/quit", "退出"),
 ];
 
-/// 面板一次最多显示几项（多出来的折成一行「… 还有 N 个候选」）。
+/// 已移除的旧命令 → 现在该用什么。
+///
+/// 「`/` 开头但不是已知命令」的输入本来是按普通消息发出去的（为了保护粘进来的绝对路径），
+/// 但把 `/quit` 当成情给模型就很困惑了 —— 这几个名字拦一下，告诉用户改用什么。
+pub const REMOVED: &[(&str, &str)] = &[
+    ("stop", "`/stop` 已移除：按 `Esc` 停止本回合"),
+    ("paste", "`/paste` 已移除：按 `Ctrl+G` 把剪贴板里的图片路径插进输入框"),
+    ("quit", "`/quit` 已移除：用 `/exit`，或直接 `Ctrl+C`"),
+];
+
+/// 面板一次最多显示几项（**滚动窗口**：窗跟高亮走，见 [`panel_lines`]）。
 pub const MAX_SHOWN: usize = 7;
 
 /// `/help` 文案：由候选表生成（对齐 Python 的「唯一事实来源」做法）。
 ///
-/// 第二行是 `!cmd`（不是 `/` 命令、不进候选表，但对等常用）——与 Python `_help_text` 同款。
+/// 第二行是**不住在候选表里**的几个键（`!cmd` / `Esc` / `Ctrl+G`）—— 它们不是 `/` 命令，
+/// 但常用，而且 `/stop` `/paste` 移除后这两件事只剩按键入口了（2026-09-23）。
 pub fn help_text() -> String {
     let rows = COMMANDS
         .iter()
@@ -47,7 +59,22 @@ pub fn help_text() -> String {
         .map(|(cmd, desc)| format!("{cmd} {desc}"))
         .collect::<Vec<_>>()
         .join(" | ");
-    format!("{rows}\n!cmd 直接执行 shell（不经过 LLM，不进会话上下文；Esc 或 /stop 可中断）")
+    format!(
+        "{rows}\n\
+         @path 文件路径补全（Tab 接受；以当前目录为根，按 .gitignore 排除）；\
+         !cmd 直接执行 shell（不经过 LLM，不进会话上下文）；\
+         Esc 停止当前回合；Ctrl+G 把剪贴板里的图片路径插进输入框"
+    )
+}
+
+/// 是不是已移除的旧命令？是就给一句「改用什么」。
+pub fn removed_hint(text: &str) -> Option<&'static str> {
+    let name = text.split_whitespace().next().unwrap_or("");
+    let name = name.strip_prefix('/').unwrap_or(name);
+    REMOVED
+        .iter()
+        .find(|(cmd, _)| *cmd == name)
+        .map(|(_, hint)| *hint)
 }
 
 /// 输入值对应的补全候选（空 `Vec` = 不显示面板）。
@@ -104,7 +131,10 @@ pub fn is_known_command(text: &str) -> bool {
         .any(|(cmd, _)| cmd.split_whitespace().next() == Some(name))
 }
 
-/// 面板内容：最多 `MAX_SHOWN` 项（高亮项带 `▸` 前缀 + 亮色），超出折成一行提示。
+/// 面板内容：最多 `MAX_SHOWN` 行（高亮项带 `▸` 前缀 + 亮色），放不下的折成一行提示。
+///
+/// 高亮项一定在窗口里：`index` 超过 `MAX_SHOWN` 时窗口**跟着高亮走**（尽量居中，贴边就贴住），
+/// 行数恒为 `shown`（面板高度不跳），每行只取 `matches[start..end]` 里真正的那几项。
 pub fn panel_lines(
     matches: &[(String, String)],
     index: usize,
@@ -114,10 +144,16 @@ pub fn panel_lines(
     if matches.is_empty() {
         return out;
     }
+    let index = index.min(matches.len() - 1);
     let shown = matches.len().min(MAX_SHOWN);
-    let index = index.min(shown - 1);
-    for (i, (cmd, desc)) in matches.iter().take(shown).enumerate() {
-        let (mark, style_cmd, style_desc) = if i == index {
+    // ⚠ 两条边界都不能想当然：`saturating_sub` 防「前面不够扣」（`index < shown/2` 时
+    // usize 下溢会 panic）；`.min(n - shown)` 防窗口越过后尾（shown ≤ n，所以不会反向溢出）。
+    // 别用「以 index 为中心、两边各摊一份」那种算法：那样窗口长会变成 2×shown，
+    // 高亮反而被 `take(shown)` 截掉。
+    let start = index.saturating_sub(shown / 2).min(matches.len() - shown);
+    let end = start + shown;
+    for (offset, (cmd, desc)) in matches[start..end].iter().enumerate() {
+        let (mark, style_cmd, style_desc) = if start + offset == index {
             (
                 "▸ ",
                 Style::default()
@@ -128,17 +164,15 @@ pub fn panel_lines(
         } else {
             ("  ", palette.style_muted(), palette.style_faint())
         };
-        out.push(Line::from(vec![
+        // 说明为空就不画那截 ` — `（文件路径候选多数不带说明）
+        let mut spans = vec![
             Span::styled(mark.to_string(), style_cmd),
             Span::styled(format!("{cmd} "), style_cmd),
-            Span::styled(format!("— {desc}"), style_desc),
-        ]));
-    }
-    if matches.len() > shown {
-        out.push(Line::from(Span::styled(
-            format!("  … 还有 {} 个候选", matches.len() - shown),
-            palette.style_faint(),
-        )));
+        ];
+        if !desc.is_empty() {
+            spans.push(Span::styled(format!("— {desc}"), style_desc));
+        }
+        out.push(Line::from(spans));
     }
     out
 }
@@ -163,6 +197,11 @@ mod tests {
 
         // 非 `/` 开头：不显示
         assert!(matches("你好", &models(), "deepseek-flash", "high").is_empty());
+        // `/balance` 也在表里（前缀命中）
+        let found = matches("/bal", &models(), "deepseek-flash", "high");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "/balance");
+        assert!(is_known_command("/balance"));
         // 不是已知命令的绝对路径也别乱弹（`/home/x.png` 不命中任何候选）
         assert!(matches("/home/luxrck/x.png", &models(), "deepseek-flash", "high").is_empty());
     }
@@ -194,7 +233,33 @@ mod tests {
         let help = help_text();
         assert!(help.contains("/help 显示帮助"), "{help}");
         assert!(help.contains("!cmd 直接执行 shell"), "！模式要进帮助：{help}");
+        assert!(help.contains("@path 文件路径补全"), "`@` 补全要进帮助：{help}");
         assert!(!help.contains("/compact tools"), "多词命令不进 /help：{help}");
+    }
+
+    /// `/stop` `/paste` `/quit` 已移除（2026-09-23，都是别名）：既不进候选表，也不进 `/help`；
+    /// `/help` 的第二行必须把真正剩下的按键入口（Esc / Ctrl+G）说清楚。
+    #[test]
+    fn removed_aliases_are_gone_from_the_table_and_help() {
+        for gone in ["/stop", "/paste", "/quit"] {
+            assert!(
+                !COMMANDS.iter().any(|(cmd, _)| *cmd == gone),
+                "{gone} 不该还在候选表里"
+            );
+            assert!(!help_text().contains(gone), "{gone} 不该还在 /help 里");
+        }
+        // 只剩 `/exit` 一个退出入口，且 Esc / Ctrl+G 这两个别名宿主在帮助里
+        assert!(is_complete_command("/exit"));
+        let help = help_text();
+        assert!(help.contains("Esc 停止当前回合"), "{help}");
+        assert!(help.contains("Ctrl+G"), "{help}");
+
+        // 敲旧名字要给一句「改用什么」（不要当普通消息发给模型）
+        assert!(removed_hint("/stop").unwrap().contains("Esc"));
+        assert!(removed_hint("/paste extra").unwrap().contains("Ctrl+G"));
+        assert!(removed_hint("/quit").unwrap().contains("/exit"));
+        assert!(removed_hint("/help").is_none(), "已移除的才提示");
+        assert!(removed_hint("/home/x/a.png").is_none(), "拼进来的路径不拦");
     }
 
     #[test]
@@ -206,6 +271,42 @@ mod tests {
         assert!(!is_known_command(""));
     }
 
+    /// 高亮跑到第 8 项以后：窗口**跟着高亮走**（高亮始终可见、面板高度不变）。
+    ///
+    /// 旧版把「窗口内下标」拿去跟「原列表下标」比、还算出个能撑到 2×shown 长的窗口，
+    /// 结果是 `take(shown)` 把高亮截掉（选到第 8 项就一个 ▸ 都没有）。
+    #[test]
+    fn panel_lines_window_follows_the_highlight() {
+        let palette = Palette::mocha();
+        let many: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("/cmd{i}"), "说明".to_string()))
+            .collect();
+        let rows_of = |index: usize| -> Vec<String> {
+            panel_lines(&many, index, &palette)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect()
+        };
+
+        for index in 0..many.len() {
+            let rows = rows_of(index);
+            assert_eq!(rows.len(), MAX_SHOWN, "index={index}：窗口长度固定");
+            let marked: Vec<&String> = rows.iter().filter(|r| r.starts_with('▸')).collect();
+            assert_eq!(marked.len(), 1, "index={index}：有且只有一行带 ▸：{rows:?}");
+            assert!(
+                marked[0].starts_with(&format!("▸ /cmd{index} ")),
+                "index={index}：高亮跑到别的项上了：{rows:?}"
+            );
+        }
+
+        // 具体位置：开头贴顶、中间居中、末尾贴底
+        assert!(rows_of(0)[0].starts_with("▸ /cmd0"), "开头贴顶");
+        assert!(rows_of(5)[MAX_SHOWN / 2].starts_with("▸ /cmd5 "), "中间居中");
+        let tail = rows_of(9);
+        assert!(tail[0].contains("/cmd3"), "末尾时窗口停在最后 7 项：{tail:?}");
+        assert!(tail[MAX_SHOWN - 1].starts_with("▸ /cmd9 "), "末尾贴底：{tail:?}");
+    }
+
     #[test]
     fn panel_lines_highlight_and_overflow_hint() {
         let palette = Palette::mocha();
@@ -213,10 +314,28 @@ mod tests {
             .map(|i| (format!("/cmd{i}"), "说明".to_string()))
             .collect();
         let lines = panel_lines(&many, 1, &palette);
-        assert_eq!(lines.len(), MAX_SHOWN + 1, "7 项 + 溢出提示");
+        // 面板是**滚动窗口**：最多 `MAX_SHOWN` 行（不再有「… 还有 N 个候选」那种尾巴）
+        assert_eq!(lines.len(), MAX_SHOWN, "窗口最多 {MAX_SHOWN} 行");
         let text = |l: &Line<'_>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
         assert!(text(&lines[1]).starts_with("▸ /cmd1 "), "{}", text(&lines[1]));
         assert!(!text(&lines[0]).starts_with('▸'));
-        assert!(text(&lines[MAX_SHOWN]).contains("还有 3 个候选"));
+
+        // 项数不够就不凑数（窗口长度 = min(项数, MAX_SHOWN)）
+        assert_eq!(panel_lines(&many[..3], 0, &palette).len(), 3);
+        assert!(panel_lines(&[], 0, &palette).is_empty());
+    }
+
+    /// 说明为空时不再画那截 ` — `（`@` 文件候选多数不带说明）。
+    #[test]
+    fn panel_lines_omit_the_dash_when_there_is_no_description() {
+        let palette = Palette::mocha();
+        let items = vec![
+            ("src/tui/app.rs".to_string(), String::new()),
+            ("src/tui/".to_string(), "目录".to_string()),
+        ];
+        let text = |l: &Line<'_>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let lines = panel_lines(&items, 0, &palette);
+        assert_eq!(text(&lines[0]), "▸ src/tui/app.rs ");
+        assert_eq!(text(&lines[1]), "  src/tui/ — 目录");
     }
 }

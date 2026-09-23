@@ -39,6 +39,8 @@ pub enum Cell {
     },
     /// 系统提示（回合中不可用的命令、粘贴结果…）
     Notice(String),
+    /// 重试进度（**就地更新**的单个块：`log::progress` 来的，同一个 `key` 只占一行）
+    Retry { key: String, text: String },
     Error(String),
 }
 
@@ -127,6 +129,9 @@ pub fn tool_summary(arguments: &str) -> String {
 }
 
 /// 工具结果里能不能看出失败（`[exit=N]`；非 shell 工具没有退出码 → 都算成功）。
+///
+/// 现在 `bash` **只在非 0 时**给这行头，所以「没头 = 成功」；`[exit=0]` 只可能来自旧会话
+/// （改之前录的）或 Python 版，所以还得认。
 pub fn tool_result_ok(content: &str) -> bool {
     match content.lines().next().unwrap_or("") {
         line if line.starts_with("[exit=") => line.starts_with("[exit=0]"),
@@ -324,10 +329,21 @@ fn char_width(c: char) -> usize {
 }
 
 /// 把一条逻辑行按显示宽度折成显示行，追加到 `out`（`src_line` = 逻辑行号）。
+fn wrap_line(line: &Line<'static>, src_line: usize, width: usize, out: &mut Vec<Row>) {
+    for wrapped in wrap_line_into(line, width) {
+        out.push(Row {
+            line: wrapped,
+            src_line,
+        });
+    }
+}
+
+/// 把一条逻辑行按显示宽度折成若干条显示行（`markdown::fit_tables` 重排单元格时也用它）。
 ///
 /// 断行策略：优先在**空白之后**断（空白留在上一行行尾，一个字符不丢）；一个词自己就超过
 /// 整行宽时硬断。空行也占一行（消息之间的空行就是这么来的）。
-fn wrap_line(line: &Line<'static>, src_line: usize, width: usize, out: &mut Vec<Row>) {
+pub(crate) fn wrap_line_into(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
     // 逐字符带样式展开：spans 会被折行切开，样式得跟着字符走
     let chars: Vec<(char, Style)> = line
         .spans
@@ -335,11 +351,8 @@ fn wrap_line(line: &Line<'static>, src_line: usize, width: usize, out: &mut Vec<
         .flat_map(|s| s.content.chars().map(|c| (c, s.style)))
         .collect();
     if chars.is_empty() {
-        out.push(Row {
-            line: Line::default(),
-            src_line,
-        });
-        return;
+        out.push(Line::default());
+        return out;
     }
     let mut start = 0usize;
     while start < chars.len() {
@@ -360,12 +373,10 @@ fn wrap_line(line: &Line<'static>, src_line: usize, width: usize, out: &mut Vec<
             }
         }
         let end = if full { soft.unwrap_or(end) } else { end };
-        out.push(Row {
-            line: rebuild_line(&chars[start..end], line),
-            src_line,
-        });
+        out.push(rebuild_line(&chars[start..end], line));
         start = end;
     }
+    out
 }
 
 /// 用一段「字符 + 样式」重建一条 `Line`（相邻同样式合并成一个 span；行级样式照搛）。
@@ -389,6 +400,7 @@ fn rebuild_line(chars: &[(char, Style)], template: &Line<'static>) -> Line<'stat
 /// 例外：手动 `!cmd`（`Cell::Tool { manual: true }`）**任何模式都展开**——那是用户主动
 /// 执行的命令，输出本身就是要看的东西（对齐 Python：`!cmd` 的两个盒子都 `lean=False`）。
 pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> Layout {
+    let width = (width as usize).max(1);
     // `out` 先装**逻辑行**（不折），最后统一折成显示行
     let mut out: Vec<Line<'static>> = Vec::new();
     for cell in cells.iter_mut() {
@@ -408,7 +420,7 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
                 }
             }
             Cell::Assistant { text, md } => {
-                for line in md.get(text).lines.iter() {
+                for line in md.get(text, width).lines.iter() {
                     out.push(line.clone());
                 }
             }
@@ -461,6 +473,16 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
                     )));
                 }
             }
+            Cell::Retry { text, .. } => {
+                // 重试进度：单个块，每次重试就地改写（不再一行一条）
+                for (i, line) in text.lines().enumerate() {
+                    let prefix = if i == 0 { "⟳ " } else { "  " };
+                    out.push(Line::from(Span::styled(
+                        format!("{prefix}{line}"),
+                        palette.style_faint(),
+                    )));
+                }
+            }
             Cell::Error(text) => {
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "✗ " } else { "  " };
@@ -473,7 +495,6 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
         }
         out.push(Line::default());
     }
-    let width = (width as usize).max(1);
     let mut rows = Vec::new();
     for (i, line) in out.iter().enumerate() {
         wrap_line(line, i, width, &mut rows);
@@ -583,7 +604,7 @@ mod tests {
             role: "assistant".into(),
             tool_calls: Some(vec![
                 call("c1", "read", r#"{"path":"a.rs"}"#),
-                call("c2", "shell", r#"{"command":"false"}"#),
+                call("c2", "bash", r#"{"command":"false"}"#),
             ]),
             ..Default::default()
         };
@@ -595,7 +616,7 @@ mod tests {
             Message::user("看看 a.rs"),
             assistant,
             Message::tool_result("c1", "read", "fn main() {}\n"),
-            Message::tool_result("c2", "shell", "[exit=1]\n\nboom"),
+            Message::tool_result("c2", "bash", "[exit=1]\n\nboom"),
             Message {
                 role: "assistant".into(),
                 content: Some(Content::Text("看完了".into())),
@@ -609,7 +630,7 @@ mod tests {
         assert!(text.contains("› 看看 a.rs"), "{text}");
         assert!(text.contains("✓ read(a.rs)"), "调用与结果要合并：{text}");
         assert!(text.contains("  fn main() {}"), "{text}");
-        assert!(text.contains("✗ shell(false)"), "退出码决定状态：{text}");
+        assert!(text.contains("✗ bash(false)"), "退出码决定状态：{text}");
         assert!(text.contains("  boom"), "{text}");
         assert!(text.contains("看完了"), "最终正文：{text}");
         // 两个调用各自配对（按 `tool_call_id`，不是按工具名回溯）
@@ -622,12 +643,12 @@ mod tests {
         let palette = Palette::mocha();
         let messages = vec![
             // 配对信息缺失（老会话没写 tool_call_id）→ 至少把结果行显示出来
-            Message::tool_result("", "shell", "[exit=0]\n\nhi"),
-            Message::tool_result("call_x", "shell", crate::cancel::CANCEL_TEXT),
+            Message::tool_result("", "bash", "[exit=0]\n\nhi"),
+            Message::tool_result("call_x", "bash", crate::cancel::CANCEL_TEXT),
         ];
         let mut cells = cells_from_history(&messages);
         let text = plain(&layout(&mut cells, &palette, 80, false));
-        assert!(text.contains("✓ shell"), "{text}");
+        assert!(text.contains("✓ bash"), "{text}");
         assert!(text.contains("hi"), "{text}");
         assert!(text.contains("⏹"), "取消哨兵 → ⏹：{text}");
     }
@@ -640,7 +661,7 @@ mod tests {
             Cell::assistant(),
             Cell::Thought(Duration::from_millis(3400)),
             Cell::Tool {
-                name: "shell".into(),
+                name: "bash".into(),
                 summary: "pwd".into(),
                 status: Status::Ok,
                 body: Some("/tmp\n".into()),
@@ -653,7 +674,7 @@ mod tests {
         assert!(text.contains("  第二行"), "续行缩进：{text}");
         assert!(text.contains("在"), "{text}");
         assert!(text.contains("• Thought for 3.4s"), "{text}");
-        assert!(text.contains("✓ shell(pwd)"), "{text}");
+        assert!(text.contains("✓ bash(pwd)"), "{text}");
         assert!(text.contains("  /tmp"), "盒子式：正文展示：{text}");
     }
 
@@ -669,7 +690,7 @@ mod tests {
                 manual: false,
             },
             Cell::Tool {
-                name: "shell".into(),
+                name: "bash".into(),
                 summary: "false".into(),
                 status: Status::Fail,
                 body: Some("[exit=1]\n\nboom".into()),
@@ -677,7 +698,7 @@ mod tests {
             },
             // 手动 `!cmd`：成功也带正文
             Cell::Tool {
-                name: "shell".into(),
+                name: "bash".into(),
                 summary: "$ pwd".into(),
                 status: Status::Ok,
                 body: Some("[exit=0]\n\n/tmp".into()),
@@ -687,10 +708,10 @@ mod tests {
         let text = plain(&layout(&mut cells, &palette, 80, true));
         assert!(text.contains("✓ read(a.rs)"), "{text}");
         assert!(!text.contains("fn main()"), "成功不带正文：{text}");
-        assert!(text.contains("✗ shell(false)"), "{text}");
+        assert!(text.contains("✗ bash(false)"), "{text}");
         assert!(text.contains("  [exit=1]"), "失败带正文：{text}");
         assert!(
-            text.contains("✓ shell($ pwd)") && text.contains("  [exit=0]"),
+            text.contains("✓ bash($ pwd)") && text.contains("  [exit=0]"),
             "手动 !cmd 不吃简洁模式：{text}"
         );
     }
@@ -698,13 +719,13 @@ mod tests {
     #[test]
     fn finish_and_cancel_only_touch_running_matching_cell() {
         let mut cells = vec![Cell::Tool {
-            name: "shell".into(),
+            name: "bash".into(),
             summary: "false".into(),
             status: Status::Running,
             body: None,
             manual: false,
         }];
-        Cell::finish_tool(&mut cells, "shell", Status::Fail, "[exit=1]\n\nboom");
+        Cell::finish_tool(&mut cells, "bash", Status::Fail, "[exit=1]\n\nboom");
         match &cells[0] {
             Cell::Tool { status, body, .. } => {
                 assert_eq!(*status, Status::Fail);
@@ -713,7 +734,7 @@ mod tests {
             _ => panic!("还是 Tool"),
         }
         // 已经结束的不再被改
-        Cell::finish_tool(&mut cells, "shell", Status::Ok, "[exit=0]");
+        Cell::finish_tool(&mut cells, "bash", Status::Ok, "[exit=0]");
         match &cells[0] {
             Cell::Tool { status, .. } => assert_eq!(*status, Status::Fail),
             _ => panic!("还是 Tool"),
@@ -722,7 +743,7 @@ mod tests {
         // 取消收尾：还挂在「运行中」的结算成 ⏹（没跑到的 tool_calls 不会再有结果事件）
         let mut cells = vec![
             Cell::Tool {
-                name: "shell".into(),
+                name: "bash".into(),
                 summary: "sleep 100".into(),
                 status: Status::Running,
                 body: None,

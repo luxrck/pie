@@ -1,9 +1,9 @@
-//! 剪贴板：把里面的**图片**变成路径插进输入框（`Ctrl+G` / `/paste`）。
+//! 剪贴板：把里面的**图片**变成路径插进输入框（`Ctrl+G`）。
 //!
 //! **普通文本不在这里处理**：文本粘贴交给终端自己的粘贴键（macOS `⌘V` / Linux
 //! `Ctrl+Shift+V`）经 bracketed paste 走 `Event::Paste`。与 Python 一致——那边也只有
 //! TextArea 的 `Ctrl+V` 会在「没有图片」时回退文本粘贴（`action_paste`），而
-//! `Ctrl+G` / `/paste`（`action_paste_image`）**只认图片**，无图就提示。
+//! `Ctrl+G`（`action_paste_image`）**只认图片**，无图就提示。
 //!
 //! 两条来源，按这个顺序看（与 Python `clipboard.grab_image_path()` 同一语义）：
 //!   1. **位图**（截图）→ PNG 编码后走 `session::store_blob` 落成本地副本（内容寻址
@@ -14,6 +14,9 @@
 //!      → 只认图片后缀、且文件确实存在的第一个，返回**原路径、不复制**。
 //!
 //! `arboard` 在部分环境不可用（Termux/无 X11），拿不到剪贴板就当「没有内容」，不报错。
+//!
+//! **写入**（消息流框选 / 输入框拖选复制）用 [`Copier`]：句柄要在 `App` 里长活，
+//! 每次写完就 drop 会在 Linux 上造成屏幕被 stderr 警告砸花 + 复制没生效（详见 `Copier`）。
 
 use std::path::{Path, PathBuf};
 
@@ -45,11 +48,30 @@ pub fn paste_image() -> Option<String> {
     None
 }
 
-/// 把文本写进系统剪贴板（消息流框选复制用）。`arboard` 不可用（无 X11 / Termux）时返回 `false`。
-pub fn copy_text(text: &str) -> bool {
-    match Clipboard::new() {
-        Ok(mut clipboard) => clipboard.set_text(text.to_string()).is_ok(),
-        Err(_) => false,
+/// 系统剪贴板的**长活**写入句柄（由 `App` 持有）。
+///
+/// 为什么不能每次 `Clipboard::new()` 写完就 drop：Linux（X11）下剪贴板内容的提供者就是本
+/// 进程，写完 100ms 内 drop 有两个后果——
+///   1. arboard 会往 **stderr** 打一行警告；TUI 期间是 raw mode + 交替屏，这行字节落在当前
+///      光标处、而 ratatui 只重画变化的格子 → 屏幕被砸花且**再也修不回来**；
+///   2. 剪贴板管理器可能来不及取走内容，复制其实没生效。
+/// 所以持有一个进程级的长活句柄，每次写复用它。
+#[derive(Default)]
+pub struct Copier {
+    slot: Option<Clipboard>,
+}
+
+impl Copier {
+    /// 把文本写进系统剪贴板（消息流框选 / 输入框拖选共用）。
+    /// `arboard` 不可用（无 X11 / Termux）时返回 `false`。
+    pub fn copy(&mut self, text: &str) -> bool {
+        if self.slot.is_none() {
+            self.slot = Clipboard::new().ok();
+        }
+        match self.slot.as_mut() {
+            Some(clipboard) => clipboard.set_text(text.to_string()).is_ok(),
+            None => false,
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 //! 模型层：基于 reqwest 的 OpenAI 兼容客户端 —— **不依赖任何 OpenAI SDK**。
 //!
 //! 对齐 Python 版 `src/pie/llm.py` 的语义，但把 SDK 那一层整个换掉：
-//!   - 端点就 3 个：`POST /chat/completions`（普通 + SSE 流式）、`GET /models`、（后续）Files API；
+//!   - 端点就 4 个：`POST /chat/completions`（普通 + SSE 流式）、`GET /models`、`GET /user/balance`
+//!     （查询余额，DeepSeek 扩展）与 Files API；
 //!   - 重试自己实现（SDK 自带那套早关了）：408/409/429/5xx + 传输层异常可重试，
 //!     等待优先服务端 `Retry-After`，否则随机退避 + 1s 下限；
 //!   - 流式**只在还没吐出过任何增量时**才重试（吐过了重来会重复内容）。
@@ -160,7 +161,7 @@ impl Message {
 
 // ---------------------------------------------------------------- 结果与用量
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct Usage {
     pub prompt_tokens: Option<i64>,
@@ -171,7 +172,7 @@ pub struct Usage {
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<i64>,
@@ -390,8 +391,8 @@ impl LlmClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
             reasoning_effort: cfg.normalized_reasoning_effort().map(str::to_string),
-            max_tokens: cfg.reserved_tokens,
-            max_retries: cfg.max_retries,
+            max_tokens: cfg.reserved_tokens.map(|n| n as i64),
+            max_retries: cfg.max_retries as u32,
             max_retry_delay: cfg.max_retry_delay_seconds,
         })
     }
@@ -460,11 +461,11 @@ impl LlmClient {
         D: FnMut(u32, &LlmError) -> Retry,
     {
         let mut attempt = 0u32;
-        loop {
+        let result = loop {
             match op().await {
-                Ok(v) => return Ok(v),
+                Ok(v) => break Ok(v),
                 Err(e) => match decide(attempt, &e) {
-                    Retry::Give => return Err(e),
+                    Retry::Give => break Err(e),
                     Retry::Now => {}
                     Retry::Backoff => {
                         attempt += 1;
@@ -472,7 +473,10 @@ impl LlmClient {
                     }
                 },
             }
-        }
+        };
+        // 这串重试结束了（成功或放弃）：让界面把那个进度块撤掉（没重试过就是空操作）
+        crate::log::progress_done(what);
+        result
     }
 
     /// 非流式完整请求（一次尝试的完整流程就写在 `with_retry` 的闭包里）。
@@ -626,10 +630,38 @@ impl LlmClient {
         .await
     }
 
+    /// 查询账号余额（`GET /user/balance`，DeepSeek 扩展，文档见
+    /// <https://api-docs.deepseek.com/zh-cn/api/get-user-balance/>）。
+    ///
+    /// 返回的是**原样**结构（可能多币种）：要显示成一行是展示层的事（见 `tui::status::balance_text`）。
+    /// 非 OpenAI 兼容端点大多没这个接口（一般回 404）——调用方该当成「拿不到」，不当错误报。
+    pub async fn fetch_balance(&self) -> Result<Balance, LlmError> {
+        self.with_retry(
+            "余额查询",
+            || async move {
+                let resp = self
+                    .http
+                    .get(self.url("user/balance"))
+                    .bearer_auth(&self.api_key)
+                    .send()
+                    .await
+                    .map_err(LlmError::Transport)?;
+                let resp = check_status(resp).await?;
+                resp.json::<Balance>().await.map_err(LlmError::Transport)
+            },
+            |attempt, e| default_retry(self.max_retries, attempt, e),
+        )
+        .await
+    }
+
     async fn sleep_before_retry(&self, attempt: u32, what: &str, e: &LlmError) {
         let delay = retry_delay(self.max_retry_delay, e.retry_after());
-        crate::log::warn(format!(
-            "[retry] {what}失败（{}），{delay:.1}s 后第 {attempt}/{} 次重试",
+        // 进度（不是告警）：TUI 侧按 `what` 就地刷新同一个块（每次重试一行太吵）；
+        // 按 `what` 分组，并行的两条流程（回合请求 / 拉模型列表）各占一块
+        crate::log::progress(
+            what,
+            format!(
+                "[retry] {what}失败（{}），{delay:.1}s 后第 {attempt}/{} 次重试",
             e.brief(),
             self.max_retries
         ));
@@ -959,6 +991,34 @@ struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
+/// 账号余额（`GET /user/balance` 的原样响应）。
+///
+/// 服务端把金额写成**字符串**（`"110.00"`，避免浮点误差）——这里也不动它，
+/// 要算要说都交给展示层。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Balance {
+    /// 当前账户是否有余额可供 API 调用
+    #[serde(default)]
+    pub is_available: bool,
+    #[serde(default)]
+    pub balance_infos: Vec<BalanceInfo>,
+}
+
+/// 一个币种的余额明细。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BalanceInfo {
+    /// `CNY` / `USD`
+    pub currency: String,
+    /// 总的可用余额（含赠金 + 充值）
+    pub total_balance: String,
+    /// 未过期的赠金余额
+    #[serde(default)]
+    pub granted_balance: String,
+    /// 充值余额
+    #[serde(default)]
+    pub topped_up_balance: String,
+}
+
 #[derive(Deserialize)]
 struct ModelEntry {
     #[serde(default)]
@@ -1059,6 +1119,36 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, LlmError::Protocol(_)));
         assert_eq!(calls.get(), 1);
+    }
+
+    /// `GET /user/balance` 的响应形状：直接拿官方文档的例子当基准（金额是**字符串**）。
+    #[test]
+    fn balance_response_parses_the_documented_example() {
+        let body = r#"{
+            "is_available": true,
+            "balance_infos": [
+                {
+                    "currency": "CNY",
+                    "total_balance": "110.00",
+                    "granted_balance": "10.00",
+                    "topped_up_balance": "100.00"
+                }
+            ]
+        }"#;
+        let parsed: Balance = serde_json::from_str(body).expect("文档例子要能解");
+        assert!(parsed.is_available);
+        assert_eq!(parsed.balance_infos.len(), 1);
+        let info = &parsed.balance_infos[0];
+        assert_eq!(info.currency, "CNY");
+        assert_eq!(info.total_balance, "110.00");
+        assert_eq!(info.granted_balance, "10.00");
+        assert_eq!(info.topped_up_balance, "100.00");
+
+        // 字段缺失也不能崩（非 DeepSeek 端点 / 老版本可能少字段）
+        let lenient: Balance = serde_json::from_str("{\"balance_infos\":[{\"currency\":\"USD\",\"total_balance\":\"1.00\"}]}")
+            .expect("缺字段按默认值");
+        assert!(!lenient.is_available);
+        assert_eq!(lenient.balance_infos[0].granted_balance, "");
     }
 
     #[test]

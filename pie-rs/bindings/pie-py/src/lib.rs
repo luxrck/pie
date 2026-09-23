@@ -1,7 +1,7 @@
-//! `pie_rs._pie_rs` —— pie-rs 核心层的 Python 绑定（PyO3）。
+//! `pie._pie_rs` —— pie-rs 核心层的 Python 绑定（PyO3）。
 //!
 //! 分工：**本 crate 只做桥接**（类型转换、GIL 纪律、事件分发、异常映射），
-//! 一切业务逻辑仍在 `pie_rs`（Rust 核心库）里。规划见仓库 `docs/python-bindings.md`。
+//! 一切业务逻辑仍在 `pie`（Rust 核心库）里。规划见仓库 `docs/python-bindings.md`。
 //!
 //! 三条贯穿全文件的纪律（别在别处破例）：
 //!   1. **长任务必须释放 GIL**：模型请求 / 工具执行可能跑几十秒，持 GIL 会冻住整个解释器
@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use pyo3::create_exception;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
 
 pub use config::PyConfig;
@@ -31,10 +31,10 @@ pub use tools::PyToolRegistry;
 
 // ---------------------------------------------------------------- 异常层级
 
-create_exception!(pie_rs, PieError, pyo3::exceptions::PyException, "pie 的错误基类");
-create_exception!(pie_rs, ConfigError, PieError, "配置读取 / 保存失败");
-create_exception!(pie_rs, LlmError, PieError, "模型请求失败（实例上带 .status）");
-create_exception!(pie_rs, ToolError, PieError, "工具执行失败");
+create_exception!(pie, PieError, pyo3::exceptions::PyException, "pie 的错误基类");
+create_exception!(pie, ConfigError, PieError, "配置读取 / 保存失败");
+create_exception!(pie, LlmError, PieError, "模型请求失败（实例上带 .status）");
+create_exception!(pie, ToolError, PieError, "工具执行失败");
 
 /// 会话正忙（同一个 session 上重入 `aturn`，或回合进行中读 `messages`）。
 pub(crate) fn busy_error() -> PyErr {
@@ -46,13 +46,13 @@ pub(crate) fn pie_error(msg: impl std::fmt::Display) -> PyErr {
 }
 
 /// `ConfigError` → Python `ConfigError`。
-pub(crate) fn config_error(e: pie_rs::config::ConfigError) -> PyErr {
+pub(crate) fn config_error(e: pie::config::ConfigError) -> PyErr {
     ConfigError::new_err(e.to_string())
 }
 
 /// 核心的 `LlmError` → Python `LlmError`，并把 HTTP 状态码挂到实例的 `.status` 上
 /// （`None` = 不是服务端返回的错误，比如连接失败）。
-pub(crate) fn llm_error(py: Python<'_>, e: pie_rs::llm::LlmError) -> PyErr {
+pub(crate) fn llm_error(py: Python<'_>, e: pie::llm::LlmError) -> PyErr {
     let status = e.status();
     let type_object = py.get_type::<LlmError>();
     match type_object.call1((e.to_string(),)) {
@@ -126,7 +126,118 @@ pub(crate) fn to_py<T: serde::Serialize>(py: Python<'_>, value: &T) -> PyResult<
     json_to_py(py, &json)
 }
 
+/// Python 对象 → `serde_json::Value`（`json_to_py` 的逆向）——`Config.update(dict)` 用。
+///
+/// 只认 JSON 能表达的那些：`dict` / `list` / `tuple` / `str` / `int` / `float` / `bool` / `None`；
+/// 别的类型直接报错（别悄悄塞个字符串进去）。
+pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if value.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = value.cast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = value.extract::<i64>() {
+        return Ok(Value::from(i));
+    }
+    // `u64` 也要认（`usize` 字段回填时可能是大正整数）
+    if let Ok(u) = value.extract::<u64>() {
+        return Ok(Value::from(u));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        return Ok(serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number));
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(Value::String(s));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
+        }
+        return Ok(Value::Object(map));
+    }
+    if let Ok(seq) = value.cast::<PyList>() {
+        let mut items = Vec::with_capacity(seq.len());
+        for item in seq.iter() {
+            items.push(py_to_json(&item)?);
+        }
+        return Ok(Value::Array(items));
+    }
+    if let Ok(seq) = value.cast::<PyTuple>() {
+        let mut items = Vec::with_capacity(seq.len());
+        for item in seq.iter() {
+            items.push(py_to_json(&item)?);
+        }
+        return Ok(Value::Array(items));
+    }
+    Err(pie_error(format!(
+        "这个类型不能当配置值：{}",
+        value.get_type().name()?
+    )))
+}
+
 // ---------------------------------------------------------------- 模块
+
+/// 一次性任务（**无会话、不落盘**）：建个临时会话跑一回合，返回最终答复。
+///
+/// 与纯 Python 版 `pie.run(task, config=…)` 同形；`config=None` 时读 `~/.pie/config.toml`
+/// （文件不在就用默认值）；`llm` / `tools` 不传就按 config 造（内置四件套）。
+///
+/// 三个执行旋钮与 [`Session.aturn`] 同义（`max_steps=None` = 不限、`stream=None` = 默认流式、
+/// `parallel_tools=None` = 跟随 `Config.parallel_tools`）。
+#[pyfunction]
+#[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None))]
+fn run(
+    py: Python<'_>,
+    task: String,
+    config: Option<&crate::config::PyConfig>,
+    llm: Option<&crate::llm::PyLlmClient>,
+    tools: Option<&crate::tools::PyToolRegistry>,
+    max_steps: Option<usize>,
+    stream: Option<bool>,
+    parallel_tools: Option<bool>,
+) -> PyResult<String> {
+    // 默认：读配置文件（不在就用默认值）——与 Python `resolve_config()` 同语义
+    let cfg = match config {
+        Some(c) => c.inner.clone(),
+        None => pie::config::Config::load(None).map_err(config_error)?,
+    };
+    let client = match llm {
+        Some(l) => l.inner.clone(),
+        None => pie::llm::LlmClient::new(&cfg).map_err(|e| llm_error(py, e))?,
+    };
+    let registry = match tools {
+        Some(t) => t.inner.clone(),
+        None => pie::tools::ToolRegistry::new(cfg.tool_defaults()),
+    };
+    let session = crate::session::PySession::wrap(pie::session::Session::ephemeral(
+        &cfg, client, registry,
+    ));
+    session.aturn(py, task, None, None, max_steps, stream, parallel_tools)
+}
+
+/// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。
+///
+/// 键名与 CLI `pie-rs sessions --json` / Python `pie sessions -j` 一致。`limit=None` = 全部。
+#[pyfunction]
+#[pyo3(signature = (limit=None))]
+fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {
+    use pyo3::types::PyList;
+    let list = PyList::empty(py);
+    for r in pie::session::list_sessions(limit) {
+        let d = PyDict::new(py);
+        d.set_item("id", r.id)?;
+        d.set_item("file", r.path.display().to_string())?;
+        d.set_item("mtime", r.mtime)?;
+        d.set_item("size", r.size)?;
+        d.set_item("turns", r.turns)?;
+        d.set_item("api_calls", r.api_calls)?;
+        d.set_item("first_query", r.first_query)?;
+        list.append(d)?;
+    }
+    Ok(list.into_any().unbind())
+}
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -137,6 +248,8 @@ fn version() -> &'static str {
 fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(run, m)?)?;
+    m.add_function(wrap_pyfunction!(list_sessions, m)?)?;
 
     m.add_class::<PyConfig>()?;
     m.add_class::<PyLlmClient>()?;

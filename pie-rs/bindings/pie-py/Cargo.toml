@@ -11,14 +11,22 @@ publish = false
 [workspace]
 
 [lib]
-# 模块名 `pie_rs._pie_rs`（Python 侧的外壳包是 `pie_rs`）。
+# 模块名 `pie._pie_rs`（Python 侧的外壳包是 `pie`）。
 name = "_pie_rs"
 crate-type = ["cdylib"]
+
+[features]
+# `asyncio`：`aturn_async` / `events()`（M5）。默认开着——不想带这个依赖就 `--no-default-features`。
+default = ["asyncio"]
+asyncio = ["dep:pyo3-async-runtimes"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 # 核心库：**default-features = false** → 不把 TUI（ratatui / crossterm / arboard…）编进来。
 pie-rs = { path = "../..", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
+# M5：`future_into_py` 把 tokio future 变成 Python 侧可 await 的对象（配 pyo3 0.29）。
+# 0.29 的 feature 叫 `tokio-runtime`（= 拉上 tokio 依赖），不是 `tokio`。
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"], optional = true }
 serde = "1"
 serde_json = "1"

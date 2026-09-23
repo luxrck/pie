@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use futures_util::stream::{self, StreamExt};
+
 use crate::cancel::{Cancel, CANCEL_TEXT};
 use crate::config::{self, Config};
 use crate::context;
@@ -49,7 +51,8 @@ pub enum TurnEvent {
         turn: usize,
         step: usize,
     },
-    /// 工具执行完毕（按真实完成顺序推；`content` 截到 500 字，与 Python 同）
+    /// 工具执行完毕（按真实完成顺序推；`content` 是**原样**文本，不再截断——
+    /// 少显示是展示层的事，见 `Session::tool_call`）
     ToolResult {
         name: String,
         content: String,
@@ -57,7 +60,7 @@ pub enum TurnEvent {
     },
     /// 最终答复。
     ///
-    /// **只在非流式（`cfg.stream = false`）时推**：流式下正文已经通过 `AssistantText` 增量
+    /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `AssistantText` 增量
     /// 推过了，再推一次消费者会重复显示（Python 是流式也推 `answer`，靠 TUI 覆盖面板绕过）。
     Answer(String),
 }
@@ -303,13 +306,32 @@ impl Session {
         self.turn_count += 1;
     }
 
+    /// 追加一条 **assistant** 消息（纯文本、无 `tool_calls`）——给嵌入方补历史用。
+    ///
+    /// 典型场景（synthetic 那套）：模型这一轮什么也没改，就在历史里补一条 assistant 再补一条
+    /// user 提醒，然后**接着跑**下一个 `aturn`。计 `turn_count` 只数用户消息，这里不动它。
+    pub fn push_assistant(&mut self, text: &str) {
+        self.messages.push(Message {
+            role: "assistant".into(),
+            content: Some(Content::Text(text.to_string())),
+            ..Default::default()
+        });
+    }
+
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
     /// **不落盘会话**（由调用方 `save`）；压缩事件写进 manifest（`ephemeral` 会话不写）。
     ///
-    /// 回合语义（对齐 Python `loop.aturn`）：工具失败文本化后照常回传、达到 `cfg.max_steps` 就把
+    /// 回合语义（对齐 Python `loop.aturn`）：工具失败文本化后照常回传、达到 `max_steps` 就把
     /// 最后一段 assistant 文本当答复（不额外追加消息）、`tool` 结果与 `tool_call_id` 严格配对。
     ///
-    /// `cancel` 触发时（`/stop` / TUI 的 Esc）：
+    /// 两个**按次**的执行旋钮（不在配置里，对齐 Python 把 `loop.aturn` 的形参）：
+    ///   - `max_steps`：单回合最多问几次模型；`None` = 不限。
+    ///   - `stream`：`None` = 默认（客户端都实现了 `stream()` → 流式）；`Some(false)` 强制一次性
+    ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
+    ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `cfg.parallel_tools`
+    ///     （默认 true）。工具共享可变状态时必须 `Some(false)`（改为按模型返回顺序串行）。
+    ///
+    /// `cancel` 触发时（TUI 的 `Esc`）：
     ///   - 模型请求中的取消 → 直接收尾（不追加 assistant 消息）；
     ///   - 工具执行中的取消 → shell 会杀掉整个进程组，**未执行的 `tool_calls` 补 `CANCEL_TEXT` 的
     ///     tool 消息**（保证每个 `tool_call_id` 都有配对结果、API 序列合法，Python `_cancel_tools` 同款）；
@@ -319,6 +341,9 @@ impl Session {
         input: &str,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
         cancel: &Cancel,
+        max_steps: Option<usize>,
+        stream: Option<bool>,
+        parallel_tools: Option<bool>,
     ) -> Result<String, LlmError> {
         self.push_user(input);
         let manifest = self.manifest.clone();
@@ -334,7 +359,10 @@ impl Session {
         };
 
         // 配置值拷出来（不长期借 `self.config`：后面还要 `&mut self` 做注入/降级）
-        let (use_stream, max_steps) = (self.config.stream, self.config.max_steps);
+        // `stream: None` = 用默认（客户端都实现了流式）；对齐 Python `stream is not False` 的判据
+        let use_stream = stream.unwrap_or(true);
+        // `parallel_tools: None` = 跟随配置（Python `cfg.parallel_tools if x is None else x` 同义）
+        let use_parallel = parallel_tools.unwrap_or(self.config.parallel_tools);
         // 回合号（事件里的 `turn` 字段）：历史里的用户消息数（图片消息是 synthetic，不计）
         let turn = self
             .messages
@@ -374,7 +402,7 @@ impl Session {
             );
 
             let specs = self.tools.specs();
-            let called = match self.model_call(&specs, on_event, cancel).await {
+            let called = match self.model_call(&specs, on_event, cancel, use_stream).await {
                 Ok(option) => option,
                 Err(e) => {
                     // file_id 失效（服务端删了 / 中途换了 key）：把历史里的图片块降级成文本占位、
@@ -383,7 +411,8 @@ impl Session {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
-                        self.model_call(&specs, on_event, cancel).await?
+                        self.model_call(&specs, on_event, cancel, use_stream)
+                            .await?
                     } else {
                         return Err(e);
                     }
@@ -426,48 +455,28 @@ impl Session {
                 break;
             }
 
-            // 本批工具结果（按调用顺序）；全部回填后拿它去注入图片
+            // —— 一批工具调用：并发（默认）或按模型返回顺序串行
+            let outcomes = self
+                .tool_call(&tool_calls, use_parallel, cancel, turn, steps, on_event)
+                .await;
+            // 全部收尾后**按原顺序**回填 ToolMessage（并发/串行都是这个顺序 → 历史扁平序列一致，
+            // compaction 的 step 批次 / keep_last_steps 认定不受影响）
             let mut batch_results: Vec<String> = Vec::with_capacity(tool_calls.len());
-            let mut pending_from: Option<usize> = None;
-            for (i, call) in tool_calls.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    pending_from = Some(i);
-                    break;
-                }
-                // 模型给了非法 JSON：把原文前 500 字回给它（比 serde 的英文报错有用），不执行工具
-                let args: Value = match serde_json::from_str(&call.function.arguments) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let raw = call.function.arguments.clone();
-                        let text = format!(
-                            "[参数解析失败] 模型返回了非法 JSON: {}",
-                            raw.chars().take(500).collect::<String>()
-                        );
-                        on_event(TurnEvent::ToolResult {
-                            name: call.function.name.clone(),
-                            content: text.clone(),
-                            arguments: raw,
-                        });
-                        self.messages.push(Message::tool_result(
-                            &call.id,
-                            &call.function.name,
-                            text.clone(),
-                        ));
-                        batch_results.push(text);
-                        continue;
+            let mut interrupted = false;
+            for (call, outcome) in tool_calls.iter().zip(outcomes) {
+                let text = match outcome {
+                    Some(text) => text,
+                    // 被取消：每个 tool_call_id 都要有配对的 tool 消息，否则回放这段历史时
+                    // API 会拒（Python `_cancel_tools` 同款）；结果事件已在 `tool_call` 里推过
+                    None => {
+                        interrupted = true;
+                        CANCEL_TEXT.to_string()
                     }
                 };
-                on_event(TurnEvent::ToolCall {
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                    turn,
-                    step: steps,
-                });
-                let text = dispatch_tool(&self.tools, call, &args, cancel).await;
                 let mut msg = Message::tool_result(&call.id, &call.function.name, text.clone());
-                if call.function.name == "shell" {
-                    // shell 超限自带落盘：把 spill 指针同步成压缩元数据 + manifest 事件
-                    //（只 shell 会落盘 → 按工具名 gate；不然 read 回来的源码字面量会被误判）
+                if call.function.name == "bash" {
+                    // bash 超限自带落盘：把 spill 指针同步成压缩元数据 + manifest 事件
+                    //（只 bash 会落盘 → 按工具名 gate；不然 read 回来的源码字面量会被误判）
                     if let Some(entry) =
                         context::mark_tool_spill(&mut msg, &call.function.name, &text)
                     {
@@ -475,28 +484,9 @@ impl Session {
                     }
                 }
                 self.messages.push(msg);
-                on_event(TurnEvent::ToolResult {
-                    name: call.function.name.clone(),
-                    content: text.chars().take(500).collect(),
-                    arguments: call.function.arguments.clone(),
-                });
-                batch_results.push(text.clone());
-                if text == CANCEL_TEXT {
-                    // 工具自己被取消（shell 会杀进程组并返回哨兵）→ 剩下的都没跑
-                    pending_from = Some(i + 1);
-                    break;
-                }
+                batch_results.push(text);
             }
-            if let Some(from) = pending_from {
-                // 未执行的 tool_calls 补 CANCEL_TEXT：每个 tool_call_id 都必须有配对的 tool 消息，
-                // 否则回放这段历史时 API 会拒（Python `_cancel_tools` 同款）
-                for call in &tool_calls[from.min(tool_calls.len())..] {
-                    self.messages.push(Message::tool_result(
-                        &call.id,
-                        &call.function.name,
-                        CANCEL_TEXT,
-                    ));
-                }
+            if interrupted {
                 cancelled = true;
                 break;
             }
@@ -524,19 +514,20 @@ impl Session {
         Ok(answer.unwrap_or_default())
     }
 
-    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推。
+    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` 由 `aturn` 按次传进来。
     /// 一次模型调用；`Ok(None)` = 请求期间被取消（不 push 任何消息，收尾由 `aturn` 统一做）。
     async fn model_call(
         &self,
         specs: &[Value],
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
         cancel: &Cancel,
+        stream: bool,
     ) -> Result<Option<LlmResult>, LlmError> {
         if cancel.is_cancelled() {
             return Ok(None);
         }
         let call = async {
-            if self.config.stream {
+            if stream {
                 self.llm
                     .stream(&self.messages, specs, |chunk| match chunk {
                         StreamChunk::Content(d) => on_event(TurnEvent::AssistantText(d)),
@@ -610,6 +601,90 @@ impl Session {
         }
     }
 
+    /// 执行**一批** `tool_call`（`model_call` 的姊妹：那边问模型，这边跑工具）。
+    ///
+    /// `parallel` = 同一批是否并发：
+    ///   - `true`：它们同时开跑，谁先跑完谁先出结果（工具共享可变状态时**不能**用）；
+    ///   - `false`：按模型返回顺序一个个来（`buffer_unordered(1)` = 严格串行）。
+    ///
+    /// 两条路的**事件形状一致**：先把整批 `tool_call` 发出去（并发时事件只能先统一发；串行
+    /// 也保持同序，嵌入方不用分情况处理），再按「谁先跑完谁先发」推 `tool_result`——被取消的
+    /// 那条推 `CANCEL_TEXT`（Python `_cancel_tools` 同款）。
+    ///
+    /// 返回与 `calls` **等长同序**的文本（`None` = 该调用被取消）——回填消息时
+    /// 才能保证历史扁平序列与串行一致（compaction 的 step 批次 / `keep_last_steps` 都看它），
+    /// 由调用方统一补 `CANCEL_TEXT`。
+    ///
+    /// 工具输出的文本**原样**交出去（不在这里截断）：要少显示是展示层（TUI / CLI）的事，
+    /// 要少回传给模型是工具自己配容量上限（`shell` / `read`）的事。
+    ///
+    /// 参数非法 JSON **不执行工具**、只把原文回给模型；单个工具失败文本化后照常返回，
+    /// 不拖累同批其他工具（对齐 Python `loop._run_tool_call`）。
+    async fn tool_call(
+        &self,
+        calls: &[ToolCall],
+        parallel: bool,
+        cancel: &Cancel,
+        turn: usize,
+        step: usize,
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+    ) -> Vec<Option<String>> {
+        for call in calls {
+            on_event(TurnEvent::ToolCall {
+                name: call.function.name.clone(),
+                arguments: call.function.arguments.clone(),
+                turn,
+                step,
+            });
+        }
+        // ⚠ `on_event` **不能**进 future：`&mut dyn FnMut` 没实现 `Sync`，一旦被 future 捕获，
+        // `aturn` 的 future 就不再是 `Send`，TUI 那边的 `tokio::spawn` 直接编不过。
+        // 所以 future 只负责算出结果，事件在下面这个循环里「完成的当下」推。
+        //
+        // ⚠ future 必须在 `for` 里造（而不是 `map(|(i, call)| async move {…})`）：
+        // 闭包参数的生命周期会变成 HRTB，撞上 rustc 的已知限制（#100013，报在调用方
+        // `tokio::spawn` 上一头雾水）。`for` 循环里的绑定没有这层问题。
+        let registry = &self.tools;
+        let mut futures = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            futures.push(async move {
+                let outcome = if cancel.is_cancelled() {
+                    None // 还没轮到就取消了
+                } else {
+                    match serde_json::from_str::<Value>(&call.function.arguments) {
+                        // 比 serde 的英文报错有用：把原文回给模型（上限 500 字）
+                        Err(_) => Some(format!(
+                            "[参数解析失败] 模型返回了非法 JSON: {}",
+                            call.function.arguments.chars().take(500).collect::<String>()
+                        )),
+                        Ok(args) => {
+                            let text = dispatch_tool(registry, call, &args, cancel).await;
+                            (text != CANCEL_TEXT).then_some(text) // shell 被杀 → 哨兵 → 算取消
+                        }
+                    }
+                };
+                (index, outcome)
+            });
+        }
+        // 并发度 = 整批（并发）或 1（串行）；`buffer_unordered` 只决定「同时 poll 几个」，
+        // 所以串行时后面的 future 根本不会被 poll —— 与手写一个个 await 等价。
+        let limit = if parallel { calls.len().max(1) } else { 1 };
+        let mut stream = stream::iter(futures).buffer_unordered(limit);
+
+        let mut outcomes: Vec<Option<String>> = vec![None; calls.len()];
+        while let Some((index, outcome)) = stream.next().await {
+            // 文本**原样**推给嵌入方（不在这里截断）：要少显示是展示层的事（TUI 按行截、
+            // CLI 只取首行），要少回传给模型是工具自己配容量上限的事。
+            on_event(TurnEvent::ToolResult {
+                name: calls[index].function.name.clone(),
+                content: outcome.clone().unwrap_or_else(|| CANCEL_TEXT.to_string()),
+                arguments: calls[index].function.arguments.clone(),
+            });
+            outcomes[index] = outcome;
+        }
+        outcomes
+    }
+
     /// 把历史里的 `file` 块就地换成文本占位，并把对应记录标失效（下次同图重传）。
     ///
     /// ⚠ 与 Python 有意不同：那边降级成**内联 base64**；这边不回退 base64 —— 代价是这次
@@ -660,7 +735,7 @@ impl Session {
                 cfg.files_api && llm::model_supports_files(&cfg.model),
                 cfg.base_url.trim_end_matches('/').to_string(),
                 llm::key_fingerprint(&cfg.api_key),
-                cfg.files_ttl_days,
+                cfg.files_ttl_days as i64,
             )
         };
         if !enabled {
@@ -853,6 +928,73 @@ impl Session {
         self.messages.truncate(1);
     }
 
+    /// `/clear`：把当前窗口（system 与**既有窗口摘要**除外）写成一块**窗口块**落盘，开新窗口。
+    ///
+    /// 新窗口 = 当前 system prompt + **所有**窗口块的「摘要 + 指针」（不只最新一块，与 Python
+    /// `Session.clear_window()` 同款）：可见上下文立刻瘦下来，原文仍在 `~/.pie/windows/`
+    /// 可经指针回查（`full_history` / resume 都能展开）。
+    ///
+    /// 返回归档后手上的窗口块**总数**（调用方拿去提示）；落盘失败则原样返回、**不动窗口**
+    ///（宁可不清，也不能把历史弄丢）。
+    pub fn clear_window(&mut self) -> Result<usize, String> {
+        // 既有窗口摘要不再入档：它们在 `self.windows` 里、由 `window_summary_messages` 统一重建
+        //（否则会「摘要的摘要」层层嵌套，旧窗口的信息反而从可见上下文里掉出去）
+        let old: Vec<Value> = self
+            .messages
+            .iter()
+            .skip(1)
+            .filter(|m| !(m.role == "system" && m.compress_level == 3))
+            .map(|m| json!(m))
+            .collect();
+        if !old.is_empty() {
+            let raw: String = old.iter().map(|d| format!("{d}\n")).collect();
+            let path = context::write_window_block(&raw)
+                .map_err(|e| format!("写窗口块失败: {e}"))?;
+            let (head, tail) = self.window_sizes();
+            // 与上下文压缩同一条 manifest（`pie context info` / `/stat` 看的就是它）
+            record_compact(
+                self.manifest.as_deref(),
+                &json!({
+                    "ts": config::iso_utc(config::now_unix()),
+                    "level": 3,
+                    "kind": "session",
+                    "raw_path": path.display().to_string(),
+                    "raw_hash": context::content_hash(&raw),
+                    "summary": context::summarize_turns(&old, head, tail)
+                        .chars()
+                        .take(200)
+                        .collect::<String>(),
+                }),
+            );
+            self.windows.push(path);
+        }
+        // 新窗口：只留「当前 system prompt + 各窗口块的摘要/指针」（提示词顺便重建一次）
+        self.messages = std::iter::once(Message::system(config::build_system_prompt(
+            &self.config,
+            self.config.system_prompt.as_deref(),
+            &self.config.append_system_prompt,
+        )))
+        .chain(self.window_summary_messages())
+        .collect();
+        Ok(self.windows.len())
+    }
+
+    /// 窗口块摘要的 head/tail（会话级压缩没配就用默认值，与 Python 同款）。
+    fn window_sizes(&self) -> (usize, usize) {
+        match self
+            .config
+            .compaction
+            .as_ref()
+            .and_then(|c| c.session.as_ref())
+        {
+            Some(sc) => (sc.head, sc.tail),
+            None => {
+                let d = config::SessionCompaction::default();
+                (d.head, d.tail)
+            }
+        }
+    }
+
     /// `/stat` 的报告文本（对齐 Python `usage_report`）：
     /// 上下文占用 / 水位 / 输入预算 / 各角色估算 / 压缩事件 / API 用量。
     pub fn usage_report(&self) -> String {
@@ -865,7 +1007,7 @@ impl Session {
         };
         let limit = self.config.context_budget();
         let reserved = match self.config.reserved_tokens {
-            Some(n) => config::thousands(n),
+            Some(n) => config::thousands(n as i64),
             None => "服务端默认".to_string(),
         };
         let pct = if limit > 0 {
@@ -890,19 +1032,19 @@ impl Session {
         parts.push(format!(
             "{label}{} / {} tokens ({pct:.1}%)",
             config::thousands(total),
-            config::thousands(limit)
+            config::thousands(limit as i64)
         ));
         parts.push(format!(
             "软阈值 {} ({:.0}%) | 目标水位 {} ({:.0}%)",
-            config::thousands(self.config.soft_limit()),
+            config::thousands(self.config.soft_limit() as i64),
             self.config.soft_ratio() * 100.0,
-            config::thousands(self.config.target_limit()),
+            config::thousands(self.config.target_limit() as i64),
             self.config.target_ratio() * 100.0
         ));
         parts.push(format!(
             "输入预算 {} = 上下文窗口 {} − 输出预留 {reserved}",
-            config::thousands(limit),
-            config::thousands(self.config.context_window)
+            config::thousands(limit as i64),
+            config::thousands(self.config.context_window as i64)
         ));
         parts.push(format!("各角色占用（估算）：{roles_txt}"));
 
@@ -1339,7 +1481,7 @@ fn first_line(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Usage;
+    use crate::llm::{FunctionCall, Usage};
 
     /// 改进程级 `PIE_DIR` 的用例共用 `config::ENV_LOCK`（跟 `context` 的测试串行化）。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1376,6 +1518,254 @@ mod tests {
 
     fn tools() -> ToolRegistry {
         ToolRegistry::new(Default::default())
+    }
+
+    /// 跑一批工具的会话（不落盘、不碰 `~/.pie`）：`tool_call` 只需要一个 `&Session`。
+    fn session() -> Session {
+        Session::ephemeral(&Config::default(), llm(), tools())
+    }
+
+    // ---------------------------------------------------------------- 一批工具的并发/串行
+
+    fn shell_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: format!("{{\"command\": {command:?}}}"),
+            },
+        }
+    }
+
+    /// `tool_call` 的结果 → 可断言的文本（`None` = 被取消）。
+    fn texts(outcomes: &[Option<String>]) -> Vec<String> {
+        outcomes
+            .iter()
+            .map(|o| o.clone().unwrap_or_else(|| "[cancelled]".into()))
+            .collect()
+    }
+
+    fn event_kinds(events: &[TurnEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                TurnEvent::ToolCall { .. } => "call",
+                TurnEvent::ToolResult { .. } => "result",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// 并发执行：三个工具（两个 0.6s + 一个 0.05s）总耗时 ≈ 最慢那个（串行要 1.25s+）。
+    /// 同时验证：结果**按调用顺序**返回（快的先跑完也不抢位），
+    /// 事件形状是「先全部 tool_call、再按完成顺序 tool_result」。
+    #[test]
+    fn parallel_batch_overlaps_and_keeps_call_order() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let calls = vec![
+                shell_call("c1", "sleep 0.6; echo one"),
+                shell_call("c2", "sleep 0.6; echo two"),
+                shell_call("c3", "sleep 0.05; echo three"),
+            ];
+            let mut events: Vec<TurnEvent> = Vec::new();
+            let started = std::time::Instant::now();
+            {
+                let mut sink = |e: TurnEvent| events.push(e);
+                let outcomes = session()
+                    .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                    .await;
+                // 结果与入参等长同序：慢的那两条仍占下标 0 / 1
+                let texts = texts(&outcomes);
+                assert!(texts[0].contains("one"), "{texts:?}");
+                assert!(texts[1].contains("two"), "{texts:?}");
+                assert!(texts[2].contains("three"), "{texts:?}");
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(
+                elapsed < 1.1,
+                "三个工具应当重叠执行（串行要 1.25s+），实际 {elapsed:.2}s"
+            );
+
+            assert_eq!(
+                event_kinds(&events),
+                ["call", "call", "call", "result", "result", "result"]
+            );
+            // 完成顺序：最快的（three）先出结果 —— 证明真的并发，而不是串行跑完再补事件
+            match &events[3] {
+                TurnEvent::ToolResult { content, .. } => assert!(content.contains("three"), "{content}"),
+                other => panic!("第 4 个事件该是结果：{other:?}"),
+            }
+        });
+    }
+
+    /// 串行：同样的两个 0.6s 工具按调用顺序一个个跑（总耗时是两个之和），
+    /// 结果事件也按调用顺序。
+    #[test]
+    fn serial_batch_runs_in_call_order() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let calls = vec![
+                shell_call("c1", "sleep 0.6; echo one"),
+                shell_call("c2", "sleep 0.6; echo two"),
+            ];
+            let mut events: Vec<TurnEvent> = Vec::new();
+            let started = std::time::Instant::now();
+            {
+                let mut sink = |e: TurnEvent| events.push(e);
+                session()
+                    .tool_call(&calls, false, &Cancel::new(), 1, 1, &mut sink)
+                    .await;
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(elapsed > 1.1, "串行总耗时是两个之和，实际 {elapsed:.2}s");
+            assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
+            match &events[2] {
+                TurnEvent::ToolResult { content, .. } => assert!(content.contains("one"), "{content}"),
+                other => panic!("第 3 个事件该是结果：{other:?}"),
+            }
+        });
+    }
+
+    /// 参数非法 JSON：**不执行工具**，把原文回给模型（但 `tool_call` / `tool_result` 事件照发）。
+    #[test]
+    fn invalid_arguments_are_reported_without_running_the_tool() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let calls = vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: "{不是 JSON".into(),
+                },
+            }];
+            let mut events: Vec<TurnEvent> = Vec::new();
+            let mut sink = |e: TurnEvent| events.push(e);
+            let outcomes = session()
+                .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                .await;
+            let text = texts(&outcomes)[0].clone();
+            assert!(text.starts_with("[参数解析失败]"), "{text}");
+            assert!(!text.contains("[exit="), "没执行工具，不该有退出码：{text}");
+            assert_eq!(event_kinds(&events), ["call", "result"]);
+        });
+    }
+
+    /// `/clear`：把当前窗口写进 `~/.pie/windows/`、只留「system + 各窗口块的摘要/指针」，
+    /// 而且这段历史**能经 `full_history` 原样展开回来**（归档不能丢信息）。
+    #[test]
+    fn clear_window_archives_and_expands_back() {
+        let _g = env_lock();
+        let dir = pie_dir_tmp("clear");
+        let mut s = Session::at(dir.join("s.jsonl"), &Config::default(), llm(), tools());
+        s.push_user("第一问");
+        s.messages.push(Message {
+            role: "assistant".into(),
+            content: Some(Content::Text("第一答".into())),
+            ..Default::default()
+        });
+        s.push_user("第二问");
+
+        assert_eq!(s.clear_window().expect("归档成功"), 1, "一个窗口块");
+
+        // 新窗口 = system（重建）+ 窗口摘要（level 3，带指针）
+        assert_eq!(s.messages.len(), 2, "{:?}", s.messages.len());
+        assert_eq!(s.messages[0].role, "system");
+        assert_eq!(s.messages[0].compress_level, 0);
+        assert_eq!(s.messages[1].compress_level, 3);
+        let block = PathBuf::from(s.messages[1].raw_path.clone().expect("带指针"));
+        assert!(block.starts_with(context::windows_dir()), "{block:?}");
+        assert!(block.exists(), "{block:?}");
+        // 块里是**原文**（三条都在），且文件名最后一段就是内容 hash
+        let raw = std::fs::read_to_string(&block).unwrap();
+        for needle in ["第一问", "第一答", "第二问"] {
+            assert!(raw.contains(needle), "块里丢了 {needle}：{raw}");
+        }
+        assert!(
+            block.file_stem().unwrap().to_string_lossy().ends_with(&context::content_hash(&raw)),
+            "hash 要放文件名最后一段：{block:?}"
+        );
+        // 摘要有窗口指针标记 + 首尾轮次
+        let text = context::content_text(s.messages[1].content.as_ref());
+        assert!(text.contains("[历史窗口:"), "{text}");
+        assert!(text.contains("第一问"), "{text}");
+
+        // manifest 里记了一条 level=3 的会话级事件
+        let manifest = manifest_path_of(&s.path);
+        let entries: Vec<Value> = std::fs::read_to_string(&manifest)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e["level"] == 3 && e["kind"] == "session"),
+            "{entries:?}"
+        );
+
+        // 归档的信息一条不少（展开回原样）
+        let full = s.full_history();
+        let roles: Vec<&str> = full.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"], "{roles:?}");
+
+        // 第二次 /clear：新窗口里没东西可归档 → 块数不变
+        assert_eq!(s.clear_window().expect("再来一次"), 1);
+        assert_eq!(s.windows.len(), 1);
+    }
+
+
+    /// 工具输出**原样**推给嵌入方：Session 不在这里截断（与 Python `clip_output(text, 500)`
+    /// 有意不同）——少显示是展示层的事（TUI 按 `TOOL_BODY_LINES` 截、CLI 只取首行），
+    /// 少回传给模型是工具自己配容量上限的事。
+    #[test]
+    fn tool_result_event_keeps_the_full_output() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            // `seq 1 300` → 1000+ 字，远超 500
+            let calls = vec![shell_call("c1", "seq 1 300")];
+            let mut events: Vec<TurnEvent> = Vec::new();
+            let mut sink = |e: TurnEvent| events.push(e);
+            let outcomes = session()
+                .tool_call(&calls, true, &Cancel::new(), 1, 1, &mut sink)
+                .await;
+            let text = outcomes[0].clone().expect("跑成功了");
+            assert!(text.len() > 500, "工具输出本来就很长：{} 字", text.len());
+            match &events[1] {
+                TurnEvent::ToolResult { content, .. } => {
+                    assert_eq!(content, &text, "事件里的文本要原样（不截断）")
+                }
+                other => panic!("第 2 个事件该是结果：{other:?}"),
+            }
+        });
+    }
+
+    /// 整批开始前就已被取消：一条都不执行（全 `None`），但仍各推一条 `CANCEL_TEXT` 结果事件。
+    #[test]
+    fn cancelled_batch_skips_every_tool() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let calls = vec![shell_call("c1", "echo hi"), shell_call("c2", "echo hi")];
+            let cancel = Cancel::new();
+            cancel.cancel();
+            let mut events: Vec<TurnEvent> = Vec::new();
+            let mut sink = |e: TurnEvent| events.push(e);
+            let outcomes = session()
+                .tool_call(&calls, true, &cancel, 1, 1, &mut sink)
+                .await;
+            assert!(outcomes.iter().all(|o| o.is_none()));
+            // 被取消的也要各推一条 `CANCEL_TEXT` 结果事件（每个 `tool_call_id` 都要有交代）
+            assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
+            for event in &events[2..] {
+                match event {
+                    TurnEvent::ToolResult { content, .. } => {
+                        assert_eq!(content.as_str(), CANCEL_TEXT)
+                    }
+                    other => panic!("第 3/4 个事件该是结果：{other:?}"),
+                }
+            }
+        });
     }
 
     /// save → load 往返：消息（去掉旧 system 后重建）、title、turn_count、usage 都要活下来。
@@ -1591,7 +1981,7 @@ mod tests {
         let spill = context::write_raw(full_text, "tool").unwrap();
         let mut tool = Message::tool_result(
             "call_1",
-            "shell",
+            "bash",
             format!(
                 "[exit=0]\n\n[工具输出全文已保存: {}]\n\nline1",
                 spill.display()
@@ -1784,7 +2174,7 @@ mod tests {
             r#"{"__meta__":true,"usage":{"prompt_tokens":123,"completion_tokens":null,"total_tokens":null,"prompt_cache_hit_tokens":null,"prompt_cache_miss_tokens":null,"reasoning_tokens":null,"calls":3},"windows":[],"cwd":"/tmp","title":"旧会话"}"#,
             r#"{"role":"system","content":"SENTINEL-OLD-SYSTEM","compress_level":3,"raw_path":"/x"}"#,
             r#"{"role":"user","content":"你好","synthetic":false}"#,
-            r#"{"role":"assistant","content":"在的","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}"#,
+            r#"{"role":"assistant","content":"在的","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}"#,
             r#"{"role":"tool","content":"[exit=0]\n\n/tmp","tool_call_id":"call_1"}"#,
         ]
         .join("\n");

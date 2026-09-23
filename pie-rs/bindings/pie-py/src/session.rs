@@ -26,9 +26,9 @@ use pyo3::types::PyDict;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 
-use pie_rs::cancel::Cancel;
-use pie_rs::context::CompactMode;
-use pie_rs::session::{Session as CoreSession, TurnEvent};
+use pie::cancel::Cancel;
+use pie::context::CompactMode;
+use pie::session::{Session as CoreSession, TurnEvent};
 
 use crate::config::PyConfig;
 use crate::llm::PyLlmClient;
@@ -38,7 +38,7 @@ use crate::{busy_error, llm_error, pie_error};
 // ---------------------------------------------------------------- Cancel
 
 /// 取消信号：给 `aturn(cancel=...)` 用，或从别的线程停住一个正在跑的回合。
-#[pyclass(name = "Cancel", module = "pie_rs")]
+#[pyclass(name = "Cancel", module = "pie")]
 pub struct PyCancel(pub(crate) Cancel);
 
 #[pymethods]
@@ -59,27 +59,32 @@ impl PyCancel {
     }
 
     fn __repr__(&self) -> String {
-        format!("<pie_rs.Cancel cancelled={}>", self.0.is_cancelled())
+        format!("<pie.Cancel cancelled={}>", self.0.is_cancelled())
     }
 }
 
 // ---------------------------------------------------------------- Session
 
-#[pyclass(name = "Session", module = "pie_rs")]
+#[pyclass(name = "Session", module = "pie")]
 pub struct PySession {
     inner: std::sync::Arc<TokioMutex<CoreSession>>,
     /// 会话文件路径（构造后就固定；单拎出来是为了不为了读个路径去抢锁）。
     path: String,
     /// 当前回合的取消信号 —— `stop()` 靠它中断（回合结束清空）。
     current: StdMutex<Option<Cancel>>,
+    /// `asyncio` 入口登记的事件队列（`aturn_async` 用；`events()` 读它）。
+    #[cfg(feature = "asyncio")]
+    events_queue: StdMutex<Option<Py<PyAny>>>,
 }
 
 impl PySession {
-    fn wrap(session: CoreSession) -> Self {
+    pub(crate) fn wrap(session: CoreSession) -> Self {
         Self {
             path: session.path.display().to_string(),
             inner: std::sync::Arc::new(TokioMutex::new(session)),
             current: StdMutex::new(None),
+            #[cfg(feature = "asyncio")]
+            events_queue: StdMutex::new(None),
         }
     }
 
@@ -92,7 +97,7 @@ impl PySession {
         cfg: &PyConfig,
         llm: &PyLlmClient,
         tools: &PyToolRegistry,
-    ) -> (pie_rs::config::Config, pie_rs::llm::LlmClient, pie_rs::tools::ToolRegistry) {
+    ) -> (pie::config::Config, pie::llm::LlmClient, pie::tools::ToolRegistry) {
         (cfg.inner.clone(), llm.inner.clone(), tools.inner.clone())
     }
 }
@@ -190,6 +195,54 @@ impl PySession {
         Ok(self.lock()?.usage_report())
     }
 
+    /// `/clear`：把当前窗口归档成**窗口块**（`~/.pie/windows/`）后开新窗口，
+    /// 返回手上的窗口块总数。历史不丢——原文留在块里，可经指针回查（`full_history` 能展开）。
+    fn clear_window(&self) -> PyResult<usize> {
+        self.lock()?.clear_window().map_err(pie_error)
+    }
+
+    /// 当前配置的**快照**（`pie.Config`）。
+    ///
+    /// ⚠ 是副本：改它**不影响**会话（会话持有自己那份）。要改会话的配置用
+    /// `set_model()` / `set_reasoning_effort()`，或建会话时把配置传进去。
+    #[getter]
+    fn config(&self) -> PyResult<crate::config::PyConfig> {
+        Ok(crate::config::PyConfig {
+            inner: self.lock()?.config.clone(),
+        })
+    }
+
+    /// 切模型：改配置 + 同步客户端实例 + **写回配置文件**；返回一句提示（与 Python `set_model` 同款）。
+    ///
+    /// ⚠ 会写盘（写到 `Config.config_file`，没设就落 `~/.pie/config.toml`）。
+    fn set_model(&self, name: &str) -> PyResult<String> {
+        Ok(self.lock()?.set_model(name))
+    }
+
+    /// 切思考深度（`level` 与 `Config.reasoning_effort` 同口径：`none`/`low`/`high`/`max`…）；
+    /// 同样会写回配置文件。返回一句提示。
+    fn set_reasoning_effort(&self, level: &str) -> PyResult<String> {
+        Ok(self.lock()?.set_reasoning_effort(level))
+    }
+
+    /// 追加一条 **assistant** 消息（纯文本、无工具调用）——给嵌入方补历史用。
+    ///
+    /// 例：模型这一轮什么都没改，就在历史里补一条 assistant 再跑一个 `aturn`（user 提醒），
+    /// 让对话读起来是一次真实往来。
+    fn push_assistant(&self, text: &str) -> PyResult<()> {
+        self.lock()?.push_assistant(text);
+        Ok(())
+    }
+
+    /// **API 形状**的消息（去掉压缩元数据）——存档 / 喂给别的模型用；
+    /// `messages` 给的是原始 dict（含 `compress_level` / `raw_path` 那些）。
+    #[getter]
+    fn api_messages(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let guard = self.lock()?;
+        let values: Vec<Value> = guard.messages.iter().map(|m| m.to_api()).collect();
+        crate::json_to_py(py, &Value::Array(values))
+    }
+
     /// 压缩历史（manifest 里的每条事件，dict 列表）。
     fn compression_history(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self.lock()?;
@@ -251,13 +304,20 @@ impl PySession {
     /// `on_event(event: dict)` 边跑边收事件（`content_delta` / `reasoning_delta` / `tool_call` /
     /// `tool_result` / `answer`，形状与纯 Python 版 `loop.aturn` 的 `on_event` 一致）；
     /// 事件在**调用线程**上回调（所以回调里能安全地 print / 更新自己的状态）。
-    #[pyo3(signature = (input, on_event=None, cancel=None))]
-    fn aturn(
+    ///
+    /// `max_steps=None` = 不限步数；`stream=None` = 默认流式（`False` 则一次性 complete，
+    /// 只推一次 `answer`）；`parallel_tools=None` = 跟随 `Config.parallel_tools`（同一批
+    /// tool_calls 是否并发执行）。三个都与纯 Python 版 `loop.aturn` 的同名形参同义（**不是**配置项）。
+    #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    pub(crate) fn aturn(
         &self,
         py: Python<'_>,
         input: String,
         on_event: Option<Py<PyAny>>,
         cancel: Option<PyRef<'_, PyCancel>>,
+        max_steps: Option<usize>,
+        stream: Option<bool>,
+        parallel_tools: Option<bool>,
     ) -> PyResult<String> {
         // ① 独占会话：拿不到锁立刻报错（别排队等）
         let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
@@ -277,7 +337,9 @@ impl PySession {
                     // 接收端没了（调用方已放弃）就静默丢弃，别把回合搞崩
                     let _ = tx.send(event);
                 };
-                session.aturn(&input, &mut emit, &token).await
+                session
+                    .aturn(&input, &mut emit, &token, max_steps, stream, parallel_tools)
+                    .await
             };
             result
         });
@@ -322,9 +384,151 @@ impl PySession {
         }
     }
 
-    fn __repr__(&self) -> String {
-        format!("<pie_rs.Session path={} busy={}>", self.path, self.inner.try_lock().is_err())
+    // ------------------------------------------------------------ asyncio（M5）
+    //
+    // 形状：`aturn_async()` 返回一个**可 await** 的对象，事件走 `async for ev in s.events()`。
+    // 三处与同步版不同（规划 §5.2 的三个坑），都由下面这套接口兜住：
+    //   ① 事件 → `asyncio.Queue`（从 tokio 线程 `loop.call_soon_threadsafe(queue.put_nowait, ev)`
+    //      —— 这一步由 Python 侧组的 `sink` 干，本模块只负责「在 tokio 线程上叫它」）；
+    //   ② `task.cancel()` → Python 侧那层 glue 捕获 `CancelledError` 后调 `s.stop()`
+    //      （见 `pie/_async.py`；tokio 任务不会因为 Python 侧取消而自己停）；
+    //   ③ runtime 用 `pyo3_async_runtimes::tokio` 的**进程级** runtime，不随 loop 生死。
+
+    /// 异步回合的底层口：把回合扔到 runtime 上跑，返回可 await 的对象。
+    ///
+    /// `sink(payload)` 在 **tokio 线程**上被调用（持 GIL）：事件是 dict，回合结束收到 `None`。
+    /// ⚠ 它必须只做「把东西丢给 asyncio」（`pie/_async.py` 里就是 `call_soon_threadsafe` +
+    /// `queue.put_nowait`）—— **别碰 Session**（回合正占着锁）。
+    #[cfg(feature = "asyncio")]
+    #[pyo3(signature = (input, sink, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    fn turn_future(
+        &self,
+        py: Python<'_>,
+        input: String,
+        sink: Py<PyAny>,
+        cancel: Option<Py<PyAny>>,
+        max_steps: Option<usize>,
+        stream: Option<bool>,
+        parallel_tools: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        // ① 独占会话 + 取消信号（与同步 `aturn` 同一套）
+        let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
+        let token = match &cancel {
+            Some(obj) => obj
+                .bind(py)
+                .extract::<PyRef<'_, PyCancel>>()
+                .map_err(|_| pie_error("cancel= 只接受 pie.Cancel（或 None）"))?
+                .0
+                .clone(),
+            None => Cancel::new(),
+        };
+        if let Ok(mut slot) = self.current.lock() {
+            *slot = Some(token.clone());
+        }
+
+        let sink_for_events = sink.clone_ref(py);
+        let sink_end = sink;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut session = guard;
+            let mut emit = move |event: TurnEvent| {
+                // 事件：只会「往 asyncio 队列里丢」，失败就当没发生（别把回合弄崩）
+                let _ = Python::attach(|py| -> PyResult<()> {
+                    let obj = event_to_py(py, &event)?;
+                    sink_for_events.bind(py).call1((obj,))?;
+                    Ok(())
+                });
+            };
+            let result = session
+                .aturn(&input, &mut emit, &token, max_steps, stream, parallel_tools)
+                .await;
+            // 收尾：告诉 Python 侧「事件到头了」——`events()` 的迭代器据此 StopAsyncIteration
+            let _ = Python::attach(|py| -> PyResult<()> {
+                sink_end.bind(py).call1((py.None(),))?;
+                Ok(())
+            });
+            result.map_err(|e| Python::attach(|py| llm_error(py, e)))
+        })
+        .map(|obj| obj.unbind())
     }
+
+    /// 登记事件队列（`aturn_async` 自己调；`events()` 读它）。
+    #[cfg(feature = "asyncio")]
+    fn _set_events_queue(&self, queue: Py<PyAny>) {
+        self.store_events_queue(queue);
+    }
+
+    /// `async for ev in session.events()` 用的（内部就是 `pie._async._Events(queue)`）。
+    ///
+    /// 没跑过 `aturn_async` 就报错——事件流是**按回合**的，没有常驻队列。
+    #[cfg(feature = "asyncio")]
+    fn events(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let queue = self
+            .events_queue
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|q| q.clone_ref(py)))
+            .ok_or_else(|| {
+                busy_error_or(
+                    "还没有事件队列：先调 session.aturn_async(...)（事件流是按回合的）",
+                )
+            })?;
+        let helper = py.import("pie._async")?.getattr("_Events")?;
+        Ok(helper.call1((queue,))?.unbind())
+    }
+
+    /// `await` 版回合（M5）：返回一个可 await 的对象，返回值同 `aturn`。
+    ///
+    /// 事件走 `async for ev in session.events()`；`task.cancel()` / `session.stop()` 都能真停住
+    /// （前者靠 Python 侧的 glue 把 `CancelledError` 桥到 `stop()`）。
+    #[cfg(feature = "asyncio")]
+    #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    fn aturn_async(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        input: String,
+        cancel: Option<Py<PyAny>>,
+        max_steps: Option<usize>,
+        stream: Option<bool>,
+        parallel_tools: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        // 队列**在这里就建好并登记**：这样 `s.aturn_async(...)` 返回后 `s.events()` 立刻能用
+        //（不用先 await 一下让协程跑起来）。胶水（哨兵 / CancelledError → stop）在 Python 侧。
+        let asyncio = py.import("asyncio")?;
+        let queue = asyncio.getattr("Queue")?.call0()?;
+        slf.store_events_queue(queue.clone().unbind());
+
+        let helper = py.import("pie._async")?.getattr("aturn_async")?;
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("queue", queue)?;
+        kwargs.set_item("cancel", cancel)?;
+        kwargs.set_item("max_steps", max_steps)?;
+        kwargs.set_item("stream", stream)?;
+        kwargs.set_item("parallel_tools", parallel_tools)?;
+        Ok(helper.call((slf, input), Some(&kwargs))?.unbind())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<pie.Session path={} busy={}>", self.path, self.inner.try_lock().is_err())
+    }
+}
+
+/// Rust 侧内部：把事件队列塞进槽位（`_set_events_queue` 与 `aturn_async` 共用）。
+///
+/// ⚠ 放在 `#[pymethods]` **外面**：它不该是 Python 方法（暴露出去只会污染接口面，
+/// 存根对拍用例也会红）。
+#[cfg(feature = "asyncio")]
+impl PySession {
+    fn store_events_queue(&self, queue: Py<PyAny>) {
+        if let Ok(mut slot) = self.events_queue.lock() {
+            *slot = Some(queue);
+        }
+    }
+}
+
+/// 通用一点的报错（`events()` 之类「接口用错」的场景）。
+#[cfg(feature = "asyncio")]
+fn busy_error_or(msg: &str) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(msg.to_string())
 }
 
 /// `TurnEvent` → dict（键名与纯 Python 版 `loop.aturn` 的 `on_event` dict 对齐）。
