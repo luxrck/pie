@@ -10,17 +10,36 @@
 //!   ✅ 图片   —— read 图 → Files API 上传（`file` 块注入，不回退内联）+ `files list|gc`
 //!   ⬜ 并行工具 / TUI
 
-// 这里换成对 lib 的引用（M0：核心层已提成 `pie_rs` 库，CLI 只是它的一个消费者）。
+// 这里换成对 lib 的引用（核心层已提成 `pie` 库，CLI 只是它的一个消费者）。
 // ⚠ 模块声明在 `src/lib.rs`，别在这里再写 `mod xxx;`——那会变成两份独立的编译单元。
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-use pie_rs::llm::LlmClient;
-use pie_rs::session::{Session, TurnEvent};
-use pie_rs::tools::{tools_from_spec, ToolRegistry};
-use pie_rs::{cancel, config, context, session, tui};
+use pie::llm::LlmClient;
+use pie::session::{Session, TurnEvent};
+use pie::tools::{tools_from_spec, ToolRegistry};
+use pie::{cancel, config, context, session, tui};
+
+/// 一次性模式的输出格式（对齐 Python `--mode {text,json,transcript}`）。
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// 只输出答案本身（stdout 能被 shell 直接接住）
+    Text,
+    /// 一行 JSON：`answer` / `session` / `turns` / `usage`
+    Json,
+    /// 完整历史（`full_history()`）的 JSON，缩进 1
+    Transcript,
+}
+
+/// `-t/--thinking` 的合法值（对齐 Python `cli.py` 的 `THINKING_LEVELS`）。
+///
+/// Python 用的是 `off`（内部才归一到配置口径 `none`）；这里**两个都收** ——
+/// 配置文件与 `/thinking` 里写的就是 `none`，顺手敲 `-t none` 也应该能用。
+const THINKING_LEVELS: [&str; 8] = [
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "pie-rs", version, about = "pie 的 Rust 重构")]
@@ -33,25 +52,25 @@ struct Cli {
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// 本次思考强度（none/low/high/max…，覆盖配置，不持久化）
-    #[arg(short = 't', long)]
+    /// 本次思考强度（off / none / low / medium / high / xhigh / max；`off` = `none`，覆盖配置，不持久化）
+    #[arg(short = 't', long, value_parser = THINKING_LEVELS)]
     thinking: Option<String>,
 
     /// 每次请求为输出预留的 token（即 API 的 max_tokens；例：131072 / 128k / auto；覆盖配置）
     #[arg(long, alias = "max-tokens", value_name = "N")]
     reserved_tokens: Option<String>,
 
-    /// 单回合最多问几次模型（覆盖配置，不持久化）
+    /// 单回合最多问几次模型（**本次运行**的旋钮，不写进配置；对齐 Python `loop.aturn(max_steps=…)`）
     #[arg(long)]
     max_steps: Option<usize>,
 
-    /// 强制非流式（一次性 complete；覆盖配置）
+    /// 强制非流式（一次性 `complete`；同样只是本次运行的旋钮）
     #[arg(long)]
     no_stream: bool,
 
     /// 上下文 token 估算超过该值即自动压缩（覆盖软阈值，不持久化）
     #[arg(long)]
-    auto_compact_threshold: Option<i64>,
+    auto_compact_threshold: Option<usize>,
 
     /// HTTP 超时秒数（覆盖配置）
     #[arg(long)]
@@ -59,7 +78,7 @@ struct Cli {
 
     /// 请求重试次数（覆盖配置）
     #[arg(long)]
-    max_retries: Option<u32>,
+    max_retries: Option<usize>,
 
     /// 重试等待上限秒数（覆盖配置）
     #[arg(long)]
@@ -81,8 +100,8 @@ struct Cli {
     #[arg(long)]
     models: bool,
 
-    /// 限制可用工具（逗号分隔）：内置名启用该工具，其他名字当 shell 子命令白名单
-    /// （如 `--tools read,ls,grep` = read + 只允许 ls/grep 的 shell）
+    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash）启用该工具，其他名字当 shell 子命令白名单
+    /// （如 `--tools read,ls,grep` = read + 只允许 ls/grep 的受限 bash）
     #[arg(long)]
     tools: Option<String>,
 
@@ -94,7 +113,12 @@ struct Cli {
     #[arg(short = 's', long = "session")]
     session: Option<String>,
 
-    /// 结束时打印 `/stat` 报告（上下文占用 / 水位 / 压缩事件 / API 用量）
+    /// 一次性模式的输出格式（对齐 Python 的 `--mode`）：`text` = 只输出答案（默认）；
+    /// `json` = 一行 JSON：`answer/session/turns/usage`；`transcript` = 完整历史 JSON
+    #[arg(long, value_name = "MODE", default_value = "text")]
+    mode: Mode,
+
+    /// 结束时把 `/stat` 报告打到 **stderr**（上下文占用 / 水位 / 压缩事件 / API 用量）
     #[arg(long)]
     stat: bool,
 
@@ -221,6 +245,11 @@ async fn run(cli: Cli) -> i32 {
     }
     let session_mode = cli.resume || cli.session.is_some();
 
+    // 两个**按次**的执行旋钮（不在配置里，对齐 Python `loop.aturn` 的形参）：
+    // `--max-steps` / `--no-stream` 直接传给每个回合（含 TUI 里的回合）。
+    let max_steps = cli.max_steps;
+    let stream = cli.no_stream.then_some(false);
+
     // 客户端与工具集（TUI / 会话 / 一次性三种模式共用；`--tools` 裁出来的工具集就从这里进）
     let client = match LlmClient::new(&cfg) {
         Ok(c) => c,
@@ -244,7 +273,7 @@ async fn run(cli: Cli) -> i32 {
         } else {
             Session::new(&cfg, None, client, registry)
         };
-        return match tui::run(session).await {
+        return match tui::run(session, max_steps, stream).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("TUI 启动失败: {e}");
@@ -254,35 +283,42 @@ async fn run(cli: Cli) -> i32 {
     }
 
     if task.trim().is_empty() && !session_mode {
-        println!(
-            "pie-rs {}（配置 {})",
+        // 非 TTY 且没给任务：对齐 Python（一行到 stderr + 退出码 2），别污染 stdout 管道
+        eprintln!(
+            "pie-rs {}（配置 {}）",
             cfg.model,
             cfg.config_file
                 .as_deref()
                 .unwrap_or(std::path::Path::new("(默认)"))
                 .display()
         );
-        println!(
+        eprintln!(
             "上下文窗口 {} tokens，可用输入预算 {}（为输出预留 {}）",
             cfg.context_window,
             cfg.context_budget(),
             cfg.reserved_tokens.unwrap_or(0)
         );
-        println!(
-            "交互式 TUI 尚在迁移中；请用 `pie-rs \"任务\"` 走一次性模式（或 `-r/-s` 接着聊）。"
-        );
+        eprintln!("请提供任务描述（`pie-rs \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI");
         return 2;
     }
 
-    let mut printer = |ev: TurnEvent| match ev {
+    // 一次性模式：与 Python 的 print 模式一个口径 —— **stdout 只放结果**、工具/步骤日志静音
+    // （`--mode text` 时 stdout = 答案本身，shell 能直接接住；`stream` 只影响到达时间）。
+    cfg.verbose = false;
+    let (mode, verbose) = (cli.mode, cfg.verbose);
+    let mut printer = move |ev: TurnEvent| match ev {
         TurnEvent::AssistantText(delta) => {
-            print!("{delta}");
-            let _ = std::io::stdout().flush();
+            if mode == Mode::Text {
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+            }
         }
         TurnEvent::Reasoning(_) => {}
-        // 非流式（cfg.stream = false）时的最终答复：流式下走 AssistantText 增量，这里不会来
+        // 非流式（`--no-stream`）时的最终答复：流式下走 AssistantText 增量，这里不会来
         TurnEvent::Answer(text) => {
-            println!("{text}");
+            if mode == Mode::Text {
+                println!("{text}");
+            }
         }
         TurnEvent::ToolCall {
             name,
@@ -290,14 +326,20 @@ async fn run(cli: Cli) -> i32 {
             turn,
             step,
         } => {
-            // 回合号 / 步号标签，与 Python 版的 `[tNsM]` 日志同形
-            eprintln!("\n[t{turn}s{step}] {name} {}", brief(&arguments, 160));
+            // 回合号 / 步号标签，与 Python 版的 `[tNsM]` 日志同形；`verbose` 关掉时静音
+            //（一次性模式就是关的，与 Python print 模式一致）
+            if verbose {
+                eprintln!("\n[t{turn}s{step}] {name} {}", brief(&arguments, 160));
+            }
         }
         TurnEvent::ToolResult {
             name,
             content,
             arguments,
         } => {
+            if !verbose {
+                return;
+            }
             let first = content.lines().next().unwrap_or("");
             // 带上调用参数摘要（「这次调的是哪个文件 / 命令」）——结果正文不一定含路径
             eprintln!(
@@ -326,7 +368,7 @@ async fn run(cli: Cli) -> i32 {
                 session.summary()
             );
             if cli.stat {
-                println!("{}", session.usage_report());
+                eprintln!("{}", session.usage_report());
             }
             return match session.save() {
                 Ok(()) => 0,
@@ -336,29 +378,30 @@ async fn run(cli: Cli) -> i32 {
                 }
             };
         }
-        let code = match session
-            .aturn(&task, &mut printer, &cancel::Cancel::new())
+        let answer = match session
+            // `parallel_tools: None` = 跟随配置（CLI 没有覆盖它的旗标，对齐 Python）
+            .aturn(
+                &task,
+                &mut printer,
+                &cancel::Cancel::new(),
+                max_steps,
+                stream,
+                None,
+            )
             .await
         {
-            Ok(_) => 0,
+            Ok(answer) => answer,
             Err(e) => {
                 eprintln!("\n{e}");
-                1
+                return 1;
             }
         };
-        if cli.stat {
-            println!("{}", session.usage_report());
-        }
+        dump_result(&session, &answer, mode, cli.stat, stream);
         if let Err(e) = session.save() {
             eprintln!("{e}");
             return 1;
         }
-        eprintln!(
-            "[session] 已保存 {}（{}）",
-            session.path.display(),
-            session.summary()
-        );
-        return code;
+        return 0;
     }
 
     // 一次性模式：临时会话（不落盘、不写 manifest），跑完就扔；
@@ -366,14 +409,18 @@ async fn run(cli: Cli) -> i32 {
     // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 cfg
     let mut session = Session::ephemeral(&cfg, client, registry);
     match session
-        .aturn(&task, &mut printer, &cancel::Cancel::new())
+        .aturn(
+            &task,
+            &mut printer,
+            &cancel::Cancel::new(),
+            max_steps,
+            stream,
+            None,
+        )
         .await
     {
-        Ok(_) => {
-            println!();
-            if cli.stat {
-                println!("{}", session.usage_report());
-            }
+        Ok(answer) => {
+            dump_result(&session, &answer, mode, cli.stat, stream);
             0
         }
         Err(e) => {
@@ -440,21 +487,57 @@ fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
 }
 
 /// 一次性覆盖（CLI 参数 → 内存里的 cfg，**不写回文件**）。
+/// 一次性模式跑完后要往 **stdout** 写的那段文本（`None` = 什么都不用写）。
+///
+/// `--mode text` 时答案已经在流式增量 / `Answer` 事件里打过了，这里只补个收尾换行
+/// （非流式时 `Answer` 事件自己已经是 `println!`，不补）；`json` / `transcript` 时
+/// stdout **一个字也不多打**（给脚本接）。`--stat` 报告走 stderr，不在这里。
+fn result_text(session: &Session, answer: &str, mode: Mode, stream: Option<bool>) -> Option<String> {
+    match mode {
+        Mode::Text if stream.unwrap_or(true) => Some(String::new()),
+        Mode::Text => None,
+        Mode::Json => Some(
+            serde_json::json!({
+                "answer": answer,
+                "session": session.path.display().to_string(),
+                "turns": session.turn_count,
+                "usage": session.usage,
+            })
+            .to_string(),
+        ),
+        Mode::Transcript => {
+            let value = serde_json::to_value(session.full_history()).unwrap_or(Value::Null);
+            Some(context::pretty_indent1(&value))
+        }
+    }
+}
+
+/// 把 `result_text` + `--stat` 报告落到各自的流上（调用点两处共用）。
+fn dump_result(session: &Session, answer: &str, mode: Mode, stat: bool, stream: Option<bool>) {
+    if let Some(text) = result_text(session, answer, mode, stream) {
+        println!("{text}");
+    }
+    if stat {
+        // 走 stderr：stdout 的语义只有「结果」（与 `--mode json` 共存不打架）
+        eprintln!("{}", session.usage_report());
+    }
+}
+
 fn apply_overrides(cfg: &mut config::Config, cli: &Cli) -> Result<(), String> {
     if let Some(m) = &cli.model {
         cfg.model = m.clone();
     }
     if let Some(t) = &cli.thinking {
-        cfg.reasoning_effort = t.clone();
+        // `-t off` 是给人看的写法 → 归一到配置口径 `none`（对齐 Python `cli.py`：
+        // 「API 只认 none」，直接发字面 `off` 服务端不认）
+        cfg.reasoning_effort = if t == "off" {
+            config::REASONING_NONE.to_string()
+        } else {
+            t.clone()
+        };
     }
     if let Some(raw) = &cli.reserved_tokens {
         cfg.reserved_tokens = config::parse_reserved_tokens(raw)?;
-    }
-    if let Some(n) = cli.max_steps {
-        cfg.max_steps = Some(n);
-    }
-    if cli.no_stream {
-        cfg.stream = false;
     }
     if let Some(n) = cli.auto_compact_threshold {
         cfg.auto_compact_threshold = Some(n);
@@ -753,9 +836,15 @@ fn open_session(
     llm: LlmClient,
     tools: ToolRegistry,
 ) -> Result<Session, String> {
+    // 横幅只在 `verbose` 时打：一次性模式（含 `-s`/`-r` 带任务）与 Python 的 print 模式一样静音
+    let note = |msg: String| {
+        if cfg.verbose {
+            eprintln!("{msg}");
+        }
+    };
     if resume {
         let s = Session::resume(cfg, llm, tools)?;
-        eprintln!("[session] 恢复 {}（{}）", s.path.display(), s.summary());
+        note(format!("[session] 恢复 {}（{}）", s.path.display(), s.summary()));
         return Ok(s);
     }
     let candidate = Session::new(cfg, id, llm, tools);
@@ -765,10 +854,10 @@ fn open_session(
             path, llm, tools, ..
         } = candidate;
         let s = Session::load(&path, cfg, llm, tools)?;
-        eprintln!("[session] 载入 {}（{}）", s.path.display(), s.summary());
+        note(format!("[session] 载入 {}（{}）", s.path.display(), s.summary()));
         Ok(s)
     } else {
-        eprintln!("[session] 新建 {}", candidate.path.display());
+        note(format!("[session] 新建 {}", candidate.path.display()));
         Ok(candidate)
     }
 }
@@ -801,5 +890,73 @@ fn brief(s: &str, max: usize) -> String {
         format!("{}…", one.chars().take(max).collect::<String>())
     } else {
         one
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("pie-rs").chain(args.iter().copied()))
+    }
+
+    /// `-t off` 归一成配置口径的 `none`（对齐 Python `cli.py`），其余值原样透传。
+    #[test]
+    fn thinking_off_is_normalized_to_none() {
+        let mut cfg = config::Config::default();
+        apply_overrides(&mut cfg, &cli(&["-t", "off"])).expect("off 能过");
+        assert_eq!(cfg.reasoning_effort, "none", "`off` 要归一到 `none`");
+
+        let mut cfg = config::Config::default();
+        apply_overrides(&mut cfg, &cli(&["-t", "xhigh"])).expect("xhigh 能过");
+        assert_eq!(cfg.reasoning_effort, "xhigh", "服务端认的值原样透传");
+    }
+
+    /// `-t` 只收 Python 那七档 + `none`；乱写的值在解析期就被拒（不静默发给服务端）。
+    #[test]
+    fn thinking_levels_are_validated() {
+        assert!(Cli::try_parse_from(["pie-rs", "-t", "off"]).is_ok());
+        assert!(Cli::try_parse_from(["pie-rs", "-t", "xhigh"]).is_ok());
+        assert!(Cli::try_parse_from(["pie-rs", "-t", "none"]).is_ok());
+        let err = Cli::try_parse_from(["pie-rs", "-t", "乱写"]).unwrap_err().to_string();
+        assert!(err.contains("minimal"), "报错要列出合法值：{err}");
+    }
+
+    /// `--mode` 的三种取值：`text` 补收尾换行、`json` 给一行结构化、`transcript` 给完整历史。
+    #[test]
+    fn result_text_covers_the_three_modes() {
+        let cfg = config::Config::default();
+        let llm = pie::llm::LlmClient::new(&cfg).expect("client");
+        let tools = pie::tools::ToolRegistry::new(Default::default());
+        let session = Session::ephemeral(&cfg, llm, tools);
+
+        assert_eq!(
+            result_text(&session, "答案", Mode::Text, None),
+            Some(String::new()),
+            "只补一个换行（println! 负责那个换行）"
+        );
+        assert_eq!(result_text(&session, "答案", Mode::Text, Some(false)), None, "非流式已有换行");
+
+        let json: Value =
+            serde_json::from_str(&result_text(&session, "答案", Mode::Json, None).unwrap()).unwrap();
+        assert_eq!(json["answer"], "答案");
+        assert_eq!(json["turns"], 0);
+        assert!(json["usage"]["calls"].is_number(), "{json}");
+        assert!(json["session"].as_str().unwrap().ends_with(".jsonl"), "{json}");
+
+        let transcript = result_text(&session, "答案", Mode::Transcript, None).unwrap();
+        assert!(transcript.starts_with("[\n "), "缩进 1 的 JSON 数组：{transcript}");
+    }
+
+    /// `--reserved-tokens` 认 `N` / `128k` / `auto`；坏值直接报错（不静默改配置）。
+    #[test]
+    fn reserved_tokens_overrides_are_parsed() {
+        let mut cfg = config::Config::default();
+        apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "64k"])).expect("64k");
+        assert_eq!(cfg.reserved_tokens, Some(64_000));
+        apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "auto"])).expect("auto");
+        assert_eq!(cfg.reserved_tokens, None);
+        assert!(apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "不是数"])).is_err());
     }
 }

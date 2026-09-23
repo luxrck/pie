@@ -15,6 +15,7 @@
 //! `terminal.draw` 每帧只写**变化的单元格**（ratatui 的双缓冲 diff），
 //! 所以「不断追加增量」不会导致整屏重绘。
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +38,7 @@ use crate::llm::LlmError;
 use crate::session::{Session, TurnEvent};
 
 use super::clipboard;
+use super::files;
 use super::history::{self, Cell};
 use super::input::Input;
 use super::palette;
@@ -51,8 +53,16 @@ pub enum UiEvent {
     ShellDone(Status, String),
     /// 后台拉到的可用模型列表（`/model ` 的补全候选）
     Models(Vec<String>),
-    /// 进程级告警（重试 / 压缩 / 图片…，见 `crate::log`）：**不能写 stderr**，进消息流
+    /// 后台建好的 `@` 文件补全索引（`None` = 建失败，当作没有）
+    FilesIndex(Option<Arc<files::Index>>),
+    /// 余额查询结果（启动时 / 每回合结束后 / `/balance`）
+    Balance(Result<crate::llm::Balance, LlmError>),
+    /// 进程级告警（压缩 / 图片…，见 `crate::log`）：**不能写 stderr**，进消息流
     Notice(String),
+    /// 进度（重试次数…）：进消息流，同 `key` 的**就地更新同一个块**（不再一行一条）
+    Retry { key: String, text: String },
+    /// 这串进度（`key`）结束了：把那个块撤掉
+    RetryDone { key: String },
 }
 
 /// tick 间隔（约 15fps）：思考计时的秒数要跟着走，但不必更高。
@@ -61,6 +71,11 @@ const TICK: Duration = Duration::from_millis(66);
 const THOUGHT_TRACE_MIN: Duration = Duration::from_millis(300);
 /// 右下角临时提示活多久（Python 版是 Textual 的 `App.notify` Toast——默认 5s，用户看到的约 3s）。
 const TOAST_TTL: Duration = Duration::from_secs(3);
+/// `@` 补全的文件索引多久算过期（在这之前沿用，免得反复扫盘）。
+///
+/// 真正的失效信号是「回合 / `!cmd` 结束」（那时可能刚写过文件），这个是兑底：外部
+/// （编辑器、别的进程）改了文件也能自己好。
+const FILE_INDEX_TTL: Duration = Duration::from_secs(60);
 
 /// 右下角浮出来的临时提示（对齐 Python 版 `self.app.notify(...)` 的 Textual Toast）：
 /// 不占消息流、到点自消，用来报「刚发生了件小事」（复制了几字符…）。
@@ -69,6 +84,32 @@ struct Toast {
     /// 失败提示换错误色边框
     ok: bool,
     until: Instant,
+}
+
+/// 鼠标能拖选的两个「文本面」。
+///
+/// 为什么不把它们合成一个「选区模型」：两者的**坐标、渲染、文本提取**本来就是两套——
+///   - 消息流：`App` 自己持有 `(绝对显示行, 单元格列)`，因为折行与源文本的对应关系就在
+///     `history::Layout` 里（`slice_text` 按源文本切），高亮也是直接改 frame buffer；
+///   - 输入框：选区在 `TextArea` 控件内部（**字符坐标**），折行、渲染、以及「输入替换
+///     选区」都是控件白送的——搬出来反而要多写一套，还会丢掉那些语义。
+/// 所以只在**手势层**统一：按下时定下拖谁、拖动与松开都交给它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    /// 消息流（`App.selection` + `history::Layout`）
+    Log,
+    /// 输入框（`TextArea` 自己的选区）
+    Input,
+}
+
+/// 屏幕坐标在不在这个区域里（宽/高为 0 的未布局区域一律不算）。
+fn inside(area: Rect, column: u16, row: u16) -> bool {
+    area.width > 0
+        && area.height > 0
+        && column >= area.x
+        && column < area.right()
+        && row >= area.y
+        && row < area.bottom()
 }
 
 pub struct App {
@@ -94,8 +135,12 @@ pub struct App {
     layout: history::Layout,
     /// 鼠标框选：起点 / 终点（**绝对**显示行, 单元格列）；`None` = 没在选
     selection: Option<((u16, u16), (u16, u16))>,
+    /// 左键正在拖哪个「文本面」（按下的那一刻定下，拖动中不变）
+    drag: Option<Surface>,
     /// 右下的临时提示（复制完弹一条，`TOAST_TTL` 后自消）
     toast: Option<Toast>,
+    /// 系统剪贴板写入句柄（**长活**：见 `clipboard::Copier`——写完就 drop 会把屏幕砸花）
+    copier: clipboard::Copier,
     frame: u64,
     busy: bool,
     should_quit: bool,
@@ -103,30 +148,41 @@ pub struct App {
     lean: bool,
     /// 端点可用模型（`/model ` 的补全候选；启动时后台拉，失败了就空着）
     models: Vec<String>,
+    /// `@` 文件补全的索引（cwd 的文件树，尊重 `.gitignore`）；`None` = 还没建好
+    file_index: Option<Arc<files::Index>>,
+    /// 「目录已补全」留下的锚点：`@` 已经被吃掉了，靠它接着往下钻（见 [`files::PathSession`]）
+    path_session: Option<files::PathSession>,
+    /// 正在后台建索引（防重复 spawn）
+    index_building: bool,
+    /// 索引过期（回合 / `!cmd` 结束后置上）→ 下次用到时重建
+    index_stale: bool,
+    /// 上次建好的时刻（配合 [`FILE_INDEX_TTL`]）
+    index_built: Option<Instant>,
+    /// 截断提示只提一次（回合结束就会重建，每次重建都提就把消息流刷屏了）
+    index_trunc_warned: bool,
+    /// 索引以哪个目录为根（= 进程 cwd，与 `read` 解析相对路径的口径一致）
+    index_root: PathBuf,
     /// 补全面板的高亮下标
     palette_index: usize,
     /// 面板被 `Esc` 临时收起（输入一变自动恢复）
     palette_hidden: bool,
     /// 上一帧的输入文本（用来发现「输入变了」→ 恢复面板）
     last_input: String,
-    /// 当前思考深度（`/thinking ` 候选的「← 当前」标注）
-    effort: String,
+    /// 余额（状态栏右下角那一小段，`status::balance_text` 的产物）；`None` = 没拿到
+    balance: Option<String>,
+    /// 余额接口是否可用（查成功过）→ 回合结束后自动再查一次；失败过就不再每回合白试
+    balance_supported: bool,
+    /// 按次执行旋钮（CLI `--max-steps` / `--no-stream` 传下来，转给每次 `Session::aturn`）
+    max_steps: Option<usize>,
+    stream: Option<bool>,
 }
 
 impl App {
     /// 建 App + 取出事件接收端（`rx` 由主循环持有，避免和 `select!` 里的 `&mut self` 打架）。
-    pub fn new(session: Session) -> (Self, UnboundedReceiver<UiEvent>) {
+    pub fn new(session: Session, max_steps: Option<usize>, stream: Option<bool>) -> (Self, UnboundedReceiver<UiEvent>) {
         let (tx, rx) = unbounded_channel();
-        let snapshot = Snapshot {
-            model: session.config.model.clone(),
-            cwd: cwd_text(),
-            prompt_tokens: session.usage.prompt_tokens,
-            budget: session.config.context_budget(),
-            calls: session.usage.calls,
-            busy: false,
-        };
         let lean = session.config.tui.lean;
-        let effort = session.config.reasoning_effort.clone();
+        let snapshot = Snapshot::capture(&session);
         // resume 的历史：把已有对话回放进消息流（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
         let cells = history::cells_from_history(&session.full_history());
@@ -145,16 +201,28 @@ impl App {
             scroll_top: 0,
             layout: history::Layout::default(),
             selection: None,
+            drag: None,
             toast: None,
+            copier: clipboard::Copier::default(),
             frame: 0,
             busy: false,
             should_quit: false,
             lean,
             models: Vec::new(),
+            file_index: None,
+            path_session: None,
+            index_building: false,
+            index_stale: false,
+            index_built: None,
+            index_trunc_warned: false,
+            index_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             palette_index: 0,
             palette_hidden: false,
             last_input: String::new(),
-            effort,
+            balance: None,
+            balance_supported: false,
+            max_steps,
+            stream,
         };
         (app, rx)
     }
@@ -172,14 +240,27 @@ impl App {
         // 按在当前光标处，而 ratatui 只重写变化的单元格 → 砸坏的行再也不会被修复。
         let log_guard = {
             let tx = self.tx.clone();
-            crate::log::install(move |msg| tx.send(UiEvent::Notice(msg)).is_ok())
+            crate::log::install(move |notice| {
+                let event = match notice.kind {
+                    crate::log::Kind::Progress => UiEvent::Retry {
+                        key: notice.key,
+                        text: notice.text,
+                    },
+                    crate::log::Kind::ProgressDone => UiEvent::RetryDone { key: notice.key },
+                    crate::log::Kind::Warn => UiEvent::Notice(notice.text),
+                };
+                tx.send(event).is_ok()
+            })
         };
         let mut events = EventStream::new();
         let mut ticker = tokio::time::interval(TICK);
         // 启动不再往消息流里推一行键位提示：底栏已经在显示键位、`/help` 有完整命令表，
         // 那一行只会在每次开新会话时把历史区顶掉一行。
         self.spawn_fetch_models();
+        self.spawn_fetch_balance(false);
         while !self.should_quit {
+            // `@` 补全的索引：需要时才后台建（**不能放 render 里**，见 `ensure_index`）
+            self.ensure_index();
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
                 maybe = events.next() => {
@@ -211,33 +292,83 @@ impl App {
         }
     }
 
-    /// 鼠标：滚轮滚历史区；**左键拖动框选，松开即复制**（对齐 Python `SelectableRichLog`）。
+    /// 鼠标：滚轮滚历史区；**左键拖动框选，松开即复制**（消息流对齐 Python `SelectableRichLog`；
+    /// 输入框里则是选输入框里的文本，松开也复制到剪贴板）。
+    ///
+    /// 两个「文本面」的坐标换算 / 渲染 / 文本提取各是一套（见 [`Surface`]），所以这里只做
+    /// **手势分发**：按下定下拖谁（顺便收掉另一个面的选区），拖动、松开都只交给它。
     fn on_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll(-3),
             MouseEventKind::ScrollDown => self.scroll(3),
-            // 按在消息流区域内才开始选（点底栏/输入框不该起选区）；拖动时贴边（可拖到区外）
+            // 没按在任何一个面上（底栏 / 空白）就不起选区
             MouseEventKind::Down(MouseButton::Left) => {
-                let area = self.body;
-                let inside = mouse.column >= area.x
-                    && mouse.column < area.x.saturating_add(area.width)
-                    && mouse.row >= area.y
-                    && mouse.row < area.y.saturating_add(area.height);
-                self.selection = inside
-                    .then(|| self.cell_at(mouse.column, mouse.row))
-                    .flatten()
-                    .map(|pt| (pt, pt));
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some((start, _)) = self.selection {
-                    if let Some(pt) = self.cell_at(mouse.column, mouse.row) {
-                        self.selection = Some((start, pt));
+                self.drag = None;
+                match self.surface_at(mouse.column, mouse.row) {
+                    Some(Surface::Input) => {
+                        self.selection = None;
+                        self.input.selection_start(mouse.column, mouse.row);
+                        self.drag = Some(Surface::Input);
                     }
+                    Some(Surface::Log) => {
+                        self.input.clear_selection();
+                        self.selection = self.cell_at(mouse.column, mouse.row).map(|pt| (pt, pt));
+                        self.drag = self.selection.map(|_| Surface::Log);
+                    }
+                    None => self.selection = None,
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.finish_selection(),
+            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
+                Some(Surface::Input) => self.input.selection_extend(mouse.column, mouse.row),
+                Some(Surface::Log) => {
+                    if let Some((start, _)) = self.selection {
+                        if let Some(pt) = self.cell_at(mouse.column, mouse.row) {
+                            self.selection = Some((start, pt));
+                        }
+                    }
+                }
+                None => {}
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(target) = self.drag.take() {
+                    self.finish_drag(target);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// 这个屏幕坐标落在哪个「文本面」上（输入框优先：它压在消息流下面）。
+    fn surface_at(&self, column: u16, row: u16) -> Option<Surface> {
+        if inside(self.input.rect(), column, row) {
+            Some(Surface::Input)
+        } else if inside(self.body, column, row) {
+            Some(Surface::Log)
+        } else {
+            None
+        }
+    }
+
+    /// 松开鼠标：从**正在拖的那个面**取选区文本，写剪贴板 + 右下角弹一条提示。
+    ///
+    /// 两个面取文本的方式不同（消息流按显示行切源文本、输入框问控件要字符区间），
+    /// 但「取到就复制 + Toast」这条收尾只有一份。空选区什么都不做（输入框还顺手收掉
+    /// 那个零宽选区）。
+    fn finish_drag(&mut self, target: Surface) {
+        let text = match target {
+            Surface::Log => self.take_selection_text(),
+            Surface::Input => self.input.take_selection(),
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let copied = self.copier.copy(&text);
+        let msg = if copied {
+            format!("已复制 {} 字符到剪贴板", text.chars().count())
+        } else {
+            "复制失败：剪贴板不可用".to_string()
+        };
+        self.toast(msg, copied);
     }
 
     /// 屏幕坐标 → 选区的 `(绝对显示行, 单元格列)`；超出消息流区域就贴到边上。
@@ -249,20 +380,6 @@ impl App {
         let col = column.saturating_sub(area.x).min(area.width - 1);
         let line = row.saturating_sub(area.y).min(area.height - 1);
         Some((self.scroll_top.saturating_add(line), col))
-    }
-
-    /// 鼠标松开：花区文本写进剪贴板（Python 同款——松开即复制 + **右下角弹一条**临时提示）。
-    fn finish_selection(&mut self) {
-        let Some(text) = self.take_selection_text() else {
-            return;
-        };
-        let copied = clipboard::copy_text(&text);
-        let msg = if copied {
-            format!("已复制 {} 字符到剪贴板", text.chars().count())
-        } else {
-            "复制失败：剪贴板不可用".to_string()
-        };
-        self.toast(msg, copied);
     }
 
     /// 弹一条右下角临时提示（`TOAST_TTL` 后自消）。
@@ -368,6 +485,9 @@ impl App {
             (KeyCode::PageDown, ..) => self.scroll(8),
             // 补全面板开着时：Tab 接受候选、↑/↓ 切候选（对齐 Python）
             (KeyCode::Tab, ..) if self.palette_visible() => self.palette_accept(),
+            // `@` token 在、索引还没落地（刚敲下 `@` 那一两帧）时，Tab 不能变成一个字面
+            // tab 打进输入框——等面板出来再按就是了
+            (KeyCode::Tab, ..) if self.file_token().is_some() => {}
             (KeyCode::Up, ..) if self.palette_visible() => self.palette_move(-1),
             (KeyCode::Down, ..) if self.palette_visible() => self.palette_move(1),
             (KeyCode::Up, ..) if self.input.is_empty() || self.input.history_active() => {
@@ -383,23 +503,61 @@ impl App {
     fn on_turn_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Models(models) => self.models = models,
+            UiEvent::FilesIndex(result) => {
+                self.index_building = false;
+                self.index_stale = false;
+                self.index_built = Some(Instant::now());
+                match result {
+                    Some(index) => {
+                        if index.truncated() && !self.index_trunc_warned {
+                            self.index_trunc_warned = true;
+                            let cap = files::MAX_ENTRIES;
+                            self.push_notice(&format!("[文件补全] 目录太大，只索引了前 {cap} 条"));
+                        }
+                        self.file_index = Some(index);
+                    }
+                    None => {
+                        self.file_index = None;
+                        self.push_notice("[文件补全] 目录索引失败（`@` 补全暂时不可用）");
+                    }
+                }
+            }
+            UiEvent::Balance(result) => match result {
+                Ok(balance) => {
+                    self.balance = status::balance_text(&balance);
+                    self.balance_supported = true;
+                }
+                // 拿不到（非 DeepSeek 端点常见）→ À 降级成「不显示」，也不每回合再试
+                Err(_) => self.balance_supported = false,
+            },
             UiEvent::Notice(text) => self.push_notice(&text),
+            UiEvent::Retry { key, text } => self.push_retry(&key, &text),
+            UiEvent::RetryDone { key } => self.clear_retry(&key),
             UiEvent::Turn(TurnEvent::Reasoning(_)) => {
+                self.settle_retry(); // 模型有响应了 = 重试成功
                 let since = *self.thought_started.get_or_insert_with(Instant::now);
                 self.activity = Activity::Thinking { since };
             }
             UiEvent::Turn(TurnEvent::AssistantText(delta)) => {
+                self.settle_retry(); // 模型开始出字 = 重试成功了
                 self.settle_thought();
-                self.activity = Activity::Streaming;
+                // 首个正文增量：开一段「Responding」计时（⚠ 不能每个增量都重设，否则永远是 0.0s）
+                if !matches!(self.activity, Activity::Streaming { .. }) {
+                    self.activity = Activity::Streaming {
+                        since: Instant::now(),
+                    };
+                }
                 Cell::push_assistant_text(&mut self.cells, &delta);
             }
             UiEvent::Turn(TurnEvent::Answer(text)) => {
+                self.settle_retry();
                 self.settle_thought();
                 Cell::push_assistant_text(&mut self.cells, &text);
             }
             UiEvent::Turn(TurnEvent::ToolCall {
                 name, arguments, ..
             }) => {
+                self.settle_retry();
                 self.settle_thought();
                 self.activity = Activity::Tool {
                     since: Instant::now(),
@@ -424,12 +582,17 @@ impl App {
                 self.busy = false;
                 self.snapshot.busy = false;
                 self.activity = Activity::Idle;
-                Cell::finish_tool(&mut self.cells, "shell", status, &body);
+                // 手打的命令可能刚建/删了文件
+                self.index_stale = true;
+                Cell::finish_tool(&mut self.cells, "bash", status, &body);
             }
             UiEvent::TurnDone(result, snapshot) => {
+                self.settle_retry();
                 self.settle_thought();
                 self.busy = false;
                 self.activity = Activity::Idle;
+                // 回合里可能刚写过 / 删过文件（`writ` / `edit` / `bash`）→ 下次用到 `@` 时重建
+                self.index_stale = true;
                 match result {
                     Ok(text) if text == crate::cancel::CANCEL_TEXT => {
                         // 没轮到的工具调用不会有结果事件 → 还挂着 `•` 的行结算成 ⏹
@@ -458,6 +621,10 @@ impl App {
                 self.snapshot = snapshot;
                 self.snapshot.busy = false;
                 self.input.move_cursor_end();
+                // 刚花掉一点 token，顺手把余额刷新一下（只在接口确实可用时）
+                if self.balance_supported {
+                    self.spawn_fetch_balance(false);
+                }
             }
         }
     }
@@ -476,28 +643,31 @@ impl App {
     // ---------------------------------------------------------------- 提交与命令
 
     fn submit(&mut self) {
-        // 半截命令：回车先接受面板里高亮的候选，再按完整命令提交（对齐 Python）
-        if self.palette_visible() && !palette::is_complete_command(&self.input.text()) {
+        // 面板开着时，回车先把候选落进输入框（规则见 `enter_accepts_candidate`）
+        if self.enter_accepts_candidate() {
             self.palette_accept();
         }
         let text = self.input.take();
+        // 发出去了就不该再接着补全（输入框已清空，留着锚点只会在下一句话上误触发）
+        self.path_session = None;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
         }
         if self.busy {
-            // 回合进行中只放行 `/stop`（等价 Esc）；其它命令/输入等回合结束
-            if trimmed == "/stop" {
-                self.request_stop();
-            } else {
-                self.push_notice("回合进行中（Esc 或 /stop 停止）");
-            }
+            // 回合进行中先把输入挡回去（唯一的停止入口是 `Esc`，2026-09-23 移除了 `/stop`）
+            self.push_notice("回合进行中（按 Esc 停止）");
             return;
         }
         if let Some(cmd) = trimmed.strip_prefix('/') {
             // `/` 开头但不是已知命令（粘进来的绝对路径最常见）→ 当**普通消息**发出去
             if palette::is_known_command(trimmed) {
                 self.command(cmd);
+                return;
+            }
+            // 已移除的旧命令（`/stop` `/paste` `/quit`）别当消息发给模型，只提一句改用什么
+            if let Some(hint) = palette::removed_hint(trimmed) {
+                self.push_notice(hint);
                 return;
             }
         }
@@ -519,9 +689,7 @@ impl App {
                 let text = palette::help_text();
                 self.push_notice(&text);
             }
-            "exit" | "quit" => self.should_quit = true,
-            // 与 `Esc` 等价（回合进行中才有效）
-            "stop" => self.request_stop(),
+            "exit" => self.should_quit = true,
             "status" => self.with_session("状态", |s| s.usage_report()),
             "model" => {
                 if arg.is_empty() {
@@ -557,19 +725,28 @@ impl App {
                     )
                 });
             }
-            "clear" | "reset" => {
+            "clear" => self.with_session_mut("切换窗口", |s| match s.clear_window() {
+                Ok(n) => {
+                    let _ = s.save();
+                    // 消息流**不动**（刚归档的东西还能往上翻着看；Python 同款）
+                    format!("已切换新窗口（现有 {n} 个历史窗口块，文件在 ~/.pie/windows/，可经指针回查）")
+                }
+                Err(e) => format!("切换窗口失败：{e}"),
+            }),
+            "reset" => {
                 self.cells.clear();
                 self.scroll_from_bottom = 0;
                 self.with_session_mut("清空历史", |s| {
                     s.reset();
-                    "已清空对话历史（窗口归档未接）".to_string()
+                    let _ = s.save();
+                    "已清空对话历史（保留 system prompt 与记忆）".to_string()
                 });
             }
             "save" => self.with_session_mut("保存", |s| match s.save() {
                 Ok(()) => format!("已保存 {}", s.path.display()),
                 Err(e) => format!("保存失败: {e}"),
             }),
-            "paste" => self.paste_clipboard(),
+            "balance" => self.spawn_fetch_balance(true),
             other => self.push_notice(&format!("未知命令：/{other}（/help 看列表）")),
         }
     }
@@ -591,22 +768,14 @@ impl App {
         let outcome = match self.session.try_lock() {
             Ok(mut guard) => {
                 let text = f(&mut guard);
-                let snapshot = (
-                    guard.config.model.clone(),
-                    guard.config.reasoning_effort.clone(),
-                    guard.usage.prompt_tokens,
-                    guard.usage.calls,
-                );
-                Ok((text, snapshot))
+                // 改完配置顺手把状态栏那份快照重生一遍（模型 / 思考深度 / 用量）
+                Ok((text, Snapshot::capture(&guard)))
             }
             Err(_) => Err(()),
         };
         match outcome {
-            Ok((text, (model, effort, tokens, calls))) => {
-                self.snapshot.model = model;
-                self.effort = effort;
-                self.snapshot.prompt_tokens = tokens;
-                self.snapshot.calls = calls;
+            Ok((text, snapshot)) => {
+                self.snapshot = snapshot;
                 self.push_notice(&text);
             }
             Err(()) => self.push_notice(&format!("回合进行中，{what} 稍后再试")),
@@ -626,21 +795,18 @@ impl App {
         let tx = self.tx.clone();
         self.cancel = Cancel::new();
         let cancel = self.cancel.clone();
+        let (max_steps, stream) = (self.max_steps, self.stream);
         tokio::spawn(async move {
             let mut guard = session.lock().await;
             let event_tx = tx.clone();
             let mut on_event = move |event: TurnEvent| {
                 let _ = event_tx.send(UiEvent::Turn(event));
             };
-            let result = guard.aturn(&input, &mut on_event, &cancel).await;
-            let snapshot = Snapshot {
-                model: guard.config.model.clone(),
-                cwd: cwd_text(),
-                prompt_tokens: guard.usage.prompt_tokens,
-                budget: guard.config.context_budget(),
-                calls: guard.usage.calls,
-                busy: false,
-            };
+            let result = guard
+                // `parallel_tools: None` = 跟随 `cfg.parallel_tools`（TUI 没有覆盖它的入口）
+                .aturn(&input, &mut on_event, &cancel, max_steps, stream, None)
+                .await;
+                let snapshot = Snapshot::capture(&guard);
             let _ = tx.send(UiEvent::TurnDone(result, snapshot));
         });
     }
@@ -650,13 +816,13 @@ impl App {
     /// `!cmd`：直接执行 shell —— **不经过 LLM、不进会话上下文**（对齐 Python `_run_shell`）。
     ///
     /// 命令行回显借工具行的形状（摘要位置放 `$ cmd`），结算时强制展开正文（`manual`，
-    /// 简洁模式也不例外）。跟回合一样占 `busy`：`Esc` / `/stop` 能中断（杀整个进程组）。
+    /// 简洁模式也不例外）。跟回合一样占 `busy`：`Esc` 能中断（杀整个进程组）。
     fn run_shell(&mut self, cmd: &str) {
         if cmd.is_empty() {
             return;
         }
         self.cells.push(Cell::Tool {
-            name: "shell".into(),
+            name: "bash".into(),
             summary: format!("$ {cmd}"),
             status: Status::Running,
             body: None,
@@ -682,8 +848,11 @@ impl App {
         if self.selection.is_some() {
             // 鼠标在窗口外松开时可能收不到 Up 事件 → 高亮会一直留着，Esc 先把选区收掉
             self.selection = None;
+        } else if self.input.has_selection() {
+            // 输入框里的选区同理（先收选区，再轮到面板 / 停回合）
+            self.input.clear_selection();
         } else if self.palette_visible() {
-            // 面板开着就先收面板（对齐 Python：Esc 第一下只收面板，不当 /stop）
+            // 面板开着就先收面板（Esc 第一下只收面板，不当停止键）
             self.palette_hidden = true;
         } else if self.busy {
             self.request_stop();
@@ -692,7 +861,7 @@ impl App {
         }
     }
 
-    /// 请求停止本回合（`Esc` 与 `/stop` 共用）。
+    /// 请求停止本回合（`Esc` 触发——这是唯一的停止入口）。
     fn request_stop(&mut self) {
         if !self.busy {
             self.push_notice("当前没有正在跑的回合");
@@ -706,37 +875,127 @@ impl App {
         self.push_notice("已请求停止…");
     }
 
-    // ---------------------------------------------------------------- 命令补全
+    // ---------------------------------------------------------------- 补全
 
-    /// 当前输入对应的补全候选（非 `/` 开头为空）。
-    fn palette_matches(&self) -> Vec<(String, String)> {
-        palette::matches(
-            &self.input.text(),
-            &self.models,
-            &self.snapshot.model,
-            &self.effort,
+    /// 当前输入的候选 + **接受时怎么落到输入框**：
+    ///
+    ///   - `replace_from = Some((行, 列))`：只替换「这一列 → 光标」这一小段（光标处的 `@`
+    ///     文件补全；起点是 `@` 自己那一列—— 接受候选时连 `@` 一起吃掉，插进去的是干净路径）；
+    ///   - `None`：整条输入换成候选（`/` 命令，含 `/model `/`/thinking `）。
+    ///
+    /// 光标处的 `@` 优先：它就住在光标旁，而 `/` 命令是整行的事。
+    fn completions(&self) -> (Vec<(String, String)>, Option<(usize, usize)>) {
+        if let Some((from, fragment)) = self.file_token() {
+            if let Some(index) = &self.file_index {
+                let items = index.matches(&fragment, files::MATCH_LIMIT);
+                if !items.is_empty() {
+                    return (items, Some(from));
+                }
+            }
+        }
+        (
+            palette::matches(
+                &self.input.text(),
+                &self.models,
+                &self.snapshot.model,
+                &self.snapshot.reasoning_effort,
+            ),
+            None,
         )
+    }
+
+    /// 光标处的路径 token：`(替换起点, 片段)`；没有就 `None`。
+    ///
+    /// 两个来源（顺序不能换）：
+    ///   1. `@` 打头——用户显式开局（认读规则见 [`files::token`]）；
+    ///   2. 目录候选接受后留下的锚点——`@` 已经吃掉了，但这一段路径还在补全中
+    ///      （看 [`files::PathSession`]），所以能接着列下一层。
+    fn file_token(&self) -> Option<((usize, usize), String)> {
+        let (row, col) = self.input.cursor();
+        let line = self.input.line(row);
+        if let Some((at, fragment)) = files::token(&line, col) {
+            return Some(((row, at), fragment));
+        }
+        let session = self.path_session.as_ref()?;
+        let fragment = session.fragment(&line, (row, col))?;
+        Some((session.anchor(), fragment))
+    }
+
+    /// 给 `@` 补全用的文件索引：需要时（有 token 且没建好 / 过期）在**后台**建一次。
+    ///
+    /// ⚠ 只能在事件循环里调（`App::run`）：`tokio::spawn` 要有 runtime，而单测直接
+    /// `render_to_string` / `submit` 时没有 runtime（会 panic）——所以**不能**放 `render` 里。
+    /// 没人敲 `@` 就不扫盘（拿 `file_token` 当开关）。
+    fn ensure_index(&mut self) {
+        if self.index_building || self.file_token().is_none() {
+            return;
+        }
+        let fresh = self.file_index.is_some()
+            && !self.index_stale
+            && self.index_built.is_some_and(|at| at.elapsed() < FILE_INDEX_TTL);
+        if fresh {
+            return;
+        }
+        self.index_building = true;
+        let root = self.index_root.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // 扫盘是同步的（9p 上本仓 ~40ms，原生盘 18k 文件 ~55ms）：丢给 blocking 池，
+            // 别把 UI 的事件循环占住
+            let built = tokio::task::spawn_blocking(move || files::Index::build(&root)).await;
+            let _ = tx.send(UiEvent::FilesIndex(built.ok().map(Arc::new)));
+        });
     }
 
     /// 面板此刻是否可见（有候选，且没被 `Esc` 收起）。
     fn palette_visible(&self) -> bool {
-        !self.palette_hidden && !self.palette_matches().is_empty()
+        !self.palette_hidden && !self.completions().0.is_empty()
     }
 
-    /// `Tab`：接受高亮候选（把输入换成完整命令）。
+    /// `Tab`：接受高亮候选。
+    ///
+    /// 文件路径只替掉「起点 → 光标」那一小段（光标留在插入文本末尾，接着打下一段路径就行），
+    /// `/` 命令则是整条输入换掉。**目录**候选接受后还留一个「路径补全会话」的锚点：
+    /// 输入框里已经没 `@` 了，但面板接着列下一层（用户要的逐层下钻）。
     fn palette_accept(&mut self) {
-        let matches = self.palette_matches();
-        if matches.is_empty() {
+        let (items, replace_from) = self.completions();
+        if items.is_empty() {
             return;
         }
-        let index = self.palette_index.min(matches.len() - 1);
-        let cmd = matches[index].0.clone();
-        self.input.set_text(&cmd);
+        let index = self.palette_index.min(items.len() - 1);
+        let text = items[index].0.clone();
+        match replace_from {
+            Some(from) => {
+                self.input.replace_before_cursor(from, &text);
+                // 目录 → 续上会话（接着钻）；文件 → 结束（面板收起，不需要再列什么）
+                self.path_session = text
+                    .ends_with('/')
+                    .then(|| files::PathSession::new(from, &text));
+            }
+            None => self.input.set_text(&text),
+        }
+    }
+
+    /// 回车前要不要先把面板里高亮的候选落进输入框（`submit` 的开场白）：
+    ///
+    ///   - `/` 命令：半截命令先补全再发（对齐 Python）；
+    ///   - `@` 文件：**只接受文件候选**（顺手吃掉 `@`）——目录候选不动（那是 Tab 的活），
+    ///     免得正文里随手打的 `@词` 被改成 `词/`。
+    fn enter_accepts_candidate(&self) -> bool {
+        if !self.palette_visible() {
+            return false;
+        }
+        let (items, replace_from) = self.completions();
+        let index = self.palette_index.min(items.len().saturating_sub(1));
+        match replace_from {
+            Some(_) => !items[index].0.ends_with('/'),
+            None => !palette::is_complete_command(&self.input.text()),
+        }
     }
 
     /// `↑`/`↓`：在候选里移动高亮。
     fn palette_move(&mut self, delta: i32) {
-        let len = self.palette_matches().len();
+        let len = self.completions().0.len();
         if len == 0 {
             return;
         }
@@ -755,7 +1014,32 @@ impl App {
         });
     }
 
-    /// `Ctrl+G` / `/paste`：**只**把剪贴板里的图片变成路径（对齐 Python `_paste_image`）。
+    /// 后台查一次余额（启动时、每回合结束后、`/balance` 共用）。
+    ///
+    /// `report` = 用户主动问的（`/balance`）：成败都把话说到（进消息流的 Notice）。
+    /// 失败不当错误抛：非 OpenAI 兼容端点大多没这个接口（一般回 404）。
+    ///
+    /// ⚠ 只借一下会话锁把客户端**克隆**出来：HTTP 请求不占会话锁（否则回合进行中
+    /// 查余额会被一个长回合堵住）。
+    fn spawn_fetch_balance(&self, report: bool) {
+        let session = self.session.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let llm = session.lock().await.llm.clone();
+            let result = llm.fetch_balance().await;
+            if report {
+                let text = match &result {
+                    Ok(balance) => format!("余额：\n{}", status::balance_detail(balance)),
+                    Err(e) => format!("余额查询失败：{e}"),
+                };
+                let _ = tx.send(UiEvent::Notice(text));
+            }
+            // 余额本身交给状态栏（右下角）
+            let _ = tx.send(UiEvent::Balance(result));
+        });
+    }
+
+    /// `Ctrl+G`：**只**把剪贴板里的图片变成路径（对齐 Python `_paste_image`）。
     ///
     /// 纯文本不走这里 —— 终端自己的粘贴键（`⌘V` / `Ctrl+Shift+V`）经 bracketed paste
     /// 直接进输入框，见 `on_terminal_event` 的 `Event::Paste`。
@@ -778,6 +1062,39 @@ impl App {
         self.cells.push(Cell::Notice(text.to_string()));
     }
 
+    /// 重试进度：**就地更新**同一 `key` 的那个块（没有就新建）——「只显示 1 个块」。
+    ///
+    /// 按 `key`（哪个请求）分组：并行的两条流程（回合请求 / 启动时拉模型列表）各占一块，
+    /// 不会互相把内容改掉。
+    fn push_retry(&mut self, key: &str, text: &str) {
+        for cell in self.cells.iter_mut().rev() {
+            if let Cell::Retry { key: k, text: t } = cell {
+                if k == key {
+                    *t = text.to_string();
+                    return;
+                }
+            }
+        }
+        self.cells.push(Cell::Retry {
+            key: key.to_string(),
+            text: text.to_string(),
+        });
+    }
+
+    /// 这串进度结束了（`with_retry` 出口）：撤掉那个块。
+    fn clear_retry(&mut self, key: &str) {
+        self.cells.retain(|cell| match cell {
+            Cell::Retry { key: k, .. } => k != key,
+            _ => true,
+        });
+    }
+
+    /// 模型恢复响应了（或回合收尾）：重试块是**临时进度**，一并撤掉（含启动时拉模型列表
+    /// 留下的那块——它已经过时了）。
+    fn settle_retry(&mut self) {
+        self.cells.retain(|cell| !matches!(cell, Cell::Retry { .. }));
+    }
+
     // ---------------------------------------------------------------- 渲染
 
     fn render(&mut self, frame: &mut Frame) {
@@ -789,7 +1106,7 @@ impl App {
             self.last_input = text;
             self.palette_hidden = false;
         }
-        let matches = self.palette_matches();
+        let (matches, _) = self.completions();
         self.palette_index = if matches.is_empty() {
             0
         } else {
@@ -804,8 +1121,9 @@ impl App {
         // 宽度要传进去：输入框现在是**软换行**的，长行会折成多行、高度跟着长
         // （`Borders::TOP` 不占左右格，所以可用宽 = 整区宽度）。
         let input_height = self.input.desired_height(area.width);
-        let [header, body, palette_area, input, hint] = Layout::vertical([
-            Constraint::Length(1),
+        // 状态行（模型 / 工作目录 / 上下文用量 / 活动指示）在最**下**方——像 codex / claude code
+        // 那样当状态栏用：消息流从屏幕第一行开始，底部一整块 chrome（面板 + 输入框 + 状态）。
+        let [body, palette_area, input, status_row] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(panel.len() as u16),
             Constraint::Length(input_height),
@@ -814,17 +1132,6 @@ impl App {
         .areas(area);
 
         let now = Instant::now();
-        frame.render_widget(
-            Paragraph::new(status::header_line(
-                &self.palette,
-                &self.snapshot,
-                self.activity,
-                self.frame,
-                now,
-                area.width,
-            )),
-            header,
-        );
 
         let layout = history::layout(&mut self.cells, &self.palette, body.width, self.lean);
         let total = layout.rows.len();
@@ -847,10 +1154,21 @@ impl App {
         if !panel.is_empty() {
             frame.render_widget(Paragraph::new(panel), palette_area);
         }
+        self.input
+            .set_placeholder(status::hint_text(self.busy), self.palette.style_faint());
         self.input.render(frame, input, &self.palette);
+        // 状态栏：整个界面唯一一处常驻 chrome，放最下方（避开消息流的第一眼位置）
         frame.render_widget(
-            Paragraph::new(status::hint_line(&self.palette, self.busy)),
-            hint,
+            Paragraph::new(status::status_line(
+                &self.palette,
+                &self.snapshot,
+                self.activity,
+                self.frame,
+                now,
+                area.width,
+                self.balance.as_deref(),
+            )),
+            status_row,
         );
         // 右下角临时提示：过期的先收掉（每帧一次，所以到点最多差一帧就消）；
         // 活着的画在**所有控件之后**——它是浮层。
@@ -1001,13 +1319,31 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     // 退出码：被信号杀死时 Python 给负数，这里取 -1（信息量等价，都是“非正常退出”）
     let code = status.code().unwrap_or(-1);
     let mark = if code == 0 { Status::Ok } else { Status::Fail };
-    (mark, format!("[exit={code}]\n\n{}", out.trim_end_matches('\n')))
+    (mark, format!("{}", out.trim_end_matches('\n')))
 }
 
 fn cwd_text() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default()
+}
+
+/// 从会话当前状态抓一份状态栏快照（`App::new` / 回合收尾 / 命令改配置后共用）。
+///
+/// ⚠ 别就地手写 `Snapshot { … }` 字面量：给结构体加字段时漏掉某一处就会**编不过**
+/// （2026-09-23 加 `reasoning_effort` 时正好踩到）。字段列表只住在这里。
+impl Snapshot {
+    fn capture(session: &Session) -> Self {
+        Self {
+            model: session.config.model.clone(),
+            reasoning_effort: session.config.reasoning_effort.clone(),
+            cwd: cwd_text(),
+            prompt_tokens: session.usage.prompt_tokens,
+            budget: session.config.context_budget(),
+            calls: session.usage.calls,
+            busy: false,
+        }
+    }
 }
 
 /// 粘贴文本里的换行统一成 `\n`（bracketed paste 里可能是 CRLF；孤立 `\r` 当换行）。
@@ -1025,6 +1361,11 @@ mod tests {
     }
 
     /// 建 App + 事件接收端（需要等后台任务（回合 / `!cmd`）回传事件时用）。
+    ///
+    /// ⚠ 会**写配置**的命令（`/model` / `/thinking`）会把配置文件写回：`Config::default()` 的
+    /// `config_file` 是 `None` → 落到 `~/.pie/config.toml`（**用户真实的配置**）。
+    /// 用到这类命令的用例请自己建 `Config { config_file: Some(临时路径), .. }`（别改 `PIE_DIR`
+    /// 环境变量：那是进程级的，会跟并行跑的用例抢），见 `thinking_change_shows_up_in_the_status_bar`。
     fn app_with_rx() -> (App, UnboundedReceiver<UiEvent>) {
         let cfg = Config {
             model: "deepseek-flash".into(),
@@ -1032,7 +1373,7 @@ mod tests {
         };
         let llm = crate::llm::LlmClient::new(&cfg).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        App::new(Session::ephemeral(&cfg, llm, tools))
+        App::new(Session::ephemeral(&cfg, llm, tools), None, None)
     }
 
     /// 断言用：把空白全去掉再比（`TestBackend` buffer 里宽字符占了两格，拼出来带空格）。
@@ -1087,7 +1428,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.input.text(), "/compact tools");
 
-        // Esc 先收面板（不当 /stop），输入一变又回来
+        // Esc 先收面板（不当停止键），输入一变又回来
         app.input.set_text("/co");
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.palette_visible(), "Esc 收起面板");
@@ -1110,6 +1451,165 @@ mod tests {
         assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
     }
 
+    // ---------------------------------------------------------- `@` 文件路径补全
+
+    /// `@` 补全用例的 cwd：一个带 `src/tui/app.rs` / `src/session.rs` 的小目录。
+    fn files_tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pie-tui-files-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/tui")).expect("建临时目录");
+        std::fs::write(dir.join("src/tui/app.rs"), "").expect("写文件");
+        std::fs::write(dir.join("src/session.rs"), "").expect("写文件");
+        std::fs::write(dir.join("README.md"), "").expect("写文件");
+        dir
+    }
+
+    /// 往左挪光标 n 次（走真实按键路径，用来把光标停在 `@` token 中间）。
+    fn move_left(app: &mut App, n: usize) {
+        for _ in 0..n {
+            app.input
+                .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+    }
+
+    /// `@` 补全：候选来自（注入的）索引；接受时**连 `@` 一起**换成干净路径、面板收起。
+    #[test]
+    fn at_completion_replaces_the_token_and_drops_the_at() {
+        let dir = files_tmp("accept");
+        let (mut app, _rx) = app_with_rx();
+        app.file_index = Some(Arc::new(files::Index::build(&dir)));
+        // 行中的 `@` 也算：光标停在 token 中间
+        app.input.insert("看看 @app 的实现");
+        move_left(&mut app, 4); // " 的实现" ← 挪回 `app` 后面
+        let (items, from) = app.completions();
+        assert_eq!(items.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(), ["src/tui/app.rs"]);
+        assert_eq!(from, Some((0, 3)), "替换起点是 `@` 那一列（连它一起替换）");
+        assert!(app.palette_visible());
+        let screen = app.render_to_string(80, 24);
+        assert!(squash(&screen).contains("▸src/tui/app.rs"), "{screen}");
+
+        // Tab 接受：`@` 被吃掉，尾巴保留，光标落在插入文本末尾
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "看看 src/tui/app.rs 的实现");
+        assert_eq!(app.input.cursor(), (0, 17), "光标落在插入路径末尾");
+        assert!(!app.palette_visible(), "`@` 没了 → 面板自然收起");
+    }
+
+    /// 索引没建好就不弹面板（首次 `@` 到索引回来之前那一下）；邮箱/裸词不误伤。
+    #[test]
+    fn at_completion_needs_an_index_and_ignores_emails() {
+        let dir = files_tmp("noindex");
+        let (mut app, _rx) = app_with_rx();
+        app.input.set_text("@app");
+        assert!(!app.palette_visible(), "没索引就不弹：{:?}", app.completions().0);
+
+        app.file_index = Some(Arc::new(files::Index::build(&dir)));
+        assert!(app.palette_visible());
+        // 邮箱不弹
+        app.input.set_text("mail a@b.com");
+        assert_eq!(app.file_token(), None, "邮箱不该被当成 `@` token");
+        assert!(!app.palette_visible());
+        // 光标在 `@` 左边也不弹
+        app.input.set_text("@app");
+        app.input.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert!(!app.palette_visible());
+    }
+
+    /// 回车：**文件**候选先补全（顺手吃掉 `@`）再发；目录候选不动——那是 Tab 的活，
+    /// 不然正文里随手打的 `@词` 会被改成 `词/`。
+    #[test]
+    fn enter_accepts_a_file_candidate_but_not_a_directory_one() {
+        let dir = files_tmp("enter");
+        let (mut app, _rx) = app_with_rx();
+        app.file_index = Some(Arc::new(files::Index::build(&dir)));
+
+        app.input.set_text("@app");
+        assert!(app.enter_accepts_candidate());
+        app.palette_accept();
+        assert_eq!(app.input.text(), "src/tui/app.rs");
+
+        app.input.set_text("@src");
+        assert_eq!(app.completions().0[0].0, "src/", "首个候选是目录自己");
+        assert!(!app.enter_accepts_candidate(), "目录候选回车不动它（那是 Tab 的活）");
+        // 已定下来的 `/` 命令不改，半截命令仍要先补全（原有行为）
+        app.input.set_text("/status");
+        assert!(!app.enter_accepts_candidate());
+        app.input.set_text("/statu");
+        assert!(app.enter_accepts_candidate());
+    }
+
+    /// 目录候选 Tab 之后**接着列下一层**：`@` 已被吃掉，靠“路径补全会话”的锚点继续。
+    #[test]
+    fn tab_on_a_directory_keeps_listing_the_next_level() {
+        let dir = files_tmp("drill");
+        let (mut app, _rx) = app_with_rx();
+        app.file_index = Some(Arc::new(files::Index::build(&dir)));
+
+        app.input.set_text("@src");
+        assert_eq!(app.completions().0[0].0, "src/", "首个候选是目录自己");
+        app.palette_accept();
+        assert_eq!(app.input.text(), "src/");
+        // 目录已接受：面板不倒，直接列这一层的子项（都是 `dir/xxx` 的完整相对路径）
+        let items: Vec<String> = app.completions().0.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(items, ["src/session.rs", "src/tui/"], "接着列 `src/` 的下一层");
+        assert!(app.palette_visible());
+        let screen = app.render_to_string(80, 24);
+        assert!(squash(&screen).contains("▸src/session.rs"), "{screen}");
+
+        // 接着往下打 / 再 Tab：逐层钻进去
+        app.input.insert("tu");
+        assert_eq!(app.input.text(), "src/tu");
+        assert_eq!(app.completions().0[0].0, "src/tui/");
+        app.palette_accept();
+        assert_eq!(app.input.text(), "src/tui/");
+        assert_eq!(app.completions().0[0].0, "src/tui/app.rs");
+        // 接受**文件** = 补全结束（面板收起、锚点扔掉）
+        app.palette_accept();
+        assert_eq!(app.input.text(), "src/tui/app.rs");
+        assert!(app.path_session.is_none());
+        assert!(!app.palette_visible());
+    }
+
+    /// 补全会话只活在「那条路径上」：打了空白 / 全选重打就结束，不会在别的文本上乱弹。
+    #[test]
+    fn path_session_ends_when_the_text_leaves_it() {
+        let dir = files_tmp("session-end");
+        let (mut app, _rx) = app_with_rx();
+        app.file_index = Some(Arc::new(files::Index::build(&dir)));
+        app.input.set_text("@src");
+        app.palette_accept();
+        assert!(app.palette_visible(), "接受目录后面板不倒");
+
+        // 打了空白 = 去写别的了
+        app.input.insert(" 看看");
+        assert_eq!(app.file_token(), None);
+        assert!(!app.palette_visible());
+
+        // 全选重打（跟那条路径没关系了）也一样
+        app.input.select_all();
+        app.input.insert("hello");
+        assert_eq!(app.file_token(), None);
+        assert!(!app.palette_visible());
+    }
+
+    /// 后台索引回来：装上、清 `building`；建失败就静默降级（当作没索引）+ 一句提示。
+    #[test]
+    fn files_index_event_installs_the_index() {
+        let dir = files_tmp("install");
+        let (mut app, _rx) = app_with_rx();
+        app.input.set_text("@app");
+        app.index_building = true;
+        app.on_turn_event(UiEvent::FilesIndex(Some(Arc::new(files::Index::build(&dir)))));
+        assert!(!app.index_building, "到了就不再算「在建」");
+        assert!(!app.index_stale);
+        assert!(app.palette_visible(), "索引到了就能弹面板");
+
+        app.on_turn_event(UiEvent::FilesIndex(None));
+        assert!(app.file_index.is_none());
+        assert!(!app.palette_visible());
+        assert!(last_notice(&app).contains("索引失败"), "{}", last_notice(&app));
+    }
+
     #[test]
     fn renders_header_history_and_hint() {
         let mut app = test_app();
@@ -1117,7 +1617,7 @@ mod tests {
         Cell::push_assistant_text(&mut app.cells, "**在**的");
         app.cells.push(Cell::Thought(Duration::from_millis(2100)));
         app.cells.push(Cell::Tool {
-            name: "shell".into(),
+            name: "bash".into(),
             summary: "pwd".into(),
             status: Status::Ok,
             body: Some("/tmp".into()),
@@ -1127,17 +1627,17 @@ mod tests {
 
         let screen = app.render_to_string(80, 24);
         let flat = squash(&screen);
-        assert!(flat.contains("deepseek-flash"), "顶栏有模型：{screen}");
+        assert!(flat.contains("deepseek-flash"), "状态栏有模型：{screen}");
         assert!(flat.contains("›你好"), "{screen}");
         assert!(flat.contains("在的"), "助手正文：{screen}");
         assert!(flat.contains("Thoughtfor2.1s"), "思考耗时：{screen}");
-        assert!(flat.contains("✓shell(pwd)"), "工具行：{screen}");
+        assert!(flat.contains("✓bash(pwd)"), "工具行：{screen}");
         assert!(!flat.contains("/tmp"), "默认简洁模式不展成功正文：{screen}");
         assert!(flat.contains("发送"), "底栏提示：{screen}");
         assert!(flat.contains("粘贴成功"), "{screen}");
     }
 
-    /// 空白新会话：顶栏就显示 `0/<预算> (0.0%)`，消息流里也不该有键位提示行（底栏那份才是键位说明）。
+    /// 空白新会话：状态栏就显示 `0/<预算> (0.0%)`，消息流里也不该有键位提示行（键位现在在输入框 placeholder 里）。
     #[test]
     fn fresh_screen_shows_zero_usage_and_no_notice() {
         let mut app = test_app();
@@ -1168,7 +1668,7 @@ mod tests {
             content: Some(crate::llm::Content::Text("上次的回答".into())),
             ..Default::default()
         });
-        let mut app = App::new(session).0;
+        let mut app = App::new(session, None, None).0;
         assert!(
             app.cells.iter().any(|c| matches!(c, Cell::User(_))),
             "历史消息要回放成单元格"
@@ -1278,10 +1778,13 @@ mod tests {
         let screen = app.render_to_string(48, 12);
         let flat = squash(&screen);
         assert!(flat.contains("已复制146字符到剪贴板"), "弹出提示：\n{screen}");
-        // 右下角：盒子最后一行的右端就是屏幕右端，且**不盖住输入框**（输入框上沿是 y=8）
+        // 右下角：盒子最后一行的右端就是屏幕右端，且**不盖住输入框**
         let lines: Vec<&str> = screen.lines().collect();
         let box_bottom = lines.iter().rposition(|l| l.contains('已')).unwrap();
-        assert!(box_bottom < 8, "提示要浮在输入框上方：\n{screen}");
+        assert!(
+            box_bottom < app.input.rect().y as usize,
+            "提示要浮在输入框上方：\n{screen}"
+        );
         assert!(
             lines[box_bottom].trim_end().ends_with('│'),
             "贴着屏幕右侧（右边框就在最后一列）：\n{screen}"
@@ -1294,6 +1797,167 @@ mod tests {
         let screen = app.render_to_string(48, 12);
         assert!(!squash(&screen).contains("已复制"), "3 秒后自动消失：\n{screen}");
         assert!(app.toast.is_none(), "过期就清掉状态");
+    }
+
+    #[test]
+    fn retry_progress_is_one_block_per_flow_and_clears_at_the_end() {
+        let mut app = test_app();
+        let retry = |key: &str, n: u32| UiEvent::Retry {
+            key: key.into(),
+            text: format!("[retry] {key}失败（boom），1.0s 后第 {n}/3 次重试"),
+        };
+        app.on_turn_event(retry("流式请求", 1));
+        let screen = app.render_to_string(80, 24);
+        assert!(squash(&screen).contains("⟳[retry]流式请求失败"), "{screen}");
+        assert!(squash(&screen).contains("第1/3次重试"), "{screen}");
+        // 标记是半角字（宽度 2）——不能把行挤歪
+        assert_eq!(Line::from("⟳ ").width(), 2);
+
+        // 再重试一次：**还是只有一个块**，内容就地改写
+        app.on_turn_event(retry("流式请求", 2));
+        let screen = app.render_to_string(80, 24);
+        assert_eq!(screen.matches('⟳').count(), 1, "只留一个块：\n{screen}");
+        assert!(squash(&screen).contains("第2/3次重试"), "{screen}");
+        assert!(!squash(&screen).contains("第1/3次重试"), "旧内容被改写：{screen}");
+
+        // 另一条流程（启动时拉模型列表）**各占一块**，不互相覆盖
+        app.on_turn_event(retry("模型列表请求", 1));
+        let screen = app.render_to_string(80, 24);
+        assert_eq!(screen.matches('⟳').count(), 2, "两条流程各一块：\n{screen}");
+        app.on_turn_event(retry("模型列表请求", 2));
+        let screen = app.render_to_string(80, 24);
+        assert_eq!(screen.matches('⟳').count(), 2, "同 key 刷新不新增：\n{screen}");
+        let flat = squash(&screen);
+        assert!(flat.contains("流式请求失败") && flat.contains("模型列表请求失败"), "{screen}");
+
+        // 这串进度结束（`with_retry` 出口）→ 只撤自己那块
+        app.on_turn_event(UiEvent::RetryDone {
+            key: "流式请求".into(),
+        });
+        let screen = app.render_to_string(80, 24);
+        assert_eq!(screen.matches('⟳').count(), 1, "只撤自己那块：\n{screen}");
+        let flat = squash(&screen);
+        assert!(!flat.contains("流式请求失败"), "结束的那块要撤：{flat}");
+        assert!(flat.contains("模型列表请求失败"), "别人的块不动：{flat}");
+
+        // 模型开始出字 = 重试成功 → 所有临时进度块都撤掉
+        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("好了".into())));
+        let flat = squash(&app.render_to_string(80, 24));
+        assert!(!flat.contains('⟳'), "恢复后不留重试块：{flat}");
+        assert!(flat.contains("好了"), "正文照常：{flat}");
+    }
+
+    #[test]
+    fn retry_block_is_replaced_by_the_error_when_the_turn_gives_up() {
+        let mut app = test_app();
+        app.on_turn_event(UiEvent::Retry {
+            key: "流式请求".into(),
+            text: "[retry] 请求失败（boom），1.0s 后第 3/3 次重试".into(),
+        });
+        let snapshot = app.snapshot.clone();
+        app.on_turn_event(UiEvent::TurnDone(
+            Err(LlmError::Protocol("boom".into())),
+            snapshot,
+        ));
+        let screen = app.render_to_string(80, 24);
+        let flat = squash(&screen);
+        assert!(flat.contains("boom"), "错误要看得见：{screen}");
+        assert!(!flat.contains('⟳'), "回合结束不留临时进度：{screen}");
+    }
+
+    #[test]
+    fn input_mouse_drag_selects_text_and_copies_on_release() {
+        let mut app = test_app();
+        app.input.insert("hello world");
+        app.render_to_string(80, 12); // 先渲染一帧：控件才会记下区域（命中测试用）
+        let rect = app.input.rect();
+        assert!(rect.height > 0, "渲染后才有区域");
+        let (x, y) = (rect.x, rect.y + 1); // 上边框下面就是第一行内容
+
+        // 输入框里按下 + 拖到第 5 格 → 选中 "hello"
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            x + 5,
+            y,
+        ));
+        assert_eq!(app.input.selection_text().as_deref(), Some("hello"));
+        assert!(app.selection.is_none(), "输入框里拖选不该起消息流选区");
+
+        // 选中的单元格在屏幕上高亮成 accent 底（用的是控件自己的选中样式）
+        let buf = render_buffer(&mut app, 80, 12);
+        assert_eq!(
+            buf[(x, y)].style().bg,
+            Some(app.palette.accent),
+            "输入框里的选中要高亮"
+        );
+
+        // 松开：写剪贴板 + 弹提示（无剪贴板时会提示失败，但提示本身要在）
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y));
+        assert!(app.toast.is_some(), "松开鼠标要弹一条提示");
+        assert!(app.drag.is_none(), "松手后结束拖选状态");
+    }
+
+    #[test]
+    fn input_click_moves_cursor_and_escape_clears_selection() {
+        let mut app = test_app();
+        app.input.insert("第一行\n第二行");
+        app.render_to_string(80, 12);
+        let rect = app.input.rect();
+        let (x, y) = (rect.x, rect.y + 1);
+        let second = (rect.x, rect.y + 2);
+
+        // 点第二行第 2 格：光标跟着走（上下行都能命中）
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), second.0 + 2, second.1));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.0 + 2, second.1));
+        let (line, col) = app.input.hit(second.0 + 2, second.1).expect("命中第二行");
+        assert_eq!((line, col), (1, 1), "点在第 2 行第 2 格");
+        assert!(app.input.selection_text().is_none(), "点一下不算选区");
+
+        // 拖选后再按 Esc：先收选区（不是清空输入）
+        app.input.insert("abcd");
+        app.render_to_string(80, 12);
+        drag(&mut app, (x, y), (x + 3, y));
+        assert!(app.input.has_selection());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.input.has_selection(), "Esc 收掉输入框选区");
+        assert!(!app.input.is_empty(), "不能顺手把输入也清了");
+    }
+
+    #[test]
+    fn click_outside_the_input_does_not_touch_it() {
+        let mut app = test_app();
+        app.input.insert("abc");
+        app.cells.push(Cell::User("日志内容".into()));
+        app.render_to_string(80, 12);
+        let body = app.body;
+        // 消息流里拖：走的是消息流框选，输入框不受影响
+        drag(&mut app, (body.x, body.y), (body.x + 3, body.y));
+        assert!(app.selection.is_some());
+        assert!(app.drag.is_some(), "拖动中记着拖的是哪个面");
+        assert!(!app.input.has_selection());
+        // 松开：走消息流那条收尾
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), body.x + 3, body.y));
+        assert!(app.drag.is_none() && app.selection.is_none(), "消息流选区松开即取走");
+    }
+
+    #[test]
+    fn drag_target_is_fixed_when_the_mouse_goes_down() {
+        let mut app = test_app();
+        app.cells.push(Cell::User("日志内容".into()));
+        app.input.insert("abc");
+        app.render_to_string(80, 12);
+        let body = app.body;
+        let rect = app.input.rect();
+        // 从消息流按下，一路拖到输入框上面：拖的还是消息流（按下那一刻定下的）
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), body.x, body.y));
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            rect.x + 2,
+            rect.y + 1,
+        ));
+        assert_eq!(app.drag, Some(Surface::Log));
+        assert!(!app.input.has_selection(), "没把输入框卷进来：{rect:?}");
     }
 
     #[test]
@@ -1382,12 +2046,12 @@ mod tests {
     #[test]
     fn input_border_highlights_focus_and_shell_mode() {
         let mut app = test_app();
-        // 布局（高 12）：header 1 行 + body(Min) + 输入框 3 行 + 底栏 1 行 → 上边框在 y=8
-        let (w, h, border_y) = (40u16, 12u16, 8u16);
+        let (w, h) = (40u16, 12u16);
         let accent = app.palette.accent;
         let tool = app.palette.tool;
 
         let buf = render_buffer(&mut app, w, h);
+        let border_y = app.input.rect().y;
         let fg = |x: u16| buf[(x, border_y)].style().fg;
         assert_eq!(fg(0), Some(accent), "聚焦时输入框上边框是强调色");
         assert_eq!(fg(w - 1), Some(accent), "整条边框线都高亮，不只开头");
@@ -1401,21 +2065,204 @@ mod tests {
         );
     }
 
+    /// 键位提示现在住在输入框的 placeholder 里（空输入时才显示），不再单独占一行。
     #[test]
-    fn single_line_input_keeps_one_blank_row_above_hint() {
+    fn hint_lives_in_the_input_placeholder() {
         let mut app = test_app();
-        app.input.insert("只有一行");
-        let screen = app.render_to_string(60, 24);
-        let lines: Vec<&str> = screen.lines().collect();
-        let last = lines.len() - 1;
-        assert!(squash(lines[last]).contains("发送"), "底栏在最后一行：\n{screen}");
+        let (w, h) = (60u16, 24u16);
+        let screen = app.render_to_string(w, h);
+        let flat = squash(&screen);
+        // ⚠ 末行是空的时候 `str::lines()` 不会多吐一条，所以用屏幕高度当基准，别用 lines().len()
+        let rows: Vec<&str> = screen.lines().collect();
+        let row = |y: usize| rows.get(y).copied().unwrap_or("");
+        assert!(flat.contains("⏎发送"), "空输入时显示键位提示：\n{screen}");
+        // 提示在输入框内容的第一行；输入框只在下面留一行（状态栏）
+        let rect = app.input.rect();
+        assert_eq!(rect.bottom(), h - 1, "输入框下方只剩状态栏：{rect:?}");
+        assert!(squash(row(rect.y as usize + 1)).contains("⏎发送"), "\n{screen}");
+        assert!(squash(row(rect.y as usize + 2)).is_empty(), "最后一行留白：\n{screen}");
+
+        // placeholder 语义：有字就不显示
+        app.input.insert("你好");
+        let flat = squash(&app.render_to_string(w, h));
+        assert!(!flat.contains("⏎发送"), "输入框里有字时不占位：{flat}");
+
+        // 回合进行中换文案（这行字就在光标待的地方，比原来那行更显眼）
+        app.busy = true;
+        app.input.clear();
+        let flat = squash(&app.render_to_string(w, h));
+        assert!(flat.contains("Esc停止"), "忙时提示 Esc：{flat}");
+    }
+
+    /// 状态栏（模型 / 目录 / 用量 / 活动）在最**下**方，屏幕第一行就是消息流。
+    /// 余额事件 → 状态栏**左边**出现 `¥110.00`（跟在用量后面）；活动指示独占**右边**。
+    #[test]
+    fn balance_lands_in_the_status_bar() {
+        let mut app = test_app();
+        app.cells.push(Cell::User("你好".into()));
+        // 100 列：名字 + 用量 + 余额 + 右侧的活动指示都放得下，名字不会被截
+        let (w, h) = (100u16, 16u16);
+        let before = app.render_to_string(w, h);
+        assert!(!before.contains('¥'), "还没拿到就不显示：{before}");
+
+        app.on_turn_event(UiEvent::Balance(Ok(crate::llm::Balance {
+            is_available: true,
+            balance_infos: vec![crate::llm::BalanceInfo {
+                currency: "CNY".into(),
+                total_balance: "110.00".into(),
+                granted_balance: "10.00".into(),
+                topped_up_balance: "100.00".into(),
+            }],
+        })));
+        let screen = app.render_to_string(w, h);
+        let status = screen.lines().last().expect("状态栏在最后一行");
+        assert!(status.starts_with(" deepseek-flash high ·"), "{status:?}");
         assert!(
-            squash(lines[last - 1]).is_empty(),
-            "单行文本下方留一行空白（默认 3 行高），不贴着底栏：\n{screen}"
+            status.contains("0/920,576 (0.0%)  │ ¥110.00"),
+            "余额紧跟在用量后面（都在左边）：{status:?}"
+        );
+        assert!(app.balance_supported, "查成功过 → 以后每回合刷新");
+
+        // 活动指示转圈/计时贴到右边（不会把用量/余额推来推去）
+        app.activity = Activity::Waiting {
+            since: Instant::now(),
+        };
+        let screen = app.render_to_string(w, h);
+        let status = screen.lines().last().unwrap();
+        assert!(status.starts_with(" deepseek-flash high ·"), "{status:?}");
+        assert!(status.ends_with("Waiting… 0.0s"), "{status:?}");
+        assert!(status.contains("¥110.00"), "{status:?}");
+
+        // 查询失败（非 DeepSeek 端点常见）→ 不再自动重试；已显示的值先留着
+        app.activity = Activity::Idle;
+        app.on_turn_event(UiEvent::Balance(Err(LlmError::Protocol("404".into()))));
+        assert!(!app.balance_supported);
+        assert!(
+            app.render_to_string(w, h)
+                .lines()
+                .last()
+                .unwrap()
+                .contains("¥110.00"),
+            "拿不到新的就先留旧的"
+        );
+    }
+
+    /// `/thinking` 改了深度 → 状态栏（快照）跟着变；补全面板的「← 当前」也读同一份。
+    ///
+    /// ⚠ 会话的 `Config` 要显式指定 `config_file`：`/thinking` 会把配置**写回文件**，而
+    /// `Config::default()` 的 `config_file` 是 `None` → 会落到**用户真实的** `~/.pie/config.toml`。
+    /// （别用环境变量改 `PIE_DIR` 代替：那是进程级的，会跟并行跑的其他用例抢。）
+    #[test]
+    fn thinking_change_shows_up_in_the_status_bar() {
+        let dir = std::env::temp_dir().join(format!("pie-tui-thinking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = crate::config::Config {
+            model: "deepseek-flash".into(),
+            config_file: Some(dir.join("config.toml")),
+            ..Default::default()
+        };
+        let llm = crate::llm::LlmClient::new(&cfg).expect("client");
+        let tools = crate::tools::ToolRegistry::new(Default::default());
+        let mut app = App::new(Session::ephemeral(&cfg, llm, tools), None, None).0;
+
+        let before = app.render_to_string(90, 16);
+        assert!(
+            before.contains("deepseek-flash high ·"),
+            "起手的深度来自配置：{before}"
+        );
+
+        app.command("thinking low");
+
+        let after = app.render_to_string(90, 16);
+        assert!(
+            after.contains("deepseek-flash low ·"),
+            "换了深度状态栏就要变：{after}"
+        );
+        assert!(!after.contains(" high "), "旧深度要消失：{after}");
+        let status = after.lines().last().expect("状态栏在最后一行");
+        assert!(
+            status.starts_with(" deepseek-flash"),
+            "前缀去掉就是去掉（行首就是模型名）：{status:?}"
         );
         assert!(
-            squash(lines[last - 2]).contains("只有一行"),
-            "输入文本在空白行的上一行：\n{screen}"
+            dir.join("config.toml").exists(),
+            "配置写回了指定的那个文件"
+        );
+
+        // 补全面板的「← 当前」读的是同一份快照
+        app.input.set_text("/thinking ");
+        let (matches, replace_from) = app.completions();
+        assert!(replace_from.is_none(), "`/` 命令是整条替换");
+        assert!(
+            matches
+                .iter()
+                .any(|(cmd, desc)| cmd == "/thinking low" && desc.contains("当前")),
+            "{matches:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正文在流式增量的**首个**分片上开表，后面的分片不许重设（否则永远 0.0s）。
+    #[test]
+    fn streaming_timer_starts_once_and_keeps_ticking() {
+        fn since_of(app: &App) -> Option<Instant> {
+            match app.activity {
+                Activity::Streaming { since } => Some(since),
+                _ => None,
+            }
+        }
+        let mut app = test_app();
+        app.activity = Activity::Thinking {
+            since: Instant::now(),
+        };
+        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("第一".into())));
+        let started = since_of(&app).expect("第一个增量开表");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("第二".into())));
+        assert_eq!(
+            since_of(&app),
+            Some(started),
+            "第二个增量不能把起点往后挪"
+        );
+    }
+
+    #[test]
+    fn status_bar_lives_at_the_bottom() {
+        let mut app = test_app();
+        app.cells.push(Cell::User("你好".into()));
+        let (w, h) = (70u16, 20u16);
+        let screen = app.render_to_string(w, h);
+        let rows: Vec<&str> = screen.lines().collect();
+        let last = squash(rows[h as usize - 1]);
+        assert!(last.contains("deepseek-flash"), "状态栏在最下：\n{screen}");
+        assert!(last.contains("0/920,576"), "带上下文用量：\n{screen}");
+        // 第一行就是消息流内容（没有顶栏了）
+        assert!(
+            squash(rows[0]).contains("›你好"),
+            "消息流从第一行开始：\n{screen}"
+        );
+        // 输入框在状态栏上方
+        assert_eq!(app.input.rect().bottom(), h - 1, "{}", app.input.rect().y);
+    }
+
+    #[test]
+    fn single_line_input_keeps_one_blank_row_inside_the_box() {
+        let mut app = test_app();
+        app.input.insert("只有一行");
+        let (w, h) = (60u16, 24u16);
+        let screen = app.render_to_string(w, h);
+        let rows: Vec<&str> = screen.lines().collect();
+        let row = |y: usize| rows.get(y).copied().unwrap_or("");
+        let rect = app.input.rect();
+        assert_eq!(rect.height, 3, "默认 3 行高");
+        assert!(
+            squash(row(rect.y as usize + 1)).contains("只有一行"),
+            "输入文本在内容第一行：\n{screen}"
+        );
+        assert!(
+            squash(row(rect.y as usize + 2)).is_empty(),
+            "下方留一行空白（默认 3 行高）：\n{screen}"
         );
     }
 
@@ -1466,19 +2313,22 @@ mod tests {
     #[test]
     fn tool_lines_and_notices_are_compact_by_default() {
         let mut app = test_app();
-        let long_body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        // 100 行 ≈ 900 字（**超过 500**）：展示层自己截，不依赖 Session 上游截断
+        // （`tool_result` 事件的 text 现在是原样的，见 `Session::tool_call`）
+        let long_body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        assert!(long_body.len() > 500);
         app.cells.push(Cell::Tool {
-            name: "shell".into(),
-            summary: "seq 1 40".into(),
+            name: "bash".into(),
+            summary: "seq 1 100".into(),
             status: Status::Fail,
             body: Some(long_body),
             manual: false,
         });
         let screen = app.render_to_string(80, 60);
         let flat = squash(&screen);
-        assert!(flat.contains("✗shell(seq140)"), "{screen}");
+        assert!(flat.contains("✗bash(seq1100)"), "{screen}");
         assert!(flat.contains("line1"), "{screen}");
-        assert!(!flat.contains("line40"), "正文截断：{screen}");
+        assert!(!flat.contains("line100"), "正文截断：{screen}");
         assert!(flat.contains("已省略"), "{screen}");
     }
 
@@ -1493,6 +2343,83 @@ mod tests {
             second.starts_with("  ") && !second.trim_start().starts_with('·'),
             "续行缩进对齐且不再带 ·：{screen}"
         );
+    }
+
+    /// 已移除的 `/stop` `/paste` `/quit`：不当事给模型，只提醒改用什么（别静默变成一条消息）。
+    #[test]
+    fn removed_commands_are_not_sent_as_messages() {
+        let mut app = test_app();
+        for (cmd, needle) in [("/stop", "Esc"), ("/paste", "Ctrl+G"), ("/quit", "/exit")] {
+            app.input.set_text(cmd);
+            app.submit();
+            assert!(!app.busy, "{cmd} 不该起回合");
+            assert!(
+                !app.cells.iter().any(|c| matches!(c, Cell::User(_))),
+                "{cmd} 不该进消息流（那是发给模型的）"
+            );
+            let notice = last_notice(&app);
+            assert!(notice.contains(needle), "{cmd} → 提示里该说 {needle}：{notice}");
+        }
+        assert!(!app.should_quit, "/quit 不再退出（只有 /exit 与 Ctrl+C）");
+
+        // 回合进行中敲 `/stop`：只提醒按 Esc（它不再是一条命令）
+        app.busy = true;
+        app.input.set_text("/stop");
+        app.submit();
+        app.busy = false;
+        assert!(last_notice(&app).contains("Esc"), "{}", last_notice(&app));
+    }
+
+    /// 最后一条 Notice 文本（命令反馈都走它）。
+    fn last_notice(app: &App) -> String {
+        app.cells
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Cell::Notice(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// `/clear` 归档当前窗口（**消息流不动**，刚归档的东西还能往上翻），
+    /// `/reset` 只清历史（消息流也清）。
+    ///
+    /// ⚠ 走 `PIE_DIR` 临时目录：窗口块落在 `$PIE_DIR/windows/`、会话与配置也写在那下面，
+    /// 不重定向就落到用户真实的 `~/.pie/`。
+    #[test]
+    fn clear_archives_window_and_reset_wipes_history() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pie-tui-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("PIE_DIR", &dir);
+
+        let mut app = test_app();
+        app.cells.push(Cell::User("旧消息".into()));
+        app.session.try_lock().expect("空闲").push_user("旧问题");
+
+        app.command("clear");
+        let notice = last_notice(&app);
+        assert!(notice.contains("窗口块"), "{notice}");
+        assert!(dir.join("windows").exists(), "窗口块落在 $PIE_DIR/windows/");
+        assert!(
+            app.cells.iter().any(|c| matches!(c, Cell::User(_))),
+            "clear 不该清屏：{}",
+            last_notice(&app)
+        );
+        {
+            let guard = app.session.try_lock().expect("空闲");
+            assert_eq!(guard.windows.len(), 1, "会话手上多了一个窗口块");
+            assert_eq!(guard.messages.len(), 2, "system + 窗口摘要");
+        }
+
+        app.command("reset");
+        assert!(
+            !app.cells.iter().any(|c| matches!(c, Cell::User(_))),
+            "reset 清屏（只剩命令反馈那条 Notice）"
+        );
+        assert!(last_notice(&app).contains("已清空"), "{}", last_notice(&app));
+        assert_eq!(app.session.try_lock().expect("空闲").messages.len(), 1);
     }
 
     #[test]
@@ -1512,16 +2439,16 @@ mod tests {
         app.submit();
         // 命令行回显立刻就位（运行中 = `•`），期间算忙（Esc 可中断）
         let flat = squash(&app.render_to_string(80, 24));
-        assert!(flat.contains("•shell($echohi)"), "{flat}");
+        assert!(flat.contains("•bash($echohi)"), "{flat}");
         assert!(app.busy, "跑 shell 期间 busy");
 
         let event = rx.recv().await.expect("ShellDone 事件");
         app.on_turn_event(event);
         let flat = squash(&app.render_to_string(80, 24));
-        assert!(flat.contains("✓shell($echohi)"), "{flat}");
-        // 手动 shell 不吃简洁模式（配置默认 lean=true）
-        assert!(flat.contains("[exit=0]"), "结果正文：{flat}");
+        assert!(flat.contains("✓bash($echohi)"), "{flat}");
+        // 手动 shell 不吃简洁模式（配置默认 lean=true），且**只给 body、不给头区**
         assert!(flat.contains("hi"), "{flat}");
+        assert!(!flat.contains("[exit="), "`!cmd` 结果只有 body：{flat}");
         assert!(!app.busy);
         let guard = app.session.try_lock().expect("没人握着锁");
         assert!(
@@ -1530,7 +2457,7 @@ mod tests {
         );
     }
 
-    /// `!cmd` 跑长命令时 `Esc` / `/stop` 要能中断（杀整个进程组，不是干等）。
+    /// `!cmd` 跑长命令时 `Esc` 要能中断（杀整个进程组，不是干等）。
     #[tokio::test]
     async fn bang_shell_can_be_stopped() {
         let (mut app, mut rx) = app_with_rx();
@@ -1543,7 +2470,7 @@ mod tests {
             .expect("ShellDone 事件");
         app.on_turn_event(event);
         let flat = squash(&app.render_to_string(80, 24));
-        assert!(flat.contains("⏹shell($sleep30)"), "{flat}");
+        assert!(flat.contains("⏹bash($sleep30)"), "{flat}");
         assert!(flat.contains("[exit=cancelled]"), "{flat}");
         assert!(flat.contains("用户手动终止"), "{flat}");
         assert!(!app.busy);

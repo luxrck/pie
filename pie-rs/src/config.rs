@@ -12,46 +12,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 
-// ---------------------------------------------------------------- 默认值
+// ---------------------------------------------------------------- 常量
+//
+// ⚠ 默认值**不在这里开 `DEFAULT_*` 常量**：类型自己有 `Default`（`impl Default for Config` /
+// `CompactionConfig` / …），值就写在那儿 —— 一处定义、改一处。这里只留**跨模块要用的**东西：
+// `REASONING_LEVELS`（TUI 的 `/thinking` 候选）、`REASONING_NONE`（CLI 的 `-t off` 归一）、
+// 以及提示词文件名（`find_project_root` / `resolve_prompt_file` / `build_system_prompt` 三处共用）。
 
-pub const DEFAULT_MODEL: &str = "deepseek-flash";
-pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/";
-/// 本部署内置的默认 key（与 Python 版一致）。空串表示"用户没配"。
-pub const DEFAULT_API_KEY: &str = "<API_KEY>";
-pub const DEFAULT_REASONING_EFFORT: &str = "high";
-
-/// 思考深度合法值（`/reasoning` 与配置 `reasoning_effort`）。
+/// 思考深度合法值（`/thinking` 候选与配置 `reasoning_effort`）。
 pub const REASONING_LEVELS: [&str; 4] = ["none", "low", "high", "max"];
 /// `none` = 关闭思考：不发 `reasoning_effort`，改发 `thinking: {type: disabled}`。
 pub const REASONING_NONE: &str = "none";
-
-pub const DEFAULT_CONTEXT_WINDOW: i64 = 1024 * 1024;
-pub const DEFAULT_KEEP_LAST_STEPS: usize = 7;
-pub const DEFAULT_SOFT_RATIO: f64 = 0.8;
-pub const DEFAULT_TARGET_RATIO: f64 = 0.55;
-
-/// 每次请求为输出预留的 token（= 发给 API 的 `max_tokens`）。`None` = 不发、用服务端默认。
-pub const DEFAULT_RESERVED_TOKENS: i64 = 128_000;
-const RESERVED_TOKENS_AUTO: [&str; 5] = ["auto", "default", "none", "0", ""];
-
-pub const DEFAULT_FILES_API: bool = true;
-pub const DEFAULT_FILES_TTL_DAYS: i64 = 30;
-
-/// read 图片的字节上限：内联受单图 32 MiB 限制；开了 Files API 后放宽到 64 MiB。
-pub const IMAGE_MAX_BYTES_INLINE: i64 = 32 * 1024 * 1024;
-pub const IMAGE_MAX_BYTES_FILES: i64 = 64 * 1024 * 1024;
 
 /// 提示词文件名（位置不再可配）。
 pub const SYSTEM_FILE: &str = "SYSTEM.md";
 pub const AGENTS_FILE: &str = "AGENTS.md";
 pub const MEMORY_FILE: &str = "MEMORY.md";
-
-/// 内置兜底 system prompt：与 Python 版 `config.SYSTEM_PROMPT` 常量**逐字一致**（用 ast 抽出来比过），
-/// 编译期嵌入 → 仓库根没有 `SYSTEM.md` 时也能单文件跑（本仓根就没有那个文件）。
-///
-/// 正文文件名小写（`prompts/system.md`）与 `prompts/memory.md` 保持一致；但**运行时找的那个
-/// 文件名仍是 `SYSTEM_FILE = "SYSTEM.md"`**（从 cwd 往上的仓库根，与 Python 版共用同一套）。
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 // ---------------------------------------------------------------- 路径
 
@@ -90,10 +66,9 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// unix 秒 → `YYYY-MM-DDTHH:MM:SS`（UTC）。
+/// unix 秒 → `YYYY-MM-DDTHH:MM:SS`（**UTC**）。
 ///
-/// 用 Howard Hinnant 的 civil_from_days（不引日期库）；`context` 的 manifest 时间戳、
-/// `files list` 显示的时间都走这一份，不开二份换算。
+/// 用 Howard Hinnant 的 civil_from_days（不引日期库）；对外的展示请用 [`iso_local`]。
 pub fn iso_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
@@ -115,12 +90,40 @@ pub fn iso_utc(secs: i64) -> String {
     )
 }
 
-/// unix 秒 → `YYYY-MM-DD HH:MM`（**UTC**）。
+/// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。
 ///
-/// ⚠ Python 版这里用本地时间（`datetime.fromtimestamp`）；Rust 没有时区库，统一按 UTC
-/// 显示——只是给人看的时间戳，不参与任何判断。
+/// 用 `localtime_r`（POSIX，线程安全）拿到带 DST 的 `struct tm`，取 `tm_gmtoff`。
+/// 非 unix 平台没这套东西 → 回退 0（显示成 UTC）：比引一个带时区库的依赖划算。
+#[cfg(unix)]
+fn local_utc_offset(secs: i64) -> i64 {
+    // SAFETY: `localtime_r` 把结果写进我们给的 `tm`（返回的不是共享缓冲）
+    unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset(_secs: i64) -> i64 {
+    0
+}
+
+/// unix 秒 → 本地时间的 ISO 串（`2026-09-23T12:37:04`，**不带时区后缀**）。
+///
+/// 与 Python `datetime.now().isoformat(timespec="seconds")` 同形：manifest 的 `ts` 用这个。
+pub fn iso_local(secs: i64) -> String {
+    iso_utc(secs + local_utc_offset(secs))
+}
+
+/// unix 秒 → `YYYY-MM-DD HH:MM`（**本地时间**；`pie sessions` / `files list` 的时间列）。
+///
+/// 只是给人看的时间戳，不参与任何判断。
 pub fn fmt_unix_ts(secs: i64) -> String {
-    let iso = iso_utc(secs);
+    let iso = iso_local(secs);
     format!("{} {}", &iso[..10], &iso[11..16])
 }
 
@@ -145,16 +148,13 @@ pub fn global_memory_file() -> PathBuf {
     pie_dir().join("memory.md")
 }
 
-/// 全局记忆的**种子文件**内容（首跑写一份，之后不再动）——与 Python 版
-/// `config.GLOBAL_MEMORY_TEMPLATE` **逐字一致**：两边共用一个 `~/.pie/memory.md`，
-/// 骨架不一样就白搭。
-///
-/// 与 `DEFAULT_SYSTEM_PROMPT` 同一套做法：正文放在 `prompts/memory.md`，`include_str!` 编进来
-/// —— 模板里全是中文与骨架，写成转义串难读也容易碰格式。
-pub const DEFAULT_GLOBAL_MEMORY: &str = include_str!("../prompts/memory.md");
-
 /// 首次运行创建全局记忆的种子文件（已存在则跳过，**不覆盖**）——对齐 Python
 /// `config._ensure_global_memory()`（它在 `ensure_config()` 里调，即每次启动）。
+///
+/// 种子正文放在 `prompts/memory.md`、`include_str!` 编进来（与内置 system prompt 同一套做法：
+/// 模板里全是中文与骨架，写成转义串难读也容易碰格式）。内容与 Python 版
+/// `config.GLOBAL_MEMORY_TEMPLATE` **逐字一致** —— 两边共用一个 `~/.pie/memory.md`，
+/// 骨架不一样就白搭。
 ///
 /// 写不了就算了（权限/只读家目录）：这只是个种子，不值得挡住启动。
 pub fn ensure_global_memory() {
@@ -165,7 +165,7 @@ pub fn ensure_global_memory() {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, DEFAULT_GLOBAL_MEMORY);
+    let _ = std::fs::write(&path, include_str!("../prompts/memory.md"));
 }
 
 /// 配置路径：显式 `-c` > `PIE_CONFIG_FILE` 环境变量 > 默认 `~/.pie/config.toml`。
@@ -217,15 +217,20 @@ enum TableOrBool<T> {
     Table(T),
 }
 
-/// 子表/布尔 → `Option<子表>`：`false` 或缺失即「关闭这一级」。
+/// 子表/布尔 → `Option<子表>`。
+///
+/// - `xx = false` → `None`（关闭这一级）
+/// - `xx = true`  → `Some(T::default())`（**开启用默认值**，与 Python 版同义：
+///   那边 `tool = true` 落到「不认的子表分支 → 保持刚建好的默认 `ToolCompaction()`」）
+/// - `[compaction.xx]` 子表 → 用它
 fn de_level<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
-    T: Deserialize<'de>,
+    T: Deserialize<'de> + Default,
 {
     Ok(match TableOrBool::<T>::deserialize(d)? {
         TableOrBool::Bool(false) => None,
-        TableOrBool::Bool(true) => None, // 只写 `xx = true` 无参数：按关闭处理（Python 版里也无参数可给）
+        TableOrBool::Bool(true) => Some(T::default()),
         TableOrBool::Table(t) => Some(t),
     })
 }
@@ -253,8 +258,8 @@ impl Default for CompactionConfig {
             tool: Some(ToolCompaction::default()),
             turn: true,
             session: Some(SessionCompaction::default()),
-            soft_ratio: DEFAULT_SOFT_RATIO,
-            target_ratio: DEFAULT_TARGET_RATIO,
+            soft_ratio: 0.8,
+            target_ratio: 0.55,
         }
     }
 }
@@ -282,21 +287,14 @@ pub struct Config {
     pub api_key: String,
     pub reasoning_effort: String,
     #[serde(deserialize_with = "de_reserved_tokens")]
-    pub reserved_tokens: Option<i64>,
-    pub context_window: i64,
+    pub reserved_tokens: Option<usize>,
+    pub context_window: usize,
     pub keep_last_steps: usize,
-    /// 单回合最多问几次模型（不写 = 不限）。
-    ///
-    /// Python 版这里是 `loop.aturn(max_steps=…)` 的形参（由嵌入方按次传），Rust 收进配置：
-    /// 要按次覆盖，调用前改一下 `cfg.max_steps` 就行（等价，且少一个形参）。
-    pub max_steps: Option<usize>,
-    /// 是否流式请求（`false` = 一次性 `complete`，`on_event` 不再收到增量）。同上：Python 是形参。
-    pub stream: bool,
     /// `None` = 不做任何上下文压缩。
     #[serde(deserialize_with = "de_compaction")]
     pub compaction: Option<CompactionConfig>,
     pub timeout_seconds: f64,
-    pub max_retries: u32,
+    pub max_retries: usize,
     pub max_retry_delay_seconds: f64,
     pub verbose: bool,
     pub theme: String,
@@ -304,7 +302,7 @@ pub struct Config {
     pub tools: HashMap<String, toml::Value>,
     pub tui: TuiConfig,
     pub files_api: bool,
-    pub files_ttl_days: i64,
+    pub files_ttl_days: usize,
     /// 同一批 tool_calls 是否并发执行。
     pub parallel_tools: bool,
 
@@ -313,7 +311,7 @@ pub struct Config {
     pub config_file: Option<PathBuf>,
     /// 运行时属性（不落盘）：CLI `--auto-compact-threshold` 一次性覆盖软阈值。
     #[serde(skip)]
-    pub auto_compact_threshold: Option<i64>,
+    pub auto_compact_threshold: Option<usize>,
     /// 运行时属性（不落盘）：CLI `--system-prompt`（替换基础提示：文本或文件内容）。
     #[serde(skip)]
     pub system_prompt: Option<String>,
@@ -325,15 +323,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: DEFAULT_MODEL.to_string(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: DEFAULT_API_KEY.to_string(),
-            reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
-            reserved_tokens: Some(DEFAULT_RESERVED_TOKENS),
-            context_window: DEFAULT_CONTEXT_WINDOW,
-            keep_last_steps: DEFAULT_KEEP_LAST_STEPS,
-            max_steps: None,
-            stream: true,
+            model: "deepseek-flash".to_string(),
+            // 本部署内置的默认 key（与 Python 版一致）；空串 = 用户没配
+            base_url: "https://api.deepseek.com/".to_string(),
+            api_key: "<API_KEY>".to_string(),
+            reasoning_effort: "high".to_string(),
+            reserved_tokens: Some(128_000),
+            context_window: 1024 * 1024,
+            keep_last_steps: 7,
             compaction: Some(CompactionConfig::default()),
             timeout_seconds: 60.0,
             max_retries: 5,
@@ -342,8 +339,8 @@ impl Default for Config {
             theme: "catppuccin".to_string(),
             tools: HashMap::new(),
             tui: TuiConfig::default(),
-            files_api: DEFAULT_FILES_API,
-            files_ttl_days: DEFAULT_FILES_TTL_DAYS,
+            files_api: true,
+            files_ttl_days: 30,
             parallel_tools: true,
             config_file: None,
             auto_compact_threshold: None,
@@ -370,21 +367,20 @@ impl Config {
     }
 
     /// 可用输入预算：服务端按「输入 tokens + max_tokens ≤ 窗口」判超限。
-    pub fn context_budget(&self) -> i64 {
-        (self.context_window - self.reserved_tokens.unwrap_or(0)).max(1)
+    pub fn context_budget(&self) -> usize {
+        // 预留比窗口还大时（配置写错）按 1 算，别让减法下溢
+        self.context_window
+            .saturating_sub(self.reserved_tokens.unwrap_or(0))
+            .max(1)
     }
 
+    /// 软 / 目标比例：没写 `[compaction]` 就用**默认那套**的比例（值与 `CompactionConfig::default()` 同源）。
     fn ratio(&self, soft: bool) -> f64 {
-        match &self.compaction {
-            Some(c) if soft => c.soft_ratio,
-            Some(c) => c.target_ratio,
-            None => {
-                if soft {
-                    DEFAULT_SOFT_RATIO
-                } else {
-                    DEFAULT_TARGET_RATIO
-                }
-            }
+        let c = self.compaction.clone().unwrap_or_default();
+        if soft {
+            c.soft_ratio
+        } else {
+            c.target_ratio
         }
     }
 
@@ -399,17 +395,17 @@ impl Config {
         self.ratio(false)
     }
 
-    pub fn soft_limit(&self) -> i64 {
+    pub fn soft_limit(&self) -> usize {
         // CLI 一次性覆盖（`--auto-compact-threshold`）优先——与 Python 的 `maybe_compact` 同语义
         if let Some(n) = self.auto_compact_threshold {
             return n.max(1);
         }
-        ((self.context_budget() as f64) * self.ratio(true)).max(1.0) as i64
+        (((self.context_budget() as f64) * self.ratio(true)).max(1.0)) as usize
     }
 
     /// 目标水位：压缩后应降到该值以下。
-    pub fn target_limit(&self) -> i64 {
-        ((self.context_budget() as f64) * self.ratio(false)).max(1.0) as i64
+    pub fn target_limit(&self) -> usize {
+        (((self.context_budget() as f64) * self.ratio(false)).max(1.0)) as usize
     }
 
     /// 工具私有默认参数（下划线开头，由 dispatch 注入）。
@@ -420,10 +416,11 @@ impl Config {
             .iter()
             .filter_map(|(k, v)| v.as_table().cloned().map(|t| (k.clone(), t)))
             .collect();
+        // 图片字节上限：内联受单图 32 MiB 限制；开了 Files API 放宽到 64 MiB
         let image_cap = if self.files_api {
-            IMAGE_MAX_BYTES_FILES
+            64 * 1024 * 1024
         } else {
-            IMAGE_MAX_BYTES_INLINE
+            32 * 1024 * 1024
         };
         out.entry("read".to_string())
             .or_default()
@@ -463,7 +460,10 @@ impl Config {
     }
 
     /// `Config` → TOML 值（形状与配置文件一致）。
-    fn to_toml(&self) -> toml::Value {
+    /// 配置 → TOML 值（**只含持久字段**：`#[serde(skip)]` 的运行时字段不在里面）。
+    ///
+    /// `save()` 用它落盘；绑定侧 `Config.to_dict()` / `update()` 也以它为基准（字段列表只有这一份）。
+    pub fn to_toml(&self) -> toml::Value {
         use toml::Value as V;
         let mut t = toml::map::Map::new();
         let mut put = |key: &str, value: V| {
@@ -476,16 +476,12 @@ impl Config {
         put(
             "reserved_tokens",
             match self.reserved_tokens {
-                Some(n) => V::Integer(n),
+                Some(n) => V::Integer(n as i64),
                 None => V::String("auto".to_string()),
             },
         );
-        put("context_window", V::Integer(self.context_window));
+        put("context_window", V::Integer(self.context_window as i64));
         put("keep_last_steps", V::Integer(self.keep_last_steps as i64));
-        if let Some(max) = self.max_steps {
-            put("max_steps", V::Integer(max as i64));
-        }
-        put("stream", V::Boolean(self.stream));
         put(
             "compaction",
             match &self.compaction {
@@ -544,7 +540,7 @@ impl Config {
         tui.insert("lean".to_string(), V::Boolean(self.tui.lean));
         put("tui", V::Table(tui));
         put("files_api", V::Boolean(self.files_api));
-        put("files_ttl_days", V::Integer(self.files_ttl_days));
+        put("files_ttl_days", V::Integer(self.files_ttl_days as i64));
         put("parallel_tools", V::Boolean(self.parallel_tools));
         V::Table(t)
     }
@@ -576,33 +572,25 @@ enum ReservedRaw {
     Str(String),
 }
 
-fn default_reserved_tokens() -> Option<i64> {
-    Some(DEFAULT_RESERVED_TOKENS)
-}
-
 /// `reserved_tokens` 容错：允许 `"auto"` / `"64k"` / `384K` 这类手写值；
-/// 0/负数按「不发送 max_tokens」处理。
-fn de_reserved_tokens<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+/// 0/负数按「不发送 max_tokens」处理（`None`）。
+///
+/// 键**缺失**时不走这里 —— `Config` 上的 `#[serde(default)]` 会拿 `Config::default()`
+/// 的值补上（`Some(128_000)`），与 Python「没写就用默认值」一致。
+fn de_reserved_tokens<'de, D>(d: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let _ = default_reserved_tokens;
     Ok(match ReservedRaw::deserialize(d)? {
-        ReservedRaw::Int(n) => {
-            if n < 1 {
-                None
-            } else {
-                Some(n)
-            }
-        }
+        ReservedRaw::Int(n) => (n >= 1).then_some(n as usize),
         ReservedRaw::Str(s) => parse_reserved_tokens(&s).ok().flatten(),
     })
 }
 
 /// 解析 `reserved_tokens` 输入：auto/default/none/0/空 → `None`；支持 `64k` / `384K` 简写。
-pub fn parse_reserved_tokens(raw: &str) -> Result<Option<i64>, String> {
+pub fn parse_reserved_tokens(raw: &str) -> Result<Option<usize>, String> {
     let text = raw.trim().to_ascii_lowercase();
-    if RESERVED_TOKENS_AUTO.contains(&text.as_str()) {
+    if ["auto", "default", "none", "0", ""].contains(&text.as_str()) {
         return Ok(None);
     }
     let (multiplier, digits) = if let Some(rest) = text.strip_suffix('k') {
@@ -614,7 +602,7 @@ pub fn parse_reserved_tokens(raw: &str) -> Result<Option<i64>, String> {
     };
     let value = digits
         .parse::<f64>()
-        .map(|v| (v * multiplier) as i64)
+        .map(|v| (v * multiplier) as usize)
         .map_err(|_| format!("无法识别的 token 数: {raw:?}（例：65536 / 64k / auto）"))?;
     if value < 1 {
         return Err("reserved_tokens 必须 ≥ 1（要恢复默认请用 auto）".to_string());
@@ -629,16 +617,11 @@ enum CompactionRaw {
     Table(CompactionConfig),
 }
 
-fn default_compaction() -> Option<CompactionConfig> {
-    Some(CompactionConfig::default())
-}
-
 /// `[compaction]` 可以为 `false`（整体关闭）或一张表；不写 = 默认三级全开。
 fn de_compaction<'de, D>(d: D) -> Result<Option<CompactionConfig>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let _ = default_compaction;
     Ok(match CompactionRaw::deserialize(d)? {
         CompactionRaw::Off(false) => None,
         CompactionRaw::Off(true) => Some(CompactionConfig::default()),
@@ -697,7 +680,9 @@ pub fn build_system_prompt(
         None => read_text(resolve_prompt_file(SYSTEM_FILE)),
     };
     let base = if base.is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
+        // 内置兜底 prompt：与 Python 版 `config.SYSTEM_PROMPT` 常量**逐字一致**（用 ast 抽出来比过），
+        // 编译期嵌入 → 仓库根没有 `SYSTEM.md` 时也能单文件跑（本仓根就没有那个文件）
+        include_str!("../prompts/system.md").to_string()
     } else {
         base
     };
@@ -749,12 +734,12 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(
             cfg.context_budget(),
-            DEFAULT_CONTEXT_WINDOW - DEFAULT_RESERVED_TOKENS
+            cfg.context_window - 128_000
         );
-        assert_eq!(cfg.soft_limit(), (cfg.context_budget() as f64 * 0.8) as i64);
+        assert_eq!(cfg.soft_limit(), (cfg.context_budget() as f64 * 0.8) as usize);
         assert_eq!(
             cfg.target_limit(),
-            (cfg.context_budget() as f64 * 0.55) as i64
+            (cfg.context_budget() as f64 * 0.55) as usize
         );
     }
 
@@ -811,9 +796,7 @@ lean = true
         let cfg = Config {
             model: "deepseek-v4-pro".into(),
             reserved_tokens: None, // → "auto"
-            max_steps: Some(7),
             context_window: 12_345,
-            stream: false,
             compaction: Some(CompactionConfig {
                 tool: None, // → tool = false
                 ..Default::default()
@@ -826,9 +809,7 @@ lean = true
         let back = Config::load(Some(&path)).expect("load");
         assert_eq!(back.model, "deepseek-v4-pro");
         assert_eq!(back.reserved_tokens, None, "\"auto\" 要读回 None");
-        assert_eq!(back.max_steps, Some(7));
         assert_eq!(back.context_window, 12_345);
-        assert!(!back.stream);
         let comp = back.compaction.as_ref().expect("compaction");
         assert!(comp.tool.is_none(), "tool = false 读回 None（该级关闭）");
         assert!(comp.session.is_some(), "session 没关就还是表");
@@ -889,5 +870,15 @@ lean = true
             toml::from_str("[compaction]\ntool = false\nturn = false\nsession = false").unwrap();
         let c = cfg.compaction.unwrap();
         assert!(c.tool.is_none() && !c.turn && c.session.is_none());
+    }
+
+    /// `tool = true` / `session = true`（只写布尔、不给参数）= **开启用默认值**（对齐 Python）。
+    #[test]
+    fn level_boolean_true_means_enabled_with_defaults() {
+        let cfg: Config =
+            toml::from_str("[compaction]\ntool = true\nsession = true").unwrap();
+        let c = cfg.compaction.unwrap();
+        assert_eq!(c.tool.unwrap().head, 30, "默认 head");
+        assert_eq!(c.session.unwrap().tail, 5, "默认 tail");
     }
 }

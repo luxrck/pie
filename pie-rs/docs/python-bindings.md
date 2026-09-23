@@ -52,18 +52,18 @@
 ## 3. 目标 API 草案（Python 侧长什么样）
 
 ```python
-import pie_rs
+import pie
 
-cfg = pie_rs.Config.load()                 # ~/.pie/config.toml（等价于 CLI 的 -c）
+cfg = pie.Config.load()                 # ~/.pie/config.toml（等价于 CLI 的 -c）
 cfg.model = "deepseek-flash"               # 内存覆盖，不写盘（与 CLI 覆盖项同语义）
 cfg.reasoning_effort = "high"
 
-llm   = pie_rs.LlmClient(cfg)
-tools = pie_rs.ToolRegistry.builtins(cfg)  # read / edit / write / shell
+llm   = pie.LlmClient(cfg)
+tools = pie.ToolRegistry.builtins(cfg)  # read / edit / writ / bash（Rust 侧工具名）
 
 # —— 会话 ——
-s = pie_rs.Session.new(cfg, llm, tools)          # 或 Session.load(path, ...) / Session.resume(...)
-# s = pie_rs.Session.ephemeral(cfg, llm, tools)  # 不落盘、不写 manifest（服务 / notebook 用）
+s = pie.Session.new(cfg, llm, tools)          # 或 Session.load(path, ...) / Session.resume(...)
+# s = pie.Session.ephemeral(cfg, llm, tools)  # 不落盘、不写 manifest（服务 / notebook 用）
 
 # ① 回调式（阻塞到回合结束，返回最终答复）
 s.aturn("读一下 README 的前 20 行", on_event=lambda ev: print(ev["type"], ev))
@@ -74,7 +74,7 @@ for ev in s.aturn_stream("同样的问题"):
         print(ev["text"], end="")
 
 # ③ 原生 async（M5 起，feature gate；见 §5.2）
-async with pie_rs.Session.new(cfg, llm, tools) as s:
+async with pie.Session.new(cfg, llm, tools) as s:
     answer = await s.aturn_async("同样的问题", on_event=print)
     async for ev in s.events():
         ...
@@ -84,15 +84,15 @@ print(s.usage_report())              # /stat 那段文本
 s.compact("tools"); s.reset(); s.save()
 
 # —— 取消 ——
-tok = pie_rs.Cancel()
+tok = pie.Cancel()
 threading.Thread(target=lambda: s.aturn("写一篇长文", on_event=..., cancel=tok)).start()
 tok.cancel()
 
 # —— 一次性 ——
-print(pie_rs.run("总结这个仓库", cfg=cfg))      # 无会话、不落盘
+print(pie.run("总结这个仓库", cfg=cfg))      # 无会话、不落盘
 
 # —— 自定义工具（M3） ——
-@pie_rs.tool(name="fetch", description="抓一个 URL 的正文")
+@pie.tool(name="fetch", description="抓一个 URL 的正文")
 def fetch(url: str) -> str:
     """url: 要抓的地址"""
     return requests.get(url).text     # 返回值 str → 工具结果文本
@@ -117,9 +117,10 @@ tools.register(fetch)                 # 或 tools.register(name="x", schema={...
 | `Message` | **dict**（`serde_json` → Python；可选 `pythonize` crate 零样板） | 字段多、含压缩元数据，逐字段 pyclass 维护成本高 |
 | `TurnEvent` | dict（`{"type": "tool_call", "name": …, "arguments": …}`） | 与 Python 版 `on_event` 的 dict 形状**一致**，两边代码可移植 |
 | `Usage` / `CompactStats` | dict | 同上 |
-| `Config` 的字段 | `to_dict()` / `update(dict)` + 少量 `#[getter]`/`#[setter]`（model / base_url / reasoning_effort / context_window / reserved_tokens / stream / max_steps / compaction / tools / tui） | 全字段属性太脆（Rust 结构体会变）；常用项给属性，其余走 dict |
+| `Config` 的字段 | `to_dict()` / `update(dict)` + 少量 `#[getter]`/`#[setter]`（model / base_url / reasoning_effort / context_window / reserved_tokens / compaction / tools / tui） | 全字段属性太脆（Rust 结构体会变）；常用项给属性，其余走 dict |
+| 每回合的执行旋钮 | `aturn(input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None)`（**形参**，不在 Config 里） | 同纯 Python 版 `loop.aturn`；`max_steps=None` = 不限，`stream=None` = 默认流式，`parallel_tools=None` = 跟随 `Config.parallel_tools` |
 
-配套 `py.typed` + `pie_rs/_pie_rs.pyi` 类型存根，把 dict 写成 `TypedDict`。
+配套 `py.typed` + `pie/_pie_rs.pyi` 类型存根，把 dict 写成 `TypedDict`。
 
 ---
 
@@ -132,9 +133,9 @@ pie-rs/
 ├── Cargo.toml          # 仍是 package；新增 [lib] + feature gate
 ├── src/lib.rs          # 新增：pub mod config/llm/tools/session/context/cancel/log
 │                       #        #[cfg(feature = "tui")] pub mod tui;
-├── src/main.rs         # 变薄：use pie_rs::{...}（bin 与 lib 同名同目录，cargo 允许）
+├── src/main.rs         # 变薄：use pie::{...}（lib 名 `pie`，bin 名仍是 `pie-rs`）
 ├── bindings/pie-py/    # 独立 crate：cdylib，path 依赖 pie-rs，default-features = false
-└── python/             # pie_rs 外壳包（__init__.py / .pyi / pyproject.toml / tests）
+└── python/             # pie 外壳包（__init__.py / .pyi / pyproject.toml / tests）
 ```
 
 - `Cargo.toml`：`default = ["tui"]`，`tui = []`；`bindings/pie-py` 用 `default-features = false`。
@@ -154,7 +155,7 @@ crates/pie-py     # cdylib：PyO3 绑定
   且 `pie-rs/` 目前**还没进 git**（`git status` 显示 `?? pie-rs/`）——大重构前先提交，否则不可回退。
 
 **建议：先 A，等 API 稳定、真要发 crates.io 时再做 B。** 两者对绑定代码的写法没有区别
-（都是 `pie_rs::session::Session` 这种路径），所以先 A 不会白干。
+（都是 `pie::session::Session` 这种路径），所以先 A 不会白干。
 
 ---
 
@@ -209,7 +210,7 @@ fn aturn_async(
 **M5 的目标形态**（feature gate `asyncio`，不影响同步路径）：
 
 ```python
-async with pie_rs.Session.new(cfg, llm, tools) as s:
+async with pie.Session.new(cfg, llm, tools) as s:
     task = asyncio.create_task(s.aturn_async("写一篇长文"))   # 事件走 asyncio.Queue
     async for ev in s.events():
         print(ev["type"])
@@ -285,7 +286,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 ## 6. 打包与分发
 
-- 构建后端 **maturin**（`pyproject.toml` + `[tool.maturin] module-name = "pie_rs._pie_rs", features = ["pyo3/extension-module"]`）。
+- 构建后端 **maturin**（`pyproject.toml` + `[tool.maturin] module-name = "pie._pie_rs", features = ["pyo3/extension-module"]`）。
 - **abi3**（`pyo3/abi3-py39`）→ 一个 wheel 覆盖 3.9+；若要 free-threading 支持需另出 `cp313t` wheel。
 - 平台：macOS arm64/x86_64（本机）、Linux manylinux（rustls + ring，**无 C 依赖**，天然友好）、Windows msvc。
 - 开发环：
@@ -297,7 +298,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 - 本机注意（沿用 `README.md` 的环境备忘）：cargo 不在 PATH（用 `~/.cargo/bin`）；
   crates.io 走公司代理 MITM → `~/.cargo/config.toml` 的 `http.cainfo` / `http.proxy` 已配好，构建时置
   `CARGO_TARGET_DIR=~/.cache/pie-rs-target`（源码在 /mnt/d 时尤其必要）。
-- 版本：`pie-rs` Cargo version = wheel version = `pie_rs.__version__`（单一来源）。
+- 版本：`pie-rs` Cargo version = wheel version = `pie.__version__`（单一来源）。
 
 ---
 
@@ -306,7 +307,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | 层 | 做法 |
 |---|---|
 | Rust 单测 | 现有的 118 项保持不变（`cargo test`）——M0 的验收就是「一个不挂」 |
-| 绑定单测（不联网） | `pie_rs` 侧 `Config.base_url` 指向**本地假 SSE 服务器**：pytest 里用 `http.server` 回放固定 chunk（tool_calls → 文本 → `[DONE]`）→ 端到端跑 aturn |
+| 绑定单测（不联网） | `pie` 侧 `Config.base_url` 指向**本地假 SSE 服务器**：pytest 里用 `http.server` 回放固定 chunk（tool_calls → 文本 → `[DONE]`）→ 端到端跑 aturn |
 | 工具/事件桥接 | 断言 `TurnEvent` 序列、Python 自定义工具被调用、异常 → `ToolError` 文本 |
 | 契约测试 | 与纯 Python `pie` 包对拍：同一台假服务器、同一任务 → 相同工具调用与文件布局（已有 `fixtures/python-tools.json` 先例） |
 | 共享资产 | 「Rust 写会话 → Python 读」/「Python 写 → Rust 读」双向（已有 session 契约测试，扩到绑定） |
@@ -320,12 +321,13 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 | 里程碑 | 内容 | 验收 | 估时 |
 |---|---|---|---|
-| **M0 结构准备** | `src/lib.rs` + `tui` feature；`main.rs` 改薄（`use pie_rs::…`）；`bindings/pie-py` 骨架 + `#[pymodule]` 空模块 | `cargo test` 118 全绿、CLI 行为不变、`import pie_rs` 成功 | 0.5d |
+| **M0 结构准备** | `src/lib.rs` + `tui` feature；`main.rs` 改薄（`use pie::…`）；`bindings/pie-py` 骨架 + `#[pymodule]` 空模块 | `cargo test` 全绿、CLI 行为不变、`import pie` 成功 | 0.5d |
 | **M1 最小闭环** | `Config` + `LlmClient` + `ToolRegistry::builtins` + `Session`（`new`/`load`/`resume`/`ephemeral`/`aturn`/`save`）+ 事件回调 + 错误层级 | 一段 Python 脚本跑通「提问 → 模型调 `read` → 打印答复」；pytest 走假服务器 | 2–3d |
 | **M2 API 补齐** | `run()`、`Cancel`、`compact`/`compression_history`/`full_history`/`usage_report`/`reset`、`list_sessions`、`Config` 属性 + `to_dict`/`update`、`PIE_DIR` 支持 | 能力对齐 CLI；上述对象都有回归用例 | 1–2d |
-| **M3 Python 工具** | `Entry` 动态变体 + `register()` + `@tool`（签名→schema）+ 返回值/异常桥接 + 线程语义文档 | Python 工具被模型调用、结果回传、异常文本化；与内置工具同列表 | 2d |
+| **M3 Python 工具** ✅ | `Entry` 动态变体 + `register()` + `@tool`（签名→schema）+ 返回值/异常桥接 + 线程语义文档 | Python 工具被模型调用、结果回传、异常文本化；与内置工具同列表 | 2d |
 | **M4 打包** | maturin + abi3 + `py.typed` / `.pyi` + README 示例 + `__version__` | 干净 venv 里 `pip install` wheel 可用 | 1–2d |
-| **M5 可选** | `aturn_async` + `events()`（`pyo3-async-runtimes 0.29`，feature gate `asyncio`；三个坑见 §5.2）；free-threading wheel；PyPI/CI | `await` 版本可用、**`task.cancel()` 真能停住**、不破坏同步路径 | 2–4d |
+| **M5** ✅ | `aturn_async` + `events()`（`pyo3-async-runtimes 0.29`，feature gate `asyncio`；三个坑见 §5.2） | `await` 版本可用、**`task.cancel()` 真能停住**、不破坏同步路径 | 2–4d |
+| M5 剩余 | free-threading wheel；PyPI/CI | — | 按需 |
 
 依赖顺序：M1 之后（M2 与 M3 可并行）；M4 最早在 M1 后可先做（便于分发试用）。
 
@@ -349,8 +351,9 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 **M1 已按推荐默认开工**（括号里是实际采取的选项，要改现在改最便宜）：
 
-1. **包名 / 模块名**：`pie_rs`（扩展模块 `pie_rs._pie_rs`）？还是叫 `pie.rust` / 别的？
-   → 已用 **`pie_rs`**。
+1. **包名 / 模块名**：`pie_rs`（扩展模块 `pie._pie_rs`）？还是叫 `pie.rust` / 别的？
+   → 先用了 `pie_rs`，**2026-09-23 用户点名改成 `pie`**（外壳包 `pie/`、扩展模块 `pie._pie_rs`、
+   发行名也改成 `pie`）—— 与纯 Python 版同名，**别装进同一个环境**。
 2. **异步**：同步为主 + M5 补原生 async（推荐，见 §5.2；两者共用同一个内部实现，不冲突），
    还是 M1 就直接上 asyncio（少一轮 API 定形，但前面三周的 bug 面更大）？ → 已按 **同步为主**。
 3. **事件形态**：回调 + 迭代器都给（草案），还是只给回调？ → 已只给 **`on_event` 回调**（迭代器 / `async for` 留给 M5）。
@@ -366,15 +369,15 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 ### 结构（方案 A 落地）
 
-- `Cargo.toml`：`[lib] name = "pie_rs"`；`[[bin]] required-features = ["cli", "tui"]`；
+- `Cargo.toml`：`[lib] name = "pie"`（2026-09-23 由 `pie_rs` 改名）；`[[bin]] required-features = ["cli", "tui"]`；
   `default = ["cli", "tui"]`。`cli` = `dep:clap`（只有 bin 用）；`tui` = ratatui / crossterm /
   ratatui-textarea / tui-markdown / arboard / unicode-width 这 6 个 **optional** 依赖。
 - **TUI 依赖必须一起转 optional**（光 gate 模块不够：依赖仍会进解析图）→ 验收方式：
   `cargo build --no-default-features` 后 `cargo tree -e normal` 里搜不到 ratatui / crossterm / arboard / tui-markdown。
-- `main.rs` 改成 `use pie_rs::{…}`（**别再写 `mod xxx;`** —— 那会变成第二份独立的编译单元，
+- `main.rs` 改成 `use pie::{…}`（**别再写 `mod xxx;`** —— 那会变成第二份独立的编译单元，
   两边的类型不兼容）。
 - `bindings/pie-py`：自己的 workspace，被父级 `exclude = ["bindings"]` 排除；
-  cdylib、`[lib] name = "_pie_rs"`（maturin 的 `module-name = "pie_rs._pie_rs"`），
+  cdylib、`[lib] name = "_pie_rs"`（maturin 的 `module-name = "pie._pie_rs"`），
   `pie-rs = { path = "../..", default-features = false }`。
 - 核心为绑定加的两处：`tools::Entry` / `tools::ToolRegistry` 加 `#[derive(Clone)]`
   （绑定要拿副本建会话；`LlmClient` / `Config` 本来就 Clone）。
@@ -416,3 +419,66 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
   一条不联网。`PIE_DIR` 指到 tmp 目录 → 不碰真实 `~/.pie`（`ephemeral` 不落盘另有断言）。
 - `.gitignore` 加了 `pie-rs/bindings/*/target/`（这个 crate 有自己的 target/）。
 - 绑定侧 dev 环境：`bindings/pie-py/.venv`（maturin + pytest）。
+
+### M5：asyncio 入口（2026-09-23）
+
+API 形状（§5.2 的目标形态）：
+
+```python
+task = asyncio.create_task(s.aturn_async("写一篇长文"))   # 事件走 asyncio.Queue
+async for ev in s.events():
+    print(ev["type"])
+answer = await task
+```
+
+- **Rust 侧只留三个小口**（`#[cfg(feature = "asyncio")]`，默认开）：
+  `Session.aturn_async()`（建队列 + 登记 + 转交给 Python 胶水）、`Session.turn_future(input, sink, …)`
+  （`pyo3_async_runtimes::tokio::future_into_py`，回合跑在**进程级** runtime 上）、`Session.events()`
+  （返回 `pie._async._Events`）。队列在 `aturn_async` 里**同步**建好并登记 → 返回后 `s.events()`
+  立刻可用（不用先 await 一下让协程跑起来）。
+- **胶水在 Python 侧**（`pie/_async.py`）——三条坑逐条对着 §5.2 办：
+  1. **事件怎么给**：`sink` 从 tokio 线程被调用，只做 `loop.call_soon_threadsafe(queue.put_nowait, ev)`
+     （`asyncio.Queue` 不是线程安全的）；回合结束时推一个 `None` → 胶水换成哨兵 → `async for` 自然结束。
+     用户代码**仍然不在 tokio 线程上跑**。
+  2. **取消**：`task.cancel()` 不会停 tokio 任务 → 胶水捕 `CancelledError` 后调 `session.stop()`。
+     实测：模型请求挂着 3s，`task.cancel()` 后 **0.30s** 返回，且会话立刻还能用（取消没弄坏历史）。
+  3. **loop / runtime 生命周期**：runtime 是进程级的，不随 loop 生死；**一个进程一个 loop 最稳**
+     （写进模块 docstring）。
+- 依赖：`pyo3-async-runtimes 0.29`（feature 名是 **`tokio-runtime`**，不是 `tokio`）+ optional，
+  `default = ["asyncio"]`。
+- 回归：`events()` 早调报错、`aturn_async` 的完整事件序列 + 答复、取消（含取消后会话仍可用）。
+
+### M3：Python 工具（2026-09-23）
+
+- **核心一侧**：`Entry` 的名字改 `String`、调用体换成 `CallFn = Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult>>`
+  （内置工具包 `erased::<T>` 的 fn 指针，Python 工具包绑定给的回调）→ **两条路共用同一条分发链**，
+  模型看不出区别；`Debug` 手写（`dyn Fn` 不是 Debug）。
+- **schema 在 Python 侧算**（`pie/_tool.py` 的 `tool()` / `_type_to_schema`，与纯 Python 版**逐字同款**）：
+  实测同一批签名两边产出的 `definition()` **逐字相同**（`str/int/float/bool/list/dict/Optional`；
+  下划线参数不进 schema；描述取 `description` → docstring 首行 → 函数名）。
+- **注册口是 `ToolRegistry.register(...)`**（写在 Rust 侧，因为原生类不能从 Python 加方法）：
+  两种用法 `register(pie.tool()(fn))` / `register(name=…, handler=…, description=…, parameters=…)`。
+  注册期就拦三类错：**名字不合法**（API 要求 `[A-Za-z0-9_-]{1,64}`）、**重名**、**async handler**（要等 M5）。
+- **调用体**：tokio worker 上 `Python::attach` 回 GIL → 参数按**关键字**传给 handler → 返回值
+  必须 `str` → 抛异常变成 `ToolError`（核心的 `dispatch_tool` 文本化成 `[工具错误] …`，回合照跑）。
+  三条纪律（**写进 docstring**）：同步函数、别在 handler 里等别的线程、**别碰同一个 Session**。
+- 回归：schema 对拍 + 端到端（模型调起来它、参数解析、结果回传）+ 异常文本化 + 三类注册期校验。
+
+### M2 补齐 + 类型存根（2026-09-23）
+
+- **补齐的 API**：模块级 `run(task, config=None, llm=None, tools=None, max_steps=…, stream=…,
+  parallel_tools=…)`（内部就是「建临时会话 → `aturn`」，**无会话不落盘**）、`list_sessions(limit=None)`
+  （键名与 CLI `sessions --json` 一致）、`Config.to_dict()` / `update(dict)`、
+  `Session.clear_window()` / `set_model()` / `set_reasoning_effort()` / `config`（快照）。
+- **`to_dict` / `update` 复用核心的 `Config::to_toml()`**（为此把它从 private 改成 `pub`）：
+  字段列表只有那一份，绑定侧不再抄一遍。`update` 的语义是「当前值 → 打补丁 → 再 deserialize 一遍」
+  → 归一/校验与读配置文件同一条路；**未知键直接报错**（打错字不会静默失效）；运行时字段
+  （`config_file` / `system_prompt` / …）原样保留。
+- **类型存根** `python/pie/_pie_rs.pyi`：dict 形状写成 `TypedDict`（`TurnEvent` 是判别联合 →
+  `ev["type"] == "tool_call"` 能窄化出 `arguments`）。三条对拍用例防漂移：`__all__` ⊆ 存根、
+  类上的公开属性双向对拍、事件 dict 的键 ⊆ 对应 TypedDict。
+  - ⚠ `__init__.py` 里再导出**类型名**要用 `if TYPE_CHECKING:` + **`X as X`** 写法：
+    `--strict` 下 mypy 不认隐式再导出（普通 `from … import X` 在外面会「未定义」）；
+    同时**别放进 `__all__`**（那会让运行时的 `import *` 炸，这些名字只在 `.pyi` 里存在）。
+- 验收：`mypy --strict` 干净（含判别联合的 `reveal_type` 窄化），pytest 20 例全绿。
+

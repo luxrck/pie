@@ -12,14 +12,14 @@ license = "MIT"
 exclude = ["bindings"]
 
 # `pie-rs` 现在同时是 lib（外部 / 绑定用）与 bin（CLI）。
-# lib 名 `pie_rs`：bin 里 `use pie_rs::…`；绑定侧直接用这个 crate。
+# lib 名 `pie`：bin 里 `use pie::…`；绑定侧直接用这个 crate（2026-09-23 由 `pie_rs` 改名）。
 [lib]
-name = "pie_rs"
+name = "pie"
 path = "src/lib.rs"
 
 # CLI 需要 clap（`cli`）与 TUI（`tui`）两个 feature；`--no-default-features` 时干脆不建 bin。
 [[bin]]
-name = "pie-rs"
+name = "pie"
 path = "src/main.rs"
 required-features = ["cli", "tui"]
 
@@ -35,6 +35,7 @@ tui = [
     "dep:tui-markdown",
     "dep:arboard",
     "dep:unicode-width",
+    "dep:ignore",
 ]
 
 [dependencies]
@@ -88,6 +89,9 @@ ratatui-textarea = { version = "0.9", optional = true }
 unicode-width = { version = "0.2", optional = true }
 # 剪贴板：粘贴文本 / 图片路径（图片本体走 session::store_blob）
 arboard = { version = "3", optional = true }
+# `@` 文件路径补全要按 `.gitignore` 扫目录：直接用 ripgrep 那套（嵌套 .gitignore、`!` 取反、
+# `/` 锚定…都齐了，手写 glob 想复刻这些很容易漏）。纯 Rust、无 C 依赖。
+ignore = { version = "0.4", optional = true }
 # markdown → ratatui Text。0.3.7+ 已迁到 ratatui 0.30 的 `ratatui-core`，与上面配套；
 # 不开默认特性：`highlight-code` 会拉 syntect（默认 oniguruma = C 库）。
 tui-markdown = { version = "0.3.9", default-features = false, optional = true }
