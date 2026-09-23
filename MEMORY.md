@@ -11,6 +11,7 @@
 - 工具名 `writ` / `bash`（Python 版叫 `write` / `shell`，2026-09-23 用户点名改；**不是笔误，别再「修」回去**）。
 - TUI 形态参考 codex：状态栏（chrome）在**最下方**，消息流从屏幕第一行开始。
 - 内置提示词正文用**小写文件名**（`prompts/system.md`）——与运行时按名找的 `SYSTEM.md` 区分开。
+- 命名口味：拿 `Config` 当参数 / 变量就叫 `config`（**不要 `cfg`**，用户点名改过）；绑定内部的核心配置叫 `core_config`。
 
 ## 项目定位与仓库
 
@@ -88,6 +89,7 @@
 - 已落地 M0–M3 + M5：`Config` / `LlmClient` / `ToolRegistry`（含 `@pie.tool` 注册 Python 工具）/ `Session` / `Cancel` / `run()` / `list_sessions()` + 事件回调 + 异常层级 + 类型存根（`mypy --strict` 干净）+ `aturn_async` / `events()`。**M4（abi3 wheel 分发）未做**。
 - 三条约定：同步外观但**释放 GIL**（要并发用 `asyncio.to_thread`）；**一个 Session 同时只跑一个回合**（事件回调里别碰同一个 Session，要停就另线程 `stop()`）；`messages` / 事件都是 dict，字段名与 JSONL 一致。
 - 构建/测试：`maturin develop`（`cargo build` 直接编 cdylib 会报一堆 Python 符号 undefined）+ `pytest tests`（本地假 SSE 端点，不联网；当前 27 例全绿）。asyncio 胶水在 `pie/_async.py`（事件从 tokio 线程经 `call_soon_threadsafe` 入队；`task.cancel()` 后要调 `session.stop()`，否则 tokio 任务不停）。
+- ⚠ 本机 macOS 树里的 `bindings/pie-py/.venv` **是坏的**（`libpython3.12.dylib` 找不到，像是从 WSL 拷来的）→ 要跑绑定的 pytest 得另建 venv：`uv venv --python 3.12 /tmp/pie-py-venv` + `uv pip install --python … maturin pytest` + `VIRTUAL_ENV=… maturin develop`（本次实测 27 例全绿）。
 
 ## 构建与环境（本机特有）
 

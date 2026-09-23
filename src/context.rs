@@ -453,7 +453,7 @@ fn protected_step_tool_indices(flat: &[Message], keep: usize) -> HashSet<usize> 
 /// 返回**真正落盘压缩了几条**（短输出不值得压 → 不计）。
 fn compact_tools(
     messages: &mut [Message],
-    cfg: &crate::config::ToolCompaction,
+    config: &crate::config::ToolCompaction,
     keep: usize,
     cb: &mut dyn FnMut(Value),
 ) -> usize {
@@ -468,17 +468,17 @@ fn compact_tools(
         };
         let content = content.clone();
         let lines: Vec<&str> = content.lines().collect();
-        if lines.len() <= cfg.head + cfg.tail {
+        if lines.len() <= config.head + config.tail {
             continue;
         }
         let prefix = m.tool_name.clone().unwrap_or_else(|| "tool".to_string());
         let Ok(path) = write_raw(&content, &prefix) else {
             continue;
         };
-        let mut preview: Vec<&str> = lines[..cfg.head.min(lines.len())].to_vec();
+        let mut preview: Vec<&str> = lines[..config.head.min(lines.len())].to_vec();
         preview.push(TOOL_GAP);
-        if cfg.tail > 0 {
-            preview.extend_from_slice(&lines[lines.len().saturating_sub(cfg.tail)..]);
+        if config.tail > 0 {
+            preview.extend_from_slice(&lines[lines.len().saturating_sub(config.tail)..]);
         }
         m.content = Some(Content::Text(format!(
             "[工具输出全文已保存: {}]\n\n{}",
@@ -594,7 +594,7 @@ fn compact_turn_span(span: &[Message], cb: &mut dyn FnMut(Value)) -> Message {
 /// 旧窗口摘要（level 3）继续保留在上下文里，不重复归档。
 fn compact_session(
     messages: &mut Vec<Message>,
-    cfg: &crate::config::SessionCompaction,
+    config: &crate::config::SessionCompaction,
     cb: &mut dyn FnMut(Value),
 ) -> bool {
     let Some(current_start) = messages.iter().rposition(is_user) else {
@@ -619,8 +619,8 @@ fn compact_session(
     let Ok(path) = write_raw(&raw, "session") else {
         return false;
     };
-    let summary = build_window_summary(&path, cfg.head, cfg.tail);
-    let digest = summarize_turns(&load_window_dicts(&path), cfg.head, cfg.tail);
+    let summary = build_window_summary(&path, config.head, config.tail);
+    let digest = summarize_turns(&load_window_dicts(&path), config.head, config.tail);
     cb(compact_event(3, "session", &path, &digest));
     let mut ptr = text_message("system", summary);
     ptr.compress_level = 3;
@@ -655,22 +655,22 @@ pub struct CompactStats {
 /// `maybe_compact(..., windows=)` 链路实际没有调用方传值）。
 pub fn maybe_compact(
     messages: &mut Vec<Message>,
-    cfg: &Config,
+    config: &Config,
     current_tokens: Option<i64>,
     on_compact: Option<&mut dyn FnMut(Value)>,
 ) -> CompactStats {
     let mut stats = CompactStats::default();
-    let Some(compaction) = &cfg.compaction else {
+    let Some(compaction) = &config.compaction else {
         return stats;
     };
-    if cfg.context_window == 0 {
+    if config.context_window == 0 {
         return stats;
     }
     let tokens = current_tokens.unwrap_or_else(|| messages_tokens(messages));
-    if tokens < cfg.soft_limit() as i64 {
+    if tokens < config.soft_limit() as i64 {
         return stats;
     }
-    let target = cfg.target_limit() as i64;
+    let target = config.target_limit() as i64;
     let before = messages_tokens(messages);
     // 回调可选：None 时给个空实现，内部各级只管调（不再层层判 Option，也就没有重复可变借用）
     let mut noop = |_: Value| {};
@@ -678,19 +678,19 @@ pub fn maybe_compact(
         Some(c) => c,
         None => &mut noop,
     };
-    if let Some(tool_cfg) = &compaction.tool {
-        stats.tools = compact_tools(messages, tool_cfg, cfg.keep_last_steps, &mut *cb);
+    if let Some(tool_config) = &compaction.tool {
+        stats.tools = compact_tools(messages, tool_config, config.keep_last_steps, &mut *cb);
     }
     if compaction.turn && messages_tokens(messages) > target {
         stats.turns = compact_turns(messages, Some(target), &mut *cb);
     }
-    if let Some(session_cfg) = &compaction.session {
+    if let Some(session_config) = &compaction.session {
         if messages_tokens(messages) > target {
-            stats.session = compact_session(messages, session_cfg, &mut *cb);
+            stats.session = compact_session(messages, session_config, &mut *cb);
         }
     }
     stats.saved_tokens = (before - messages_tokens(messages)).max(0);
-    if cfg.verbose && (stats.tools > 0 || stats.turns > 0 || stats.session) {
+    if config.verbose && (stats.tools > 0 || stats.turns > 0 || stats.session) {
         crate::log::warn(format!(
             "[context] 压缩节省约 {} tokens（turns={}, tools={}, session={}）",
             stats.saved_tokens, stats.turns, stats.tools, stats.session
@@ -718,12 +718,12 @@ pub enum CompactMode {
 #[allow(dead_code)]
 pub fn compact(
     messages: &mut Vec<Message>,
-    cfg: &Config,
+    config: &Config,
     mode: CompactMode,
     on_compact: Option<&mut dyn FnMut(Value)>,
 ) -> CompactStats {
     let mut stats = CompactStats::default();
-    let Some(compaction) = &cfg.compaction else {
+    let Some(compaction) = &config.compaction else {
         stats.skipped = Some("compaction disabled (未配置 [compaction])".to_string());
         return stats;
     };
@@ -734,8 +734,8 @@ pub fn compact(
         None => &mut noop,
     };
     if matches!(mode, CompactMode::Auto | CompactMode::Tools) {
-        if let Some(tool_cfg) = &compaction.tool {
-            stats.tools = compact_tools(messages, tool_cfg, cfg.keep_last_steps, &mut *cb);
+        if let Some(tool_config) = &compaction.tool {
+            stats.tools = compact_tools(messages, tool_config, config.keep_last_steps, &mut *cb);
         }
     }
     if matches!(mode, CompactMode::Auto | CompactMode::Turns) && compaction.turn {
@@ -996,8 +996,8 @@ mod tests {
             Message::user("当前问题"),
         ];
         let mut events: Vec<Value> = Vec::new();
-        let cfg = SessionCompaction { head: 1, tail: 1 };
-        assert!(compact_session(&mut msgs, &cfg, &mut |e| events.push(e)));
+        let config = SessionCompaction { head: 1, tail: 1 };
+        assert!(compact_session(&mut msgs, &config, &mut |e| events.push(e)));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["level"], 3);
         // 窗口块路径从事件里回报（不再单开出参）——调用方据此登记
@@ -1012,7 +1012,7 @@ mod tests {
         assert!(text.contains("旧问题") && text.contains("旧答复"), "{text}");
         assert_eq!(msgs[2].role, "user");
         // 只剩窗口摘要 + 当前轮 → 没有再可归档的
-        assert!(!compact_session(&mut msgs, &cfg, &mut |_| {}));
+        assert!(!compact_session(&mut msgs, &config, &mut |_| {}));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
     fn maybe_compact_triggers_above_soft_limit_only() {
         let _g = env_lock();
         let dir = pie_dir_tmp("maybe");
-        let cfg = Config {
+        let config = Config {
             context_window: 400,
             reserved_tokens: None,
             verbose: false,
@@ -1036,7 +1036,7 @@ mod tests {
         // 短历史 → 不动
         let mut short = vec![Message::system("s"), Message::user("hi")];
         assert_eq!(
-            maybe_compact(&mut short, &cfg, None, None),
+            maybe_compact(&mut short, &config, None, None),
             CompactStats::default()
         );
 
@@ -1048,7 +1048,7 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"),
         ];
-        let stats = maybe_compact(&mut long, &cfg, Some(9999), None);
+        let stats = maybe_compact(&mut long, &config, Some(9999), None);
         assert_eq!(stats.tools, 1);
         assert!(stats.saved_tokens > 0, "{stats:?}");
         assert_eq!(long[2].compress_level, 1);
@@ -1060,17 +1060,17 @@ mod tests {
     fn manual_compact_reports_skipped_when_disabled() {
         let _g = env_lock();
         let dir = pie_dir_tmp("manual");
-        let mut cfg = Config {
+        let mut config = Config {
             compaction: None,
             ..Default::default()
         };
         let mut msgs = vec![Message::system("s"), Message::user("hi")];
-        let stats = compact(&mut msgs, &cfg, CompactMode::Auto, None);
+        let stats = compact(&mut msgs, &config, CompactMode::Auto, None);
         assert!(stats.skipped.is_some());
         assert_eq!(stats.turns, 0);
 
-        cfg.compaction = Some(CompactionConfig::default());
-        cfg.keep_last_steps = 1; // 保护窗口只罩住最近 1 个 step 批次，好让更早的那批能被压
+        config.compaction = Some(CompactionConfig::default());
+        config.keep_last_steps = 1; // 保护窗口只罩住最近 1 个 step 批次，好让更早的那批能被压
         let mut msgs = vec![
             Message::system("s"),
             Message::user("q1"),
@@ -1081,7 +1081,7 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"), // 最近一批：受 keep 保护
         ];
-        let stats = compact(&mut msgs, &cfg, CompactMode::Auto, None);
+        let stats = compact(&mut msgs, &config, CompactMode::Auto, None);
         assert_eq!(stats.tools, 1, "压掉保护窗口之外那条长输出");
         assert_eq!(stats.turns, 1, "第一轮（已完成）压成摘要");
         assert!(stats.saved_tokens > 0);

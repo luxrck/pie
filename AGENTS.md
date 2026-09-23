@@ -69,6 +69,7 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   依赖本库 → TUI 那堆依赖**真的**不进依赖图（`cargo tree` 验过）。
 - `main.rs` 只 `use pie::…`，**不要**再写 `mod xxx;`（那会变成第二份编译单元）。模块声明只住 `src/lib.rs`。
 - TUI / CLI 参数结构不进 lib 的对外承诺；lib 目前**全 pub**（M0 的临时状态，收紧要等绑定 API 稳定）。
+- **命名**：拿 `Config` 当参数 / 变量就叫 `config`（**不要 `cfg`**）；绑定内部从 `PyConfig` 里取出的核心配置叫 `core_config`（Python 侧参数名仍是 `config`）。
 
 ### 工具层
 

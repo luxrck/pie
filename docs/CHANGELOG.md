@@ -12,6 +12,8 @@
   - 回归：`ensure_config_file_writes_defaults_once_and_keeps_existing`（含父目录不存在要先建、写下来的默认值要能读回）与 `ensure_global_memory_reports_whether_it_created_the_file`。
 - **删掉与 Python 逐字对拍的契约测试 + `fixtures/`**（用户要求）：`generated_specs_match_python` 及其辅助（`canonical` / `python_name` / `with_python_names`）与基准 `fixtures/python-tools.json` 一起移除，只留 `builtin_tool_names` 钉住注册名与顺序。代价：工具描述/参数再与 Python 分叉就没有自动拦网了。
 - **修回 `prompts/system.md` 的大小写**：上次搬家把它改成了 `SYSTEM.md`，而代码是 `include_str!("../prompts/system.md")` —— macOS 大小写不敏感照样编过，**Linux/WSL 上会直接编译失败**。
+- **参数命名统一 `cfg` → `config`**（用户点名）：拿 `Config` 当参数/局部变量时一律叫 `config`（含 `context.rs` 的 `ToolCompaction` / `SessionCompaction` 与测试里的 `let cfg = …`）；绑定内部从 `PyConfig` 取出的核心配置叫 `core_config`（免得与 Python 侧参数名 `config` 撞）。纯改名，无行为变化（core 166 例 + 绑定 27 例照旧）。
+- **修掉绑定里过期的 `[exit=0]` 断言**：`test_turn_runs_tool_and_streams_events` 还按老协议断言成功命令的结果以 `[exit=0]` 开头，而协议早已改成「失败才给头」→ 现改成断言正文 `hi\n`（这条失败与本次改名无关，是上次改协议后漏改的）。
 
 ## 2026-09-22
 

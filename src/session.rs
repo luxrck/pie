@@ -98,18 +98,18 @@ impl Session {
     ///
     /// `llm` / `tools` 由调用方给（Python `Session.new(config=…, llm=…, tools=…)` 同款）：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
-    pub fn new(cfg: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
-        Self::at(resolve_path(id), cfg, llm, tools)
+    pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
+        Self::at(resolve_path(id), config, llm, tools)
     }
 
     /// 临时会话（`pie-rs "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
     ///
     /// Python 那边一次性模式走独立的 `loop.run()`；这边既然回合循环已经并在 `Session` 上，
     /// 就用“不记账的 Session”表达同一件事。
-    pub fn ephemeral(cfg: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
+    pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
         let mut session = Self::at(
             sessions_dir().join(format!("ephemeral-{}.jsonl", timestamp())),
-            cfg,
+            config,
             llm,
             tools,
         );
@@ -157,13 +157,13 @@ impl Session {
     /// 从 JSONL 恢复（`path` 必须存在）。
     pub fn load(
         path: &Path,
-        cfg: &Config,
+        config: &Config,
         llm: LlmClient,
         tools: ToolRegistry,
     ) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|e| format!("读取会话失败 {}: {e}", path.display()))?;
-        let mut session = Self::at(path.to_path_buf(), cfg, llm, tools);
+        let mut session = Self::at(path.to_path_buf(), config, llm, tools);
         let mut restored: Vec<Message> = Vec::new();
         for (n, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -243,7 +243,7 @@ impl Session {
 
     /// 按 `self.windows` 生成历史窗口的摘要 system 消息（`compaction.session` 关掉就不生成）。
     fn window_summary_messages(&self) -> Vec<Message> {
-        let Some(session_cfg) = self
+        let Some(session_config) = self
             .config
             .compaction
             .as_ref()
@@ -259,8 +259,8 @@ impl Session {
             let raw = std::fs::read_to_string(block).unwrap_or_default();
             let mut msg = Message::system(context::build_window_summary(
                 block,
-                session_cfg.head,
-                session_cfg.tail,
+                session_config.head,
+                session_config.tail,
             ));
             msg.compress_level = 3;
             msg.raw_path = Some(block.display().to_string());
@@ -277,24 +277,24 @@ impl Session {
     }
 
     /// 恢复最近的会话：优先**当前工作目录**下最新的，没有则全局最新。
-    pub fn resume(cfg: &Config, llm: LlmClient, tools: ToolRegistry) -> Result<Self, String> {
+    pub fn resume(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Result<Self, String> {
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string());
-        Self::resume_in(&sessions_dir(), cwd.as_deref(), cfg, llm, tools)
+        Self::resume_in(&sessions_dir(), cwd.as_deref(), config, llm, tools)
     }
 
     /// `resume` 的本体（目录可注入，便于测试）。
     pub fn resume_in(
         dir: &Path,
         cwd: Option<&str>,
-        cfg: &Config,
+        config: &Config,
         llm: LlmClient,
         tools: ToolRegistry,
     ) -> Result<Self, String> {
         let path =
             latest_in(dir, cwd).ok_or_else(|| format!("{} 中没有历史会话", dir.display()))?;
-        Self::load(&path, cfg, llm, tools)
+        Self::load(&path, config, llm, tools)
     }
 
     /// 追加一条用户消息（不含模型调用）。
@@ -328,7 +328,7 @@ impl Session {
     ///   - `max_steps`：单回合最多问几次模型；`None` = 不限。
     ///   - `stream`：`None` = 默认（客户端都实现了 `stream()` → 流式）；`Some(false)` 强制一次性
     ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
-    ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `cfg.parallel_tools`
+    ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `config.parallel_tools`
     ///     （默认 true）。工具共享可变状态时必须 `Some(false)`（改为按模型返回顺序串行）。
     ///
     /// `cancel` 触发时（TUI 的 `Esc`）：
@@ -361,7 +361,7 @@ impl Session {
         // 配置值拷出来（不长期借 `self.config`：后面还要 `&mut self` 做注入/降级）
         // `stream: None` = 用默认（客户端都实现了流式）；对齐 Python `stream is not False` 的判据
         let use_stream = stream.unwrap_or(true);
-        // `parallel_tools: None` = 跟随配置（Python `cfg.parallel_tools if x is None else x` 同义）
+        // `parallel_tools: None` = 跟随配置（Python `config.parallel_tools if x is None else x` 同义）
         let use_parallel = parallel_tools.unwrap_or(self.config.parallel_tools);
         // 回合号（事件里的 `turn` 字段）：历史里的用户消息数（图片消息是 synthetic，不计）
         let turn = self
@@ -393,7 +393,7 @@ impl Session {
             }
             steps += 1;
 
-            // 请求前：按**估算**水位压一次（`cfg.compaction` 未配置就什么都不做）
+            // 请求前：按**估算**水位压一次（`config.compaction` 未配置就什么都不做）
             context::maybe_compact(
                 &mut self.messages,
                 &self.config,
@@ -730,12 +730,12 @@ impl Session {
         src: &str,
     ) -> Option<String> {
         let (enabled, base_url, key_fp, ttl_days) = {
-            let cfg = &self.config;
+            let config = &self.config;
             (
-                cfg.files_api && llm::model_supports_files(&cfg.model),
-                cfg.base_url.trim_end_matches('/').to_string(),
-                llm::key_fingerprint(&cfg.api_key),
-                cfg.files_ttl_days as i64,
+                config.files_api && llm::model_supports_files(&config.model),
+                config.base_url.trim_end_matches('/').to_string(),
+                llm::key_fingerprint(&config.api_key),
+                config.files_ttl_days as i64,
             )
         };
         if !enabled {
@@ -1080,18 +1080,18 @@ impl Session {
         parts.join("\n")
     }
 
-    fn at(path: PathBuf, cfg: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
+    fn at(path: PathBuf, config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
         let manifest = Some(manifest_path_of(&path));
         Self {
             path,
-            config: cfg.clone(),
+            config: config.clone(),
             llm,
             tools,
             manifest,
             messages: vec![Message::system(config::build_system_prompt(
-                cfg,
-                cfg.system_prompt.as_deref(),
-                &cfg.append_system_prompt,
+                config,
+                config.system_prompt.as_deref(),
+                &config.append_system_prompt,
             ))],
             usage: UsageTracker::default(),
             windows: Vec::new(),
@@ -1771,9 +1771,9 @@ mod tests {
     /// save → load 往返：消息（去掉旧 system 后重建）、title、turn_count、usage 都要活下来。
     #[test]
     fn downgrade_replaces_file_blocks_and_invalidates() {
-        let cfg = Config::default();
+        let config = Config::default();
         let path = tmp("downgrade.jsonl");
-        let mut s = Session::new(&cfg, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
         // 历史里两条消息各带一个 file 块 + 一个普通 text 块
         s.messages.push(Message {
             role: "user".into(),
@@ -1906,12 +1906,12 @@ mod tests {
     fn ensure_image_file_is_none_when_disabled() {
         let _g = env_lock();
         let dir = pie_dir_tmp("disabled");
-        let cfg = Config {
+        let config = Config {
             files_api: false,
             ..Default::default()
         };
         let mut s = Session::new(
-            &cfg,
+            &config,
             Some(dir.join("s.jsonl").to_str().unwrap()),
             llm(),
             tools(),
@@ -1973,8 +1973,8 @@ mod tests {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history");
         std::fs::create_dir_all(context::context_dir()).unwrap();
-        let cfg = Config::default();
-        let mut s = Session::ephemeral(&cfg, llm(), tools());
+        let config = Config::default();
+        let mut s = Session::ephemeral(&config, llm(), tools());
 
         // 工具级：落盘的是被截断的那份输出全文（纯文本，不是消息）
         let full_text = "line1\nline2\nline3\n";
@@ -2047,8 +2047,8 @@ mod tests {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history-gone");
         std::fs::create_dir_all(context::context_dir()).unwrap();
-        let cfg = Config::default();
-        let mut s = Session::ephemeral(&cfg, llm(), tools());
+        let config = Config::default();
+        let mut s = Session::ephemeral(&config, llm(), tools());
 
         let turn = context::write_raw("[]", "turn").unwrap();
         let mut summary = Message {
@@ -2079,12 +2079,12 @@ mod tests {
         let _g = env_lock();
         let dir = pie_dir_tmp("setmodel");
         let path = dir.join("config.toml");
-        let cfg = Config {
+        let config = Config {
             config_file: Some(path.clone()),
             ..Default::default()
         };
         let mut s = Session::new(
-            &cfg,
+            &config,
             Some(dir.join("s.jsonl").to_str().unwrap()),
             llm(),
             tools(),
@@ -2106,12 +2106,12 @@ mod tests {
         let _g = env_lock();
         let dir = pie_dir_tmp("stat");
         let path = dir.join("s.jsonl");
-        let cfg = Config {
+        let config = Config {
             context_window: 100_000,
             reserved_tokens: Some(4_000),
             ..Default::default()
         };
-        let mut s = Session::new(&cfg, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
         s.push_user("hi");
         s.usage.record(&Usage {
             prompt_tokens: Some(1_234),
@@ -2127,9 +2127,9 @@ mod tests {
 
     #[test]
     fn round_trips_through_jsonl() {
-        let cfg = Config::default();
+        let config = Config::default();
         let path = tmp("rt.jsonl");
-        let mut s = Session::new(&cfg, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
         assert_eq!(s.path, path);
         s.push_user("第一轮：读一下 Cargo.toml");
         s.messages.push(Message {
@@ -2140,7 +2140,7 @@ mod tests {
         s.usage.record(&usage(10));
         s.save().expect("save");
 
-        let back = Session::load(&path, &cfg, llm(), tools()).expect("load");
+        let back = Session::load(&path, &config, llm(), tools()).expect("load");
         assert_eq!(back.turn_count, 1);
         assert_eq!(back.title.as_deref(), Some("第一轮：读一下 Cargo.toml"));
         assert_eq!(back.usage.calls, 1);
@@ -2168,7 +2168,7 @@ mod tests {
     /// **跨版本兼容**：Python 版写下的会话（含未知字段 / 旧 system / null token）必须能读。
     #[test]
     fn loads_python_written_session() {
-        let cfg = Config::default();
+        let config = Config::default();
         let path = tmp("py.jsonl");
         let jsonl = [
             r#"{"__meta__":true,"usage":{"prompt_tokens":123,"completion_tokens":null,"total_tokens":null,"prompt_cache_hit_tokens":null,"prompt_cache_miss_tokens":null,"reasoning_tokens":null,"calls":3},"windows":[],"cwd":"/tmp","title":"旧会话"}"#,
@@ -2180,7 +2180,7 @@ mod tests {
         .join("\n");
         std::fs::write(&path, format!("{jsonl}\n")).unwrap();
 
-        let s = Session::load(&path, &cfg, llm(), tools()).expect("load");
+        let s = Session::load(&path, &config, llm(), tools()).expect("load");
         assert_eq!(s.title.as_deref(), Some("旧会话"));
         assert_eq!(s.usage.calls, 3);
         assert_eq!(s.usage.prompt_tokens, Some(123));
@@ -2198,7 +2198,7 @@ mod tests {
     /// resume：同 cwd 优先；都不匹配时取 mtime 最新的。
     #[test]
     fn resume_prefers_same_cwd_then_latest() {
-        let cfg = Config::default();
+        let config = Config::default();
         let dir = std::env::temp_dir().join(format!("pie-rs-sessdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2219,18 +2219,18 @@ mod tests {
         let other_cwd = write("b.jsonl", "/elsewhere", "other-cwd");
 
         // cwd 匹配优先（哪怕它更旧）
-        let s = Session::resume_in(&dir, Some("/work/dir"), &cfg, llm(), tools()).unwrap();
+        let s = Session::resume_in(&dir, Some("/work/dir"), &config, llm(), tools()).unwrap();
         assert_eq!(s.title.as_deref(), Some("same-cwd"));
         assert_eq!(s.path, same_cwd);
         // 都不匹配 → 取 mtime 最新
-        let s = Session::resume_in(&dir, Some("/nope"), &cfg, llm(), tools()).unwrap();
+        let s = Session::resume_in(&dir, Some("/nope"), &config, llm(), tools()).unwrap();
         assert_eq!(s.title.as_deref(), Some("other-cwd"));
         assert_eq!(s.path, other_cwd);
         // 空目录 → 报错不 panic
         let empty = std::env::temp_dir().join(format!("pie-rs-sessempty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(Session::resume_in(&empty, None, &cfg, llm(), tools())
+        assert!(Session::resume_in(&empty, None, &config, llm(), tools())
             .unwrap_err()
             .contains("没有历史会话"));
         let _ = std::fs::remove_dir_all(&dir);

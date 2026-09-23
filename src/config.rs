@@ -199,9 +199,9 @@ pub fn ensure_config_file(explicit: Option<&Path>) -> Result<(PathBuf, bool), Co
     if path.exists() {
         return Ok((path, false));
     }
-    let mut cfg = Config::default();
-    cfg.config_file = Some(path.clone()); // 让 save() 写到解析出来的那个路径
-    cfg.save()?;
+    let mut config = Config::default();
+    config.config_file = Some(path.clone()); // 让 save() 写到解析出来的那个路径
+    config.save()?;
     Ok((path, true))
 }
 
@@ -378,7 +378,7 @@ impl Config {
     /// 从配置文件加载。文件不存在 → 全默认值（Python 版这里会走交互式向导，CLI 层负责）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = resolve_config_file(explicit);
-        let mut cfg = if path.exists() {
+        let mut config = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::Io(path.clone(), e.to_string()))?;
             toml::from_str::<Config>(&text)
@@ -386,8 +386,8 @@ impl Config {
         } else {
             Config::default()
         };
-        cfg.config_file = Some(path);
-        Ok(cfg)
+        config.config_file = Some(path);
+        Ok(config)
     }
 
     /// 可用输入预算：服务端按「输入 tokens + max_tokens ≤ 窗口」判超限。
@@ -755,15 +755,15 @@ mod tests {
 
     #[test]
     fn budget_and_limits() {
-        let cfg = Config::default();
+        let config = Config::default();
         assert_eq!(
-            cfg.context_budget(),
-            cfg.context_window - 128_000
+            config.context_budget(),
+            config.context_window - 128_000
         );
-        assert_eq!(cfg.soft_limit(), (cfg.context_budget() as f64 * 0.8) as usize);
+        assert_eq!(config.soft_limit(), (config.context_budget() as f64 * 0.8) as usize);
         assert_eq!(
-            cfg.target_limit(),
-            (cfg.context_budget() as f64 * 0.55) as usize
+            config.target_limit(),
+            (config.context_budget() as f64 * 0.55) as usize
         );
     }
 
@@ -798,26 +798,26 @@ tail = 5
 [tui]
 lean = true
 "#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        assert_eq!(cfg.model, "deepseek-flash");
-        assert_eq!(cfg.reserved_tokens, Some(128_000));
-        let comp = cfg.compaction.unwrap();
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.model, "deepseek-flash");
+        assert_eq!(config.reserved_tokens, Some(128_000));
+        let comp = config.compaction.unwrap();
         assert_eq!(comp.tool.unwrap().head, 30);
         assert_eq!(comp.session.unwrap().tail, 5);
         assert!(comp.turn);
-        assert!(cfg.tui.lean);
+        assert!(config.tui.lean);
     }
 
     /// `save` → `load` 往返：TOML 没有 null，`reserved_tokens = None` 要写成 `"auto"` 再读回 None；
     /// `compaction` 是 `false` / 表（子级关掉写成 `tool = false`）。
     #[test]
     fn config_round_trips_through_toml() {
-        let dir = std::env::temp_dir().join(format!("pie-rs-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-rs-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
 
-        let cfg = Config {
+        let config = Config {
             model: "deepseek-v4-pro".into(),
             reserved_tokens: None, // → "auto"
             context_window: 12_345,
@@ -828,7 +828,7 @@ lean = true
             config_file: Some(path.clone()),
             ..Default::default()
         };
-        cfg.save().expect("save");
+        config.save().expect("save");
 
         let back = Config::load(Some(&path)).expect("load");
         assert_eq!(back.model, "deepseek-v4-pro");
@@ -837,8 +837,8 @@ lean = true
         let comp = back.compaction.as_ref().expect("compaction");
         assert!(comp.tool.is_none(), "tool = false 读回 None（该级关闭）");
         assert!(comp.session.is_some(), "session 没关就还是表");
-        assert_eq!(back.keep_last_steps, cfg.keep_last_steps);
-        assert_eq!(back.max_retries, cfg.max_retries);
+        assert_eq!(back.keep_last_steps, config.keep_last_steps);
+        assert_eq!(back.max_retries, config.max_retries);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -922,15 +922,15 @@ lean = true
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
 
-        let cfg = Config::default();
+        let config = Config::default();
         // 按**路径**判有无：项目记忆里可能碰巧引用了「## 全局记忆（…）」这个形状
         // （本仓 MEMORY.md 就写过）——拿那串当断言会自打脸。
         let marker = format!("## 全局记忆（{}）", global_memory_file().display());
-        let before = build_system_prompt(&cfg, None, &[]);
+        let before = build_system_prompt(&config, None, &[]);
         assert!(!before.contains(&marker), "没文件就不拼这块");
 
         ensure_global_memory();
-        let after = build_system_prompt(&cfg, None, &[]);
+        let after = build_system_prompt(&config, None, &[]);
         assert!(after.contains(&marker), "种子文件要进 system prompt：{after}");
         assert!(after.contains("跨项目的持久记忆"), "连正文一起拼进去");
 
@@ -939,20 +939,20 @@ lean = true
 
     #[test]
     fn compaction_can_be_disabled() {
-        let cfg: Config = toml::from_str("compaction = false").unwrap();
-        assert!(cfg.compaction.is_none());
-        let cfg: Config =
+        let config: Config = toml::from_str("compaction = false").unwrap();
+        assert!(config.compaction.is_none());
+        let config: Config =
             toml::from_str("[compaction]\ntool = false\nturn = false\nsession = false").unwrap();
-        let c = cfg.compaction.unwrap();
+        let c = config.compaction.unwrap();
         assert!(c.tool.is_none() && !c.turn && c.session.is_none());
     }
 
     /// `tool = true` / `session = true`（只写布尔、不给参数）= **开启用默认值**（对齐 Python）。
     #[test]
     fn level_boolean_true_means_enabled_with_defaults() {
-        let cfg: Config =
+        let config: Config =
             toml::from_str("[compaction]\ntool = true\nsession = true").unwrap();
-        let c = cfg.compaction.unwrap();
+        let c = config.compaction.unwrap();
         assert_eq!(c.tool.unwrap().head, 30, "默认 head");
         assert_eq!(c.session.unwrap().tail, 5, "默认 tail");
     }
