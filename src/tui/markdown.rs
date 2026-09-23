@@ -4,8 +4,11 @@
 //! 做法与 codex 的 `markdown_stream` / `markdown_text_merge` 同一个思路（那边是自己写渲染，
 //! 要更细的流式控制）：这里先用 `tui-markdown` 转换，只在文本（或宽度）变化时重解析一次。
 //!
-//! ⚠ 关掉了 `tui-markdown` 的默认特性 `highlight-code`——它会拉 `syntect`，而 syntect 默认
-//! 后端是 oniguruma（C 库）。代码高亮等真需要时再上（换 `default-fancy` 后端即可）。
+//! ⚠ 开了 `tui-markdown` 的默认特性 `highlight-code`（2026-09-24）：代码块用 syntect 做语法
+//! 高亮，主题是它内置的 Base16 Ocean Dark。代价是 syntect 默认后端 oniguruma（C 库，靠 `cc` 编译）
+//! + 几 MB 语法/主题数据——**有意接受**（想零 C 依赖就换自写高亮，见 docs/CHANGELOG.md）。
+//! 另注意：流式期间每个 delta 都会让缓存失效 → 整段重渲染（含 syntect），长代码块有 CPU 成本
+//! （release 下 300 行代码块约 8ms/次）。
 //!
 //! **表格按可用宽度重排**（`fit_tables`）：`tui-markdown` 的列宽 = 内容自然宽度，它根本
 //! 不知道终端有多宽；而消息流是 `history::layout` 自己逐行折行的 → 超宽表格会被拦腰折断、
