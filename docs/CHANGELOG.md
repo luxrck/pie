@@ -2,6 +2,25 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-24
+
+- **时间子系统坍缩成一个时钟出口 `fn now() -> Duration`**（用户：选 A）。前提：全仓**没有任何一处把时间串解析回时间**（唯一「读」是原样打印 / 转发），所以统一成数字几乎零风险。
+  - `config` 里 `now_unix` / `iso_utc` / `iso_local` / `fmt_unix_ts` 四个函数塌缩成：`now() -> Duration`（**唯一碰 `SystemTime` 的地方**，秒 / `subsec_micros` / `subsec_nanos` 都从它取）+ `fmt_local(secs)`（展示，分钟精度）+ 私有的 `civil`（纯函数，Hinnant 的 civil_from_days）与 `local_utc_offset`（只服务展示）。`session::timestamp()` 收编进 `now()`，`llm::retry_delay` 的 jitter、`collect_file_garbage` 的 age 比较也改用它（原先各自裸调 `SystemTime::now()`）。
+  - **落盘时间统一 unix 秒数字**（用户上一轮点名要的）：manifest 的 `ts`、`__meta__.files[].uploaded_at` 由 ISO 串改成 `now().as_secs() as i64`，`iso_utc` / `iso_local` 随之删除。旧 manifest 里的 ISO 串**不解析**，`pie context info` 原样打印。
+  - 破坏性（对外）：`compression_history()` 及各事件里的 `ts` / `uploaded_at` 从 ISO 串变数字。
+  - 测试：原先依赖本机时区的旧断言（`iso_utc_matches_known_instants`，住在 `context.rs`）删掉，改成 `config.rs` 里测纯函数 `civil`（含负值 `-1 → 1969-12-31T23:59:59`）+ `fmt_local` 只断言形状（core 仍 166 例）。
+
+- **`tool_call` 事件删掉 `turn` / `step`**（用户：选 B）：核实下来这两个值在仓库内**没有任何活着的读者**——
+  - `turn`（历史里非 synthetic 的 user 消息数）在一次 `aturn` 里恒定，消费方自己数就行；`step` 同理能从事件流里推。
+  - Rust 侧唯一的读者是 CLI 一次性模式那条 `[t{turn}s{step}] …` stderr 日志，而它**跑不到**：`main.rs` 在装 printer 之前就 `config.verbose = false` 了（`ToolResult` 的 `[tool] …←…` 同一条命运）。TUI 本来就忽略（`ToolCall { name, arguments, .. }`）。
+  - 绑定侧只是把它俩塞进事件 dict + `.pyi` + 一条断言 → 一起去掉。**这是对外事件形状的破坏性变更**（Python 侧 `ev["turn"]` 不再存在）。
+  - 顺带：`Session::tool_call(calls, parallel, cancel, on_event)` 少两个形参，`aturn` 里那 6 行派生逻辑删掉。（这是在**反转** 2026-09-15 那次「保留 `turn`，因为嵌入方可能有用」的决定：至今没长出一个消费方。）
+- **`Config.verbose` 整个删掉**（用户要求）：它只剩两处门控，删 `verbose` 后都没有意义了——
+  - 一次性模式那两条日志（上一条里说的死分支）跟着删，printer 只处理 `AssistantText` / `Reasoning` / `Answer`；
+  - `open_session` 的 `[session] 恢复/载入/新建` 横幅删掉（TUI 进交替屏后本来就看不见；会话模式无任务时那条 `[session] <path>（摘要）` 照旧打印）；
+  - 「压缩省了多少 token」的提示改成**无条件** `log::warn`（TUI 里仍是消息流一条 `· …`，CLI 里进 stderr——原来 `verbose = true` 时就是这么走的）。
+  - 连带：配置文件少一个键（老配置里的 `verbose = true` 会被忽略，不报错）、绑定的 `Config.verbose` 属性与 `.pyi` 声明一起删。
+
 ## 2026-09-23
 
 - **仓库转纯 Rust**：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）整体删除，`pie-rs/` 的内容上提到仓库根（`src/`、`prompts/`、`bindings/`、`docs/`）。Python 版从此只是历史参照（`git show b188058^:src/pie/…`）。

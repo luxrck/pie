@@ -270,7 +270,6 @@ def test_turn_runs_tool_and_streams_events(env):
     assert call["name"] == "bash"
     assert call["arguments"] == {"command": "echo hi"}  # 参数已解析成 dict
     assert call["arguments_raw"] == '{"command": "echo hi"}'
-    assert (call["turn"], call["step"]) == (1, 1)
 
     result = events[1]
     assert result["name"] == "bash"

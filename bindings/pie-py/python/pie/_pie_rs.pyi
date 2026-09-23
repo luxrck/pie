@@ -41,8 +41,6 @@ class ToolCallEvent(TypedDict):
     name: str
     arguments: dict[str, Any]
     arguments_raw: str
-    turn: int
-    step: int
 
 class ToolResultEvent(TypedDict):
     type: Literal["tool_result"]
@@ -55,7 +53,7 @@ class AnswerEvent(TypedDict):
     text: str
 
 TurnEvent = ContentDelta | ReasoningDelta | ToolCallEvent | ToolResultEvent | AnswerEvent
-"""`on_event` 收到的事件（`turn` / `step` 只在 `tool_call` 上有）。"""
+"""`on_event` 收到的事件。"""
 
 class Usage(TypedDict):
     """token 是**最近一次** provider 上报值（不求和），只有 `calls` 累计。"""
@@ -150,8 +148,6 @@ class Config:
     """`False` = 不做任何压缩；`True` = 三级全开（要细调就改配置文件）。"""
     config_file: str | None
     append_system_prompt: list[str]
-    verbose: bool
-    """是否打调试日志（`[tNsM] 工具…`）。"""
     system_prompt: str | None
     """替换基础 system prompt（运行时属性、不落盘）；`None` = 用内置/仓库那份。"""
     parallel_tools: bool

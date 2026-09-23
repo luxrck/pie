@@ -146,7 +146,7 @@ pub fn write_window_block(raw: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
         "window-{}-{}.jsonl",
-        crate::config::now_unix(),
+        crate::config::now().as_secs(),
         content_hash(raw)
     ));
     std::fs::write(&path, raw)?;
@@ -183,7 +183,7 @@ pub fn write_manifest(manifest: &Path, entry: &Value) -> std::io::Result<()> {
 /// 而 shell 自带落盘的内容是 stdout 原文——若拿结果文本重算就对不上了。
 fn compact_event(level: u8, kind: &str, path: &Path, summary: &str) -> Value {
     let mut entry = serde_json::json!({
-        "ts": now_iso_local(),
+        "ts": crate::config::now().as_secs() as i64,
         "level": level,
         "kind": kind,
         "raw_path": path.display().to_string(),
@@ -202,11 +202,6 @@ fn raw_hash_of(path: &Path) -> String {
         .and_then(|s| s.rsplit('-').next())
         .unwrap_or_default()
         .to_string()
-}
-
-/// 压缩事件的时间戳（`YYYY-MM-DDTHH:MM:SS` **本地时间**）——时间换算统一在 `config`。
-fn now_iso_local() -> String {
-    crate::config::iso_local(crate::config::now_unix())
 }
 
 /// JSON 美化（缩进 1 空格，对齐 Python `json.dumps(..., indent=1)`）——落盘原文 / `--mode transcript` 用。
@@ -690,7 +685,7 @@ pub fn maybe_compact(
         }
     }
     stats.saved_tokens = (before - messages_tokens(messages)).max(0);
-    if config.verbose && (stats.tools > 0 || stats.turns > 0 || stats.session) {
+    if stats.tools > 0 || stats.turns > 0 || stats.session {
         crate::log::warn(format!(
             "[context] 压缩节省约 {} tokens（turns={}, tools={}, session={}）",
             stats.saved_tokens, stats.turns, stats.tools, stats.session
@@ -1024,7 +1019,6 @@ mod tests {
         let config = Config {
             context_window: 400,
             reserved_tokens: None,
-            verbose: false,
             keep_last_steps: 1,
             compaction: Some(CompactionConfig {
                 tool: Some(ToolCompaction { head: 1, tail: 1 }),
@@ -1158,15 +1152,5 @@ mod tests {
         assert!(!garbage.contains(&referenced), "{garbage:?}");
         assert!(referenced_raw_paths().contains(&referenced));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn iso_utc_matches_known_instants() {
-        assert_eq!(crate::config::iso_utc(0), "1970-01-01T00:00:00");
-        // 本地时间：偏移是整数秒，只断言形状与 UTC 的关系（不硬编码本机时区）
-        let offset = crate::config::iso_local(0);
-        assert_eq!(offset.len(), 19, "{offset}");
-        assert!(offset[10..].starts_with('T'), "{offset}");
-        assert_eq!(crate::config::iso_utc(1_700_000_000), "2023-11-14T22:13:20");
     }
 }

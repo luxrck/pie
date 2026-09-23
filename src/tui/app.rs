@@ -554,9 +554,7 @@ impl App {
                 self.settle_thought();
                 Cell::push_assistant_text(&mut self.cells, &text);
             }
-            UiEvent::Turn(TurnEvent::ToolCall {
-                name, arguments, ..
-            }) => {
+            UiEvent::Turn(TurnEvent::ToolCall { name, arguments }) => {
                 self.settle_retry();
                 self.settle_thought();
                 self.activity = Activity::Tool {

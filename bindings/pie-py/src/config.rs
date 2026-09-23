@@ -212,16 +212,6 @@ impl PyConfig {
             .map_err(config_error)
     }
 
-    /// 是否打调试日志（`[tNsM] 工具…` 那些；一次性模式恒关）。
-    #[getter]
-    fn verbose(&self) -> bool {
-        self.inner.verbose
-    }
-    #[setter]
-    fn set_verbose(&mut self, value: bool) {
-        self.inner.verbose = value;
-    }
-
     /// 替换基础 system prompt（运行时属性，**不落盘**）；`None` = 用内置/仓库里的那份。
     ///
     /// 想给某次会话换提示词：`config.system_prompt = "…"` 再 `Session.ephemeral(config, …)`。

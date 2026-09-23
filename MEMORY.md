@@ -43,9 +43,10 @@
 - resume 时按 `__meta__.windows` 重建窗口摘要（旧 system 会被丢掉后按当前提示词重建；**不重建模型就看不到归档历史**）。`full_history()` 把压缩指针展开成完整转录（工具级回到落盘全文，并把原消息头区拼回去——`[exit=N]` 在头区、不在落盘件里）。
 - 三级压缩（`context.rs`）：工具级（head/tail 指针）/ 轮次级 / 会话级；级别只升不降、内容 hash 落盘、软阈值与目标水位迟滞（相对 `context_budget = context_window - reserved_tokens`）、`keep_last_steps` 保护最近 N 个 step 批次。消息是扁平 `Vec<Message>`（靠 `role` + `compress_level` + `synthetic` 判定），压缩就地改写列表；消息模型与 Python 的类层级不同。
 - 压缩元数据字段（`compress_level` / `raw_path` / `raw_hash` / `raw_len` / `raw_tokens` / `synthetic`）**绝不能进 API 请求体** → 发模型前统一过 `Message::to_api()`（tool 的 content 兜空串、assistant 带 tool_calls 必须带 `reasoning_content`）。
-- 目录分工：压缩落盘 `~/.pie/context/`（`context gc` 的地盘）、`/clear` 归档的窗口块 `~/.pie/windows/`（gc 不碰）、图片副本 `~/.pie/files/`。manifest 落盘 `indent=1`、`ts` 用**本地时间** ISO（`config::iso_local` 走 `localtime_r` 的 `tm_gmtoff`，不引日期库）。`clear_window()` 写盘失败就不动窗口（宁可不清也不丢历史）。
+- 目录分工：压缩落盘 `~/.pie/context/`（`context gc` 的地盘）、`/clear` 归档的窗口块 `~/.pie/windows/`（gc 不碰）、图片副本 `~/.pie/files/`。manifest 落盘 `indent=1`、`ts` 用 **unix 秒数字**（落盘时间统一数字，旧的 ISO 串只被原样显示）。`clear_window()` 写盘失败就不动窗口（宁可不清也不丢历史）。
 - **图片只走 Files API，不回退 base64**：read 到图 → 本地内容寻址副本（`img-<sha256[:16]>`，0o600）→ 上传拿 `file_id` → 注入一条 `synthetic` user 消息 `{"type":"file","file_id":…}`。拿不到 `file_id` 就不注入图（标记文本仍在）；`file_id` 失效 → `downgrade_file_blocks` 把历史里的 `file` 块换成文本占位 + 标失效（下次同图重传）+ 重试一次。分层：协议在 `llm.rs`（`upload_file`/`list_files` 自动翻页/`delete_file` + `model_supports_files`/`key_fingerprint`/`TTL_MAX_DAYS`），本地文件管理在 `session.rs`（副本、`__meta__.files`、GC、`files list|gc` 数据源）；时间换算统一在 `config.rs`。
 - ⚠ `expires_after` **只能用方括号展开的表单字段**发：`expires_after[anchor]=created_at` + `expires_after[seconds]=N`（发 JSON 串 → 响应 `expires_at` 为 null = 被当永久件收下，TTL 静默失效）。本地副本与 `__meta__.files` 字段名与 Python 逐字一致（两边记录互认）；`files gc` 有 24h mtime 保护窗（刚粘贴还没 read 的图不算垃圾）。
+- 事件形状：`TurnEvent::{AssistantText, Reasoning, ToolCall{name, arguments}, ToolResult{name, content, arguments}, Answer}`。`ToolCall` 曾经还有 `turn` / `step`（第几轮 / 本回合第几次模型调用），**2026-09-24 删除**（仓库内没有活着的读者：TUI 忽略、CLI 那条 `[tNsM]` 日志跑不到，只有绑定的事件 dict 在转发）。
 - 取消（`cancel.rs`）：`AtomicBool` + `Notify`（**`notify_waiters` 不补发** → 先查标志再 `notified().await`）。三个取消点：`aturn` 每步开头、模型请求 `select!` race（返回 `Ok(None)`、不 push 消息）、shell 等待时 race + `killpg`。收尾必须保证 API 序列合法：未执行的 `tool_call` 补 `CANCEL_TEXT` 的 tool 消息 + 历史写一条 `CANCEL_TEXT` 的 assistant 消息 + 作为本轮答复返回。
 - TUI 侧取消只有 `Esc`（`/stop` 已移除，busy 时输入会提示按 Esc）；退出时先 cancel 再等锁保存。
 
@@ -58,7 +59,7 @@
 
 ### CLI（main.rs）
 
-- 模式判定：**真 TTY 且无任务 → TUI**；有任务 → 一次性（子 agent，不落盘、`verbose=false`、stdout 只有答案，stderr 静音）；非 TTY 且无任务 → 一行提示 + 退出码 2；无任务时从 stdin 读。
+- 模式判定：**真 TTY 且无任务 → TUI**；有任务 → 一次性（子 agent，不落盘，stdout 只有答案、工具活动不打印）；非 TTY 且无任务 → 一行提示 + 退出码 2；无任务时从 stdin 读。
 - 覆盖项（只改内存 cfg、不写回文件，集中在 `apply_overrides`）：`-m/-t/--reserved-tokens(--max-tokens)/--auto-compact-threshold/--timeout-seconds/--max-retries/--max-retry-delay-seconds/--cwd/--system-prompt/--append-system-prompt/--stat/--mode {text,json,transcript}`；`-t` 校验七档 + `none`（`off` 归一到 `none`）。
 - `setup`（补齐 `~/.pie/` 缺的默认件：`config::ensure_config_file` 写一份 `Config::default()`，`config::ensure_global_memory_file` 写 `prompts/memory.md` 种子）在 `run()` 里**早于** `Config::load` 与启动时那发记忆种子——配置缺失/坏掉正是它要修的情形，也保证「已创建」是真的。两个助手都幂等、返回 `(路径, 是否新建)`、已存在一律不覆盖。
 - ⚠ `--max-steps` / `--no-stream` **不进 Config**：它们是按次旋钮，直接传给每个 `Session::aturn`（TUI 经 `tui::run(session, max_steps, stream)` 带下来）。
@@ -79,9 +80,10 @@
 
 ### 配置 / 提示词 / 记忆
 
-- 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）。默认值只写在各自 `impl Default` 里（不再有 `DEFAULT_*` 常量）；整数字段统一 `usize`（写负数在解析期就报错），`reserved_tokens` 认不出的字符串按「不发 max_tokens」处理。`Config.tools`（`[tools.read]` 这种）按下划线私有参数注入，只注入下划线且不覆盖显式传参。
+- 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）。默认值只写在各自 `impl Default` 里（不再有 `DEFAULT_*` 常量）；整数字段统一 `usize`（写负数在解析期就报错），`reserved_tokens` 认不出的字符串按「不发 max_tokens」处理；未知键忽略（如旧配置里的 `verbose`，2026-09-24 已删）。`Config.tools`（`[tools.read]` 这种）按下划线私有参数注入，只注入下划线且不覆盖显式传参。
 - 提示词分两类：`prompts/system.md` / `prompts/memory.md` 是**编译期 `include_str!`** 的内置正文（**小写文件名**），`SYSTEM.md` / `AGENTS.md` / `MEMORY.md` 是**运行时**从 cwd 往上找的文件（`find_project_root`：含任一提示词文件或 `.git` 的最近祖先）。本仓根没有 `SYSTEM.md` → 实际走内置那份；`AGENTS.md` 与 `MEMORY.md` 会被拼进 system prompt（改它们 = 改 agent 行为）。
 - `config::ensure_global_memory()` 首跑写 `~/.pie/memory.md` 种子（已存在不覆盖），在 `main::run` 开头调。
+- **时间只有一个时钟出口**（`config.rs`，2026-09-24）：`config::now() -> Duration` 是唯一碰 `SystemTime` 的地方（秒 / `subsec_micros` / `subsec_nanos` 都从它取），其余是**纯函数**——`fmt_local`（展示，本地偏移走 `localtime_r`）、`civil`（Hinnant 的 civil_from_days，不引日期库，私有）。**落盘统一 unix 秒数字**（manifest `ts` / `uploaded_at`），显示层才格式化；旧 manifest 里的 ISO `ts` 只被原样打印，不解析。
 
 ### Python 绑定（bindings/pie-py）
 

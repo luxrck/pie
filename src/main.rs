@@ -313,10 +313,10 @@ async fn run(cli: Cli) -> i32 {
         return 2;
     }
 
-    // 一次性模式：与 Python 的 print 模式一个口径 —— **stdout 只放结果**、工具/步骤日志静音
-    // （`--mode text` 时 stdout = 答案本身，shell 能直接接住；`stream` 只影响到达时间）。
-    config.verbose = false;
-    let (mode, verbose) = (cli.mode, config.verbose);
+    // 一次性模式：与 Python 的 print 模式一个口径 —— **stdout 只放结果**，工具活动／步骤
+    // 与调试日志都不往 stderr 写（`--mode text` 时 stdout = 答案本身，shell 能直接接住；
+    // `stream` 只影响到达时间）。
+    let mode = cli.mode;
     let mut printer = move |ev: TurnEvent| match ev {
         TurnEvent::AssistantText(delta) => {
             if mode == Mode::Text {
@@ -331,34 +331,9 @@ async fn run(cli: Cli) -> i32 {
                 println!("{text}");
             }
         }
-        TurnEvent::ToolCall {
-            name,
-            arguments,
-            turn,
-            step,
-        } => {
-            // 回合号 / 步号标签，与 Python 版的 `[tNsM]` 日志同形；`verbose` 关掉时静音
-            //（一次性模式就是关的，与 Python print 模式一致）
-            if verbose {
-                eprintln!("\n[t{turn}s{step}] {name} {}", brief(&arguments, 160));
-            }
-        }
-        TurnEvent::ToolResult {
-            name,
-            content,
-            arguments,
-        } => {
-            if !verbose {
-                return;
-            }
-            let first = content.lines().next().unwrap_or("");
-            // 带上调用参数摘要（「这次调的是哪个文件 / 命令」）——结果正文不一定含路径
-            eprintln!(
-                "[tool] {name}({}) ← {}",
-                brief(&arguments, 60),
-                brief(first, 120)
-            );
-        }
+        // 工具活动不打印（stdout 只放结果；曾经的 `[tNsM]` / `[tool] …←…` 日志是 verbose 门控的，
+        // 已随 `Config.verbose` 一起删除）
+        TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. } => {}
     };
 
     // 会话模式（--resume / --session）：读写 `~/.pie/sessions/`，跑完落盘；一次性模式不碰磁盘。
@@ -516,7 +491,7 @@ fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
             r.id,
             r.turns,
             r.api_calls,
-            config::fmt_unix_ts(r.mtime)
+            config::fmt_local(r.mtime)
         );
         if r.first_query.is_empty() {
             println!("    ↳ (无用户消息)");
@@ -726,7 +701,7 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
                 println!("{image_hash}  {size:>10} B  {mime}  {local_name}");
                 let expires = entry.get("expires_at").and_then(Value::as_f64);
                 let expires_txt = match expires {
-                    Some(t) if t > 0.0 => config::fmt_unix_ts(t as i64),
+                    Some(t) if t > 0.0 => config::fmt_local(t as i64),
                     _ => "永久".to_string(),
                 };
                 println!(
@@ -796,11 +771,11 @@ async fn files_remote_list(config: &config::Config) -> i32 {
         );
         let created = f
             .created_at
-            .map(config::fmt_unix_ts)
+            .map(config::fmt_local)
             .unwrap_or_else(|| "?".into());
         let expires = f
             .expires_at
-            .map(config::fmt_unix_ts)
+            .map(config::fmt_local)
             .unwrap_or_else(|| "永久".into());
         let sessions = index
             .get(&f.id)
@@ -888,15 +863,8 @@ fn open_session(
     llm: LlmClient,
     tools: ToolRegistry,
 ) -> Result<Session, String> {
-    // 横幅只在 `verbose` 时打：一次性模式（含 `-s`/`-r` 带任务）与 Python 的 print 模式一样静音
-    let note = |msg: String| {
-        if config.verbose {
-            eprintln!("{msg}");
-        }
-    };
     if resume {
         let s = Session::resume(config, llm, tools)?;
-        note(format!("[session] 恢复 {}（{}）", s.path.display(), s.summary()));
         return Ok(s);
     }
     let candidate = Session::new(config, id, llm, tools);
@@ -906,10 +874,8 @@ fn open_session(
             path, llm, tools, ..
         } = candidate;
         let s = Session::load(&path, config, llm, tools)?;
-        note(format!("[session] 载入 {}（{}）", s.path.display(), s.summary()));
         Ok(s)
     } else {
-        note(format!("[session] 新建 {}", candidate.path.display()));
         Ok(candidate)
     }
 }
@@ -933,15 +899,6 @@ async fn list_models(config: &config::Config) -> i32 {
             eprintln!("拉取模型列表失败: {e}");
             1
         }
-    }
-}
-
-fn brief(s: &str, max: usize) -> String {
-    let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() > max {
-        format!("{}…", one.chars().take(max).collect::<String>())
-    } else {
-        one
     }
 }
 
