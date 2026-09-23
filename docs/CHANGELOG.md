@@ -2,6 +2,17 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-23
+
+- **仓库转纯 Rust**：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）整体删除，`pie-rs/` 的内容上提到仓库根（`src/`、`prompts/`、`bindings/`、`docs/`）。Python 版从此只是历史参照（`git show b188058^:src/pie/…`）。
+- **新增 `pie setup` 子命令**（用户要求）：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子（`prompts/memory.md`）。
+  - **非交互**：Python 版那个 `setup` 是逐个问答模型/地址/key 的向导；这边只写默认值（默认值唯一来源就是 `Config::default()`），之后自己改。
+  - **幂等、不覆盖**：已存在的文件原样保留（里面可能有用户自己的 key 与记忆），所以可以反复跑。两个助手函数 `config::ensure_config_file` / `config::ensure_global_memory_file` 都返回 `(路径, 是否新建)`，命令据此报「已创建 / 已存在」。
+  - 位置：`run()` 里**早于** `Config::load` 与启动时那发记忆种子（配置缺失/坏掉正是它要修的场景；也保证 memory.md 的「已创建」是真的，不会被启动时的隐式种子抢先）；`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 照旧生效。
+  - 回归：`ensure_config_file_writes_defaults_once_and_keeps_existing`（含父目录不存在要先建、写下来的默认值要能读回）与 `ensure_global_memory_reports_whether_it_created_the_file`。
+- **删掉与 Python 逐字对拍的契约测试 + `fixtures/`**（用户要求）：`generated_specs_match_python` 及其辅助（`canonical` / `python_name` / `with_python_names`）与基准 `fixtures/python-tools.json` 一起移除，只留 `builtin_tool_names` 钉住注册名与顺序。代价：工具描述/参数再与 Python 分叉就没有自动拦网了。
+- **修回 `prompts/system.md` 的大小写**：上次搬家把它改成了 `SYSTEM.md`，而代码是 `include_str!("../prompts/system.md")` —— macOS 大小写不敏感照样编过，**Linux/WSL 上会直接编译失败**。
+
 ## 2026-09-22
 
 - **`aturn` / `run` 新增 `stream: bool | None = None`**（用户要求：给外部嵌入方手动控制流式）：

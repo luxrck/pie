@@ -158,14 +158,22 @@ pub fn global_memory_file() -> PathBuf {
 ///
 /// 写不了就算了（权限/只读家目录）：这只是个种子，不值得挡住启动。
 pub fn ensure_global_memory() {
+    let _ = ensure_global_memory_file();
+}
+
+/// 同上，但把结果交给调用方（`pie setup` 要报「已创建 / 已存在」）：返回 `(路径, 是否新建)`。
+pub fn ensure_global_memory_file() -> std::io::Result<(PathBuf, bool)> {
     let path = global_memory_file();
     if path.exists() {
-        return;
+        return Ok((path, false));
     }
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    let _ = std::fs::write(&path, include_str!("../prompts/memory.md"));
+    std::fs::write(&path, include_str!("../prompts/memory.md"))?;
+    Ok((path, true))
 }
 
 /// 配置路径：显式 `-c` > `PIE_CONFIG_FILE` 环境变量 > 默认 `~/.pie/config.toml`。
@@ -179,6 +187,22 @@ pub fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
         }
     }
     default_config_file()
+}
+
+/// `pie setup` 用：配置文件不存在就写一份默认的（父目录 `~/.pie` 也一起建）。
+///
+/// 已存在**一律不覆盖**（里面可能有用户自己的 key / 注释），所以可以反复跑。
+/// 默认值只有一个来源：`Config::default()` —— 与「没有配置文件时 `pie` 的行为」逐字一致。
+/// 返回 `(路径, 是否新建)`。
+pub fn ensure_config_file(explicit: Option<&Path>) -> Result<(PathBuf, bool), ConfigError> {
+    let path = resolve_config_file(explicit);
+    if path.exists() {
+        return Ok((path, false));
+    }
+    let mut cfg = Config::default();
+    cfg.config_file = Some(path.clone()); // 让 save() 写到解析出来的那个路径
+    cfg.save()?;
+    Ok((path, true))
 }
 
 // ---------------------------------------------------------------- 压缩配置
@@ -836,6 +860,57 @@ lean = true
         std::fs::write(&path, "我的记忆").unwrap();
         ensure_global_memory();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "我的记忆");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_global_memory_reports_whether_it_created_the_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pie-rs-memory-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("PIE_DIR", &dir);
+
+        // `~/.pie` 不存在：连父目录一起建，并报「已创建」
+        let (path, created) = ensure_global_memory_file().expect("写种子");
+        assert!(created, "第一次要报已创建");
+        assert_eq!(path, global_memory_file());
+        assert!(path.exists());
+
+        // 再跑一次：文件已在，报「已存在」且内容不动
+        std::fs::write(&path, "我的记忆").unwrap();
+        let (_, created) = ensure_global_memory_file().expect("再跑一次");
+        assert!(!created, "已存在就不算新建");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "我的记忆");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_file_writes_defaults_once_and_keeps_existing() {
+        let dir = std::env::temp_dir().join(format!("pie-rs-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 父目录故意不存在：`pie setup` 要能把 `~/.pie/` 一起建出来
+        let path = dir.join("nested").join("config.toml");
+
+        let (written, created) = ensure_config_file(Some(&path)).expect("写默认配置");
+        assert_eq!(written, path);
+        assert!(created);
+        // 写出来的必须能读回来（默认值往返，不是一份手写样板）
+        let back = Config::load(Some(&path)).expect("读回默认配置");
+        let dflt = Config::default();
+        assert_eq!(back.model, dflt.model);
+        assert_eq!(back.base_url, dflt.base_url);
+        assert_eq!(back.api_key, dflt.api_key);
+        assert_eq!(back.reserved_tokens, dflt.reserved_tokens);
+        assert_eq!(back.context_window, dflt.context_window);
+        assert_eq!(back.tui.lean, dflt.tui.lean);
+
+        // 已存在：原样保留，报「已存在」
+        std::fs::write(&path, "model = \"mine\"\n").unwrap();
+        let (_, created) = ensure_config_file(Some(&path)).expect("再跑一次");
+        assert!(!created, "已存在就不算新建");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \"mine\"\n");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -151,7 +151,7 @@ crates/pie-py     # cdylib：PyO3 绑定
 ```
 
 - 优点：依赖边界硬隔离；将来 `pie-core` 可单独发 crates.io。
-- 缺点：一次大搬家（所有 `crate::` 路径、`include_str!` 相对路径、`fixtures/`、测试分布全要动），
+- 缺点：一次大搬家（所有 `crate::` 路径、`include_str!` 相对路径、测试分布全要动），
   且 `pie-rs/` 目前**还没进 git**（`git status` 显示 `?? pie-rs/`）——大重构前先提交，否则不可回退。
 
 **建议：先 A，等 API 稳定、真要发 crates.io 时再做 B。** 两者对绑定代码的写法没有区别
@@ -309,7 +309,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | Rust 单测 | 现有的 118 项保持不变（`cargo test`）——M0 的验收就是「一个不挂」 |
 | 绑定单测（不联网） | `pie` 侧 `Config.base_url` 指向**本地假 SSE 服务器**：pytest 里用 `http.server` 回放固定 chunk（tool_calls → 文本 → `[DONE]`）→ 端到端跑 aturn |
 | 工具/事件桥接 | 断言 `TurnEvent` 序列、Python 自定义工具被调用、异常 → `ToolError` 文本 |
-| 契约测试 | 与纯 Python `pie` 包对拍：同一台假服务器、同一任务 → 相同工具调用与文件布局（已有 `fixtures/python-tools.json` 先例） |
+| 契约测试 | 与纯 Python `pie` 包对拍：同一台假服务器、同一任务 → 相同工具调用与文件布局（工具 schema 逐字对拍那条先例，已随 `fixtures/` 于 2026-09-23 移除） |
 | 共享资产 | 「Rust 写会话 → Python 读」/「Python 写 → Rust 读」双向（已有 session 契约测试，扩到绑定） |
 | GIL 行为 | 起两条 Python 线程：一条跑 `aturn`（慢假服务器），另一条 `time.sleep` 计数 → 验证没被冻住 |
 
