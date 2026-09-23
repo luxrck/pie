@@ -10,7 +10,7 @@
 //!   - [`tools`]   —— read / edit / write / shell（`@tool` 的 Rust 形态：结构体即参数）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + manifest + gc
-//!   - [`cancel`]  —— 取消信号（`/stop`、Esc）
+//!   - [`cancel`]  —— 取消信号（TUI 的 Esc）
 //!   - [`log`]     —— 告警出口（TUI 期间不能直接写 stderr）
 //!
 //! ⚠ 目前是**全 pub**（M0 阶段）：先把模块边界立起来、让 CLI 与绑定都能用，真实 API 面等

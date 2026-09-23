@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pie-rs"
+name = "pie"
 version = "0.1.0"
 description = "pie-rs（Rust 版 agent harness）的 Python 绑定"
 requires-python = ">=3.9"
@@ -14,6 +14,6 @@ classifiers = [
 ]
 
 [tool.maturin]
-# 扩展模块装在 `pie_rs` 包里（`pie_rs/_pie_rs.*.so`）：外壳包负责 re-export 与类型存根。
+# 扩展模块装在 `pie` 包里（`pie/_pie_rs.*.so`）：外壳包负责 re-export 与类型存根。
 python-source = "python"
-module-name = "pie_rs._pie_rs"
+module-name = "pie._pie_rs"

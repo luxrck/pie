@@ -1,4 +1,4 @@
-//! 回合取消信号（`/stop` / TUI 的 `Esc`）。
+//! 回合取消信号（TUI 的 `Esc`；`aturn` 的 `cancel` 形参也能外部触发）。
 //!
 //! 一个很薄的东西：`AtomicBool`（随时可问「取消了没」）+ `Notify`（取消时唤醒正在等的人）。
 //! 放在模块顶层是因为**三层都要用**：`session`（回合循环）、`llm`（请求 race）、`tools`（shell 杀进程组）；

@@ -130,7 +130,11 @@ fn strip_schema_noise(value: &mut Value) {
 /// 统一「Headers\n\nBody」：headers 一行一个 `[...]`；body 非空时用空行分隔。
 ///
 /// 四个工具都用它 → 留在这儿，「输出格式只有一处定义」。
+/// 没有头区就直接给正文（`bash` 成功时就是这种）——否则会以空串 join 出一个多余的空行。
 fn format_output(headers: &[String], body: &str) -> String {
+    if headers.is_empty() {
+        return body.to_string();
+    }
     let head = headers.join("\n");
     if body.is_empty() {
         head
@@ -603,14 +607,14 @@ impl Tool for Edit {
 
 /// 把 content 写入 path，覆盖已有内容并自动创建父目录。
 #[derive(Deserialize, JsonSchema)]
-pub struct Write {
+pub struct Writ {
     /// Path to the file to write (relative or absolute)
     pub path: String,
     /// Content to write to the file
     pub content: String,
 }
 
-impl Tool for Write {
+impl Tool for Writ {
     async fn call(self, _ctx: ToolCtx) -> ToolResult {
         let Self { path, content } = self;
         let p = Path::new(&path);
@@ -637,7 +641,7 @@ impl Tool for Write {
 
 /// 执行 shell 命令，返回 stdout/stderr 与退出码（YOLO，无权限确认）。
 #[derive(Deserialize, JsonSchema)]
-pub struct Shell {
+pub struct Bash {
     /// Shell command to execute
     pub command: String,
     /// Timeout in seconds (optional, no default timeout)
@@ -652,7 +656,23 @@ pub struct Shell {
     pub _allow_cmds: Option<Vec<String>>,
 }
 
-impl Tool for Shell {
+impl Bash {
+    /// 本工具实际用的 shell：Unix 是 `bash -c`，Windows 是 `cmd /C`。
+    ///
+    /// ⚠ **单一事实来源**：`call` 里起进程用它——不再各写一份字面量（写岔了就会对不上）。
+    #[cfg(unix)]
+    const SHELL: &'static str = "bash";
+    #[cfg(not(unix))]
+    const SHELL: &'static str = "cmd";
+
+    /// 运行 shell 时传的选项：`bash -c <cmd>` / `cmd /C <cmd>`。
+    #[cfg(unix)]
+    const SHELL_FLAG: &'static str = "-c";
+    #[cfg(not(unix))]
+    const SHELL_FLAG: &'static str = "/C";
+}
+
+impl Tool for Bash {
     async fn call(self, ctx: ToolCtx) -> ToolResult {
         let Self {
             command,
@@ -671,22 +691,16 @@ impl Tool for Shell {
                     first
                 };
                 return err(format!(
-                    "[shell] 本次仅允许以这些命令开头: {}（收到: {got}）",
+                    "[bash] 本次仅允许以这些命令开头: {}（收到: {got}）",
                     allow.join(", ")
                 ));
             }
         }
-        // 命令交给 `sh -c`（Windows 是 `cmd /C`）——与 Python 版一致；构造就地写在 call 里，只有本工具用。
-        #[cfg(unix)]
+        // 命令交给 `bash -c`（Windows 是 `cmd /C`）——名字与选项只住在上面的两个常量里，
+        // 所以两个平台共用这一段（不再各写一份字面量）。（⚠ 与 Python 版不同：那边是 `sh -c`。）
         let mut cmd = {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(&command);
-            c
-        };
-        #[cfg(not(unix))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(&command);
+            let mut c = tokio::process::Command::new(Self::SHELL);
+            c.arg(Self::SHELL_FLAG).arg(&command);
             c
         };
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -731,7 +745,7 @@ impl Tool for Shell {
             child.wait().await
         };
 
-        // 取消（Esc / `/stop`）：与超时同款处理——杀掉**整个进程组**，返回哨兵文本
+        // 取消（Esc）：与超时同款处理——杀掉**整个进程组**，返回哨兵文本
         // （上层看到 `CANCEL_TEXT` 就收尾：补全未执行的 tool 消息 + 写一条终止 assistant 消息）。
         let cancel_waiter = async {
             match ctx.cancel.clone() {
@@ -759,7 +773,7 @@ impl Tool for Shell {
                             // 而管道不 EOF 就会把等待卡到子孙自然退出（实测能卡满 timeout）。
                             kill_group();
                             return Ok(format!(
-                                "[shell] 命令超过 {t}s 超时，可能仍在后台运行：{command}"
+                                "[bash] 命令超过 {t}s 超时，可能仍在后台运行：{command}"
                             ));
                         }
                     },
@@ -781,7 +795,7 @@ impl Tool for Shell {
             },
         };
 
-        // 退出码：被信号杀死时 Python 给负数，这里取 -1（信息量等价，都是“非正常退出”）
+        // 退出码：被信号杀死时 Python 给负数，这里取 -1（信息量等价，都是「非正常退出」）
         let code = status.code().unwrap_or(-1);
         let out: String = chunks.concat();
 
@@ -814,19 +828,27 @@ impl Tool for Shell {
             (cap < lines.len()).then(|| lines[..cap].concat())
         };
 
+        // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
+        // 「判成败」：Rust TUI 的 `history::tool_result_ok` 与 Python 版 TUI 都只看这一行，
+        // 所以它必须是**第一行的纯值** `[exit=N]`（没有任何头 = 按成功看待）。
+        let mut headers: Vec<String> = Vec::new();
+        if code != 0 {
+            headers.push(format!("[exit={code}]"));
+            headers.push(format!("[os={}]", std::env::consts::OS));
+            headers.push(format!("[shell={}]", Self::SHELL));
+        }
+
         match head {
-            None => Ok(format_output(&[format!("[exit={code}]")], &out)),
+            None => Ok(format_output(&headers, &out)),
             Some(head) => {
                 // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针，指针是取回
                 // 被截掉那部分的唯一途径。落盘走 context::write_raw（内容 hash 寻址，按内容去重）。
-                let spill = crate::context::write_raw(&out, "shell")
+                let spill = crate::context::write_raw(&out, "bash")
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|e| format!("(落盘失败: {e})"));
+                headers.push(format!("[工具输出全文已保存: {spill}]"));
                 Ok(format_output(
-                    &[
-                        format!("[exit={code}]"),
-                        format!("[工具输出全文已保存: {spill}]"),
-                    ],
+                    &headers,
                     &head,
                 ))
             }
@@ -836,15 +858,32 @@ impl Tool for Shell {
 
 // ---------------------------------------------------------------- 注册表
 
-/// 注册表里的一条：名字 + 描述 + schema + 「JSON → 调用」的函数指针（类型擦除的产物）。
+/// 动态注册的调用体：内置工具包的是 `erased::<T>`（fn 指针），**Python 工具**包的是
+/// 一段回调（绑定侧往 Python 里再叫一次）。两条路共用同一条分发链。
+pub type CallFn = std::sync::Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult> + Send + Sync>;
+
+/// 注册表里的一条：名字 + 描述 + schema + 「JSON → 调用」的调用体（类型擦除的产物）。
 ///
-/// `Clone` 是给嵌入方用的（Python 绑定要能拿一份副本建会话，见 `bindings/pie-py`）。
-#[derive(Debug, Clone)]
+/// `Clone` 是给嵌入方用的（Python 绑定要能拿一份副本建会话，见 `bindings/pie-py`）；
+/// `Debug` 手写（`Box<dyn Fn>` 不是 `Debug`，打印成 `<call>` 就够）。
+#[derive(Clone)]
 pub struct Entry {
-    pub name: &'static str,
+    /// 工具名（`String`：Python 工具的名字是运行时给的，不是 `&'static str`）。
+    pub name: String,
     pub description: String,
     pub parameters: Value,
-    pub call: fn(Value, ToolCtx) -> BoxFuture<ToolResult>,
+    pub call: CallFn,
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("parameters", &self.parameters)
+            .field("call", &"<call>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -866,17 +905,41 @@ impl ToolRegistry {
     ///
     /// 传的是**类型**而不是值——因为「结构体即参数」，带字段的结构体在 Rust 里根本不是
     /// 一个值表达式（`Read` 这三个字写不出来）。名字手动给，和 Python 版一样显式。
-    pub fn with_tool<T: Tool>(mut self, name: &'static str) -> Self {
+    pub fn with_tool<T: Tool>(mut self, name: &str) -> Self {
         assert!(
             !self.entries.iter().any(|e| e.name == name),
             "工具已存在: {name}"
         );
         let (description, parameters) = schema_of::<T>();
         self.entries.push(Entry {
-            name,
+            name: name.to_string(),
             description,
             parameters,
-            call: erased::<T>,
+            call: std::sync::Arc::new(erased::<T>),
+        });
+        self
+    }
+
+    /// **动态注册**（Python 工具走这条）：名字 / 描述 / schema 都是运行时给的，
+    /// 调用体由调用方提供（绑定里就是「往 Python 里叫一次」那段）。
+    ///
+    /// 与 `with_tool` 同规矩：重名直接 panic（注册期编程错误，不是运行期数据问题）。
+    pub fn with_dynamic(
+        mut self,
+        name: &str,
+        description: &str,
+        parameters: Value,
+        call: CallFn,
+    ) -> Self {
+        assert!(
+            !self.entries.iter().any(|e| e.name == name),
+            "工具已存在: {name}"
+        );
+        self.entries.push(Entry {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters,
+            call,
         });
         self
     }
@@ -886,12 +949,12 @@ impl ToolRegistry {
         Self::empty(defaults)
             .with_tool::<Read>("read")
             .with_tool::<Edit>("edit")
-            .with_tool::<Write>("write")
-            .with_tool::<Shell>("shell")
+            .with_tool::<Writ>("writ")
+            .with_tool::<Bash>("bash")
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
-        self.entries.iter().map(|e| e.name).collect()
+    pub fn names(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.name.as_str()).collect()
     }
 
     /// 发给模型的 `tools` 数组（OpenAI 线上形状：`{"type": "function", "function": …}`）。
@@ -932,8 +995,8 @@ impl ToolRegistry {
 
     /// 按名字分发（解析 + 调用都在工具自己那边，注册表只管找）。
     pub async fn dispatch(&self, name: &str, args: &Value, ctx: ToolCtx) -> ToolResult {
-        let Some(entry) = self.entries.iter().find(|e| e.name == name) else {
-            let names: Vec<&str> = self.entries.iter().map(|e| e.name).collect();
+        let Some(entry) = self.entries.iter().find(|e| e.name.as_str() == name) else {
+            let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
             return err(format!("未知工具: {name}（可用: {}）", names.join(", ")));
         };
         let mut args = args.clone();
@@ -945,14 +1008,14 @@ impl ToolRegistry {
 /// 按 `--tools` 说明构建可用工具集（无 spec / 空串 → 默认全量）。
 ///
 /// 解析优先级：内置工具名 > shell 子命令。
-///   - 名字 ∈ 内置（read/edit/write/shell）→ 启用该工具；
+///   - 名字 ∈ 内置（read/edit/writ/bash）→ 启用该工具；
 ///   - 其他名字 → 收集成 shell 允许的子命令白名单，并隐式启用**受限 shell**；
 ///   - 未显式列 shell 且没有任何非内置名 → shell 工具禁用。
 ///
-/// 示例：`"read"` → 仅 read；`"read,shell"` → read + 不限子命令的 shell；
-/// `"read,ls,grep"` → read + 只允许 ls/grep 的 shell；`"ls,grep"` → 仅受限 shell。
+/// 示例：`"read"` → 仅 read；`"read,bash"` → read + 不限子命令的 bash；
+/// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash；`"ls,grep"` → 仅受限 bash。
 pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table>) -> ToolRegistry {
-    const BUILTINS: [&str; 4] = ["read", "edit", "write", "shell"];
+    const BUILTINS: [&str; 4] = ["read", "edit", "writ", "bash"];
 
     let mut enabled: Vec<&'static str> = Vec::new();
     let mut allow_cmds: Vec<String> = Vec::new();
@@ -985,7 +1048,7 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
     let mut defaults = defaults;
     if restricted {
         // 白名单走「私有参数注入」这条路：Shell 里有 `_allow_cmds` 字段（→ `#[schemars(skip)]`，不进 schema）
-        let mut table = defaults.remove("shell").unwrap_or_default();
+        let mut table = defaults.remove("bash").unwrap_or_default();
         table.insert(
             "_allow_cmds".to_string(),
             toml::Value::Array(
@@ -996,26 +1059,26 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
                     .collect(),
             ),
         );
-        defaults.insert("shell".to_string(), table);
+        defaults.insert("bash".to_string(), table);
     }
 
     let mut reg = ToolRegistry::empty(defaults);
     for name in BUILTINS {
-        if !(enabled.contains(&name) || (name == "shell" && restricted)) {
+        if !(enabled.contains(&name) || (name == "bash" && restricted)) {
             continue;
         }
         reg = match name {
             "read" => reg.with_tool::<Read>("read"),
             "edit" => reg.with_tool::<Edit>("edit"),
-            "write" => reg.with_tool::<Write>("write"),
-            _ => reg.with_tool::<Shell>("shell"),
+            "writ" => reg.with_tool::<Writ>("writ"),
+            _ => reg.with_tool::<Bash>("bash"),
         };
     }
     if restricted {
         // description 追加白名单，让模型事先知道边界、少试错（Python 同款）
         let allow_txt = allow_cmds.join(", ");
         if let Some(entry) = reg.entries.last_mut() {
-            if entry.name == "shell" {
+            if entry.name == "bash" {
                 entry
                     .description
                     .push_str(&format!("\n本次运行仅允许以这些命令开头: {allow_txt}"));
@@ -1071,6 +1134,9 @@ mod tests {
     fn format_output_omits_blank_line_when_body_empty() {
         assert_eq!(format_output(&["[exit=0]".into()], ""), "[exit=0]");
         assert_eq!(format_output(&["[exit=0]".into()], "hi"), "[exit=0]\n\nhi");
+        // 没有头区 → 直接给正文（`bash` 成功时就是这种；别以空串 join 出多余空行）
+        assert_eq!(format_output(&[], "hi"), "hi");
+        assert_eq!(format_output(&[], ""), "");
     }
 
     /// 图片识别走 **read 的公开路径**（原 `probe_image` 已并进 `Read::call`，没有可单测的内部函数了）。
@@ -1355,9 +1421,37 @@ mod tests {
         }
     }
 
-    /// **契约测试**：工具定义必须与 Python 版一致。
+    /// Rust 工具名 → Python 工具名（**故意分叉的两个**：`writ`/`bash`，2026-09-23 用户点名改的）。
     ///
-    /// 唯一允许的差异是 `required` 的元素顺序（见 `canonical` 的说明）。
+    /// 除了名字，schema（参数 / 描述 / 协议形状）仍必须与 Python 版逐字一致 ——
+    /// 所以契约测试先把名字换回去、再逐字比。
+    fn python_name(name: &str) -> &str {
+        match name {
+            "writ" => "write",
+            "bash" => "shell",
+            other => other,
+        }
+    }
+
+    /// 把 specs 里的工具名换成 Python 侧的名字（只动 `function.name`）。
+    fn with_python_names(specs: &[Value]) -> Value {
+        let mut specs = Value::Array(specs.to_vec());
+        if let Value::Array(items) = &mut specs {
+            for item in items.iter_mut() {
+                if let Some(name) = item.pointer_mut("/function/name") {
+                    if let Some(s) = name.as_str() {
+                        *name = json!(python_name(s));
+                    }
+                }
+            }
+        }
+        specs
+    }
+
+    /// **契约测试**：工具定义必须与 Python 版一致（**只允许工具名不同**，见 `python_name`）。
+    ///
+    /// 允许的差异只有两处：`required` 的元素顺序（见 `canonical`）与工具名
+    /// （`writ`/`bash` ⇄ `write`/`shell`，用户点名改的）。参数、描述、协议形状仍逐字对齐。
     ///
     /// 基准文件由 Python 侧导出（改了工具 schema 就重新生成）：
     /// ```bash
@@ -1370,8 +1464,15 @@ mod tests {
         let expected: Value =
             serde_json::from_str(include_str!("../fixtures/python-tools.json")).expect("基准 JSON");
         let reg = builtin();
-        assert_eq!(canonical(&Value::Array(reg.specs())), canonical(&expected));
-        assert_eq!(reg.names(), vec!["read", "edit", "write", "shell"]);
+        assert_eq!(
+            canonical(&with_python_names(&reg.specs())),
+            canonical(&expected)
+        );
+        assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash"]);
+        // 映射本身别写错（否则契约测试会静默地什么都比不到）
+        assert_eq!(python_name("writ"), "write");
+        assert_eq!(python_name("bash"), "shell");
+        assert_eq!(python_name("read"), "read");
     }
 
     // 自测工具（非内置）：验证 `.with_tool` 这条公开路径。
@@ -1452,13 +1553,14 @@ mod tests {
     #[test]
     fn tools_from_spec_selects_and_restricts() {
         // 无 spec → 全量
-        let mut names = tools_from_spec(None, HashMap::new()).names();
+        let all = tools_from_spec(None, HashMap::new());
+        let mut names = all.names();
         names.sort();
-        assert_eq!(names, vec!["edit", "read", "shell", "write"]);
+        assert_eq!(names, vec!["bash", "edit", "read", "writ"]);
 
         // 四个内置全列且无白名单 → 也走全量（未受限）
-        let reg = tools_from_spec(Some("read,edit,write,shell"), HashMap::new());
-        assert_eq!(reg.names(), vec!["read", "edit", "write", "shell"]);
+        let reg = tools_from_spec(Some("read,edit,writ,bash"), HashMap::new());
+        assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash"]);
 
         // 仅 read → shell 禁用
         let reg = tools_from_spec(Some("read"), HashMap::new());
@@ -1466,11 +1568,11 @@ mod tests {
 
         // 非内置名 → 隐式启用受限 shell；description 追加白名单；私有参数仍不进 schema
         let reg = tools_from_spec(Some("read, echo ,echo"), HashMap::new());
-        assert_eq!(reg.names(), vec!["read", "shell"]);
+        assert_eq!(reg.names(), vec!["read", "bash"]);
         let shell = reg
             .specs()
             .into_iter()
-            .find(|s| s["function"]["name"] == "shell")
+            .find(|s| s["function"]["name"] == "bash")
             .expect("有 shell");
         let desc = shell["function"]["description"].as_str().unwrap();
         assert!(
@@ -1485,17 +1587,18 @@ mod tests {
     #[tokio::test]
     async fn restricted_shell_rejects_commands_outside_allowlist() {
         let reg = tools_from_spec(Some("echo"), HashMap::new());
-        assert_eq!(reg.names(), vec!["shell"]);
+        assert_eq!(reg.names(), vec!["bash"]);
         // 白名单内 → 正常执行
         let out = reg
-            .dispatch("shell", &json!({"command": "echo hi"}), ToolCtx::default())
+            .dispatch(
+                "bash", &json!({"command": "echo hi"}), ToolCtx::default())
             .await
             .unwrap();
         assert!(out.contains("hi"), "{out}");
         // 白名单外（含空命令）→ 直接回给模型，不启动进程
         let e = reg
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "rm -rf /tmp/nope"}),
                 ToolCtx::default(),
             )
@@ -1504,7 +1607,8 @@ mod tests {
         assert!(e.0.contains("本次仅允许以这些命令开头: echo"), "{e}");
         assert!(e.0.contains("收到: rm"), "{e}");
         let e = reg
-            .dispatch("shell", &json!({"command": "  "}), ToolCtx::default())
+            .dispatch(
+                "bash", &json!({"command": "  "}), ToolCtx::default())
             .await
             .unwrap_err();
         assert!(e.0.contains("收到: (空命令)"), "{e}");
@@ -1535,30 +1639,87 @@ mod tests {
     async fn shell_merges_stderr_and_reports_exit() {
         let out = builtin()
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "echo out; echo err 1>&2"}),
                 ToolCtx::default(),
             )
             .await
             .unwrap();
-        assert!(out.starts_with("[exit=0]"), "{out}");
-        assert!(out.contains("out") && out.contains("err"), "{out}"); // stderr 已合并到 stdout
+        assert_eq!(out, "out\nerr\n", "成功：纯正文、没有退出码头：{out:?}");
+        // stderr 已合并到 stdout（顺序稳定：同一个管道）
     }
 
     #[tokio::test]
     async fn shell_reports_nonzero_exit_code() {
         let out = builtin()
-            .dispatch("shell", &json!({"command": "exit 3"}), ToolCtx::default())
+            .dispatch(
+                "bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
         assert!(out.starts_with("[exit=3]"), "{out}");
+    }
+
+    /// 失败：`[exit=N]` + `[os=…]` + `[shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
+    #[tokio::test]
+    async fn shell_exit_headers_only_on_failure() {
+        let reg = builtin();
+        let ok = reg
+            .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
+            .await
+            .unwrap();
+        assert_eq!(ok, "hi\n", "成功：只有正文");
+
+        let silent = reg
+            .dispatch("bash", &json!({"command": "true"}), ToolCtx::default())
+            .await
+            .unwrap();
+        assert_eq!(silent, "", "成功且没输出：结果为空（没有 `[exit=0]` 可给）");
+
+        // 失败：三行头（os / shell 跟着平台走，所以按常量拼期望值，别把 linux/bash 写死）
+        let headers = format!(
+            "[exit=3]\n[os={}]\n[shell={}]",
+            std::env::consts::OS,
+            Bash::SHELL
+        );
+        let bad = reg
+            .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
+            .await
+            .unwrap();
+        assert_eq!(bad, headers, "失败且没输出：只有三行头");
+
+        let bad = reg
+            .dispatch(
+                "bash",
+                &json!({"command": "echo boom; exit 3"}),
+                ToolCtx::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
+        // 第一行必须是纯值 `[exit=N]`：前端（Rust TUI / Python 版）只认它判成败
+        assert_eq!(bad.lines().next(), Some("[exit=3]"), "{bad}");
+    }
+
+    /// 被信号干掉（`code()` 拿不到）→ `[exit=-1]`（与 Python 版同款：都是「非正常退出」）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killed_shell_reports_minus_one() {
+        let out = builtin()
+            .dispatch(
+                "bash",
+                &json!({"command": "kill -TERM $$"}),
+                ToolCtx::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.starts_with("[exit=-1]"), "{out}");
     }
 
     #[tokio::test]
     async fn shell_truncates_head_and_spills_full_output() {
         let out = builtin()
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "seq 1 200", "_max_lines": 5}),
                 ToolCtx::default(),
             )
@@ -1590,20 +1751,18 @@ mod tests {
         // 未超限 → 原文照回，没有落盘指针
         let out = reg
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "seq 1 5", "_max_lines": 100}),
                 ToolCtx::default(),
             )
             .await
             .unwrap();
-        assert!(out.starts_with("[exit=0]"), "{out}");
-        assert!(!out.contains("全文已保存"), "{out}");
-        assert!(out.ends_with("1\n2\n3\n4\n5\n"), "{out}");
+        assert_eq!(out, "1\n2\n3\n4\n5\n", "成功且未超限：纯正文，没有头也没有指针");
 
         // 字节预算：每行 "1\n" 实打实 2 字节 → 6 字节装 3 行（与 Python `_tail_output` 同口径）
         let out = reg
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "seq 1 100", "_max_bytes": 6}),
                 ToolCtx::default(),
             )
@@ -1620,7 +1779,7 @@ mod tests {
         let started = std::time::Instant::now();
         let out = builtin()
             .dispatch(
-                "shell",
+                "bash",
                 &json!({"command": "sleep 30 & wait", "timeout": 1}),
                 ToolCtx::default(),
             )

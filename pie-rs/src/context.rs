@@ -128,6 +128,31 @@ pub fn content_hash(text: &str) -> String {
     hex::encode(hasher.finalize())[..16].to_string()
 }
 
+/// 历史窗口块目录：`<PIE_DIR>/windows/`。
+///
+/// **刻意放在 `context/` 之外**：那是压缩落盘 + `context gc` 的地盘，而窗口块是用户
+/// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它（与 Python `WINDOWS_DIR` 同款）。
+pub fn windows_dir() -> PathBuf {
+    crate::config::pie_dir().join("windows")
+}
+
+/// 把一段窗口原文落成窗口块（`/clear` 用），返回路径。
+///
+/// 文件名 `window-<unix 秒>-<内容 hash>.jsonl`：时间戳防重名（同一秒内两次 `/clear`
+/// 内容必然不同、hash 不同），**hash 放最后一段** —— 读回时 `window_summary_messages`
+/// 就是按「文件名最后一段」取 `raw_hash` 的（与 shell 落盘同一规矩）。
+pub fn write_window_block(raw: &str) -> std::io::Result<PathBuf> {
+    let dir = windows_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(
+        "window-{}-{}.jsonl",
+        crate::config::now_unix(),
+        content_hash(raw)
+    ));
+    std::fs::write(&path, raw)?;
+    Ok(path)
+}
+
 /// 原文落盘：`<PIE_DIR>/context/<prefix>-<hash>.txt`（已存在则不动）。
 pub fn write_raw(blob: &str, prefix: &str) -> std::io::Result<PathBuf> {
     let dir = context_dir();
@@ -158,7 +183,7 @@ pub fn write_manifest(manifest: &Path, entry: &Value) -> std::io::Result<()> {
 /// 而 shell 自带落盘的内容是 stdout 原文——若拿结果文本重算就对不上了。
 fn compact_event(level: u8, kind: &str, path: &Path, summary: &str) -> Value {
     let mut entry = serde_json::json!({
-        "ts": now_iso_utc(),
+        "ts": now_iso_local(),
         "level": level,
         "kind": kind,
         "raw_path": path.display().to_string(),
@@ -179,13 +204,13 @@ fn raw_hash_of(path: &Path) -> String {
         .to_string()
 }
 
-/// 压缩事件的时间戳（`YYYY-MM-DDTHH:MM:SS` UTC）——时间换算统一在 `config`。
-fn now_iso_utc() -> String {
-    crate::config::iso_utc(crate::config::now_unix())
+/// 压缩事件的时间戳（`YYYY-MM-DDTHH:MM:SS` **本地时间**）——时间换算统一在 `config`。
+fn now_iso_local() -> String {
+    crate::config::iso_local(crate::config::now_unix())
 }
 
-/// JSON 美化（缩进 1 空格，对齐 Python `json.dumps(..., indent=1)`）——落盘原文用。
-fn pretty_indent1(value: &Value) -> String {
+/// JSON 美化（缩进 1 空格，对齐 Python `json.dumps(..., indent=1)`）——落盘原文 / `--mode transcript` 用。
+pub fn pretty_indent1(value: &Value) -> String {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
@@ -638,14 +663,14 @@ pub fn maybe_compact(
     let Some(compaction) = &cfg.compaction else {
         return stats;
     };
-    if cfg.context_window <= 0 {
+    if cfg.context_window == 0 {
         return stats;
     }
     let tokens = current_tokens.unwrap_or_else(|| messages_tokens(messages));
-    if tokens < cfg.soft_limit() {
+    if tokens < cfg.soft_limit() as i64 {
         return stats;
     }
-    let target = cfg.target_limit();
+    let target = cfg.target_limit() as i64;
     let before = messages_tokens(messages);
     // 回调可选：None 时给个空实现，内部各级只管调（不再层层判 Option，也就没有重复可变借用）
     let mut noop = |_: Value| {};
@@ -851,8 +876,8 @@ mod tests {
     fn content_hash_and_pointer_round_trip() {
         let _g = env_lock();
         let dir = pie_dir_tmp("hash");
-        let a = write_raw("same", "shell").unwrap();
-        let b = write_raw("same", "shell").unwrap();
+        let a = write_raw("same", "bash").unwrap();
+        let b = write_raw("same", "bash").unwrap();
         assert_eq!(a, b, "同内容只落一份");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "same");
         // 真指针：文件在 → 认；把文件删了（或凭空写的字符串）→ 假指针，不算
@@ -872,10 +897,10 @@ mod tests {
         let body = long_body(200);
         let mut msgs = vec![
             Message::system("s"),
-            assistant_calls("c1", "shell"),
-            Message::tool_result("c1", "shell", body.clone()),
-            assistant_calls("c2", "shell"),
-            Message::tool_result("c2", "shell", body.clone()),
+            assistant_calls("c1", "bash"),
+            Message::tool_result("c1", "bash", body.clone()),
+            assistant_calls("c2", "bash"),
+            Message::tool_result("c2", "bash", body.clone()),
         ];
         let mut events: Vec<Value> = Vec::new();
         let n = compact_tools(
@@ -905,11 +930,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["level"], 1);
         assert_eq!(events[0]["kind"], "tool");
-        assert_eq!(events[0]["tool"], "shell");
+        assert_eq!(events[0]["tool"], "bash");
         // 短输出不值得压
         let mut short = vec![
-            assistant_calls("c3", "shell"),
-            Message::tool_result("c3", "shell", "ok"),
+            assistant_calls("c3", "bash"),
+            Message::tool_result("c3", "bash", "ok"),
         ];
         assert_eq!(
             compact_tools(
@@ -931,8 +956,8 @@ mod tests {
         let mut msgs = vec![
             Message::system("s"),
             Message::user("第一轮问题"),
-            assistant_calls("c1", "shell"),
-            Message::tool_result("c1", "shell", "out1"),
+            assistant_calls("c1", "bash"),
+            Message::tool_result("c1", "bash", "out1"),
             assistant_text("第一轮答复"),
             Message::user("第二轮问题"),
             assistant_text("第二轮答复"),
@@ -1018,10 +1043,10 @@ mod tests {
         // 一条巨长 tool 输出（≈ 5000 字符 → 远超 400×0.8）→ 触发工具级压缩
         let mut long = vec![
             Message::system("s"),
-            assistant_calls("c1", "shell"),
-            Message::tool_result("c1", "shell", long_body(2000)),
-            assistant_calls("c2", "shell"),
-            Message::tool_result("c2", "shell", "ok"),
+            assistant_calls("c1", "bash"),
+            Message::tool_result("c1", "bash", long_body(2000)),
+            assistant_calls("c2", "bash"),
+            Message::tool_result("c2", "bash", "ok"),
         ];
         let stats = maybe_compact(&mut long, &cfg, Some(9999), None);
         assert_eq!(stats.tools, 1);
@@ -1049,12 +1074,12 @@ mod tests {
         let mut msgs = vec![
             Message::system("s"),
             Message::user("q1"),
-            assistant_calls("c1", "shell"),
-            Message::tool_result("c1", "shell", long_body(200)),
+            assistant_calls("c1", "bash"),
+            Message::tool_result("c1", "bash", long_body(200)),
             assistant_text("a1"),
             Message::user("q2"),
-            assistant_calls("c2", "shell"),
-            Message::tool_result("c2", "shell", "ok"), // 最近一批：受 keep 保护
+            assistant_calls("c2", "bash"),
+            Message::tool_result("c2", "bash", "ok"), // 最近一批：受 keep 保护
         ];
         let stats = compact(&mut msgs, &cfg, CompactMode::Auto, None);
         assert_eq!(stats.tools, 1, "压掉保护窗口之外那条长输出");
@@ -1069,17 +1094,17 @@ mod tests {
     fn marks_shell_spill_so_gc_keeps_it() {
         let _g = env_lock();
         let dir = pie_dir_tmp("spill");
-        let full = write_raw(&long_body(200), "shell").unwrap();
+        let full = write_raw(&long_body(200), "bash").unwrap();
         let text = format!(
             "[exit=0]\n\n[工具输出全文已保存: {}]\n\nline 1\n...[中间省略]...\nline 200\n",
             full.display()
         );
-        let mut msg = Message::tool_result("c1", "shell", text.clone());
-        let entry = mark_tool_spill(&mut msg, "shell", &text).expect("有真指针 → 有事件");
+        let mut msg = Message::tool_result("c1", "bash", text.clone());
+        let entry = mark_tool_spill(&mut msg, "bash", &text).expect("有真指针 → 有事件");
         assert_eq!(msg.compress_level, 1);
         assert_eq!(entry["level"], 1);
         assert_eq!(entry["kind"], "tool");
-        assert_eq!(entry["tool"], "shell");
+        assert_eq!(entry["tool"], "bash");
         let raw = PathBuf::from(msg.raw_path.clone().unwrap());
         assert!(raw.exists());
         // 关键：manifest + raw_path 都引用了它 → GC 不能删
@@ -1089,8 +1114,8 @@ mod tests {
 
         // 指针指向的文件不存在（如 read 回来的源码里恰好含这种字符串）→ 假指针，不动消息
         let fake = "[工具输出全文已保存: /tmp/pie-rs-definitely-missing.txt]";
-        let mut m = Message::tool_result("c2", "shell", fake);
-        assert!(mark_tool_spill(&mut m, "shell", fake).is_none());
+        let mut m = Message::tool_result("c2", "bash", fake);
+        assert!(mark_tool_spill(&mut m, "bash", fake).is_none());
         assert_eq!(m.compress_level, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1120,7 +1145,7 @@ mod tests {
     fn gc_keeps_referenced_files_only() {
         let _g = env_lock();
         let dir = pie_dir_tmp("gc");
-        let referenced = write_raw("referenced", "shell").unwrap();
+        let referenced = write_raw("referenced", "bash").unwrap();
         let orphan = write_raw("orphan", "turn").unwrap();
         let manifest = context_dir().join("s.manifest.jsonl");
         write_manifest(
@@ -1138,6 +1163,10 @@ mod tests {
     #[test]
     fn iso_utc_matches_known_instants() {
         assert_eq!(crate::config::iso_utc(0), "1970-01-01T00:00:00");
+        // 本地时间：偏移是整数秒，只断言形状与 UTC 的关系（不硬编码本机时区）
+        let offset = crate::config::iso_local(0);
+        assert_eq!(offset.len(), 19, "{offset}");
+        assert!(offset[10..].starts_with('T'), "{offset}");
         assert_eq!(crate::config::iso_utc(1_700_000_000), "2023-11-14T22:13:20");
     }
 }
