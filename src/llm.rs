@@ -379,21 +379,21 @@ fn default_retry(max_retries: u32, attempt: u32, e: &LlmError) -> Retry {
 }
 
 impl LlmClient {
-    pub fn new(cfg: &Config) -> Result<Self, LlmError> {
+    pub fn new(config: &Config) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(cfg.timeout_seconds.max(1.0)))
+            .timeout(Duration::from_secs_f64(config.timeout_seconds.max(1.0)))
             .user_agent(concat!("pie-rs/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(LlmError::Transport)?;
         Ok(Self {
             http,
-            api_key: cfg.api_key.clone(),
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
-            model: cfg.model.clone(),
-            reasoning_effort: cfg.normalized_reasoning_effort().map(str::to_string),
-            max_tokens: cfg.reserved_tokens.map(|n| n as i64),
-            max_retries: cfg.max_retries as u32,
-            max_retry_delay: cfg.max_retry_delay_seconds,
+            api_key: config.api_key.clone(),
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            model: config.model.clone(),
+            reasoning_effort: config.normalized_reasoning_effort().map(str::to_string),
+            max_tokens: config.reserved_tokens.map(|n| n as i64),
+            max_retries: config.max_retries as u32,
+            max_retry_delay: config.max_retry_delay_seconds,
         })
     }
 
@@ -1169,16 +1169,16 @@ mod tests {
 
     #[test]
     fn request_body_shape() {
-        let mut cfg = Config::default();
-        cfg.reasoning_effort = "high".into();
-        let c = LlmClient::new(&cfg).unwrap();
+        let mut config = Config::default();
+        config.reasoning_effort = "high".into();
+        let c = LlmClient::new(&config).unwrap();
         let b = c.request_body(&[Message::user("hi")], &[], false, false);
         assert_eq!(b["reasoning_effort"], "high");
         assert!(b.get("thinking").is_none());
         assert_eq!(b["max_tokens"], 128_000);
 
-        cfg.reasoning_effort = "none".into();
-        let c = LlmClient::new(&cfg).unwrap();
+        config.reasoning_effort = "none".into();
+        let c = LlmClient::new(&config).unwrap();
         let b = c.request_body(&[Message::user("hi")], &[], true, true);
         assert!(b.get("reasoning_effort").is_none());
         assert_eq!(b["thinking"]["type"], "disabled");

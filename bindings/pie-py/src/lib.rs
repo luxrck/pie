@@ -199,20 +199,20 @@ fn run(
     parallel_tools: Option<bool>,
 ) -> PyResult<String> {
     // 默认：读配置文件（不在就用默认值）——与 Python `resolve_config()` 同语义
-    let cfg = match config {
+    let core_config = match config {
         Some(c) => c.inner.clone(),
         None => pie::config::Config::load(None).map_err(config_error)?,
     };
     let client = match llm {
         Some(l) => l.inner.clone(),
-        None => pie::llm::LlmClient::new(&cfg).map_err(|e| llm_error(py, e))?,
+        None => pie::llm::LlmClient::new(&core_config).map_err(|e| llm_error(py, e))?,
     };
     let registry = match tools {
         Some(t) => t.inner.clone(),
-        None => pie::tools::ToolRegistry::new(cfg.tool_defaults()),
+        None => pie::tools::ToolRegistry::new(core_config.tool_defaults()),
     };
     let session = crate::session::PySession::wrap(pie::session::Session::ephemeral(
-        &cfg, client, registry,
+        &core_config, client, registry,
     ));
     session.aturn(py, task, None, None, max_steps, stream, parallel_tools)
 }

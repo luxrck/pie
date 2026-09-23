@@ -94,11 +94,11 @@ impl PySession {
     }
 
     fn build(
-        cfg: &PyConfig,
+        config: &PyConfig,
         llm: &PyLlmClient,
         tools: &PyToolRegistry,
     ) -> (pie::config::Config, pie::llm::LlmClient, pie::tools::ToolRegistry) {
-        (cfg.inner.clone(), llm.inner.clone(), tools.inner.clone())
+        (config.inner.clone(), llm.inner.clone(), tools.inner.clone())
     }
 }
 
@@ -113,15 +113,15 @@ impl PySession {
         tools: &PyToolRegistry,
         id: Option<&str>,
     ) -> Self {
-        let (cfg, llm, tools) = Self::build(config, llm, tools);
-        Self::wrap(CoreSession::new(&cfg, id, llm, tools))
+        let (core_config, llm, tools) = Self::build(config, llm, tools);
+        Self::wrap(CoreSession::new(&core_config, id, llm, tools))
     }
 
     /// 临时会话：**不落盘、不写压缩 manifest**（一次性任务 / notebook / 服务用）。
     #[staticmethod]
     fn ephemeral(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry) -> Self {
-        let (cfg, llm, tools) = Self::build(config, llm, tools);
-        Self::wrap(CoreSession::ephemeral(&cfg, llm, tools))
+        let (core_config, llm, tools) = Self::build(config, llm, tools);
+        Self::wrap(CoreSession::ephemeral(&core_config, llm, tools))
     }
 
     /// 从 JSONL 恢复（`path` 必须存在）。
@@ -132,8 +132,8 @@ impl PySession {
         llm: &PyLlmClient,
         tools: &PyToolRegistry,
     ) -> PyResult<Self> {
-        let (cfg, llm, tools) = Self::build(config, llm, tools);
-        CoreSession::load(Path::new(path), &cfg, llm, tools)
+        let (core_config, llm, tools) = Self::build(config, llm, tools);
+        CoreSession::load(Path::new(path), &core_config, llm, tools)
             .map(Self::wrap)
             .map_err(pie_error)
     }
@@ -141,8 +141,8 @@ impl PySession {
     /// 恢复最近的会话（同工作目录优先）——与 CLI 的 `-r` 同款。
     #[staticmethod]
     fn resume(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry) -> PyResult<Self> {
-        let (cfg, llm, tools) = Self::build(config, llm, tools);
-        CoreSession::resume(&cfg, llm, tools)
+        let (core_config, llm, tools) = Self::build(config, llm, tools);
+        CoreSession::resume(&core_config, llm, tools)
             .map(Self::wrap)
             .map_err(pie_error)
     }

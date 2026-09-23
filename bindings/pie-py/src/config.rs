@@ -224,7 +224,7 @@ impl PyConfig {
 
     /// 替换基础 system prompt（运行时属性，**不落盘**）；`None` = 用内置/仓库里的那份。
     ///
-    /// 想给某次会话换提示词：`cfg.system_prompt = "…"` 再 `Session.ephemeral(cfg, …)`。
+    /// 想给某次会话换提示词：`config.system_prompt = "…"` 再 `Session.ephemeral(config, …)`。
     #[getter]
     fn system_prompt(&self) -> Option<String> {
         self.inner.system_prompt.clone()

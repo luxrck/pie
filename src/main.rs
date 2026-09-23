@@ -207,7 +207,7 @@ async fn run(cli: Cli) -> i32 {
     // 首次运行写入全局记忆的种子文件（已存在则跳过）：对齐 Python 每次启动先
     // `_ensure_global_memory()`——它会被拼进 system prompt，没文件就白白少一层记忆。
     config::ensure_global_memory();
-    let mut cfg = match config::Config::load(cli.config.as_deref()) {
+    let mut config = match config::Config::load(cli.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -215,8 +215,8 @@ async fn run(cli: Cli) -> i32 {
         }
     };
 
-    // 一次性覆盖（`-m` / `-t` / `--reserved-tokens` …）——只改内存里的 cfg，不写回文件
-    if let Err(e) = apply_overrides(&mut cfg, &cli) {
+    // 一次性覆盖（`-m` / `-t` / `--reserved-tokens` …）——只改内存里的 config，不写回文件
+    if let Err(e) = apply_overrides(&mut config, &cli) {
         eprintln!("{e}");
         return 2;
     }
@@ -228,14 +228,14 @@ async fn run(cli: Cli) -> i32 {
         }
     }
 
-    // 维护类子命令（不需要模型）；files 要 cfg（建 Files API 客户端）
+    // 维护类子命令（不需要模型）；files 要 config（建 Files API 客户端）
     if let Some(cmd) = &cli.command {
         return match cmd {
             // 正常走不到（`run()` 开头已提前返回）——但这条臂留着：万一提前返回被挪掉，
             // `setup` 依旧是对的（它对已有文件一律不动，与启动时那发种子同级）。
             Cmd::Setup => setup_main(&cli),
             Cmd::Context { action } => context_main(action),
-            Cmd::Files { action } => files_main(&cfg, action).await,
+            Cmd::Files { action } => files_main(&config, action).await,
             Cmd::Sessions { limit, all, json } => {
                 sessions_main(if *all { None } else { Some(*limit) }, *json)
             }
@@ -243,7 +243,7 @@ async fn run(cli: Cli) -> i32 {
     }
 
     if cli.models {
-        return list_models(&cfg).await;
+        return list_models(&config).await;
     }
 
     // 任务：位置参数拼起来；没给就从 stdin 读（`echo "任务" | pie-rs`）；都空才打印帮助
@@ -262,19 +262,19 @@ async fn run(cli: Cli) -> i32 {
     let stream = cli.no_stream.then_some(false);
 
     // 客户端与工具集（TUI / 会话 / 一次性三种模式共用；`--tools` 裁出来的工具集就从这里进）
-    let client = match LlmClient::new(&cfg) {
+    let client = match LlmClient::new(&config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
             return 1;
         }
     };
-    let registry = tools_from_spec(cli.tools.as_deref(), cfg.tool_defaults());
+    let registry = tools_from_spec(cli.tools.as_deref(), config.tool_defaults());
 
     // TTY 且没有任务 → 进 TUI（`-r` / `-s` 就接着那个会话聊）；非 TTY 保持原来的行为
     if task.trim().is_empty() && std::io::stdin().is_terminal() {
         let session = if session_mode {
-            match open_session(&cfg, cli.resume, cli.session.as_deref(), client, registry) {
+            match open_session(&config, cli.resume, cli.session.as_deref(), client, registry) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("{e}");
@@ -282,7 +282,7 @@ async fn run(cli: Cli) -> i32 {
                 }
             }
         } else {
-            Session::new(&cfg, None, client, registry)
+            Session::new(&config, None, client, registry)
         };
         return match tui::run(session, max_steps, stream).await {
             Ok(()) => 0,
@@ -297,17 +297,17 @@ async fn run(cli: Cli) -> i32 {
         // 非 TTY 且没给任务：对齐 Python（一行到 stderr + 退出码 2），别污染 stdout 管道
         eprintln!(
             "pie-rs {}（配置 {}）",
-            cfg.model,
-            cfg.config_file
+            config.model,
+            config.config_file
                 .as_deref()
                 .unwrap_or(std::path::Path::new("(默认)"))
                 .display()
         );
         eprintln!(
             "上下文窗口 {} tokens，可用输入预算 {}（为输出预留 {}）",
-            cfg.context_window,
-            cfg.context_budget(),
-            cfg.reserved_tokens.unwrap_or(0)
+            config.context_window,
+            config.context_budget(),
+            config.reserved_tokens.unwrap_or(0)
         );
         eprintln!("请提供任务描述（`pie-rs \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI");
         return 2;
@@ -315,8 +315,8 @@ async fn run(cli: Cli) -> i32 {
 
     // 一次性模式：与 Python 的 print 模式一个口径 —— **stdout 只放结果**、工具/步骤日志静音
     // （`--mode text` 时 stdout = 答案本身，shell 能直接接住；`stream` 只影响到达时间）。
-    cfg.verbose = false;
-    let (mode, verbose) = (cli.mode, cfg.verbose);
+    config.verbose = false;
+    let (mode, verbose) = (cli.mode, config.verbose);
     let mut printer = move |ev: TurnEvent| match ev {
         TurnEvent::AssistantText(delta) => {
             if mode == Mode::Text {
@@ -364,7 +364,7 @@ async fn run(cli: Cli) -> i32 {
     // 会话模式（--resume / --session）：读写 `~/.pie/sessions/`，跑完落盘；一次性模式不碰磁盘。
     if session_mode {
         let mut session =
-            match open_session(&cfg, cli.resume, cli.session.as_deref(), client, registry) {
+            match open_session(&config, cli.resume, cli.session.as_deref(), client, registry) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("{e}");
@@ -417,8 +417,8 @@ async fn run(cli: Cli) -> i32 {
 
     // 一次性模式：临时会话（不落盘、不写 manifest），跑完就扔；
     // 回合循环现在就在 `Session::aturn` 里（原 loop.rs 已并入）；
-    // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 cfg
-    let mut session = Session::ephemeral(&cfg, client, registry);
+    // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 config
+    let mut session = Session::ephemeral(&config, client, registry);
     match session
         .aturn(
             &task,
@@ -538,7 +538,7 @@ fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
     0
 }
 
-/// 一次性覆盖（CLI 参数 → 内存里的 cfg，**不写回文件**）。
+/// 一次性覆盖（CLI 参数 → 内存里的 config，**不写回文件**）。
 /// 一次性模式跑完后要往 **stdout** 写的那段文本（`None` = 什么都不用写）。
 ///
 /// `--mode text` 时答案已经在流式增量 / `Answer` 事件里打过了，这里只补个收尾换行
@@ -575,39 +575,39 @@ fn dump_result(session: &Session, answer: &str, mode: Mode, stat: bool, stream: 
     }
 }
 
-fn apply_overrides(cfg: &mut config::Config, cli: &Cli) -> Result<(), String> {
+fn apply_overrides(config: &mut config::Config, cli: &Cli) -> Result<(), String> {
     if let Some(m) = &cli.model {
-        cfg.model = m.clone();
+        config.model = m.clone();
     }
     if let Some(t) = &cli.thinking {
         // `-t off` 是给人看的写法 → 归一到配置口径 `none`（对齐 Python `cli.py`：
         // 「API 只认 none」，直接发字面 `off` 服务端不认）
-        cfg.reasoning_effort = if t == "off" {
+        config.reasoning_effort = if t == "off" {
             config::REASONING_NONE.to_string()
         } else {
             t.clone()
         };
     }
     if let Some(raw) = &cli.reserved_tokens {
-        cfg.reserved_tokens = config::parse_reserved_tokens(raw)?;
+        config.reserved_tokens = config::parse_reserved_tokens(raw)?;
     }
     if let Some(n) = cli.auto_compact_threshold {
-        cfg.auto_compact_threshold = Some(n);
+        config.auto_compact_threshold = Some(n);
     }
     if let Some(t) = cli.timeout_seconds {
-        cfg.timeout_seconds = t;
+        config.timeout_seconds = t;
     }
     if let Some(n) = cli.max_retries {
-        cfg.max_retries = n;
+        config.max_retries = n;
     }
     if let Some(d) = cli.max_retry_delay_seconds {
-        cfg.max_retry_delay_seconds = d;
+        config.max_retry_delay_seconds = d;
     }
     if let Some(sp) = &cli.system_prompt {
-        cfg.system_prompt = Some(read_text_or_path(sp));
+        config.system_prompt = Some(read_text_or_path(sp));
     }
     if !cli.append_system_prompt.is_empty() {
-        cfg.append_system_prompt = cli
+        config.append_system_prompt = cli
             .append_system_prompt
             .iter()
             .map(|v| read_text_or_path(v))
@@ -701,11 +701,11 @@ fn context_main(action: &ContextAction) -> i32 {
 }
 
 /// `pie-rs files list|gc`：图片上传件维护（文案对齐 Python 版 `pie files`）。
-async fn files_main(cfg: &config::Config, action: &FilesAction) -> i32 {
+async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
     match action {
         FilesAction::List { all } => {
             if *all {
-                return files_remote_list(cfg).await;
+                return files_remote_list(config).await;
             }
             let rows = session::iter_session_files(&session::sessions_dir());
             if rows.is_empty() {
@@ -755,7 +755,7 @@ async fn files_main(cfg: &config::Config, action: &FilesAction) -> i32 {
                 println!("已删除 {} 个文件", garbage.len());
             }
             if *all {
-                return files_gc_remote(cfg).await;
+                return files_gc_remote(config).await;
             }
             0
         }
@@ -763,8 +763,8 @@ async fn files_main(cfg: &config::Config, action: &FilesAction) -> i32 {
 }
 
 /// `pie-rs files list --all`：列出服务端本账号的全部上传件（顺带标出哪个会话记着它）。
-async fn files_remote_list(cfg: &config::Config) -> i32 {
-    let client = match files_client(cfg) {
+async fn files_remote_list(config: &config::Config) -> i32 {
+    let client = match files_client(config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -813,8 +813,8 @@ async fn files_remote_list(cfg: &config::Config) -> i32 {
 
 /// `pie-rs files gc --all`：调 Files API 清空服务端上传件（本地副本 / 会话记录不动）。
 /// 单个删除失败不中断，有失败返回 1。
-async fn files_gc_remote(cfg: &config::Config) -> i32 {
-    let client = match files_client(cfg) {
+async fn files_gc_remote(config: &config::Config) -> i32 {
+    let client = match files_client(config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -856,11 +856,11 @@ async fn files_gc_remote(cfg: &config::Config) -> i32 {
 }
 
 /// 建一个调 Files API 的客户端（不可逆操作前先把「打到哪个账号」写清楚：多套配置时看得出来）。
-fn files_client(cfg: &config::Config) -> Result<LlmClient, String> {
-    if cfg.api_key.is_empty() {
+fn files_client(config: &config::Config) -> Result<LlmClient, String> {
+    if config.api_key.is_empty() {
         return Err("未配置 api_key，无法调用 Files API（先跑 pie setup）".to_string());
     }
-    let tail: String = cfg
+    let tail: String = config
         .api_key
         .chars()
         .rev()
@@ -869,8 +869,8 @@ fn files_client(cfg: &config::Config) -> Result<LlmClient, String> {
         .into_iter()
         .rev()
         .collect();
-    println!("Files API: {}  key=…{tail}", cfg.base_url);
-    LlmClient::new(cfg).map_err(|e| e.to_string())
+    println!("Files API: {}  key=…{tail}", config.base_url);
+    LlmClient::new(config).map_err(|e| e.to_string())
 }
 
 /// `file_id` → 记着它的会话名（给 `list --all` 标注用）。
@@ -882,7 +882,7 @@ fn session_stem(path: &std::path::Path) -> String {
 
 /// 打开会话：`--resume` 恢复最近的；`--session <id|路径>` 已存在则载入、否则新建。
 fn open_session(
-    cfg: &config::Config,
+    config: &config::Config,
     resume: bool,
     id: Option<&str>,
     llm: LlmClient,
@@ -890,22 +890,22 @@ fn open_session(
 ) -> Result<Session, String> {
     // 横幅只在 `verbose` 时打：一次性模式（含 `-s`/`-r` 带任务）与 Python 的 print 模式一样静音
     let note = |msg: String| {
-        if cfg.verbose {
+        if config.verbose {
             eprintln!("{msg}");
         }
     };
     if resume {
-        let s = Session::resume(cfg, llm, tools)?;
+        let s = Session::resume(config, llm, tools)?;
         note(format!("[session] 恢复 {}（{}）", s.path.display(), s.summary()));
         return Ok(s);
     }
-    let candidate = Session::new(cfg, id, llm, tools);
+    let candidate = Session::new(config, id, llm, tools);
     if candidate.path.exists() {
         // 已存在 → 载入它（把客户端 / 工具集从刚建好的壳里取出来再用）
         let Session {
             path, llm, tools, ..
         } = candidate;
-        let s = Session::load(&path, cfg, llm, tools)?;
+        let s = Session::load(&path, config, llm, tools)?;
         note(format!("[session] 载入 {}（{}）", s.path.display(), s.summary()));
         Ok(s)
     } else {
@@ -914,8 +914,8 @@ fn open_session(
     }
 }
 
-async fn list_models(cfg: &config::Config) -> i32 {
-    let client = match LlmClient::new(cfg) {
+async fn list_models(config: &config::Config) -> i32 {
+    let client = match LlmClient::new(config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -956,13 +956,13 @@ mod tests {
     /// `-t off` 归一成配置口径的 `none`（对齐 Python `cli.py`），其余值原样透传。
     #[test]
     fn thinking_off_is_normalized_to_none() {
-        let mut cfg = config::Config::default();
-        apply_overrides(&mut cfg, &cli(&["-t", "off"])).expect("off 能过");
-        assert_eq!(cfg.reasoning_effort, "none", "`off` 要归一到 `none`");
+        let mut config = config::Config::default();
+        apply_overrides(&mut config, &cli(&["-t", "off"])).expect("off 能过");
+        assert_eq!(config.reasoning_effort, "none", "`off` 要归一到 `none`");
 
-        let mut cfg = config::Config::default();
-        apply_overrides(&mut cfg, &cli(&["-t", "xhigh"])).expect("xhigh 能过");
-        assert_eq!(cfg.reasoning_effort, "xhigh", "服务端认的值原样透传");
+        let mut config = config::Config::default();
+        apply_overrides(&mut config, &cli(&["-t", "xhigh"])).expect("xhigh 能过");
+        assert_eq!(config.reasoning_effort, "xhigh", "服务端认的值原样透传");
     }
 
     /// `-t` 只收 Python 那七档 + `none`；乱写的值在解析期就被拒（不静默发给服务端）。
@@ -978,10 +978,10 @@ mod tests {
     /// `--mode` 的三种取值：`text` 补收尾换行、`json` 给一行结构化、`transcript` 给完整历史。
     #[test]
     fn result_text_covers_the_three_modes() {
-        let cfg = config::Config::default();
-        let llm = pie::llm::LlmClient::new(&cfg).expect("client");
+        let config = config::Config::default();
+        let llm = pie::llm::LlmClient::new(&config).expect("client");
         let tools = pie::tools::ToolRegistry::new(Default::default());
-        let session = Session::ephemeral(&cfg, llm, tools);
+        let session = Session::ephemeral(&config, llm, tools);
 
         assert_eq!(
             result_text(&session, "答案", Mode::Text, None),
@@ -1004,11 +1004,11 @@ mod tests {
     /// `--reserved-tokens` 认 `N` / `128k` / `auto`；坏值直接报错（不静默改配置）。
     #[test]
     fn reserved_tokens_overrides_are_parsed() {
-        let mut cfg = config::Config::default();
-        apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "64k"])).expect("64k");
-        assert_eq!(cfg.reserved_tokens, Some(64_000));
-        apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "auto"])).expect("auto");
-        assert_eq!(cfg.reserved_tokens, None);
-        assert!(apply_overrides(&mut cfg, &cli(&["--reserved-tokens", "不是数"])).is_err());
+        let mut config = config::Config::default();
+        apply_overrides(&mut config, &cli(&["--reserved-tokens", "64k"])).expect("64k");
+        assert_eq!(config.reserved_tokens, Some(64_000));
+        apply_overrides(&mut config, &cli(&["--reserved-tokens", "auto"])).expect("auto");
+        assert_eq!(config.reserved_tokens, None);
+        assert!(apply_overrides(&mut config, &cli(&["--reserved-tokens", "不是数"])).is_err());
     }
 }

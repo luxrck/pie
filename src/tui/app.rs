@@ -803,7 +803,7 @@ impl App {
                 let _ = event_tx.send(UiEvent::Turn(event));
             };
             let result = guard
-                // `parallel_tools: None` = 跟随 `cfg.parallel_tools`（TUI 没有覆盖它的入口）
+                // `parallel_tools: None` = 跟随 `config.parallel_tools`（TUI 没有覆盖它的入口）
                 .aturn(&input, &mut on_event, &cancel, max_steps, stream, None)
                 .await;
                 let snapshot = Snapshot::capture(&guard);
@@ -1367,13 +1367,13 @@ mod tests {
     /// 用到这类命令的用例请自己建 `Config { config_file: Some(临时路径), .. }`（别改 `PIE_DIR`
     /// 环境变量：那是进程级的，会跟并行跑的用例抢），见 `thinking_change_shows_up_in_the_status_bar`。
     fn app_with_rx() -> (App, UnboundedReceiver<UiEvent>) {
-        let cfg = Config {
+        let config = Config {
             model: "deepseek-flash".into(),
             ..Default::default()
         };
-        let llm = crate::llm::LlmClient::new(&cfg).expect("client");
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        App::new(Session::ephemeral(&cfg, llm, tools), None, None)
+        App::new(Session::ephemeral(&config, llm, tools), None, None)
     }
 
     /// 断言用：把空白全去掉再比（`TestBackend` buffer 里宽字符占了两格，拼出来带空格）。
@@ -1655,13 +1655,13 @@ mod tests {
     /// resume：已有历史要回放进消息流（否则打开就是一片空白，看着像丢了对话）。
     #[test]
     fn resume_replays_history_into_the_message_stream() {
-        let cfg = Config {
+        let config = Config {
             model: "deepseek-flash".into(),
             ..Default::default()
         };
-        let llm = crate::llm::LlmClient::new(&cfg).expect("client");
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        let mut session = Session::ephemeral(&cfg, llm, tools);
+        let mut session = Session::ephemeral(&config, llm, tools);
         session.messages.push(crate::llm::Message::user("上次的问题"));
         session.messages.push(crate::llm::Message {
             role: "assistant".into(),
@@ -2156,14 +2156,14 @@ mod tests {
     fn thinking_change_shows_up_in_the_status_bar() {
         let dir = std::env::temp_dir().join(format!("pie-tui-thinking-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let cfg = crate::config::Config {
+        let config = crate::config::Config {
             model: "deepseek-flash".into(),
             config_file: Some(dir.join("config.toml")),
             ..Default::default()
         };
-        let llm = crate::llm::LlmClient::new(&cfg).expect("client");
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        let mut app = App::new(Session::ephemeral(&cfg, llm, tools), None, None).0;
+        let mut app = App::new(Session::ephemeral(&config, llm, tools), None, None).0;
 
         let before = app.render_to_string(90, 16);
         assert!(
