@@ -274,7 +274,9 @@ def test_turn_runs_tool_and_streams_events(env):
 
     result = events[1]
     assert result["name"] == "bash"
-    assert result["text"].startswith("[exit=0]")  # 头区在，说明真的执行了 shell
+    # 成功**只有正文**（`[exit=N]` 头只在失败时给，2026-09-23 定稿）：正文就是 `echo` 的输出，
+    # 说明 shell 真跑了
+    assert result["text"] == "hi\n"
     assert "hi" in result["text"]
 
     assert [e["text"] for e in events[2:]] == ["搞定", "了"]
@@ -282,7 +284,7 @@ def test_turn_runs_tool_and_streams_events(env):
     # 历史：user → assistant(tool_calls) → tool → assistant
     roles = [m["role"] for m in session.messages]
     assert roles == ["system", "user", "assistant", "tool", "assistant"]
-    assert session.messages[3]["content"].startswith("[exit=0]")
+    assert session.messages[3]["content"] == "hi\n"
     assert session.messages[-1]["content"] == "搞定了"
 
     # 两次请求都带上了工具 schema，且第二次把工具结果回传了
