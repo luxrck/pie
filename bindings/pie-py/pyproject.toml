@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "pie"
 version = "0.1.0"
-description = "pie-rs（Rust 版 agent harness）的 Python 绑定"
+description = "pie（Rust 版 agent harness）的 Python 绑定"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 classifiers = [

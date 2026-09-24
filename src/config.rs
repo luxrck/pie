@@ -818,7 +818,7 @@ lean = true
     /// `compaction` 是 `false` / 表（子级关掉写成 `tool = false`）。
     #[test]
     fn config_round_trips_through_toml() {
-        let dir = std::env::temp_dir().join(format!("pie-rs-config-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -851,7 +851,7 @@ lean = true
     #[test]
     fn ensure_global_memory_seeds_once_and_never_overwrites() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("pie-rs-memory-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
 
@@ -873,7 +873,7 @@ lean = true
     #[test]
     fn ensure_global_memory_reports_whether_it_created_the_file() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("pie-rs-memory-report-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-memory-report-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
 
@@ -894,7 +894,7 @@ lean = true
 
     #[test]
     fn ensure_config_file_writes_defaults_once_and_keeps_existing() {
-        let dir = std::env::temp_dir().join(format!("pie-rs-setup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-setup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // 父目录故意不存在：`pie setup` 要能把 `~/.pie/` 一起建出来
         let path = dir.join("nested").join("config.toml");
@@ -924,7 +924,7 @@ lean = true
     #[test]
     fn seeded_global_memory_lands_in_the_system_prompt() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("pie-rs-memory-prompt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-memory-prompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
 

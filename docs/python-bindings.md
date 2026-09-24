@@ -1,10 +1,10 @@
-# pie-rs：Python 绑定规划（PyO3 / maturin）
+# pie：Python 绑定规划（PyO3 / maturin）
 
 > **进度**：M0–M3 + M5 ✅（`import pie` 可用：`Config`/`LlmClient`/`ToolRegistry`/`Session`/`Cancel`
 > /`run()`/`list_sessions()` + 事件回调 + 异常层级 + 类型存根 + `@pie.tool`）。**M4（abi3 wheel 分发）⬜**。
 > 实现时定的东西见 §11。
 >
-> 目标：把 `pie-rs` 的 harness 能力以原生扩展的形式给 Python 程序调用。包名 `pie`（`import pie`）
+> 目标：把 `pie` 的 harness 能力以原生扩展的形式给 Python 程序调用。包名 `pie`（`import pie`）
 > ——它曾与**旧纯 Python 实现**（`python -m pie`，Textual TUI 那套）同名，但那个实现已于 2026-09-23
 > 删除（历史与差异见 [`python-legacy.md`](python-legacy.md)），本绑定就是它现在的对应物。
 >
@@ -25,7 +25,7 @@
 ### 非目标
 
 - **TUI 不进绑定**：`src/tui/`（ratatui / crossterm / tui-markdown / arboard）不暴露、不依赖。
-  交互界面继续走 `pie-rs` 二进制。
+  交互界面继续走 `pie` 二进制。
 - 不追求 1:1 覆盖旧 Python 版 `__all__`（31 项）；先覆盖「跑 agent」这条主链，其余按需补。
 - 不保证与旧 Python 版**行为逐字一致**——Rust 版已有几处有意差异（不回退内联 base64、shell 超限保留头部、
   Toast 时长等），绑定继承 Rust 行为，文档需明示（完整差异清单见 [`python-legacy.md`](python-legacy.md)）。
@@ -130,12 +130,12 @@ tools.register(fetch)                 # 或 tools.register(name="x", schema={...
 ### 方案 A：最小侵入（推荐先做）
 
 ```
-pie-rs/
+pie/
 ├── Cargo.toml          # 仍是 package；新增 [lib] + feature gate
 ├── src/lib.rs          # 新增：pub mod config/llm/tools/session/context/cancel/log
 │                       #        #[cfg(feature = "tui")] pub mod tui;
-├── src/main.rs         # 变薄：use pie::{...}（lib 名 `pie`，bin 名仍是 `pie-rs`）
-├── bindings/pie-py/    # 独立 crate：cdylib，path 依赖 pie-rs，default-features = false
+├── src/main.rs         # 变薄：use pie::{...}（lib 名 `pie`，bin 名仍是 `pie`）
+├── bindings/pie-py/    # 独立 crate：cdylib，path 依赖 pie，default-features = false
 └── python/             # pie 外壳包（__init__.py / .pyi / pyproject.toml / tests）
 ```
 
@@ -153,7 +153,7 @@ crates/pie-py     # cdylib：PyO3 绑定
 
 - 优点：依赖边界硬隔离；将来 `pie-core` 可单独发 crates.io。
 - 缺点：一次大搬家（所有 `crate::` 路径、`include_str!` 相对路径、测试分布全要动），
-  且 `pie-rs/` 目前**还没进 git**（`git status` 显示 `?? pie-rs/`）——大重构前先提交，否则不可回退。
+  且 `pie/` 目前**还没进 git**（`git status` 显示 `?? pie/`）——大重构前先提交，否则不可回退。
 
 **建议：先 A，等 API 稳定、真要发 crates.io 时再做 B。** 两者对绑定代码的写法没有区别
 （都是 `pie::session::Session` 这种路径），所以先 A 不会白干。
@@ -280,7 +280,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 - 继续用 `~/.pie/`（`sessions/` `context/` `files/` `memory.md` `config.toml`），
   用 `PIE_DIR` / `PIE_CONFIG_FILE` 重定向（与 CLI 完全一致）。
-- 这意味着**旧 Python 版 / pie-rs CLI / 绑定**共享同一批会话文件 —— 已经在做的同格式契约，
+- 这意味着**旧 Python 版 / pie CLI / 绑定**共享同一批会话文件 —— 已经在做的同格式契约，
   绑定侧只是多一个消费者；旧版写的会话文件现在仍能读（见 `python-legacy.md`）。
 
 ---
@@ -293,13 +293,13 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 - 开发环：
   ```bash
   uv venv && uv pip install maturin
-  cd pie-rs/bindings/pie-py && maturin develop --release      # 装进当前 venv
+  cd pie/bindings/pie-py && maturin develop --release      # 装进当前 venv
   uvx maturin build --release                                  # 出 wheel 到 target/wheels
   ```
 - 本机注意（沿用 `README.md` 的环境备忘）：cargo 不在 PATH（用 `~/.cargo/bin`）；
   crates.io 走公司代理 MITM → `~/.cargo/config.toml` 的 `http.cainfo` / `http.proxy` 已配好，构建时置
-  `CARGO_TARGET_DIR=~/.cache/pie-rs-target`（源码在 /mnt/d 时尤其必要）。
-- 版本：`pie-rs` Cargo version = wheel version = `pie.__version__`（单一来源）。
+  `CARGO_TARGET_DIR=~/.cache/pie-target`（源码在 /mnt/d 时尤其必要）。
+- 版本：`pie` Cargo version = wheel version = `pie.__version__`（单一来源）。
 
 ---
 
@@ -341,7 +341,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | GIL 死锁 / 回调重入 | 卡死或 panic 穿过 FFI（进程崩） | §5.4 纪律 + `Mutex::try_lock` + 回调里禁碰同一 Session + 有专门回归 |
 | 阻塞式 Python 工具占住 tokio worker | 并发下降、看似卡住 | 多线程 runtime + 文档；必要时 `spawn_blocking` |
 | 类型面漂移（Rust 字段改了、Python 没跟上） | 静默错误 | dict-first（JSON 自动同步）+ `.pyi` 由 Rust 测试对拍字段名 |
-| `pie-rs/` 未进 git | 大重构（方案 B）不可回退 | **M0 前先 `git add pie-rs/`** |
+| `pie/` 未进 git | 大重构（方案 B）不可回退 | **M0 前先 `git add pie/`** |
 | 与旧 Python 版行为分叉 | 用户预期落差 | 文档明确「有意差异」清单（现收在 `docs/python-legacy.md`） |
 | PyO3 版本 API 变动（如 `Python::with_gil` → `Python::attach`） | 编译不过 | 动手时以锁定版本的文档为准，别照抄过时示例 |
 | abi3 + free-threading 目标不同 | wheel 矩阵变大 | 先只出 abi3 常规 wheel，3.13t 按需 |
@@ -379,7 +379,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
   两边的类型不兼容）。
 - `bindings/pie-py`：自己的 workspace，被父级 `exclude = ["bindings"]` 排除；
   cdylib、`[lib] name = "_pie_rs"`（maturin 的 `module-name = "pie._pie_rs"`），
-  `pie-rs = { path = "../..", default-features = false }`。
+  `pie = { path = "../..", default-features = false }`。
 - 核心为绑定加的两处：`tools::Entry` / `tools::ToolRegistry` 加 `#[derive(Clone)]`
   （绑定要拿副本建会话；`LlmClient` / `Config` 本来就 Clone）。
 
@@ -418,7 +418,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 - 绑定回归 = pytest + **本地假 SSE 端点**（`http.server`，按 `messages[-1].role` 决定回工具调用还是最终答复）；
   一条不联网。`PIE_DIR` 指到 tmp 目录 → 不碰真实 `~/.pie`（`ephemeral` 不落盘另有断言）。
-- `.gitignore` 加了 `pie-rs/bindings/*/target/`（这个 crate 有自己的 target/）。
+- `.gitignore` 加了 `pie/bindings/*/target/`（这个 crate 有自己的 target/）。
 - 绑定侧 dev 环境：`bindings/pie-py/.venv`（maturin + pytest）。
 
 ### M5：asyncio 入口（2026-09-23）

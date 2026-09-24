@@ -1831,7 +1831,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pie-rs"
+name = "pie"
 version = "0.1.0"
 dependencies = [
  "arboard",

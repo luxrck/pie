@@ -104,7 +104,7 @@ impl Session {
         Self::at(resolve_path(id), config, llm, tools)
     }
 
-    /// 临时会话（`pie-rs "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
+    /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
     ///
     /// Python 那边一次性模式走独立的 `loop.run()`；这边既然回合循环已经并在 `Session` 上，
     /// 就用“不记账的 Session”表达同一件事。
@@ -1190,7 +1190,7 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
     })
 }
 
-/// 历史会话概览（`pie-rs sessions` 用）。
+/// 历史会话概览（`pie sessions` 用）。
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub id: String,
@@ -1539,14 +1539,14 @@ mod tests {
     }
 
     fn pie_dir_tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pie-rs-img-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-img-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
         dir
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("pie-rs-session-{}-{name}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("pie-session-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -2323,7 +2323,7 @@ mod tests {
     #[test]
     fn resume_prefers_same_cwd_then_latest() {
         let config = Config::default();
-        let dir = std::env::temp_dir().join(format!("pie-rs-sessdir-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-sessdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, cwd: &str, title: &str| {
@@ -2351,7 +2351,7 @@ mod tests {
         assert_eq!(s.title.as_deref(), Some("other-cwd"));
         assert_eq!(s.path, other_cwd);
         // 空目录 → 报错不 panic
-        let empty = std::env::temp_dir().join(format!("pie-rs-sessempty-{}", std::process::id()));
+        let empty = std::env::temp_dir().join(format!("pie-sessempty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         assert!(Session::resume_in(&empty, None, &config, llm(), tools())

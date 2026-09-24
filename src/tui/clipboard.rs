@@ -122,7 +122,7 @@ mod tests {
         let _g = crate::config::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("pie-rs-paste-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-paste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PIE_DIR", &dir);
 
@@ -145,7 +145,7 @@ mod tests {
     /// 文件列表：跳过「非图片」与「不存在」的项，取第一个真图片；扩展名大小写不敏感。
     #[test]
     fn file_list_keeps_first_existing_image() {
-        let dir = std::env::temp_dir().join(format!("pie-rs-paste-files-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-paste-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let txt = dir.join("notes.txt");

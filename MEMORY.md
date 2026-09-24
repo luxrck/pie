@@ -15,7 +15,7 @@
 
 ## 项目定位与仓库
 
-- **纯 Rust 项目**（2026-09-23 用户完成「重构代码到 Rust」）：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）已从本仓库删除；仓库根就是一个 Cargo 项目（package `pie-rs`、lib 名 `pie`、bin 名 `pie`）+ Python 绑定（`bindings/pie-py`）。
+- **纯 Rust 项目**（2026-09-23 用户完成「重构代码到 Rust」）：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）已从本仓库删除；仓库根就是一个 Cargo 项目（package `pie`、lib 名 `pie`、bin 名 `pie`）+ Python 绑定（`bindings/pie-py`）。
 - 本机位置：macOS `/Users/luxrck/Projects/pie`（**当前实际改的这树**）；远端 `git@github.com:luxrck/pie.git`（只能走 SSH）。旧记录里还有 WSL 树 `/mnt/d/pie-master`（从 macOS 看不到，别假设它与这里同步）。
 - 旧 **Python 版**（2026-09-23 删除）只作**历史参照**：「迁一块对一块」的 oracle 角色已完成——它的历史、旧版长什么样、与现版的逐条差异见 `docs/python-legacy.md`；查旧实现用 `git show b188058^:src/pie/xxx.py`，但**新代码一律以 Rust 为准**。
 
@@ -100,7 +100,7 @@
 
 ## 构建与环境（本机特有）
 
-- cargo 不在默认 PATH → 用 `~/.cargo/bin`。源码在 9p 盘时要 `CARGO_TARGET_DIR=$HOME/.cache/pie-rs-target`（macOS 本地盘可省）。
+- cargo 不在默认 PATH → 用 `~/.cargo/bin`。源码在 9p 盘时要 `CARGO_TARGET_DIR=$HOME/.cache/pie-target`（macOS 本地盘可省）。
 - 公司代理 MITM crates.io → `~/.cargo/config.toml` 配了 `http.cainfo=~/.cargo/certs/bundle.pem` 与 `http.proxy`；`api.deepseek.com` **没被** MITM（系统根证书够用）→ reqwest 用 `rustls-tls-native-roots`（provider = ring），**不需要** libssl/pkg-config/cmake/perl，依赖只要 `cc`。
 - 本机 nightly（1.100.0）格式串**不接受 `f` 类型**：`{x:.1f}` 报 `unknown format trait f` → 用 `{x:.1}`。
 - 跨平台检查（rustup 装 target 会被代理证书挡住）：用 curl 下 `rust-std-<target>.tar.xz` 解到 `$(rustc --print sysroot)/lib/rustlib/`，再拿临时 crate 把要查的代码 `include!` 进去 `cargo check --target`（整包会被 `ring` 的 build script 挡住）。

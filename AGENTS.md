@@ -47,7 +47,7 @@ pie/
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"                  # 本机 cargo 不在默认 PATH
-export CARGO_TARGET_DIR=$HOME/.cache/pie-rs-target    # 可选：产物放大盘（源码在 9p 盘时才必要）
+export CARGO_TARGET_DIR=$HOME/.cache/pie-target       # 可选：产物放大盘（源码在 9p 盘时才必要）
 cargo test                                            # 168 例（lib 164 + bin 4），不联网
 cargo build && cargo run -- --models                  # 端点可用模型
 cargo run                                             # 真 TTY + 无任务 → 进 TUI

@@ -4,6 +4,13 @@
 
 ## 2026-09-24
 
+- **crate 名 `pie-rs` → `pie`**（用户：「我就是要把 pie-rs 改成 pie」）：根 `Cargo.toml` 的
+  `package.name` 改成 `pie`（`[lib]` / `[[bin]]` 本来就都叫 `pie`），连带：`bindings/pie-py` 的
+  path 依赖键（`pie = { path = "../.." }`）、两份 `Cargo.lock`、CLI 的 `#[command(name = …)]`
+  （`--help` / usage 里的程序名）、`llm.rs` 的 UA（`pie/<version>`）、以及 README / AGENTS / MEMORY /
+  docs 里所有 `pie-rs` 提法。**不动 `_pie_rs`**（Python 扩展模块名 `pie._pie_rs`，属于绑定 API）。
+  本机 `CARGO_TARGET_DIR` 约定目录顺带改名（`~/.cache/pie-rs-target` → `~/.cache/pie-target`）。
+
 - **状态栏也跟着窗口焦点变灰**（用户：把输入框那种 unfocused 变灰的渲染也用到状态栏）：
   `status::status_line` / `activity_line` 多一个 `focused` 形参（与 `Input::render` 同款），
   失焦时那两档“活的”颜色从 accent 降成 muted：**名字**（本来 accent + BOLD，失焦连粗体一起去掉）与
@@ -114,7 +121,7 @@
 
 ## 2026-09-23
 
-- **仓库转纯 Rust**：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）整体删除，`pie-rs/` 的内容上提到仓库根（`src/`、`prompts/`、`bindings/`、`docs/`）。Python 版从此只是历史参照（`git show b188058^:src/pie/…`）。
+- **仓库转纯 Rust**：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）整体删除，`pie/` 的内容上提到仓库根（`src/`、`prompts/`、`bindings/`、`docs/`）。Python 版从此只是历史参照（`git show b188058^:src/pie/…`）。
 - **新增 `pie setup` 子命令**（用户要求）：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子（`prompts/memory.md`）。
   - **非交互**：Python 版那个 `setup` 是逐个问答模型/地址/key 的向导；这边只写默认值（默认值唯一来源就是 `Config::default()`），之后自己改。
   - **幂等、不覆盖**：已存在的文件原样保留（里面可能有用户自己的 key 与记忆），所以可以反复跑。两个助手函数 `config::ensure_config_file` / `config::ensure_global_memory_file` 都返回 `(路径, 是否新建)`，命令据此报「已创建 / 已存在」。

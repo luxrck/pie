@@ -7,7 +7,7 @@ scripts/
 *.egg-info/
 .pytest_cache/
 
-# Rust 重构（pie-rs）的构建产物
+# Rust 重构（pie）的构建产物
 target/
 
 # Python 绑定的构建产物（扩展模块自己的 target/）

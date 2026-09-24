@@ -81,7 +81,7 @@ pub fn activity_line(
 }
 
 /// 状态栏：**左边**是常驻信息 `<模型> <思考深度> · <目录> │ <上下文用量> │ <余额>`
-/// （**不带 `pie-rs` 前缀**——用户点名去掉，省下的列给目录）；**右边**贴屏幕右边缘的只有
+/// （**不带 `pie` 前缀**——用户点名去掉，省下的列给目录）；**右边**贴屏幕右边缘的只有
 /// **活动指示**（转圈 + 耗时）——它一直变，单独占右边一位，不会把用量/余额推来推去。
 ///
 /// `balance` = [`balance_text`] 的产物（拿不到就给 `None`，那一块就不画）。
@@ -294,8 +294,8 @@ mod tests {
             text.contains("deepseek-flash high · ~/Projects/pie"),
             "左边一直显示思考深度（`/thinking` 改了能一眼看出）：{text}"
         );
-        // 不带 `pie-rs` 前缀（用户点名去掉）——看行首就是模型名（别拿 `contains` 判：cwd 里
-        // 完全可能正好叫 pie-rs）
+        // 不带 `pie` 前缀（用户点名去掉）——看行首就是模型名（别拿 `contains` 判：cwd 里
+        // 完全可能正好叫 pie）
         assert!(text.starts_with(" deepseek-flash"), "{text}");
         // 深度为空 → 不占位（`{模型} · {目录}`，不会多一个空段落）
         let no_effort = Snapshot {

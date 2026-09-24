@@ -1,4 +1,4 @@
-//! `pie._pie_rs` —— pie-rs 核心层的 Python 绑定（PyO3）。
+//! `pie._pie_rs` —— pie 核心层的 Python 绑定（PyO3）。
 //!
 //! 分工：**本 crate 只做桥接**（类型转换、GIL 纪律、事件分发、异常映射），
 //! 一切业务逻辑仍在 `pie`（Rust 核心库）里。规划见仓库 `docs/python-bindings.md`。
@@ -77,7 +77,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_name("pie-rs")
+            .thread_name("pie")
             .build()
             .expect("建 tokio runtime 失败")
     })
@@ -219,7 +219,7 @@ fn run(
 
 /// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。
 ///
-/// 键名与 CLI `pie-rs sessions --json` / Python `pie sessions -j` 一致。`limit=None` = 全部。
+/// 键名与 CLI `pie sessions --json` / Python `pie sessions -j` 一致。`limit=None` = 全部。
 #[pyfunction]
 #[pyo3(signature = (limit=None))]
 fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {

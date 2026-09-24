@@ -382,7 +382,7 @@ impl LlmClient {
     pub fn new(config: &Config) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs_f64(config.timeout_seconds.max(1.0)))
-            .user_agent(concat!("pie-rs/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("pie/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(LlmError::Transport)?;
         Ok(Self {
