@@ -222,7 +222,7 @@ def test_config_defaults_and_repr_masks_key():
     cfg = pie.Config()
     assert cfg.model and cfg.base_url and cfg.context_window > 0
     # ⚠ 核心 `Config::default()` 里压缩是**开着**的（`Some(CompactionConfig::default())`）：
-    # 与 Python 版「不写 `[compaction]` 就不压」不同，这里是「不写就按默认三级压」。
+    # 不写 `[compaction]` 就按默认三级压（写了才按子表覆盖）。
     assert cfg.compaction is True
     cfg.compaction = False
     assert cfg.compaction is False
@@ -516,7 +516,7 @@ def test_session_clear_window_setters_and_transcript(env, tmp_path, monkeypatch)
     assert roles[:3] == ["system", "user", "assistant"], roles
 
     note = session.set_model("deepseek-v4-pro")
-    assert "已写入配置" in note, note                     # 与 Python `_persist_note` 同款
+    assert "已写入配置" in note, note                     # 与「写回配置文件」的提示语一致
     assert session.config.model == "deepseek-v4-pro", "会话内配置跟着改"
     assert "deepseek-v4-pro" in Path(cfg.config_file).read_text(), "写回了指定的配置文件"
     assert cfg.model == "test-model", "传给 Session 的那个 cfg 是副本，不会跟着变"
@@ -540,7 +540,7 @@ def test_stub_covers_every_exported_name():
     import ast
 
     declared = {n.name for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
-    # `tool` / `Tool` 由纯 Python 的 `pie/_tool.py` 提供，不在扩展模块的存根里
+    # `tool` / `Tool` 由绑定自带的纯 Python 层（`pie/_tool.py`）提供，不在扩展模块的存根里
     python_layer = {"tool", "Tool"}
     assert set(pie.__all__) - python_layer <= declared, set(pie.__all__) - python_layer - declared
 
@@ -557,7 +557,7 @@ def test_stub_declares_every_public_attribute():
         if not isinstance(cls, type) or issubclass(cls, BaseException):
             continue  # 异常类只查「存根里有这个名字」（继承来的 args 之类不用写）
         if name == "Tool":
-            continue  # 纯 Python 层（`pie/_tool.py`）的 dataclass，存根不管它
+            continue  # 绑定自带纯 Python 层（`pie/_tool.py`）的 dataclass，存根不管它
         node = classes[name]
         declared = set()
         for item in node.body:
@@ -609,12 +609,11 @@ def test_stub_event_shapes_match_the_real_events(env):
 # ---------------------------------------------------------------- M3：Python 工具
 
 
-def test_tool_schema_matches_the_pure_python_oracle():
-    """`@pie.tool` 的 schema 与纯 Python 版 `@tool` **逐字相同**（值是用 oracle 跑出来对过的）。
+def test_tool_schema_shape_is_stable():
+    """`@pie.tool` 的 schema 形状固定（值对着期望逐字比）。
 
     ⚠ 测试文件本身有 `from __future__ import annotations`，所以注解是字符串；嵌套函数里的注解
-    得能从**模块全局/内建**解析出来（`list[str]` / `int | None` 行；函数内 import 的名字不行）——
-    这与纯 Python 版同一条限制。
+    得能从**模块全局/内建**解析出来（`list[str]` / `int | None` 行；函数内 import 的名字不行）。
     """
 
     def fetch(url: str, retries: int = 3, timeout: float = 1.5) -> str:

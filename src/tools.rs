@@ -1,10 +1,10 @@
-//! 工具层：内置 read / edit / write / shell + 统一的「Headers\n\nBody」输出格式。
+//! 工具层：内置 read / edit / writ / bash + 统一的「Headers\n\nBody」输出格式。
 //!
-//! 对齐 Python 版 `src/pie/tools.py` 的行为契约：
+//! 行为契约：
 //!   - 返回文本统一为 `Headers\n\nBody`（headers 一行一个 `[...]`；body 为空则省略空行）；
 //!   - 私有参数（下划线开头）不进 schema，由配置按工具名注入；
-//!   - read 截断**不落盘**（内容可再生，按 offset 续读）；shell 截断**落盘**（stdout 不可再生）；
-//!   - shell 必须独立进程组 + killpg（否则取消/超时会被孙进程持有的管道卡住）。
+//!   - read 截断**不落盘**（内容可再生，按 offset 续读）；bash 截断**落盘**（stdout 不可再生）；
+//!   - bash 必须独立进程组 + killpg（否则取消/超时会被孙进程持有的管道卡住）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -46,7 +46,7 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 //
 // ---------------------------------------------------------------- 工具上下文
 
-/// 工具执行上下文：目前只装**取消信号**（将来放实时进度回调——Python 版的 `_on_progress` 就是走这条链）。
+/// 工具执行上下文：目前只装**取消信号**（将来放实时进度回调也走这条链）。
 ///
 /// 按值传（内部是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
 #[derive(Clone, Default)]
@@ -75,7 +75,7 @@ fn erased<T: Tool>(args: Value, ctx: ToolCtx) -> BoxFuture<ToolResult> {
     })
 }
 
-/// schemars 的 schema → 与 Python 版一致的精简 schema，返回 `(工具描述, parameters)`。
+/// schemars 的 schema → 精简后的 schema，返回 `(工具描述, parameters)`。
 ///
 /// 要归一化的都是**实测出来的**差异：
 ///   - `$schema` / `title` 删掉（描述本来就在根上，待会儿提到 `function.description` 去）；
@@ -106,9 +106,9 @@ fn schema_of<T: schemars::JsonSchema>() -> (String, Value) {
     (description, schema)
 }
 
-/// 递归剔掉 schemars 挂上去、而 Python 版没有的装饰字段：
+/// 递归剔掉 schemars 挂上去的多余装饰字段：
 ///   - `format`（`int64` / `uint` …）；
-///   - `minimum`：无符号整数会被自动加上 `minimum: 0`，而 Python 版没有；而且 `read` 的 `offset`
+///   - `minimum`：无符号整数会被自动加上 `minimum: 0`；而 `read` 的 `offset`
 ///     实际从 1 起（0 会被工具回错），写 0 反而误导。
 fn strip_schema_noise(value: &mut Value) {
     match value {
@@ -202,7 +202,7 @@ impl Tool for Read {
         // VP8X/VP8/VP8L 三个变体，手写一遍就是几十行容易悄悄出错的位运算（progressive JPEG、
         // 带 EXIF 的 JPEG 都是坑）。实测两者在 Pillow 生成的真图上结果完全一致。
         // ⚠ `guess_format` 的魔数表比这里宽：**即使没开 tiff/ico 的 feature，它照样认出
-        // TIFF/ICO**（只是解码器不可用）。所以必须过白名单——Python 版只把
+        // TIFF/ICO**（只是解码器不可用）。所以必须过白名单——只有
         // PNG/JPEG/GIF/WebP/BMP 当图片，其余的仍走文本/二进制分支。
         let image_info = image::guess_format(&head).ok().and_then(|format| {
             let mime = match format {
@@ -271,7 +271,7 @@ impl Tool for Read {
         }
         // 字节预算：从 start 起累计「行 + 1（换行）」字节不超过 `_max_bytes` 的行数（至少 1 行，
         // 保证单行超长也读得到）。这些行**不含**换行（`lines()` 已经去掉了），所以每行要 +1 才对得上
-        // 磁盘上的实际大小——与 shell 那侧不同（它的行含 `\n`，见 `Shell::call`；Python 版两边也是这么分的）。
+        // 磁盘上的实际大小——与 bash 那侧不同（它的行含 `\n`，见 `Bash::call`）。
         let lines_by_bytes = |start: usize, max_bytes: usize| -> usize {
             let mut n = 0usize;
             let mut sz = 0usize;
@@ -327,7 +327,7 @@ pub struct ImageRef {
 ///
 /// 标记是 read 自己写的（见 `Read::call`）：
 /// `[图片已读取: path=<路径>, mime=<mime>, size=<字节>[, dim=<宽>x<高>]]`
-/// 路径里不会出现 `,` 或 `]`（Python 的正则也是这么排的），所以手写解析足够，不用引 regex。
+/// 路径里不会出现 `,` 或 `]`，所以手写解析足够，不用引 regex。
 pub fn parse_image_marker(text: &str) -> Option<ImageRef> {
     const MARK: &str = "[图片已读取: ";
     let start = text.find(MARK)? + MARK.len();
@@ -365,7 +365,7 @@ pub fn parse_image_marker(text: &str) -> Option<ImageRef> {
 }
 
 // ⚠ 工具描述（`function.description`）**不能**只靠 doc 注释：schemars 会把 doc 里的单换行
-// 合并成空格（`merge_description_lines`），而 Python 版这里是多行的 —— 用下面的
+// 合并成空格（`merge_description_lines`），而这里要多行 —— 用下面的
 // `#[schemars(description = ...)]` 显式给。
 #[derive(Deserialize, JsonSchema)]
 #[schemars(
@@ -378,8 +378,8 @@ pub struct Edit {
     pub edits: Vec<EditOp>,
 }
 
-// `edits` 数组的元素。**故意不加 doc 注释**：Python 版的 `items` 没有 description，
-// 而 schemars 会把结构体 doc 填上去（加了就对不上）。
+// `edits` 数组的元素。**故意不加 doc 注释**：`items` 不该带 description，
+// 而 schemars 会把结构体 doc 填上去。
 #[derive(Deserialize, JsonSchema)]
 #[allow(non_snake_case)]
 pub struct EditOp {
@@ -417,7 +417,7 @@ impl Tool for Edit {
         // —— 诊断：oldText 找不到时，给出「原文里最接近的位置 + 简版 diff」——
         // 拿 oldText 里最长的一行当锚（最可能是唯一标识），在原文里找字符级最相似的一行，
         // 再以它为基准取**同长窗口**逐行对齐输出。锚行相似度 < 50% 就不给（宁可不给，不给误导）。
-        // 简版之处：用 LCS 近似 Python 的 `difflib.ratio()`，且窗口与 oldText 等长（不处理行
+        // 简版之处：用 LCS 近似 `difflib.ratio()` 的相似度，且窗口与 oldText 等长（不处理行
         // 插入/删除引起的位移，那种情况会多出几条 -/+ 而已）。
         let lcs_len = |a: &[char], b: &[char]| -> usize {
             let mut prev = vec![0usize; b.len() + 1];
@@ -697,7 +697,7 @@ impl Tool for Bash {
             }
         }
         // 命令交给 `bash -c`（Windows 是 `cmd /C`）——名字与选项只住在上面的两个常量里，
-        // 所以两个平台共用这一段（不再各写一份字面量）。（⚠ 与 Python 版不同：那边是 `sh -c`。）
+        // 所以两个平台共用这一段（不再各写一份字面量）。
         let mut cmd = {
             let mut c = tokio::process::Command::new(Self::SHELL);
             c.arg(Self::SHELL_FLAG).arg(&command);
@@ -707,7 +707,7 @@ impl Tool for Bash {
         #[cfg(unix)]
         {
             cmd.process_group(0); // 独立进程组：取消/超时时 killpg 连子孙一起杀
-                                  // stderr 合并进 stdout，保证输出顺序稳定（与 Python 版一致）
+                                  // stderr 合并进 stdout，保证输出顺序稳定
             unsafe {
                 cmd.pre_exec(|| {
                     if libc::dup2(1, 2) == -1 {
@@ -728,7 +728,7 @@ impl Tool for Bash {
         let mut chunks: Vec<String> = Vec::new();
 
         // 逐块读 stdout（stderr 已 dup2 到同一管道）——用 read_until 保留原始字节，
-        // 不做行重整（Python 版同样是「原样累积」，只在进度回调里剥掉换行）。
+        // 不做行重整——原样累积，只在进度回调里剥掉换行。
         let read_and_wait = async {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stdout);
@@ -795,7 +795,7 @@ impl Tool for Bash {
             },
         };
 
-        // 退出码：被信号杀死时 Python 给负数，这里取 -1（信息量等价，都是「非正常退出」）
+        // 退出码：被信号杀死时取 -1（都是「非正常退出」）
         let code = status.code().unwrap_or(-1);
         let out: String = chunks.concat();
 
@@ -811,7 +811,7 @@ impl Tool for Bash {
                 cap = cap.min(m.max(0) as usize);
             }
             if let Some(m) = _max_bytes {
-                // 字节预算：这些行**已含** `\n`，按实际字节累计即可（Python 的 `_tail_output` 同口径；
+                // 字节预算：这些行**已含** `\n`，按实际字节累计即可；
                 // `read` 那边行不含换行，所以是 len+1）
                 let mut sz: i64 = 0;
                 let mut n = 0usize;
@@ -907,7 +907,7 @@ impl ToolRegistry {
     /// **注册一个工具**：`.with_tool::<Read>("read")`。
     ///
     /// 传的是**类型**而不是值——因为「结构体即参数」，带字段的结构体在 Rust 里根本不是
-    /// 一个值表达式（`Read` 这三个字写不出来）。名字手动给，和 Python 版一样显式。
+    /// 一个值表达式（`Read` 这三个字写不出来）。名字得手动给。
     pub fn with_tool<T: Tool>(mut self, name: &str) -> Self {
         assert!(
             !self.entries.iter().any(|e| e.name == name),
@@ -947,7 +947,7 @@ impl ToolRegistry {
         self
     }
 
-    /// 全量内置工具（对应 Python 版的 `register_builtins`）。
+    /// 全量内置工具。
     pub fn new(defaults: HashMap<String, toml::Table>) -> Self {
         Self::empty(defaults)
             .with_tool::<Read>("read")
@@ -962,7 +962,7 @@ impl ToolRegistry {
 
     /// 发给模型的 `tools` 数组（OpenAI 线上形状：`{"type": "function", "function": …}`）。
     ///
-    /// 形状知识就放在这儿（与 Python 版一致：`Tool.definition()` 也是工具层自己出的），
+    /// 形状知识就放在这儿（工具层自己出 `definition`），
     /// llm 层只管把整个数组塞进请求体的 `tools` 键。
     pub fn specs(&self) -> Vec<Value> {
         self.entries
@@ -1040,7 +1040,7 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
         }
     }
 
-    // 无 spec、或「四个内置全列且无白名单」→ 默认全量（与 Python 一致）
+    // 无 spec、或「四个内置全列且无白名单」→ 默认全量
     if (enabled.is_empty() && allow_cmds.is_empty())
         || (allow_cmds.is_empty() && enabled.len() == BUILTINS.len())
     {
@@ -1078,7 +1078,7 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
         };
     }
     if restricted {
-        // description 追加白名单，让模型事先知道边界、少试错（Python 同款）
+        // description 追加白名单，让模型事先知道边界、少试错
         let allow_txt = allow_cmds.join(", ");
         if let Some(entry) = reg.entries.last_mut() {
             if entry.name == "bash" {
@@ -1193,7 +1193,7 @@ mod tests {
     /// 非图片、以及魔数认得出但**不在白名单**的格式（TIFF/ICO）仍走文本/二进制分支。
     #[tokio::test]
     async fn read_keeps_off_list_formats_as_plain_files() {
-        // TIFF/ICO 的魔数 `guess_format` 认得出（这正是必须显式过白名单的原因），但 Python 版不当图片
+        // TIFF/ICO 的魔数 `guess_format` 认得出（这正是必须显式过白名单的原因），但不当图片
         assert!(
             image::guess_format(b"II*\0\x08\0\0\0").is_ok(),
             "guess_format 认得 TIFF"
@@ -1204,7 +1204,7 @@ mod tests {
         wav.extend_from_slice(b"WAVE");
 
         let reg = builtin();
-        // ⚠ TIFF/ICO/WAV 的魔数全在 ASCII + 控制字符范围 → UTF-8 解得出来，**仍当文本读**（与 Python 版一致）；
+        // ⚠ TIFF/ICO/WAV 的魔数全在 ASCII + 控制字符范围 → UTF-8 解得出来，**仍当文本读**；
         // 这里要断言的是「不被当成图片」。真正走二进制分支的是解不出 UTF-8 的字节。
         for (name, bytes, marker) in [
             ("text", b"hello world\n".to_vec(), "[行 1-1，共 1 行]"),
@@ -1482,7 +1482,7 @@ mod tests {
         assert!(e.0.contains("可用: demo"), "{}", e.0);
     }
 
-    /// 重名注册是编程错误 → 直接 panic（Python 版 `register` 抛 ValueError）。
+    /// 重名注册是编程错误 → 直接 panic。
     #[test]
     #[should_panic(expected = "工具已存在")]
     fn with_tool_rejects_duplicate_name() {
@@ -1645,7 +1645,7 @@ mod tests {
         );
     }
 
-    /// 被信号干掉（`code()` 拿不到）→ `[exit=-1]`（与 Python 版同款：都是「非正常退出」）。
+    /// 被信号干掉（`code()` 拿不到）→ `[exit=-1]`（与真 bash 一致：都是「非正常退出」）。
     #[cfg(unix)]
     #[tokio::test]
     async fn killed_shell_reports_minus_one() {
@@ -1704,7 +1704,7 @@ mod tests {
             .unwrap();
         assert_eq!(out, "1\n2\n3\n4\n5\n", "成功且未超限：纯正文，没有头也没有指针");
 
-        // 字节预算：每行 "1\n" 实打实 2 字节 → 6 字节装 3 行（与 Python `_tail_output` 同口径）
+        // 字节预算：每行 "1\n" 实打实 2 字节 → 6 字节装 3 行
         let out = reg
             .dispatch(
                 "bash",

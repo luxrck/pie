@@ -2,18 +2,16 @@
 //!
 //! 回合循环原来在独立的 `loop.rs`（`run_turn`），已并进 `Session::aturn`：两者本来就是一件事的
 //! 两半，分开只会让每次调用在两模块之间穿 7 个参数（其中 4 个还是 `self` 的字段）。
-//! ⚠ 与 Python 版的结构差异：那边 `loop.py` 仍是独立一层（`loop.aturn` 被 `Session.aturn` 调，
-//! `loop.run` 供一次性模式复用）；这边一次性模式改走 `Session::ephemeral()`（不落盘、不写 manifest）。
+//! 一次性模式改走 `Session::ephemeral()`（不落盘、不写 manifest）。
 //!
-//! **持久化契约**（与 Python 版同格式，两边写下的文件可以互相读）：
+//! **持久化契约**：
 //!   - 一行一条 JSON：首行 `__meta__`（usage / windows / cwd / title），之后每行一条消息；
 //!   - 恢复时**丢弃文件里的 system 消息**，按当前 SYSTEM.md / AGENTS.md / MEMORY.md 重建
 //!     （提示词会变，历史里那份旧 system 没有意义）；
-//!   - 会话目录与 Python 版同一处，resume 按 mtime 选最新、「同 cwd 优先」（读 meta 里的 `cwd`；
-//!     旧会话没这个键就当不匹配）；未知字段（Python 的 `synthetic` / `compress_level`…）serde 直接忽略。
+//!   - 会话目录是 `~/.pie/sessions/`，resume 按 mtime 选最新、「同 cwd 优先」（读 meta 里的 `cwd`；
+//!     旧会话没这个键就当不匹配）；未知字段 serde 直接忽略。
 //!
-//! 文件名用 `chat-<unix 秒>-<微秒>.jsonl`（Python 用本地时间 `%Y%m%d-%H%M%S-%f`）：没有日期库，
-//! Unix 时间戳一样能做到「可排序 + 微秒级不撞车」；两边都按 mtime 排序，命名不同不影响互相 resume。
+//! 文件名用 `chat-<unix 秒>-<微秒>.jsonl`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
 
 use std::collections::HashMap;
 use std::fs;
@@ -39,9 +37,8 @@ const ERROR_TURN_PREFIX: &str = "[请求失败] ";
 
 /// 回合过程中推给调用方的事件（TUI / CLI 边跑边渲染用）。
 ///
-/// 与 Python 版 `loop.aturn` 的 `on_event` dict 一一对应（那边是 `{"type": …}` 裸 dict，
-/// 这边是枚举）；`arguments` 传**原始 JSON 字符串**，由消费者自己解析出「这次调的是哪个
-/// 文件 / 命令」的摘要（Python 那边直接给解析后的 dict）。
+/// 事件形状与绑定的 `on_event` dict 一一对应（`{"type": …}`）；`arguments` 传**原始 JSON 字符串**，
+/// 由消费者自己解析出「这次调的是哪个文件 / 命令」的摘要。
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// 正文增量
@@ -63,7 +60,7 @@ pub enum TurnEvent {
     /// 最终答复。
     ///
     /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `AssistantText` 增量
-    /// 推过了，再推一次消费者会重复显示（Python 是流式也推 `answer`，靠 TUI 覆盖面板绕过）。
+    /// 推过了，再推一次消费者会重复显示。
     Answer(String),
 }
 #[derive(Debug)]
@@ -72,9 +69,9 @@ pub struct Session {
     pub path: PathBuf,
     /// 配置快照（压缩水位 / `keep_last_steps` / `compaction` 都从它取）。
     pub config: Config,
-    /// 模型后端（Python `Session.llm` 同款：会话自己拿揰着）。
+    /// 模型后端（会话自己持有）。
     pub llm: LlmClient,
-    /// 工具集（Python `Session.tools` 同款；`--tools` 裁剪过的注册表就从这里进来）。
+    /// 工具集（`--tools` 裁剪过的注册表就从这里进来）。
     pub tools: ToolRegistry,
     /// 压缩 manifest（`~/.pie/context/<会话名>.manifest.jsonl`）；`None` = 不记账（`ephemeral`）。
     pub manifest: Option<PathBuf>,
@@ -98,7 +95,7 @@ impl Session {
     /// 新建会话：`id` 给了就用它（纯名字 → `~/.pie/sessions/<id>.jsonl`，带目录/绝对路径 → 原样），
     /// 否则按时间戳新建文件。
     ///
-    /// `llm` / `tools` 由调用方给（Python `Session.new(config=…, llm=…, tools=…)` 同款）：
+    /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
     pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
         Self::at(resolve_path(id), config, llm, tools)
@@ -106,7 +103,7 @@ impl Session {
 
     /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
     ///
-    /// Python 那边一次性模式走独立的 `loop.run()`；这边既然回合循环已经并在 `Session` 上，
+    /// 既然回合循环已经并在 `Session` 上，
     /// 就用“不记账的 Session”表达同一件事。
     pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
         let mut session = Self::at(
@@ -130,7 +127,7 @@ impl Session {
     }
 
     /// 切模型（`/model <id>`）：改配置 + 同步客户端实例，并把配置写回文件。
-    /// 返回一句提示（写不进去就说明“仅本次生效”）——与 Python `set_model` 同款。
+    /// 返回一句提示（写不进去就说明“仅本次生效”）。
     ///
     /// ⚠ 暂时只有单测在读它：入口是交互层的 `/model` 命令。
     #[allow(dead_code)]
@@ -185,7 +182,7 @@ impl Session {
                     .get("title")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                // 窗口块列表（旧键 `fs` 是 Python 改名前的写法，一并兼容）
+                // 窗口块列表（旧键 `fs` 是更早的写法，一并兼容）
                 let windows = value.get("windows").or_else(|| value.get("fs"));
                 session.windows = windows
                     .and_then(Value::as_array)
@@ -213,13 +210,13 @@ impl Session {
             restored.push(msg);
         }
         // 防御：带 tool_calls 却没有 reasoning_content 的 assistant 消息补空串
-        // （Python 版同款；thinking 模式回放这种历史会被 DeepSeek 判 400）
+        // （thinking 模式回放这种历史会被 DeepSeek 判 400）
         for m in &mut restored {
             if m.tool_calls.is_some() && m.reasoning_content.is_none() {
                 m.reasoning_content = Some(String::new());
             }
         }
-        // 用户轮数：`synthetic` 的（注入的图片消息，role 也是 user）不算轮次（Python 同款）
+        // 用户轮数：`synthetic` 的（注入的图片消息，role 也是 user）不算轮次
         session.turn_count = restored
             .iter()
             .filter(|m| m.role == "user" && !m.synthetic)
@@ -236,7 +233,7 @@ impl Session {
                     });
         }
         // 文件里的旧 system（提示词 / 窗口摘要）都已丢掉 → 按 `windows` 列表**重建**窗口摘要：
-        // 摘要文本随 `head/tail` 配置与提示词变化，重建比留着旧的更准（Python 同款）。
+        // 摘要文本随 `head/tail` 配置与提示词变化，重建比留着旧的更准。
         let window_summaries = session.window_summary_messages();
         session.messages.extend(window_summaries);
         session.messages.extend(restored);
@@ -338,10 +335,10 @@ impl Session {
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
     /// **不落盘会话**（由调用方 `save`）；压缩事件写进 manifest（`ephemeral` 会话不写）。
     ///
-    /// 回合语义（对齐 Python `loop.aturn`）：工具失败文本化后照常回传、达到 `max_steps` 就把
+    /// 回合语义：工具失败文本化后照常回传、达到 `max_steps` 就把
     /// 最后一段 assistant 文本当答复（不额外追加消息）、`tool` 结果与 `tool_call_id` 严格配对。
     ///
-    /// 两个**按次**的执行旋钮（不在配置里，对齐 Python 把 `loop.aturn` 的形参）：
+    /// 两个**按次**的执行旋钮（不在配置里）：
     ///   - `max_steps`：单回合最多问几次模型；`None` = 不限。
     ///   - `stream`：`None` = 默认（客户端都实现了 `stream()` → 流式）；`Some(false)` 强制一次性
     ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
@@ -351,7 +348,7 @@ impl Session {
     /// `cancel` 触发时（TUI 的 `Esc`）：
     ///   - 模型请求中的取消 → 直接收尾（不追加 assistant 消息）；
     ///   - 工具执行中的取消 → shell 会杀掉整个进程组，**未执行的 `tool_calls` 补 `CANCEL_TEXT` 的
-    ///     tool 消息**（保证每个 `tool_call_id` 都有配对结果、API 序列合法，Python `_cancel_tools` 同款）；
+    ///     tool 消息**（保证每个 `tool_call_id` 都有配对结果、API 序列合法）；
     ///   - 两种收尾都往历史里写一条 `CANCEL_TEXT` 的 assistant 消息，并把它作为本轮答复返回。
     pub async fn aturn(
         &mut self,
@@ -376,9 +373,9 @@ impl Session {
         };
 
         // 配置值拷出来（不长期借 `self.config`：后面还要 `&mut self` 做注入/降级）
-        // `stream: None` = 用默认（客户端都实现了流式）；对齐 Python `stream is not False` 的判据
+        // `stream: None` = 用默认（客户端都实现了流式）
         let use_stream = stream.unwrap_or(true);
-        // `parallel_tools: None` = 跟随配置（Python `config.parallel_tools if x is None else x` 同义）
+        // `parallel_tools: None` = 跟随配置
         let use_parallel = parallel_tools.unwrap_or(self.config.parallel_tools);
         let mut steps = 0usize;
         let mut answer: Option<String> = None;
@@ -484,7 +481,7 @@ impl Session {
                 let text = match outcome {
                     Some(text) => text,
                     // 被取消：每个 tool_call_id 都要有配对的 tool 消息，否则回放这段历史时
-                    // API 会拒（Python `_cancel_tools` 同款）；结果事件已在 `tool_call` 里推过
+                    // API 会拒）；结果事件已在 `tool_call` 里推过
                     None => {
                         interrupted = true;
                         CANCEL_TEXT.to_string()
@@ -516,7 +513,7 @@ impl Session {
         self.windows.extend(new_windows);
 
         if cancelled {
-            // 历史里留一条终止消息（Python `_cancel_turn` 同款），并把它当本轮答复
+            // 历史里留一条终止消息，并把它当本轮答复
             self.messages.push(Message {
                 role: "assistant".into(),
                 content: Some(Content::Text(CANCEL_TEXT.to_string())),
@@ -565,7 +562,7 @@ impl Session {
     /// 把本批 `read` 工具读到的图片作为多模态 user 消息注入（下一轮请求模型就能看到图）。
     ///
     /// **只走 Files API**：拿不到 `file_id`（未开启 / 模型不支持 / 上传失败）就不注入——
-    /// 与 Python 有意不同（那边回退内联 base64）。标记文本仍在工具结果里，模型知道有这张图；
+    /// **不回退内联 base64**。标记文本仍在工具结果里，模型知道有这张图；
     /// 本地副本与记录也会留下，下次同图直接命中不再重传。
     async fn inject_read_images(&mut self, calls: &[ToolCall], results: &[String]) {
         for (call, text) in calls.iter().zip(results.iter()) {
@@ -626,7 +623,7 @@ impl Session {
     ///
     /// 两条路的**事件形状一致**：先把整批 `tool_call` 发出去（并发时事件只能先统一发；串行
     /// 也保持同序，嵌入方不用分情况处理），再按「谁先跑完谁先发」推 `tool_result`——被取消的
-    /// 那条推 `CANCEL_TEXT`（Python `_cancel_tools` 同款）。
+    /// 那条推 `CANCEL_TEXT`。
     ///
     /// 返回与 `calls` **等长同序**的文本（`None` = 该调用被取消）——回填消息时
     /// 才能保证历史扁平序列与串行一致（compaction 的 step 批次 / `keep_last_steps` 都看它），
@@ -636,7 +633,7 @@ impl Session {
     /// 要少回传给模型是工具自己配容量上限（`shell` / `read`）的事。
     ///
     /// 参数非法 JSON **不执行工具**、只把原文回给模型；单个工具失败文本化后照常返回，
-    /// 不拖累同批其他工具（对齐 Python `loop._run_tool_call`）。
+    /// 不拖累同批其他工具。
     async fn tool_call(
         &self,
         calls: &[ToolCall],
@@ -700,7 +697,7 @@ impl Session {
 
     /// 把历史里的 `file` 块就地换成文本占位，并把对应记录标失效（下次同图重传）。
     ///
-    /// ⚠ 与 Python 有意不同：那边降级成**内联 base64**；这边不回退 base64 —— 代价是这次
+    /// ⚠ 降级时不回退内联 base64 —— 代价是这次
     /// 请求里模型看不到那张图（但回合能继续跑，比整个请求 400 报废强），本地副本还在。
     fn downgrade_file_blocks(&mut self) -> bool {
         let mut changed = false;
@@ -734,7 +731,7 @@ impl Session {
     /// 保证这张图有一个可用的 `file_id`：先落本地副本 → 命中可用记录就复用，否则上传。
     ///
     /// 未开启（`files_api = false` / 模型不支持）或上传失败 → `None`，调用方就不注入图片
-    /// （**不回退内联 base64**，与 Python 有意不同）。记录就地写进 `self.files`（下次 `save` 带上）。
+    /// （**不回退内联 base64**）。记录就地写进 `self.files`（下次 `save` 带上）。
     async fn ensure_image_file(
         &mut self,
         data: &[u8],
@@ -832,7 +829,7 @@ impl Session {
             meta["title"] = json!(t);
         }
         if !self.files.is_empty() {
-            // 空表不写：别把每个会话文件都撑起来（Python 同款）
+            // 空表不写：别把每个会话文件都撑起来
             meta["files"] = json!(self.files);
         }
         let mut out = String::new();
@@ -851,7 +848,7 @@ impl Session {
     }
 
     /// 手动压缩（`/compact`）：不看水位，按 `mode` 压；轮次级一路压到不能再压。
-    /// **不含会话级**（整窗口归档是 `/clear` 的事，与 Python 一致）。
+    /// **不含会话级**（整窗口归档是 `/clear` 的事）。
     #[allow(dead_code)] // 入口是交互层的 `/compact`
     pub fn compact(&mut self, mode: context::CompactMode) -> context::CompactStats {
         let manifest = self.manifest.clone();
@@ -880,10 +877,10 @@ impl Session {
     /// 完整转录：按消息顺序**展开压缩指针**——工具级还原落盘全文，轮次级 / 会话级还原原始消息序列。
     ///
     /// 给 TUI resume 回放用：会话里存的是「摘要 + 指针」，照着回放看着没头没尾；展开才是当初界面上
-    /// 真正出现过的内容（对齐 Python `Session.full_history`）。落盘文件不在（被 `context gc` 收走）
+    /// 真正出现过的内容。落盘文件不在（被 `context gc` 收走）
     /// 就退回压缩形式本身。
     ///
-    /// 与 Python 的差异：不再把 manifest 里「已不在消息中」的原文追加到末尾——那些原文要么仍在消息
+    /// 不再把 manifest 里「已不在消息中」的原文追加到末尾——那些原文要么仍在消息
     /// 里（各自展开）、要么属于已归档的窗口块（走 `windows` 重建的摘要消息），另追加一遍只会让回放
     /// 顺序错乱。
     pub fn full_history(&self) -> Vec<Message> {
@@ -909,8 +906,7 @@ impl Session {
                 // 工具级：落盘的是被截断的那份输出全文（纯文本，不是消息）。
                 //
                 // 头区（`[exit=N]` / 指针行）不在落盘件里，从压缩后的消息里补回来——否则回放的
-                // shell 行看不到退出码，会被当成成功（Python 版没补，算它的瑕疵：回放里失败的命令
-                // 显示 〼 且不带正文）。
+                // bash 行看不到退出码，会被当成成功（回放里失败的命令显示 〼 且不带正文）。
                 (1, Some(path)) if m.role == "tool" => {
                     let pointer = context::content_text(m.content.as_ref());
                     let headers = pointer.split_once("\n\n").map_or(
@@ -943,8 +939,8 @@ impl Session {
 
     /// `/clear`：把当前窗口（system 与**既有窗口摘要**除外）写成一块**窗口块**落盘，开新窗口。
     ///
-    /// 新窗口 = 当前 system prompt + **所有**窗口块的「摘要 + 指针」（不只最新一块，与 Python
-    /// `Session.clear_window()` 同款）：可见上下文立刻瘦下来，原文仍在 `~/.pie/windows/`
+    /// 新窗口 = 当前 system prompt + **所有**窗口块的「摘要 + 指针」（不只最新一块）：
+    /// 可见上下文立刻瘦下来，原文仍在 `~/.pie/windows/`
     /// 可经指针回查（`full_history` / resume 都能展开）。
     ///
     /// 返回归档后手上的窗口块**总数**（调用方拿去提示）；落盘失败则原样返回、**不动窗口**
@@ -997,7 +993,7 @@ impl Session {
         Ok(self.windows.len())
     }
 
-    /// 窗口块摘要的 head/tail（会话级压缩没配就用默认值，与 Python 同款）。
+    /// 窗口块摘要的 head/tail（会话级压缩没配就用默认值）。
     fn window_sizes(&self) -> (usize, usize) {
         match self
             .config
@@ -1013,7 +1009,7 @@ impl Session {
         }
     }
 
-    /// `/stat` 的报告文本（对齐 Python `usage_report`）：
+    /// `/stat` 的报告文本：
     /// 上下文占用 / 水位 / 输入预算 / 各角色估算 / 压缩事件 / API 用量。
     pub fn usage_report(&self) -> String {
         let (total, label) = match self.usage.prompt_tokens {
@@ -1130,7 +1126,7 @@ fn json_line<T: serde::Serialize>(value: &T) -> Result<String, String> {
 /// 把 JSON 文本里**裸的** C1 控制符（U+0080–U+009F）与 U+2028/U+2029 换成 `\uXXXX`。
 ///
 /// `serde_json` 只转义 C0（U+0000–U+001F），C1 与两个 Unicode 行分隔符在 JSON 里合法、会原样落盘；
-/// 但按「Unicode 行边界」切行的读者（Python 的 `str.splitlines()` / `bytes.splitlines()`、部分编辑器与
+/// 但按「Unicode 行边界」切行的读者（`splitlines()` 那一类、部分编辑器与
 /// 日志工具）会把 **U+0085 当换行** → 一条消息被劈成两半、整份 JSONL 读不出来（工具输出里出现这些
 /// 字节一点不稀奇：转义序列 dump、二进制预览）。落盘前转义掉，读回来还是同一个字符。
 ///
@@ -1292,7 +1288,7 @@ pub fn sessions_dir() -> PathBuf {
 // ---------------------------------------------------------------- 图片文件管理
 //
 // 本地那一侧的事都在这里（`llm.rs` 只放 Files API 协议）：内容寻址副本、`__meta__.files`
-// 记录表、本地副本的 GC 清单。字段名与 Python 版 `files.py` 逐字对齐。
+// 记录表、本地副本的 GC 清单。
 
 /// 本地副本目录：`~/.pie/files/`（与 `context/` 分开：那边是压缩落盘的文本）。
 pub fn files_dir() -> PathBuf {
@@ -1764,8 +1760,8 @@ mod tests {
     }
 
 
-    /// 工具输出**原样**推给嵌入方：Session 不在这里截断（与 Python `clip_output(text, 500)`
-    /// 有意不同）——少显示是展示层的事（TUI 按 `TOOL_BODY_LINES` 截、CLI 只取首行），
+    /// 工具输出**原样**推给嵌入方：Session 不在这里截断——少显示是展示层的事（TUI 按
+    /// `TOOL_BODY_LINES` 截、CLI 只取首行），
     /// 少回传给模型是工具自己配容量上限的事。
     #[test]
     fn tool_result_event_keeps_the_full_output() {
@@ -1974,7 +1970,7 @@ mod tests {
     }
 
     /// 窗口摘要在 `load` 时要**重建**回来：文件里的旧 system 被丢掉，但 `meta.windows`
-    /// 记着窗口块，按当前 `head/tail` 重新生成摘要 system 消息（Python 同款）。
+    /// 记着窗口块，按当前 `head/tail` 重新生成摘要 system 消息。
     /// （不重建的话 resume 后模型就看不到被归档的历史了。）
     #[test]
     fn load_rebuilds_window_summaries() {
@@ -2200,7 +2196,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 落盘把 C1 控制符 / U+2028 转义掉：否则按「Unicode 行边界」切行的读者（Python `splitlines()`）
+    /// 落盘把 C1 控制符 / U+2028 转义掉：否则按「Unicode 行边界」切行的读者（`splitlines()`）
     /// 会把 U+0085 当换行 → 一条消息被劈成两半、整份 JSONL 读不出来。
     #[test]
     fn save_escapes_control_chars_that_break_line_readers() {
@@ -2276,7 +2272,7 @@ mod tests {
         });
     }
 
-    /// 用量是「最近一次上报值 + calls 累计」（不求和），与 Python 版一致。
+    /// 用量是「最近一次上报值 + calls 累计」（不求和）。
     #[test]
     fn usage_tracker_overwrites_tokens_but_counts_calls() {
         let mut t = UsageTracker::default();
@@ -2289,9 +2285,9 @@ mod tests {
         assert!(json.contains(r#""prompt_tokens":30"#), "{json}");
     }
 
-    /// **跨版本兼容**：Python 版写下的会话（含未知字段 / 旧 system / null token）必须能读。
+    /// **向后兼容**：旧版写下的会话（含未知字段 / 旧 system / null token）必须能读。
     #[test]
-    fn loads_python_written_session() {
+    fn loads_legacy_written_session() {
         let config = Config::default();
         let path = tmp("py.jsonl");
         let jsonl = [

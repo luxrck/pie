@@ -1,12 +1,11 @@
 //! `/` 命令补全：候选表 + 匹配 + 面板渲染。
 //!
-//! 对应 Python 版 `tui.py` 的 `PALETTE_COMMANDS` / `_palette_matches` / `_render_palette`：
 //! **候选表是唯一事实来源**（`/help` 文案也从它生成，避免两处漂移）。
 //!
 //! `@` 文件路径补全（候选是扫出来的、不在这个表里）在 [`super::files`]；它只是**共用**
 //! 这里的 [`panel_lines`] 画面板，匹配与接受都是另一条路（见 `App::completions`）。
 //!
-//! 匹配规则（三条，与 Python 同序）：
+//! 匹配规则（三条，按序）：
 //!   1. `/model ` 前缀 → 端点可用模型列表（「← 当前」标注现用那个）；
 //!   2. `/thinking ` 前缀 → 思考级别（`REASONING_LEVELS`，同上标注）；
 //!   3. 其它以 `/` 开头 → 候选表里**前缀命中**的项（完整命令也在内，所以刚打完就还留着面板）。
@@ -48,7 +47,7 @@ pub const REMOVED: &[(&str, &str)] = &[
 /// 面板一次最多显示几项（**滚动窗口**：窗跟高亮走，见 [`panel_lines`]）。
 pub const MAX_SHOWN: usize = 12;
 
-/// `/help` 文案：由候选表生成（对齐 Python 的「唯一事实来源」做法）。
+/// `/help` 文案：由候选表生成（唯一事实来源）。
 ///
 /// 第二行是**不住在候选表里**的几个键（`!cmd` / `Esc` / `Ctrl+G`）—— 它们不是 `/` 命令，
 /// 但常用，而且 `/stop` `/paste` 移除后这两件事只剩按键入口了（2026-09-23）。
@@ -124,7 +123,7 @@ pub fn is_complete_command(value: &str) -> bool {
 /// 首词是不是已知命令名。
 ///
 /// 不能只看 `/` 开头——粘贴进来的绝对路径（`/Users/.../img-x.png`）是最常见的误伤，那种一律
-/// 当**普通消息**发出去（对齐 Python 的 `is_known_command`，否则消息会静默消失）。
+/// 当**普通消息**发出去（否则消息会静默消失）。
 pub fn is_known_command(text: &str) -> bool {
     let name = text.split_whitespace().next().unwrap_or("");
     COMMANDS
@@ -274,7 +273,7 @@ mod tests {
 
     /// 高亮跑到第 8 项以后：窗口**跟着高亮走**（高亮始终可见、面板高度不变）。
     ///
-    /// 旧版把「窗口内下标」拿去跟「原列表下标」比、还算出个能撑到 2×shown 长的窗口，
+    /// 早先的实现把「窗口内下标」拿去跟「原列表下标」比、还算出个能撑到 2×shown 长的窗口，
     /// 结果是 `take(shown)` 把高亮截掉（选到第 8 项就一个 ▸ 都没有）。
     #[test]
     fn panel_lines_window_follows_the_highlight() {

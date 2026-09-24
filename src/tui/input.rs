@@ -476,9 +476,9 @@ impl Input {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, palette: &Palette, focused: bool) {
         self.rect = area;
         // **聚焦高亮**：本 TUI 只有输入框一个可聚焦控件（键盘事件全归它），所以「聚焦」
-        // 在视觉上就是常亮的 accent 上边框 —— 对齐 Python 版 `#input:focus`（border: accent）。
+        // 在视觉上就是常亮的 accent 上边框。
         // 窗口**失焦**时降成 muted（见 [`Palette::style_emphasis`]：全界面同一口径，状态栏也用它）。
-        // 例外：输入以 `!` 开头时切工具色（Python `#input.shell-mode`）——提醒这条会直接
+        // 例外：输入以 `!` 开头时切工具色——提醒这条会直接
         // 当 shell 跑、不进上下文（`App::submit` 认的就是同一个判据）；失焦时仍按 muted 显示。
         let border = if focused && self.text().trim_start().starts_with('!') {
             palette.style_tool()
@@ -492,7 +492,7 @@ impl Input {
         frame.render_widget(block, area);
         self.area.set_style(palette.style_assistant());
         // 选中高亮：控件默认是 `bg LightBlue`（浅蓝底 + 正文色字，深色终端下糊成一片）→
-        // 与 Python `#input .text-area--selection` 一致（`Palette::style_selection`）。
+        // 统一到 `Palette::style_selection`。
         // 选区来源：`Shift+方向键` / `Ctrl+A`，或者**鼠标在输入框里拖**（见 `App::on_mouse`
         // 与 [`Input::hit`]——鼠标捕获开着，终端自己的选择用不了，那层屏幕坐标换算自己算）。
         self.area.set_selection_style(palette.style_selection());

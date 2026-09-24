@@ -1,12 +1,12 @@
 //! TUI：ratatui + crossterm 的交互界面（**参考 codex 的形态**：消息流 + 底部输入区 + 状态栏）。
 //!
-//! 与 Python 版 Textual 实现**不追求逐项对齐**：这边按 ratatui 的习惯来（每帧 `draw` 只写变化的
-//! 单元格、内容随流式增量追加、滚动自己算偏移）。两点与「纯 ratatui 习惯」不同，都是为了复制：
+//! 按 ratatui 的习惯来（每帧 `draw` 只写变化的单元格、内容随流式增量追加、滚动自己算偏移）。
+//! 两点与「纯 ratatui 习惯」不同，都是为了复制：
 //! **消息流自己折行**（`history::layout`，而非 `Paragraph::wrap`）→ 知道每个显示行对应源文本的哪一段；
 //! **鼠标左键拖动框选、松开即复制**（`App::on_mouse` + `Layout::slice_text`）——鼠标捕获为了滚轮
 //! 一直开着，终端自己的选择就不能用了，所以得自己做。
 //!
-//! 模块划分（对应 Python 的 `tui.py` / `theme.py` / `textkit.py` / `clipboard.py`）：
+//! 模块划分：
 //!   - `app`：状态机 + 事件循环（`select!`：终端事件 / 回合事件 / tick）
 //!   - `history`：消息流单元格（用户 / 助手 / 思考耗时 / 工具 / 提示）+ **折行与复制切片**
 //!     （`layout` 返回带逻辑行号的 `Row`，`Layout::slice_text` 按源文本切选区）

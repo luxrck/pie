@@ -85,11 +85,11 @@ impl PyToolRegistry {
     ///     `.name` / `.description` / `.parameters` / `.handler`）；
     ///   - `reg.register(name="x", handler=fn, description="…", parameters={...})`：直接给零件。
     ///
-    /// 语义与纯 Python 版 `ToolRegistry.register` 一致：重名报 `ValueError`；handler 的返回
+    /// 注册语义：重名报 `ValueError`；handler 的返回
     /// 值当工具结果文本（必须是 `str`）；**抛异常会被文本化**回给模型（`[工具错误] …`），
     /// 不打断整个回合。
     ///
-    /// ⚠ 三条纪律（与纯 Python 版同一套，写在文档里了）：
+    /// ⚠ 三条纪律：
     ///   1. handler 得是**同步**函数（`async def` 要等 M5 的 async 入口）；
     ///   2. 它跑在 runtime 的 worker 线程上、期间持有 GIL —— 别在里面等别的线程；
     ///   3. **别在 handler 里碰同一个 Session**（会拿到「session 正忙」，那是防死锁）。
@@ -143,7 +143,7 @@ impl PyToolRegistry {
         }
         let parameters_json = crate::py_to_json(&parameters)?;
 
-        // ③ 调用体：tokio 线程上 attach 回 GIL 调 Python（handler 按**关键字**传参，同 Python 版）
+        // ③ 调用体：tokio 线程上 attach 回 GIL 调 Python（handler 按**关键字**传参）
         let handler_for_call = handler.clone_ref(py);
         let tool_name = name.clone();
         let call: CallFn = Arc::new(move |args: Value, _ctx: tools::ToolCtx| {

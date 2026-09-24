@@ -1,6 +1,6 @@
 """`pie._pie_rs`（PyO3 扩展）的类型存根。
 
-手写、与 Rust 侧一一对应；dict 的形状按「与纯 Python 版 `loop.aturn` 的 `on_event` 一致」写成
+手写、与 Rust 侧一一对应；dict 的形状按事件 dict 的口径写成
 `TypedDict`。改了 Rust 的公开面记得同步这里（`pytest` 里有一条对拍键名的用例）。
 """
 

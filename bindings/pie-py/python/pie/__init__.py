@@ -1,8 +1,7 @@
 """pie —— pie（Rust 版 agent harness）的 Python 绑定。
 
-与纯 Python 的 ``pie`` 包**并存**：那个是 Textual TUI 那套，这个是核心层（config / llm /
-tools / session / context）的原生扩展，两边共用同一份 ``~/.pie/``（配置文件、会话 JSONL、
-压缩记录、图片副本）。
+核心层（config / llm / tools / session / context）的原生扩展；与 CLI 共用同一份 ``~/.pie/``
+（配置文件、会话 JSONL、压缩记录、图片副本）。
 
 最小用法：
 
@@ -24,13 +23,13 @@ tools / session / context）的原生扩展，两边共用同一份 ``~/.pie/``�
 约定（详见仓内 ``docs/python-bindings.md``）：
   - **同步外观**：``aturn`` 阻塞到回合结束，期间**释放 GIL**（别的 Python 线程照常跑）。
     要并发就用 ``asyncio.to_thread``；原生 ``await`` 版本是后续里程碑。
-  - **事件是 dict**：键名与纯 Python 版 ``loop.aturn`` 的 ``on_event`` 一致
+  - **事件是 dict**：键名见 ``docs/python-bindings.md``
     （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``answer``）。
-    ⚠ 一处**有意不同**：``tool_result.text`` **不截断**（纯 Python 版截到 500 字）——
+    ⚠ ``tool_result.text`` **不截断**——
     要少显示自己截；同理，一批多个 tool_call 时事件顺序是「先全部 tool_call、再按完成顺序
     tool_result」（``parallel_tools`` 只在并发度上有区别）。
   - **消息是 dict**：``session.messages`` 返回 dict 列表，字段名与 JSONL 文件一致
-    （含压缩元数据），因此与 Python 版写下的会话可以互读。
+    （含压缩元数据），与 CLI 写下的会话可互读。
   - **一个 Session 同一时刻只跑一个回合**：回合进行中再调 ``aturn`` / 读属性会抛
     ``RuntimeError("session 正忙")``；**事件回调里不要碰同一个 Session**。
 """

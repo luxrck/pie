@@ -114,8 +114,7 @@ pub fn fmt_duration(d: Duration) -> String {
 ///
 /// 只有这两个键可达 —— 内置工具的字符串参数就 `path` / `command` / `content` / `edits`
 /// （`content` 是正文、`edits` 是数组，都不适合当摘要），没有哪些工具用 `file_path` /
-/// `pattern` / `query` 这类键（Python 那版是 `LEAN_SUMMARY_KEYS = {read/write/edit: path,
-/// shell: command}`，同效）。以后加新工具再往这里补它的键。
+/// `pattern` / `query` 这类键。以后加新工具再往这里补它的键。
 pub fn tool_summary(arguments: &str) -> String {
     const KEYS: [&str; 2] = ["path", "command"];
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) {
@@ -132,7 +131,7 @@ pub fn tool_summary(arguments: &str) -> String {
 ///
 /// 现在 `bash` **只在非 0 时**给这行头（一行里带 `exit` / `os` / `shell` 三个字段，2026-09-24 起），
 /// 所以「没头 = 成功」；判据只用到前缀，**不解析退出码**。`[exit=0]` 只可能来自旧会话
-/// （改之前录的）或 Python 版，所以还得认。
+/// （改之前录的），所以还得认。
 pub fn tool_result_ok(content: &str) -> bool {
     match content.lines().next().unwrap_or("") {
         line if line.starts_with("[exit=") => line.starts_with("[exit=0]"),
@@ -173,7 +172,7 @@ pub fn tool_status(content: &str) -> Status {
 /// 历史回放（resume）：把会话消息转成消息流单元格。
 ///
 /// 输入应当是 `Session::full_history()`——压缩指针已展开；直接给 `messages` 也能跑，只是压缩过的
-/// 回合只剩摘要 + 指针。规则与实时渲染对齐（对齐 Python `PieApp._render_history`）：
+/// 回合只剩摘要 + 指针。规则与实时渲染对齐：
 ///
 ///   - `system`（system prompt / 窗口摘要）**不显示**；
 ///   - user → `› ` 一行（`synthetic` 的注入消息跳过：那是图片，不是用户输入）；
@@ -259,8 +258,8 @@ pub struct Row {
 /// 消息流的排版结果：`rows` 是**已按宽度折好**的显示行。
 ///
 /// 折行自己算（而非交给 `Paragraph::wrap`）只为了一件事：知道每个显示行对应源文本的哪一段
-/// —— 复制按源文本切，软换行的长行复制成一行、不断成多行（对齐 Python `SelectableRichLog`
-/// 的目标）。折点处**不丢字符**（断点空白留在上一行行尾），所以同一个逻辑行的相邻显示行
+/// —— 复制按源文本切，软换行的长行复制成一行、不断成多行。折点处**不丢字符**（断点空白留在
+/// 上一行行尾），所以同一个逻辑行的相邻显示行
 /// 拼起来就是原文。
 #[derive(Default)]
 pub struct Layout {
@@ -399,7 +398,7 @@ fn rebuild_line(chars: &[(char, Style)], template: &Line<'static>) -> Line<'stat
 /// `TOOL_BODY_LINES` 行，末尾一行省略提示）。
 ///
 /// 例外：手动 `!cmd`（`Cell::Tool { manual: true }`）**任何模式都展开**——那是用户主动
-/// 执行的命令，输出本身就是要看的东西（对齐 Python：`!cmd` 的两个盒子都 `lean=False`）。
+/// 执行的命令，输出本身就是要看的东西（`!cmd` 的两个盒子都 `lean=False`）。
 pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> Layout {
     let width = (width as usize).max(1);
     // `out` 先装**逻辑行**（不折），最后统一折成显示行
@@ -584,7 +583,7 @@ mod tests {
         assert_eq!(l.slice_text(0, 2, 0, 5), "中文");
         // 只选到“中”的右半格，整个字也要（不能劈成半个）
         assert_eq!(l.slice_text(0, 2, 0, 2), "中");
-        // 起点落在“中”的右半格（第 3 格）→ 从**下一个**字开始（同 Python `_cell_to_char` 口径）
+        // 起点落在“中”的右半格（第 3 格）→ 从**下一个**字开始
         assert_eq!(l.slice_text(0, 3, 0, 6), "文测");
         // 末尾列给大也只会取到行尾
         assert_eq!(l.slice_text(0, 0, 0, 999), "› 中文测试");

@@ -88,7 +88,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 /// `serde_json::Value` → Python 对象（dict / list / str / int / float / bool / None）。
 ///
 /// 走它而不是给每个类型写 pyclass：`Message` / `TurnEvent` / `Usage` / `Config` 在 Rust 侧
-/// 本来就都是 serde 的，字段名又与 Python 版 `to_dict()` 逐字对齐 → 桥接零维护。
+/// 本来就都是 serde 的，字段名又与落盘的 dict 形状对齐 → 桥接零维护。
 pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     Ok(match value {
         Value::Null => py.None(),
@@ -181,7 +181,7 @@ pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 /// 一次性任务（**无会话、不落盘**）：建个临时会话跑一回合，返回最终答复。
 ///
-/// 与纯 Python 版 `pie.run(task, config=…)` 同形；`config=None` 时读 `~/.pie/config.toml`
+/// `config=None` 时读 `~/.pie/config.toml`
 /// （文件不在就用默认值）；`llm` / `tools` 不传就按 config 造（内置四件套）。
 ///
 /// 三个执行旋钮与 [`Session.aturn`] 同义（`max_steps=None` = 不限、`stream=None` = 默认流式、
@@ -198,7 +198,7 @@ fn run(
     stream: Option<bool>,
     parallel_tools: Option<bool>,
 ) -> PyResult<String> {
-    // 默认：读配置文件（不在就用默认值）——与 Python `resolve_config()` 同语义
+    // 默认：读配置文件（不在就用默认值）
     let core_config = match config {
         Some(c) => c.inner.clone(),
         None => pie::config::Config::load(None).map_err(config_error)?,
@@ -219,7 +219,7 @@ fn run(
 
 /// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。
 ///
-/// 键名与 CLI `pie sessions --json` / Python `pie sessions -j` 一致。`limit=None` = 全部。
+/// 键名与 CLI `pie sessions --json` 一致。`limit=None` = 全部。
 #[pyfunction]
 #[pyo3(signature = (limit=None))]
 fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {

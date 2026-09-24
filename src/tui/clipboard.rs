@@ -1,15 +1,14 @@
 //! 剪贴板：把里面的**图片**变成路径插进输入框（`Ctrl+G`）。
 //!
 //! **普通文本不在这里处理**：文本粘贴交给终端自己的粘贴键（macOS `⌘V` / Linux
-//! `Ctrl+Shift+V`）经 bracketed paste 走 `Event::Paste`。与 Python 一致——那边也只有
-//! TextArea 的 `Ctrl+V` 会在「没有图片」时回退文本粘贴（`action_paste`），而
-//! `Ctrl+G`（`action_paste_image`）**只认图片**，无图就提示。
+//! `Ctrl+Shift+V`）经 bracketed paste 走 `Event::Paste`。`Ctrl+G` **只认图片**——无图就提示，
+//! 不把剪贴板里的文本塞进来。
 //!
-//! 两条来源，按这个顺序看（与 Python `clipboard.grab_image_path()` 同一语义）：
+//! 两条来源，按这个顺序看：
 //!   1. **位图**（截图）→ PNG 编码后走 `session::store_blob` 落成本地副本（内容寻址
 //!      `img-<sha256[:16]>`、0o600、写临时文件再 rename），返回**副本**路径 —— 与 `read`
 //!      用的是同一份副本，所以粘贴后回车 `read` 这个路径是零复制的；PNG 编码用 `image`
-//!      crate（Python 那边是 Pillow 干的活）。
+//!      crate。
 //!   2. **文件列表**（Finder / 资源管理器里 `⌘C` 一个图片文件时剪贴板里是文件引用而非位图）
 //!      → 只认图片后缀、且文件确实存在的第一个，返回**原路径、不复制**。
 //!
@@ -24,7 +23,7 @@ use arboard::Clipboard;
 
 use crate::session;
 
-/// 剪贴板里的文件只认这些后缀（Python `clipboard._IMAGE_SUFFIXES` 同款，含多收的 TIFF）
+/// 剪贴板里的文件只认这些后缀（含多收的 TIFF）。
 /// —— 复制个 `.txt` 过来不算图片（会落回「剪贴板里没有图片」，不往输入框塞路径）。
 const IMAGE_SUFFIXES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
 
@@ -75,7 +74,7 @@ impl Copier {
     }
 }
 
-/// 「剪贴板里没有图片」时按平台补一句怎么把图弄进剪贴板（对齐 Python `_NO_IMAGE_HINT`）。
+/// 「剪贴板里没有图片」时按平台补一句怎么把图弄进剪贴板。
 pub fn no_image_hint() -> &'static str {
     if cfg!(target_os = "macos") {
         "（macOS：截图要按 ⌃⇧⌘4 才会进剪贴板；⇧⌘4 是存成文件——在 Finder 里 ⌘C 复制也行）"
@@ -86,8 +85,7 @@ pub fn no_image_hint() -> &'static str {
     }
 }
 
-/// 文件列表 → 第一个「存在的图片文件」；**不复制**，直接用用户磁盘上那个文件
-/// （与 Python `clipboard._from_file_list` 一致）。
+/// 文件列表 → 第一个「存在的图片文件」；**不复制**，直接用用户磁盘上那个文件。
 fn image_from_paths(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|p| is_image_file(p)).cloned()
 }

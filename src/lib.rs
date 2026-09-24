@@ -1,13 +1,13 @@
-//! pie 的 Rust 重构 —— 核心库（agent harness：config / llm / tools / session / context）。
+//! pie —— 核心库（agent harness：config / llm / tools / session / context）。
 //!
-//! 这一层是**给外部用的库**（CLI 二进制、将来的 Python 绑定都建立在它之上），所以：
+//! 这一层是**给外部用的库**（CLI 二进制、Python 绑定都建立在它之上），所以：
 //!   - 只放与交互无关的东西；**TUI 不在必选依赖里**（`tui` feature，默认开——CLI 要用）。
 //!   - 绑定侧用 `default-features = false` 依赖本库 → 不会把 ratatui / crossterm / arboard 编进来。
 //!
-//! 模块职责（与 Python 版 `src/pie/*.py` 一一对应）：
+//! 模块职责：
 //!   - [`config`]  —— 配置加载/保存 + 分层 system prompt + 全局记忆种子
 //!   - [`llm`]     —— OpenAI 兼容客户端（reqwest + 手写 SSE，无 SDK）+ 重试 + Files API
-//!   - [`tools`]   —— read / edit / write / shell（`@tool` 的 Rust 形态：结构体即参数）
+//!   - [`tools`]   —— read / edit / writ / bash（结构体即参数：一个工具 = 一个结构体）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + manifest + gc
 //!   - [`cancel`]  —— 取消信号（TUI 的 Esc）

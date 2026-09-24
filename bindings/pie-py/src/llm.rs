@@ -45,8 +45,7 @@ impl PyLlmClient {
 
     /// 同步调一次模型（**不吃工具循环**）：`messages` 是 API 形状的 dict 列表，`tools` 可选。
     ///
-    /// 返回 `{"content", "reasoning_content", "tool_calls", "usage"}`——字段名与纯 Python 版
-    /// `LLMResult` 一致。适合「拿模型当纯函数用」的场景（如生成评测清单），不要拿它跑回合
+    /// 返回 `{"content", "reasoning_content", "tool_calls", "usage"}`。适合「拿模型当纯函数用」的场景（如生成评测清单），不要拿它跑回合
     /// （工具循环请用 `Session.aturn`）。
     ///
     /// ⚠ 阻塞（内部含重试），期间释放 GIL。
@@ -70,7 +69,7 @@ impl PyLlmClient {
         let got = py
             .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs)))
             .map_err(|e| llm_error(py, e))?;
-        // `LlmResult` 没有 Serialize → 手拼（字段名与 Python 版 `LLMResult` 对齐）
+        // `LlmResult` 没有 Serialize → 手拼
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("content", got.content)?;
         dict.set_item("reasoning_content", got.reasoning_content)?;

@@ -69,7 +69,7 @@ pub enum UiEvent {
 const TICK: Duration = Duration::from_millis(66);
 /// 短于这个时长的思考不留痕（免得满屏 `Thought for 0.1s`）。
 const THOUGHT_TRACE_MIN: Duration = Duration::from_millis(300);
-/// 右下角临时提示活多久（Python 版是 Textual 的 `App.notify` Toast——默认 5s，用户看到的约 3s）。
+/// 右下角临时提示活多久（约 3s；到点自消）。
 const TOAST_TTL: Duration = Duration::from_secs(3);
 /// `@` 补全的文件索引多久算过期（在这之前沿用，免得反复扫盘）。
 ///
@@ -77,7 +77,7 @@ const TOAST_TTL: Duration = Duration::from_secs(3);
 /// （编辑器、别的进程）改了文件也能自己好。
 const FILE_INDEX_TTL: Duration = Duration::from_secs(60);
 
-/// 右下角浮出来的临时提示（对齐 Python 版 `self.app.notify(...)` 的 Textual Toast）：
+/// 右下角浮出来的临时提示：
 /// 不占消息流、到点自消，用来报「刚发生了件小事」（复制了几字符…）。
 struct Toast {
     text: String,
@@ -326,8 +326,7 @@ impl App {
         }
     }
 
-    /// 鼠标：滚轮滚历史区；**左键拖动框选，松开即复制**（消息流对齐 Python `SelectableRichLog`；
-    /// 输入框里则是选输入框里的文本，松开也复制到剪贴板）。
+    /// 鼠标：滚轮滚历史区；**左键拖动框选，松开即复制**（消息流与输入框都是拖选，松手进剪贴板）。
     ///
     /// 两个「文本面」的坐标换算 / 渲染 / 文本提取各是一套（见 [`Surface`]），所以这里只做
     /// **手势分发**：按下定下拖谁（顺便收掉另一个面的选区），拖动、松开都只交给它。
@@ -507,7 +506,7 @@ impl App {
             (KeyCode::Char('c'), true, _) => self.should_quit = true,
             (KeyCode::Char('d'), true, _) if self.input.is_empty() => self.should_quit = true,
             (KeyCode::Char('g'), true, _) => self.paste_clipboard(),
-            // Ctrl+A = 全选（对齐 Python/Textual TextArea；控件默认把它当跳到行首）
+            // Ctrl+A = 全选（控件默认把它当跳到行首）
             (KeyCode::Char('a'), true, _) => self.input.select_all(),
             (KeyCode::Esc, _, _) => self.on_escape(),
             // ⇧⏎ 在多数终端里就是 LF（= Ctrl+J），两个都认
@@ -515,7 +514,7 @@ impl App {
             (KeyCode::Enter, _, false) => self.submit(),
             (KeyCode::PageUp, ..) => self.scroll(-8),
             (KeyCode::PageDown, ..) => self.scroll(8),
-            // 补全面板开着时：Tab 接受候选、↑/↓ 切候选（对齐 Python）
+            // 补全面板开着时：Tab 接受候选、↑/↓ 切候选
             (KeyCode::Tab, ..) if self.palette_visible() => self.palette_accept(),
             // `@` token 在、索引还没落地（刚敲下 `@` 那一两帧）时，Tab 不能变成一个字面
             // tab 打进输入框——等面板出来再按就是了
@@ -758,7 +757,7 @@ impl App {
             "clear" => self.with_session_mut("切换窗口", |s| match s.clear_window() {
                 Ok(n) => {
                     let _ = s.save();
-                    // 消息流**不动**（刚归档的东西还能往上翻着看；Python 同款）
+                    // 消息流**不动**（刚归档的东西还能往上翻着看）
                     format!("已切换新窗口（现有 {n} 个历史窗口块，文件在 ~/.pie/windows/，可经指针回查）")
                 }
                 Err(e) => format!("切换窗口失败：{e}"),
@@ -843,7 +842,7 @@ impl App {
 
     // ---------------------------------------------------------------- 手动 shell（`!cmd`）
 
-    /// `!cmd`：直接执行 shell —— **不经过 LLM、不进会话上下文**（对齐 Python `_run_shell`）。
+    /// `!cmd`：直接执行 shell —— **不经过 LLM、不进会话上下文**。
     ///
     /// 命令行回显借工具行的形状（摘要位置放 `$ cmd`），结算时强制展开正文（`manual`，
     /// 简洁模式也不例外）。跟回合一样占 `busy`：`Esc` 能中断（杀整个进程组）。
@@ -1017,7 +1016,7 @@ impl App {
 
     /// 回车前要不要先把面板里高亮的候选落进输入框（`submit` 的开场白）：
     ///
-    ///   - `/` 命令：半截命令先补全再发（对齐 Python）；
+    ///   - `/` 命令：半截命令先补全再发；
     ///   - `@` 文件：**只接受文件候选**（顺手吃掉 `@`）——目录候选不动（那是 Tab 的活），
     ///     免得正文里随手打的 `@词` 被改成 `词/`。
     fn enter_accepts_candidate(&self) -> bool {
@@ -1078,7 +1077,7 @@ impl App {
         });
     }
 
-    /// `Ctrl+G`：**只**把剪贴板里的图片变成路径（对齐 Python `_paste_image`）。
+    /// `Ctrl+G`：**只**把剪贴板里的图片变成路径。
     ///
     /// 纯文本不走这里 —— 终端自己的粘贴键（`⌘V` / `Ctrl+Shift+V`）经 bracketed paste
     /// 直接进输入框，见 `on_terminal_event` 的 `Event::Paste`。
@@ -1139,7 +1138,7 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // 输入一变就恢复被 `Esc` 收起的补全面板（对齐 Python 的 on_text_area_changed）
+        // 输入一变就恢复被 `Esc` 收起的补全面板
         let text = self.input.text();
         if text != self.last_input {
             self.last_input = text;
@@ -1273,10 +1272,9 @@ impl App {
 
 /// 跑一条手动 `!cmd`，返回（状态，结果正文）。
 ///
-/// 与工具层的 `shell` 同款：独立进程组 + 取消时 killpg（只杀 `sh` 本体的话，持有 stdout
+/// 与工具层的 bash 同款：独立进程组 + 取消时 killpg（只杀 shell 本体的话，持有 stdout
 /// 管道写端的子孙会让读端不 EOF、等不到结束）；stderr 合进 stdout 保证顺序。
-/// 正文格式对齐 Python `_show_shell_result`：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]`
-/// + 一行 `[用户手动终止]`）。
+/// 正文格式：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]` + 一行 `[用户手动终止]`）。
 async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     #[cfg(unix)]
     let mut command = {
@@ -1359,7 +1357,7 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
         Ok(status) => status,
         Err(e) => return (Status::Fail, format!("[exit=error]\n\n等待子进程失败: {e}")),
     };
-    // 退出码：被信号杀死时 Python 给负数，这里取 -1（信息量等价，都是“非正常退出”）
+    // 退出码：被信号杀死时取 -1（都是「非正常退出」）
     let code = status.code().unwrap_or(-1);
     let mark = if code == 0 { Status::Ok } else { Status::Fail };
     (mark, format!("{}", out.trim_end_matches('\n')))
