@@ -119,6 +119,8 @@ pub struct App {
     cells: Vec<Cell>,
     input: Input,
     palette: Palette,
+    /// `Config.theme` 认不出来时的那句告警，等 `run()` 装好日志出口后再提（现在提会砸屏）。
+    theme_warning: Option<String>,
     snapshot: Snapshot,
     activity: Activity,
     /// 思考起点（首个 reasoning 增量时记）
@@ -131,6 +133,10 @@ pub struct App {
     body: Rect,
     /// 上一帧第一条可见的显示行号（同上；绝对行号 = `scroll_top` + 区域内行偏移）
     scroll_top: u16,
+    /// 上一帧输入框插入符的屏幕单元格（[`Input::caret_position`]）：每帧 `draw` 之后把它
+    /// 交给终端（`Terminal::set_cursor_position`）——终端光标一直隐藏着，但它是**输入法**
+    /// 定位候选框的锚点，见 [`App::run`] 里的注释。
+    caret: Option<(u16, u16)>,
     /// 上一帧的排版（复制时按它切源文本）
     layout: history::Layout,
     /// 鼠标框选：起点 / 终点（**绝对**显示行, 单元格列）；`None` = 没在选
@@ -166,6 +172,11 @@ pub struct App {
     palette_index: usize,
     /// 面板被 `Esc` 临时收起（输入一变自动恢复）
     palette_hidden: bool,
+    /// 终端窗口是否在前台（`FocusGained` / `FocusLost`，见 `tui::run` 里的 `EnableFocusChange`）。
+    ///
+    /// 初值 `true`：**大多数终端根本不发焦点事件**（也可能用户关了该上报），收不到就当聚焦——
+    /// 否则光标会在所有终端上一律变暗。输入框光标据此决定亮/暗（见 `Input::render`）。
+    focused: bool,
     /// 上一帧的输入文本（用来发现「输入变了」→ 恢复面板）
     last_input: String,
     /// 余额（状态栏右下角那一小段，`status::balance_text` 的产物）；`None` = 没拿到
@@ -186,12 +197,17 @@ impl App {
         // resume 的历史：把已有对话回放进消息流（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
         let cells = history::cells_from_history(&session.full_history());
+        // 主题：`Config.theme`（族名 / 具体 flavor 都认，见 `Palette::from_name`）。认不出来就用
+        // 默认并留一句告警——`run()` 里装好出口后再说（此刻 raw mode + 交替屏，写 stderr 会砸花）。
+        let (palette, theme_warning) = Palette::resolve(&session.config.theme);
         let app = Self {
             session: Arc::new(Mutex::new(session)),
             tx,
             cells,
             input: Input::new(),
-            palette: Palette::default(),
+            palette,
+            theme_warning,
+            focused: true,
             snapshot,
             activity: Activity::Idle,
             thought_started: None,
@@ -199,6 +215,7 @@ impl App {
             scroll_from_bottom: 0,
             body: Rect::default(),
             scroll_top: 0,
+            caret: None,
             layout: history::Layout::default(),
             selection: None,
             drag: None,
@@ -254,6 +271,10 @@ impl App {
         };
         let mut events = EventStream::new();
         let mut ticker = tokio::time::interval(TICK);
+        // 出口装好后才敢提（`Config.theme` 认不出来时的退路告警）
+        if let Some(text) = self.theme_warning.take() {
+            crate::log::warn(text);
+        }
         // 启动不再往消息流里推一行键位提示：底栏已经在显示键位、`/help` 有完整命令表，
         // 那一行只会在每次开新会话时把历史区顶掉一行。
         self.spawn_fetch_models();
@@ -262,6 +283,16 @@ impl App {
             // `@` 补全的索引：需要时才后台建（**不能放 render 里**，见 `ensure_index`）
             self.ensure_index();
             terminal.draw(|frame| self.render(frame))?;
+            // **把（隐藏的）终端光标摆到插入符上**。TUI 的光标块是自己画的（ratatui 每帧还发
+            // `Hide`），终端光标的位置看似没人关心——但**输入法**关心：IME 的候选框不跟着我们
+            // 画的那一格，而是跟着**终端光标单元格**（VS Code 的 xterm 把隐藏的 textarea 摆在
+            // 终端光标处，Windows 就把候选框画在那个 textarea 的插入符位置；输入法起手
+            // `compositionstart` 时它还会再同步一次）。不显式摆位置，终端光标就停在**上一帧 diff
+            // 最后写入的那一格**上：点一下消息流（只为选中高亮重画被点的那一格）就能把候选框
+            // 带到点击处。放在 `draw` **之后**：diff 的写入才是真正挪光标的人，我们负责收尾。
+            if let Some((x, y)) = self.caret {
+                terminal.set_cursor_position((x, y))?;
+            }
             tokio::select! {
                 maybe = events.next() => {
                     if let Some(Ok(event)) = maybe {
@@ -288,6 +319,9 @@ impl App {
             }
             Event::Paste(text) => self.input.insert(&normalize_newlines(&text)),
             Event::Mouse(mouse) => self.on_mouse(mouse),
+            // 窗口焦点（`EnableFocusChange` 开着才有）：只影响输入框光标的亮/暗
+            Event::FocusGained => self.focused = true,
+            Event::FocusLost => self.focused = false,
             _ => {}
         }
     }
@@ -445,9 +479,7 @@ impl App {
         } else {
             ((r2, c2), (r1, c1))
         };
-        let style = Style::default()
-            .bg(self.palette.accent)
-            .fg(self.palette.accent_text);
+        let style = self.palette.style_selection();
         let buf = frame.buffer_mut();
         for r in r1..=r2 {
             let Some(line) = r.checked_sub(self.scroll_top) else {
@@ -884,11 +916,15 @@ impl App {
     /// 光标处的 `@` 优先：它就住在光标旁，而 `/` 命令是整行的事。
     fn completions(&self) -> (Vec<(String, String)>, Option<(usize, usize)>) {
         if let Some((from, fragment)) = self.file_token() {
-            if let Some(index) = &self.file_index {
-                let items = index.matches(&fragment, files::MATCH_LIMIT);
-                if !items.is_empty() {
-                    return (items, Some(from));
-                }
+            // `..` / `/` / `~/` 三档实时列目录（不依赖索引），其余走索引
+            let items = files::matches(
+                &fragment,
+                self.file_index.as_deref(),
+                &self.index_root,
+                files::MATCH_LIMIT,
+            );
+            if !items.is_empty() {
+                return (items, Some(from));
             }
         }
         (
@@ -923,9 +959,14 @@ impl App {
     ///
     /// ⚠ 只能在事件循环里调（`App::run`）：`tokio::spawn` 要有 runtime，而单测直接
     /// `render_to_string` / `submit` 时没有 runtime（会 panic）——所以**不能**放 `render` 里。
-    /// 没人敲 `@` 就不扫盘（拿 `file_token` 当开关）。
+    /// 没人敲 `@` 就不扫盘（拿 `file_token` 当开关）；`..` / `/` / `~/` 自带目录、不走索引，
+    /// 所以也不为此扫盘。
     fn ensure_index(&mut self) {
-        if self.index_building || self.file_token().is_none() {
+        let Some((_, fragment)) = self.file_token() else {
+            return;
+        };
+        // `..` / `/` / `~/` 自带目录（列的是索引之外的一层）→ 用不着 cwd 索引，也就不必扫盘
+        if self.index_building || files::external(&fragment, &self.index_root).is_some() {
             return;
         }
         let fresh = self.file_index.is_some()
@@ -1154,7 +1195,10 @@ impl App {
         }
         self.input
             .set_placeholder(status::hint_text(self.busy), self.palette.style_faint());
-        self.input.render(frame, input, &self.palette);
+        self.input.render(frame, input, &self.palette, self.focused);
+        // 插入符的屏幕位置（上面 `render` 里刚更新过 `rect` / `scroll_top`）：`run` 每帧拿它去
+        // 摆终端光标，好让输入法的候选框跟在输入框的光标上（见 [`App::run`]）。
+        self.caret = self.input.caret_position();
         // 状态栏：整个界面唯一一处常驻 chrome，放最下方（避开消息流的第一眼位置）
         frame.render_widget(
             Paragraph::new(status::status_line(
@@ -1165,6 +1209,7 @@ impl App {
                 now,
                 area.width,
                 self.balance.as_deref(),
+                self.focused,
             )),
             status_row,
         );
@@ -1369,6 +1414,11 @@ mod tests {
             model: "deepseek-flash".into(),
             ..Default::default()
         };
+        app_with_rx_for(config)
+    }
+
+    /// 同上，但自己给 `Config`（要试非默认 `theme` 这类字段时用）。
+    fn app_with_rx_for(config: Config) -> (App, UnboundedReceiver<UiEvent>) {
         let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
         App::new(Session::ephemeral(&config, llm, tools), None, None)
@@ -1387,6 +1437,94 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| app.render(frame)).expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn palette_follows_config_theme() {
+        // `Config.theme` 现在真的被读了（以前只写不读）：认得出就用它，认不出回 mocha + 一句告警。
+        for (name, want) in [
+            ("latte", Palette::latte()),
+            ("catppuccin-latte", Palette::latte()),
+            ("catppuccin-macchiato", Palette::macchiato()),
+            ("frappe", Palette::frappe()),
+            ("catppuccin", Palette::mocha()),
+        ] {
+            let config = Config {
+                theme: name.into(),
+                ..Default::default()
+            };
+            let (app, _rx) = app_with_rx_for(config);
+            assert_eq!(app.palette.assistant, want.assistant, "`{name}` 没接上");
+            assert!(app.theme_warning.is_none(), "`{name}` 认得出来，不该提告警");
+        }
+
+        let config = Config {
+            theme: "dracula".into(),
+            ..Default::default()
+        };
+        let (mut app, _rx) = app_with_rx_for(config);
+        assert_eq!(
+            app.palette.assistant,
+            Palette::mocha().assistant,
+            "认不出就用 mocha"
+        );
+        let warning = app.theme_warning.clone().expect("认不出要留一句告警");
+        // 告警等 `run()` 装好日志出口才提（形状与其它告警一致：消息流一条 `· …`）
+        app.push_notice(&warning);
+        let flat = squash(&app.render_to_string(80, 24));
+        assert!(
+            flat.contains("[theme]") && flat.contains("dracula"),
+            "{flat}"
+        );
+    }
+
+    #[test]
+    fn empty_input_caret_and_border_follow_window_focus() {
+        let mut app = test_app();
+        assert!(app.focused, "初值就是聚焦（多数终端不发焦点事件）");
+        // 探针：数「背景 = accent」的格（光标）+ 输入框上边框那一格的颜色 + **状态栏**名字首字的颜色。
+        // 上边框 = 第一列是 `─` 的那一行（当下只有输入框画这条线）；状态栏是屏幕最后一行。
+        let probe = |app: &mut App| {
+            let buf = render_buffer(app, 80, 24);
+            let carets = (0..24)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].bg == app.palette.accent)
+                .count();
+            let border = (0..24)
+                .find(|&y| buf[(0, y)].symbol() == "─")
+                .map(|y| buf[(0, y)].fg)
+                .expect("输入框上边框");
+            let status = buf[(1, 23)].fg; // 状态栏开头是 ` <模型>`
+            (carets, border, status)
+        };
+
+        // 空输入（只有 placeholder）+ 聚焦：一个 accent 光标块 + accent 边框
+        let (carets, border, status) = probe(&mut app);
+        assert_eq!(carets, 1, "聚焦时空输入也该有一个 accent 光标块");
+        assert_eq!(border, app.palette.accent, "聚焦时上边框是 accent");
+        assert_eq!(status, app.palette.accent, "聚焦时状态栏名字是 accent");
+
+        // 窗口失焦：光标 / 边框 / **状态栏**一起降级成 muted
+        app.on_terminal_event(Event::FocusLost);
+        assert!(!app.focused);
+        let (carets, border, status) = probe(&mut app);
+        assert_eq!(carets, 0, "失焦后不该再画 accent 光标块");
+        assert_eq!(border, app.palette.muted, "失焦后上边框也变暗");
+        assert_eq!(status, app.palette.muted, "失焦后状态栏也变灰");
+
+        // 回到前台：三处一起亮回来
+        app.on_terminal_event(Event::FocusGained);
+        assert!(app.focused);
+        let (carets, border, status) = probe(&mut app);
+        assert_eq!(carets, 1, "回前台后光标重新亮起");
+        assert_eq!(border, app.palette.accent, "回前台后边框也重新亮起");
+        assert_eq!(status, app.palette.accent, "回前台后状态栏也重新亮起");
+
+        // `!cmd`（手动 shell）优先工具色；但窗口不在前台时还是按 muted 显示
+        app.input.insert("!ls");
+        assert_eq!(probe(&mut app).1, app.palette.tool, "shell 模式用工具色");
+        app.on_terminal_event(Event::FocusLost);
+        assert_eq!(probe(&mut app).1, app.palette.muted, "失焦盖过 shell 色");
     }
 
     #[test]
@@ -1568,6 +1706,43 @@ mod tests {
         assert!(!app.palette_visible());
     }
 
+    /// 三档锚点（`@..` / `@/` / `@~/`）在 App 里：**没索引也弹**、能 Tab 进去接着钻，
+    /// 而且不会为它们去扫 cwd 索引。
+    #[test]
+    fn at_completion_handles_parent_and_root_without_an_index() {
+        let dir = files_tmp("anchors"); // dir/{README.md, src/{session.rs, tui/app.rs}}
+        let (mut app, _rx) = app_with_rx();
+        app.index_root = dir.join("src/tui"); // cwd = dir/src/tui（`..` 就是 dir/src）
+        assert!(app.file_index.is_none());
+
+        // `@..`：列上级目录（= dir/src）的直接子项；没索引照样弹
+        app.input.set_text("@..");
+        let items: Vec<String> = app.completions().0.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(items, ["../session.rs", "../tui/"], "{items:?}");
+        assert!(app.palette_visible());
+        // `..` 自带目录 → 不该为它扫盘（真去 tokio::spawn 了，这里没 runtime 就会炸）
+        app.ensure_index();
+        assert!(!app.index_building, "三档锚点不建 cwd 索引");
+
+        // 接着钻：`@../tu` → `../tui/` → `../tui/app.rs`（接受文件后收场）
+        app.input.set_text("@../tu");
+        assert_eq!(app.completions().0[0].0, "../tui/");
+        app.palette_accept();
+        assert_eq!(app.input.text(), "../tui/");
+        assert!(app.palette_visible(), "接受目录后面板不倒");
+        app.palette_accept();
+        assert_eq!(app.input.text(), "../tui/app.rs");
+        assert!(app.path_session.is_none(), "接受文件 = 结束");
+
+        // `@/`：根目录（绝对路径）
+        app.input.set_text("@/");
+        let items = app.completions().0;
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|(i, _)| i.starts_with('/')), "{items:?}");
+        let screen = app.render_to_string(80, 24);
+        assert!(squash(&screen).contains("▸/"), "{screen}");
+    }
+
     /// 补全会话只活在「那条路径上」：打了空白 / 全选重打就结束，不会在别的文本上乱弹。
     #[test]
     fn path_session_ends_when_the_text_leaves_it() {
@@ -1606,6 +1781,24 @@ mod tests {
         assert!(app.file_index.is_none());
         assert!(!app.palette_visible());
         assert!(last_notice(&app).contains("索引失败"), "{}", last_notice(&app));
+    }
+
+    /// 插入符位置每帧都要记下（`run` 用它在 `draw` 之后摆终端光标，IME 的候选框跟着它走）。
+    #[test]
+    fn caret_follows_the_input_insertion_point() {
+        let mut app = test_app();
+        let buf = render_buffer(&mut app, 80, 24);
+        let (x, y) = app.caret.expect("渲染一帧就该有插入符位置");
+        // 输入框最下面：上边框是最后一条 `─` 线，插入符在它下面一行、行首
+        let border_y = (0..24)
+            .rev()
+            .find(|&y| buf[(0, y)].symbol() == "─")
+            .expect("输入框上边框");
+        assert_eq!((x, y), (0, border_y + 1));
+        // 输入内容后跟着往后走（「你好」占 4 个显示列）
+        app.input.insert("你好");
+        render_buffer(&mut app, 80, 24);
+        assert_eq!(app.caret, Some((4, y)));
     }
 
     #[test]

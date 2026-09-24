@@ -46,7 +46,7 @@ pub const REMOVED: &[(&str, &str)] = &[
 ];
 
 /// 面板一次最多显示几项（**滚动窗口**：窗跟高亮走，见 [`panel_lines`]）。
-pub const MAX_SHOWN: usize = 7;
+pub const MAX_SHOWN: usize = 12;
 
 /// `/help` 文案：由候选表生成（对齐 Python 的「唯一事实来源」做法）。
 ///
@@ -61,7 +61,8 @@ pub fn help_text() -> String {
         .join(" | ");
     format!(
         "{rows}\n\
-         @path 文件路径补全（Tab 接受；以当前目录为根，按 .gitignore 排除）；\
+         @path 文件路径补全（Tab 接受；默认以当前目录为根，按 .gitignore 排除；\
+         `@..` 列上级目录、`@/` 列根目录、`@~/` 列主目录——这三档实时列目录，不必等扫盘）；\
          !cmd 直接执行 shell（不经过 LLM，不进会话上下文）；\
          Esc 停止当前回合；Ctrl+G 把剪贴板里的图片路径插进输入框"
     )
@@ -278,7 +279,9 @@ mod tests {
     #[test]
     fn panel_lines_window_follows_the_highlight() {
         let palette = Palette::mocha();
-        let many: Vec<(String, String)> = (0..10)
+        // 样本要比上限多出富余（否则窗口根本没机会滚，`rows.len() == MAX_SHOWN` 这条也不成立）
+        let n = MAX_SHOWN + 8;
+        let many: Vec<(String, String)> = (0..n)
             .map(|i| (format!("/cmd{i}"), "说明".to_string()))
             .collect();
         let rows_of = |index: usize| -> Vec<String> {
@@ -301,16 +304,30 @@ mod tests {
 
         // 具体位置：开头贴顶、中间居中、末尾贴底
         assert!(rows_of(0)[0].starts_with("▸ /cmd0"), "开头贴顶");
-        assert!(rows_of(5)[MAX_SHOWN / 2].starts_with("▸ /cmd5 "), "中间居中");
-        let tail = rows_of(9);
-        assert!(tail[0].contains("/cmd3"), "末尾时窗口停在最后 7 项：{tail:?}");
-        assert!(tail[MAX_SHOWN - 1].starts_with("▸ /cmd9 "), "末尾贴底：{tail:?}");
+        // 居中那一档：窗口起点 = index - MAX_SHOWN/2（两头都没贴住时）。
+        // 取 `n/2` 是为了两头都留出富余：`index` 太靠前会贴顶、太靠后会贴底，都不叫居中。
+        let mid = n / 2;
+        assert!(
+            rows_of(mid)[MAX_SHOWN / 2].starts_with(&format!("▸ /cmd{mid} ")),
+            "中间居中：{:?}",
+            rows_of(mid)
+        );
+        let tail = rows_of(n - 1);
+        assert!(
+            tail[0].contains(&format!("/cmd{}", n - MAX_SHOWN)),
+            "末尾时窗口停在最后 {MAX_SHOWN} 项：{tail:?}"
+        );
+        assert!(
+            tail[MAX_SHOWN - 1].starts_with(&format!("▸ /cmd{} ", n - 1)),
+            "末尾贴底：{tail:?}"
+        );
     }
 
     #[test]
     fn panel_lines_highlight_and_overflow_hint() {
         let palette = Palette::mocha();
-        let many: Vec<(String, String)> = (0..10)
+        // 同上：样本要比上限多，窗口才真的在「有溢出」的状态下测
+        let many: Vec<(String, String)> = (0..MAX_SHOWN + 8)
             .map(|i| (format!("/cmd{i}"), "说明".to_string()))
             .collect();
         let lines = panel_lines(&many, 1, &palette);

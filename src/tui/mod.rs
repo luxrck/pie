@@ -37,7 +37,8 @@ use crate::session::Session;
 /// （见它的文档）；`None` = 默认（不限步数 / 流式）。
 ///
 /// 终端初始化/恢复用 ratatui 的 `init()` / `restore()`（它还顺带装了 panic hook，
-/// 崩了也不会把终端留在 raw 模式）；鼠标捕获与 **bracketed paste** 要自己开，退出前一定关掉。
+/// 崩了也不会把终端留在 raw 模式）；鼠标捕获、**bracketed paste** 与**窗口焦点上报**要自己开，
+/// 退出前一定关掉。
 ///
 /// ⚠ bracketed paste 不能省：不开的话终端不会用 `\x1b[200~` 包住粘贴内容，多行粘贴会被拆成
 /// 一个个按键（换行 = 回车）→ 粘一段多行文本会在第一行就发出去。
@@ -46,7 +47,9 @@ pub async fn run(session: Session, max_steps: Option<usize>, stream: Option<bool
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        // 窗口焦点（`Event::FocusGained/FocusLost`）：目前只用来让输入框光标在失焦时变暗
+        crossterm::event::EnableFocusChange
     );
 
     let (app, rx) = app::App::new(session, max_steps, stream);
@@ -55,7 +58,8 @@ pub async fn run(session: Session, max_steps: Option<usize>, stream: Option<bool
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange
     );
     ratatui::restore();
     // 退出时的提示（保存失败…）留到终端恢复后再写
