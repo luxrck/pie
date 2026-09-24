@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 pub struct Palette {
     /// 强调色（输入提示、用户消息前缀、活动指示）—— mocha `blue`
     pub accent: Color,
-    /// accent 底上的文字色（输入框内选中高亮用，对齐 Python `accent_text`）—— mocha `crust`
+    /// accent 底上的文字色（输入框内选中高亮用）—— mocha `crust`
     pub accent_text: Color,
     /// 用户消息正文 —— mocha `green`
     pub user: Color,
@@ -82,11 +82,11 @@ impl Palette {
     }
 
     /// 把 `Config.theme` 里的字符串解成色板：认具体 flavor（`mocha` / `macchiato` / `frappe` /
-    /// `latte`）、Python 那种带族名的写法（`catppuccin-<flavor>`）、以及族名 `catppuccin` 本身。
+    /// `latte`）、带族名的写法（`catppuccin-<flavor>`）、以及族名 `catppuccin` 本身。
     /// 大小写、前后空白、重音都宽容（`Frappé` / `catppuccin-frappé` 都认）。
     ///
-    /// 族名不带变体时怎么选：**没有终端背景（OSC 11）探测** → 按深色取 `mocha`（与 Python 版
-    /// 「探测不到就按深色」的习惯一致）；真想要浅色得写全名 `catppuccin-latte`。
+    /// 族名不带变体时怎么选：**没有终端背景（OSC 11）探测** → 按深色取 `mocha`；
+    /// 真想要浅色得写全名 `catppuccin-latte`。
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_lowercase().as_str() {
             "mocha" | "catppuccin-mocha" | "catppuccin" => Some(Self::mocha()),
@@ -113,7 +113,7 @@ impl Palette {
 }
 
 impl Palette {
-    /// 「执行结果」字形只有一套（状态轴与角色轴分开，跟 Python 版约定一致）。
+    /// 「执行结果」字形只有一套（状态轴与角色轴分开）。
     pub fn mark(&self, status: Status) -> (&'static str, Color) {
         match status {
             Status::Ok => ("✓", self.ok),

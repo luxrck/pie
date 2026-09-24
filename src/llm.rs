@@ -1,18 +1,14 @@
 //! 模型层：基于 reqwest 的 OpenAI 兼容客户端 —— **不依赖任何 OpenAI SDK**。
 //!
-//! 对齐 Python 版 `src/pie/llm.py` 的语义，但把 SDK 那一层整个换掉：
 //!   - 端点就 4 个：`POST /chat/completions`（普通 + SSE 流式）、`GET /models`、`GET /user/balance`
 //!     （查询余额，DeepSeek 扩展）与 Files API；
-//!   - 重试自己实现（SDK 自带那套早关了）：408/409/429/5xx + 传输层异常可重试，
+//!   - 重试自己实现：408/409/429/5xx + 传输层异常可重试，
 //!     等待优先服务端 `Retry-After`，否则随机退避 + 1s 下限；
 //!   - 流式**只在还没吐出过任何增量时**才重试（吐过了重来会重复内容）。
 //!
-//! Rust 侧顺带白拿的好处（Python 版要专门绕的坑，这里根本不存在）：
-//!   - 读到 SSE `[DONE]` 直接 break 不会留下挂起的异步生成器，也就没有
-//!     `generator didn't stop after athrow()` 那类收尾噪音（Python 版为此写了 `aio.py`）；
-//!   - 一个 `reqwest::Client` 就是一个连接池，不需要「按事件循环缓存 client」的
-//!     WeakKeyDictionary hack；
-//!   - 错误是自己定义的类型，`retryable()` 不用靠 `type(exc).__module__` 嗅探。
+//! 手写 SSE + 自建错误类型带来的好处：
+//!   - 读到 SSE `[DONE]` 直接 break 不会留下挂起的异步生成器，也就没有收尾噪音；
+//!   - 一个 `reqwest::Client` 就是一个连接池，不需要额外缓存 client。
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,9 +51,8 @@ pub struct ToolCall {
 /// 一条会话消息。字段全部可缺省，构造走下面的便捷方法。
 ///
 /// 带压缩元数据（`compress_level` / `raw_*`）：这些字段**只进会话文件，不进 API 请求体**
-/// （发给模型前统一过 `to_api()`，与 Python 版 `Message.to_api()` 同规则）。字段名与 Python 版
-/// `to_dict()` 逐字对齐，所以两边写下的会话文件可以互相读（Rust 不写 Python 那个 `cls`——
-/// 没有类层级，Python 侧读不到 cls 时本来就按 `role` 回退）。
+/// （发给模型前统一过 `to_api()`）。字段名与落盘的 `to_dict()` 形状对齐，所以会话文件可以互读
+/// （不写冗余的 `cls` 字段——消息没有类层级，靠 `role` 判定即可）。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct Message {
@@ -122,7 +117,7 @@ impl Message {
         }
     }
 
-    /// 转成发给模型的消息（**剥掉压缩元数据**，与 Python 版 `Message.to_api()` 同规则）：
+    /// 转成发给模型的消息（**剥掉压缩元数据**）：
     ///   - `tool`：只要 `tool_call_id` + `content`（空则 `""`）；
     ///   - `assistant` 带 `tool_calls`：**必须带 `reasoning_content`**（空串兜底），thinking 模式缺了报 400；
     ///   - `assistant` 有思考内容：带上；
@@ -186,10 +181,10 @@ impl Usage {
     }
 }
 
-/// 会话级用量：token 字段是**最近一次** API 上报的值（**不累计求和**，跟 Python 一致——
+/// 会话级用量：token 字段是**最近一次** API 上报的值（**不累计求和**——
 /// 上下文是累积的，最近一次的 `prompt_tokens` 就是当前上下文大小），只有 `calls` 累加。
 ///
-/// 字段名与 Python 版 `UsageTracker` 逐字对齐，所以两边写下的 `__meta__.usage` 可以互相读。
+/// 字段名即 `__meta__.usage` 的形状。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageTracker {
@@ -300,7 +295,7 @@ impl LlmError {
         }
     }
 
-    /// 日志里的一行摘要（对齐 Python 的 `[retry] …（异常摘要）`）。
+    /// 日志里的一行摘要（`[retry] …（异常摘要）`）。
     fn brief(&self) -> String {
         match self {
             LlmError::Transport(e) => {
@@ -580,7 +575,7 @@ impl LlmClient {
                             let payload = payload.trim();
                             if payload == "[DONE]" {
                                 // 直接 return 是安全的：reqwest 的 body 被 drop 即关连接，
-                                // 不存在 Python 那边挂起的异步生成器收尾问题。
+                                // 不存在挂起的异步生成器收尾问题。
                                 return Ok(state.finish());
                             }
                             let chunk: StreamChunkWire =
@@ -671,12 +666,11 @@ impl LlmClient {
 
 // ---------------------------------------------------------------- Files API（图片上传件）
 //
-// 与 Python 版 `src/pie/files.py` 同一套契约（本地副本命名、`__meta__.files` 条目字段、
-// `expires_after` 语义），只是按用户要求**不再单独开一个 files.rs**，全放在这里。
+// 本地副本命名、`__meta__.files` 条目字段、`expires_after` 语义都收敛在这里
+// （不单独开一个 files.rs）。
 //
-// 与 Python 的一处**有意差异**：那边上传失败（或模型不支持）会**回退内联 base64**，
-// 这边只走 Files API —— 拿不到 `file_id` 就不注入图片（read 的标记文本仍在工具结果里），
-// 不做 base64 回退。
+// **只走 Files API、不回退内联 base64**：上传失败（或模型不支持）时拿不到 `file_id` 就不注入
+// 图片（read 的标记文本仍在工具结果里）。
 
 /// 服务端上传件（`GET /files` 的条目）：字段缺失给 None，别让展示层崩。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -689,7 +683,7 @@ pub struct FileObject {
     pub expires_at: Option<i64>,
 }
 
-/// 支持 `file` 内容块的模型（与 Python `FILES_API_MODELS` 同名单）。
+/// 支持 `file` 内容块的模型白名单。
 pub const FILES_API_MODELS: [&str; 2] = ["deepseek-flash", "deepseek-v4-flash-vision-exp"];
 
 /// 服务端允许的上传有效期上限（天）。
@@ -711,7 +705,7 @@ impl LlmClient {
     ///
     /// `expires_after` 是 DeepSeek 扩展字段，用**方括号展开**的两个表单字段发：
     /// `expires_after[anchor]=created_at`、`expires_after[seconds]=N`——
-    /// 这是 Python SDK 的 `_serialize_multipartform`（`stringify_items(array_format="brackets")`）
+    /// 这是 OpenAI SDK 内部 `_serialize_multipartform`（`stringify_items(array_format="brackets")`）
     /// 干的事，也是**服务端唯一认的编码**：实测把 JSON 串（无论 part 是不是 application/json）
     /// 当单个字段发，响应里 `expires_at` 都是 `null`（= 服务端当永久件收下了）。
     pub async fn upload_file(
@@ -1038,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_matches_python_semantics() {
+    fn retryable_semantics_match() {
         let api = |s: u16| LlmError::Api {
             status: s,
             body: String::new(),

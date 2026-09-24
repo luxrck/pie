@@ -1,6 +1,6 @@
 """`@pie.tool`：把普通函数变成工具（类型注解 → JSON schema）。
 
-与纯 Python 版的 `pie.tools.tool` **同一套规则、同一份 schema 形状**（两边写的工具可以互相搬）：
+规则与 schema 形状：
 `str` / `int` / `float` / `bool` / `list[...]` / `dict` / `Optional[...]` 认，其余注解直接报错；
 下划线开头的参数（注入项）不进 schema；描述取 `description` → docstring 首行 → 函数名。
 

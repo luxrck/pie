@@ -1,11 +1,9 @@
 //! 配置层：从 `~/.pie/config.toml` 读取 + 组装分层 system prompt。
 //!
-//! 对齐 Python 版 `src/pie/config.py`：同样的默认值、同样的文件名、同样的
-//! 「从 cwd 向上找项目根」提示词解析规则。差异都写在注释里。
+//! 默认值、文件名、以及「从 cwd 向上找项目根」的提示词解析规则都收敛在这里。
 //!
-//! 迁移取舍：Python 那版 load() 里有一大堆旧键迁移（max_tokens→reserved_tokens、
-//! compress_tools→compaction、compaction = true/false …）。这里只保留**当前**的配置形状
-//! 加少量仍在用的容错，历史迁移链不再背——重构的目标是活在当下，不是兼容三年前。
+//! 迁移取舍：只保留**当前**的配置形状 + 少量仍在用的容错，不背历史键迁移链
+//! （早期那版 load() 里那一大堆 max_tokens→reserved_tokens、compress_tools→compaction … 已不再维护）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,7 +125,7 @@ fn local_utc_offset(_secs: i64) -> i64 {
     0
 }
 
-/// 千分位（`1234567` → `1,234,567`）：Rust 的 format 没有 Python 的 `{:,}`，只能自己加。
+/// 千分位（`1234567` → `1,234,567`）：Rust 的 format 没有千分位语法，只能自己加。
 pub fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
@@ -148,13 +146,10 @@ pub fn global_memory_file() -> PathBuf {
     pie_dir().join("memory.md")
 }
 
-/// 首次运行创建全局记忆的种子文件（已存在则跳过，**不覆盖**）——对齐 Python
-/// `config._ensure_global_memory()`（它在 `ensure_config()` 里调，即每次启动）。
+/// 首次运行创建全局记忆的种子文件（已存在则跳过，**不覆盖**）：每次启动时检查一次。
 ///
 /// 种子正文放在 `prompts/memory.md`、`include_str!` 编进来（与内置 system prompt 同一套做法：
-/// 模板里全是中文与骨架，写成转义串难读也容易碰格式）。内容与 Python 版
-/// `config.GLOBAL_MEMORY_TEMPLATE` **逐字一致** —— 两边共用一个 `~/.pie/memory.md`，
-/// 骨架不一样就白搭。
+/// 模板里全是中文与骨架，写成转义串难读也容易碰格式）。
 ///
 /// 写不了就算了（权限/只读家目录）：这只是个种子，不值得挡住启动。
 pub fn ensure_global_memory() {
@@ -244,8 +239,7 @@ enum TableOrBool<T> {
 /// 子表/布尔 → `Option<子表>`。
 ///
 /// - `xx = false` → `None`（关闭这一级）
-/// - `xx = true`  → `Some(T::default())`（**开启用默认值**，与 Python 版同义：
-///   那边 `tool = true` 落到「不认的子表分支 → 保持刚建好的默认 `ToolCompaction()`」）
+/// - `xx = true`  → `Some(T::default())`（**开启用默认值**：只写布尔、不给参数 = 用该级的默认配置）
 /// - `[compaction.xx]` 子表 → 用它
 fn de_level<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
@@ -347,7 +341,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: "deepseek-flash".to_string(),
-            // 本部署内置的默认 key（与 Python 版一致）；空串 = 用户没配
+            // 本部署内置的默认 key；空串 = 用户没配
             base_url: "https://api.deepseek.com/".to_string(),
             api_key: "<API_KEY>".to_string(),
             reasoning_effort: "high".to_string(),
@@ -373,7 +367,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 从配置文件加载。文件不存在 → 全默认值（Python 版这里会走交互式向导，CLI 层负责）。
+    /// 从配置文件加载。文件不存在 → 全默认值（要不要补齐默认件由 CLI 层负责）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = resolve_config_file(explicit);
         let mut config = if path.exists() {
@@ -418,7 +412,7 @@ impl Config {
     }
 
     pub fn soft_limit(&self) -> usize {
-        // CLI 一次性覆盖（`--auto-compact-threshold`）优先——与 Python 的 `maybe_compact` 同语义
+        // CLI 一次性覆盖（`--auto-compact-threshold`）优先
         if let Some(n) = self.auto_compact_threshold {
             return n.max(1);
         }
@@ -594,7 +588,7 @@ enum ReservedRaw {
 /// 0/负数按「不发送 max_tokens」处理（`None`）。
 ///
 /// 键**缺失**时不走这里 —— `Config` 上的 `#[serde(default)]` 会拿 `Config::default()`
-/// 的值补上（`Some(128_000)`），与 Python「没写就用默认值」一致。
+/// 的值补上（`Some(128_000)`）—— 没写就用默认值。
 fn de_reserved_tokens<'de, D>(d: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
@@ -692,14 +686,14 @@ pub fn build_system_prompt(
     system_prompt: Option<&str>,
     append_system_prompt: &[String],
 ) -> String {
-    let _ = config; // 预留：Python 版这里会拼一行上下文预算说明（当前被注释掉）
+    let _ = config; // 预留：将来这里可拼一行上下文预算说明
     let base = match system_prompt {
         Some(s) => s.to_string(),
         None => read_text(resolve_prompt_file(SYSTEM_FILE)),
     };
     let base = if base.is_empty() {
-        // 内置兜底 prompt：与 Python 版 `config.SYSTEM_PROMPT` 常量**逐字一致**（用 ast 抽出来比过），
-        // 编译期嵌入 → 仓库根没有 `SYSTEM.md` 时也能单文件跑（本仓根就没有那个文件）
+        // 内置兜底 prompt（`prompts/system.md`）：编译期嵌入 → 仓库根没有 `SYSTEM.md` 时也能单文件跑
+        // （本仓根就没有那个文件）
         include_str!("../prompts/system.md").to_string()
     } else {
         base
@@ -953,7 +947,7 @@ lean = true
         assert!(c.tool.is_none() && !c.turn && c.session.is_none());
     }
 
-    /// `tool = true` / `session = true`（只写布尔、不给参数）= **开启用默认值**（对齐 Python）。
+    /// `tool = true` / `session = true`（只写布尔、不给参数）= **开启用默认值**。
     #[test]
     fn level_boolean_true_means_enabled_with_defaults() {
         let config: Config =

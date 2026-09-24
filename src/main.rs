@@ -1,14 +1,7 @@
-//! pie 的 Rust 重构 —— 极简 agent harness（YOLO，内置 read / edit / write / shell）。
+//! pie —— 极简 agent harness（YOLO，内置 read / edit / writ / bash）的 CLI 入口。
 //!
-//! 分阶段迁移进度（详见 pie/README.md）：
-//!   ✅ config  —— 配置加载 + 分层 system prompt
-//!   ✅ llm     —— reqwest + 手写 SSE 的 OpenAI 兼容客户端（不含任何 SDK）
-//!   ✅ tools   —— read / edit / write / shell（统一 Headers\n\nBody 输出）
-//!   ✅ session —— JSONL 持久化（`~/.pie/sessions/`，与 Python 同格式）+ resume + **回合循环**（原 loop.rs 并入）
-//!   ✅ cli     —— 一次性模式（子 agent）；`-t/--tools`、`-r/--resume`、`-s/--session`
-//!   ✅ context —— 三级压缩（工具/轮次/会话级） + 落盘指针 + manifest + `context info|verify|gc`
-//!   ✅ 图片   —— read 图 → Files API 上传（`file` 块注入，不回退内联）+ `files list|gc`
-//!   ⬜ 并行工具 / TUI
+//! 这里只做参数解析与分发：一次性（子 agent）/ 会话 / TUI 三种形态，外加 `sessions` /
+//! `context` / `files` / `setup` 维护类子命令。核心逻辑都在 `pie` 库（见 `src/lib.rs`）。
 
 // 这里换成对 lib 的引用（核心层已提成 `pie` 库，CLI 只是它的一个消费者）。
 // ⚠ 模块声明在 `src/lib.rs`，别在这里再写 `mod xxx;`——那会变成两份独立的编译单元。
@@ -22,7 +15,7 @@ use pie::session::{Session, TurnEvent};
 use pie::tools::{tools_from_spec, ToolRegistry};
 use pie::{cancel, config, context, session, tui};
 
-/// 一次性模式的输出格式（对齐 Python `--mode {text,json,transcript}`）。
+/// 一次性模式的输出格式（`text` / `json` / `transcript`）。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// 只输出答案本身（stdout 能被 shell 直接接住）
@@ -33,9 +26,9 @@ enum Mode {
     Transcript,
 }
 
-/// `-t/--thinking` 的合法值（对齐 Python `cli.py` 的 `THINKING_LEVELS`）。
+/// `-t/--thinking` 的合法值。
 ///
-/// Python 用的是 `off`（内部才归一到配置口径 `none`）；这里**两个都收** ——
+/// 对外写法是 `off`（内部才归一到配置口径 `none`）；这里**两个都收** ——
 /// 配置文件与 `/thinking` 里写的就是 `none`，顺手敲 `-t none` 也应该能用。
 const THINKING_LEVELS: [&str; 8] = [
     "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -60,7 +53,7 @@ struct Cli {
     #[arg(long, alias = "max-tokens", value_name = "N")]
     reserved_tokens: Option<String>,
 
-    /// 单回合最多问几次模型（**本次运行**的旋钮，不写进配置；对齐 Python `loop.aturn(max_steps=…)`）
+    /// 单回合最多问几次模型（**本次运行**的旋钮，不写进配置）
     #[arg(long)]
     max_steps: Option<usize>,
 
@@ -113,7 +106,7 @@ struct Cli {
     #[arg(short = 's', long = "session")]
     session: Option<String>,
 
-    /// 一次性模式的输出格式（对齐 Python 的 `--mode`）：`text` = 只输出答案（默认）；
+    /// 一次性模式的输出格式：`text` = 只输出答案（默认）；
     /// `json` = 一行 JSON：`answer/session/turns/usage`；`transcript` = 完整历史 JSON
     #[arg(long, value_name = "MODE", default_value = "text")]
     mode: Mode,
@@ -204,8 +197,8 @@ async fn run(cli: Cli) -> i32 {
         return setup_main(&cli);
     }
 
-    // 首次运行写入全局记忆的种子文件（已存在则跳过）：对齐 Python 每次启动先
-    // `_ensure_global_memory()`——它会被拼进 system prompt，没文件就白白少一层记忆。
+    // 首次运行写入全局记忆的种子文件（已存在则跳过）：它会被拼进 system prompt，
+    // 没文件就白白少一层记忆。
     config::ensure_global_memory();
     let mut config = match config::Config::load(cli.config.as_deref()) {
         Ok(c) => c,
@@ -256,7 +249,7 @@ async fn run(cli: Cli) -> i32 {
     }
     let session_mode = cli.resume || cli.session.is_some();
 
-    // 两个**按次**的执行旋钮（不在配置里，对齐 Python `loop.aturn` 的形参）：
+    // 两个**按次**的执行旋钮（不在配置里）：
     // `--max-steps` / `--no-stream` 直接传给每个回合（含 TUI 里的回合）。
     let max_steps = cli.max_steps;
     let stream = cli.no_stream.then_some(false);
@@ -294,7 +287,7 @@ async fn run(cli: Cli) -> i32 {
     }
 
     if task.trim().is_empty() && !session_mode {
-        // 非 TTY 且没给任务：对齐 Python（一行到 stderr + 退出码 2），别污染 stdout 管道
+        // 非 TTY 且没给任务：一行到 stderr + 退出码 2，别污染 stdout 管道
         eprintln!(
             "pie {}（配置 {}）",
             config.model,
@@ -313,7 +306,7 @@ async fn run(cli: Cli) -> i32 {
         return 2;
     }
 
-    // 一次性模式：与 Python 的 print 模式一个口径 —— **stdout 只放结果**，工具活动／步骤
+    // 一次性模式：**stdout 只放结果**，工具活动／步骤
     // 与调试日志都不往 stderr 写（`--mode text` 时 stdout = 答案本身，shell 能直接接住；
     // `stream` 只影响到达时间）。
     let mode = cli.mode;
@@ -365,7 +358,7 @@ async fn run(cli: Cli) -> i32 {
             };
         }
         let answer = match session
-            // `parallel_tools: None` = 跟随配置（CLI 没有覆盖它的旗标，对齐 Python）
+            // `parallel_tools: None` = 跟随配置（CLI 没有覆盖它的旗标）
             .aturn(
                 &task,
                 &mut printer,
@@ -422,7 +415,7 @@ async fn run(cli: Cli) -> i32 {
 
 /// `pie setup`：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子。
 ///
-/// **非交互**（Python 版那个会逐个问模型 / 地址 / key；这边只写默认值，之后自己改），
+/// **非交互**（只写默认值，之后自己改），
 /// 已存在的文件**一律不覆盖**（里面可能有用户自己的 key 与记忆）→ 重复跑安全、幂等。
 fn setup_main(cli: &Cli) -> i32 {
     let mut code = 0;
@@ -461,7 +454,7 @@ fn setup_main(cli: &Cli) -> i32 {
     0
 }
 
-/// `pie sessions`：列出历史会话（文案对齐 Python `pie sessions`）。
+/// `pie sessions`：列出历史会话。
 fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
     let rows = session::list_sessions(limit);
     if json {
@@ -500,7 +493,7 @@ fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
         if r.first_query.is_empty() {
             println!("    ↳ (无用户消息)");
         } else {
-            // 压成单行、超 80 字截断（Python 同款）
+            // 压成单行、超 80 字截断
             let one_line: String = r
                 .first_query
                 .chars()
@@ -559,8 +552,8 @@ fn apply_overrides(config: &mut config::Config, cli: &Cli) -> Result<(), String>
         config.model = m.clone();
     }
     if let Some(t) = &cli.thinking {
-        // `-t off` 是给人看的写法 → 归一到配置口径 `none`（对齐 Python `cli.py`：
-        // 「API 只认 none」，直接发字面 `off` 服务端不认）
+        // `-t off` 是给人看的写法 → 归一到配置口径 `none`
+        // （API 只认 none，直接发字面 `off` 服务端不认）
         config.reasoning_effort = if t == "off" {
             config::REASONING_NONE.to_string()
         } else {
@@ -614,7 +607,7 @@ fn read_text_or_path(value: &str) -> String {
     }
 }
 
-/// `pie context info|verify|gc`：上下文压缩维护（与 Python 版同一套输出文案）。
+/// `pie context info|verify|gc`：上下文压缩维护。
 fn context_main(action: &ContextAction) -> i32 {
     let dir = context::context_dir();
     if !dir.exists() {
@@ -679,7 +672,7 @@ fn context_main(action: &ContextAction) -> i32 {
     }
 }
 
-/// `pie files list|gc`：图片上传件维护（文案对齐 Python 版 `pie files`）。
+/// `pie files list|gc`：图片上传件维护。
 async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
     match action {
         FilesAction::List { all } => {
@@ -914,7 +907,7 @@ mod tests {
         Cli::parse_from(std::iter::once("pie").chain(args.iter().copied()))
     }
 
-    /// `-t off` 归一成配置口径的 `none`（对齐 Python `cli.py`），其余值原样透传。
+    /// `-t off` 归一成配置口径的 `none`，其余值原样透传。
     #[test]
     fn thinking_off_is_normalized_to_none() {
         let mut config = config::Config::default();
@@ -926,7 +919,7 @@ mod tests {
         assert_eq!(config.reasoning_effort, "xhigh", "服务端认的值原样透传");
     }
 
-    /// `-t` 只收 Python 那七档 + `none`；乱写的值在解析期就被拒（不静默发给服务端）。
+    /// `-t` 只收那七档 + `none`；乱写的值在解析期就被拒（不静默发给服务端）。
     #[test]
     fn thinking_levels_are_validated() {
         assert!(Cli::try_parse_from(["pie", "-t", "off"]).is_ok());

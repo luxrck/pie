@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-/// 取消后写入历史 / 返回给调用方的固定文本（与 Python 版 `CANCEL_TEXT` 同字面量）。
+/// 取消后写入历史 / 返回给调用方的固定文本。
 pub const CANCEL_TEXT: &str = "用户手动终止";
 
 #[derive(Clone, Default)]

@@ -4,6 +4,7 @@
 
 ## 2026-09-24
 
+- **文档精简（AGENTS.md / README.md / MEMORY.md）**（用户：「简化、聚焦一下 AGENTS.md README.md MEMORY.md，多余的内容可以放到 CHANGELOG 里面」）：三份文件互相重复（TUI / 环境 / 已知限制在 `AGENTS.md` 与 `MEMORY.md` 各写一遍），且把大量属本文件的「历史决策 / 机制解释」也写进了正文。按分工收敛——`AGENTS.md`（会被拼进 system prompt）只留「怎么在本仓库干活」的规则（TUI 聚焦色板 / 宽字符残影 / IME 锚点等机制故事各压成一条规则）；`README.md` 面向人，TODO 只留简短列表；`MEMORY.md` 只保「当前状态」、约定一律指向 `AGENTS.md`。被删的机制细节此前多已在本文件记录，未记录的一并补上：`README.md` 原 TODO 里那大段 `parallel_tools` 实现细节搬到 2026-09-23（见下）。随后按用户「可以不提及之前的 Python 版本了，反正信息已经保存在 docs 里面」再做一轮：去掉三份文件里对**旧 Python 实现**的提及（工具名、会话 JSONL 格式、`[exit=0]` 兼容、TUI 行为等只保留与当前行为相关的规则；两版差异一律只在 `docs/python-legacy.md`）——**Python 绑定**是现役功能，不算旧版本，照留。同一轮又把**源码注释**也同步了（用户：「同步代码」）：`src/` 与 `bindings/` 里那批 `// 对齐 Python 版 …` 之类的**旧版注脚**一并去掉（保留「为什么这么写」的理由）；顺手修掉几处过时注释——`main.rs` 顶部那段「分阶段迁移进度」表（还写着旧工具名 `write`/`shell`、`⬜ TUI`）、`lib.rs` / `tools.rs` 模块头里的 `write`/`shell`、`context.rs` 里「Rust 还没实现 `/clear`」都按现状改写。`bindings/` 里指自身那层纯 Python 助手（`pie/_tool.py`）与「Python 绑定」本身的话照留。
 - **crate 名 `pie-rs` → `pie`**（用户：「我就是要把 pie-rs 改成 pie」）：根 `Cargo.toml` 的
   `package.name` 改成 `pie`（`[lib]` / `[[bin]]` 本来就都叫 `pie`），连带：`bindings/pie-py` 的
   path 依赖键（`pie = { path = "../.." }`）、两份 `Cargo.lock`、CLI 的 `#[command(name = …)]`
@@ -52,7 +53,7 @@
   - README 的 `## 与 Python 版的已知差异` 整节（131 行）搬进该文件，README 只留一段指针 + 原本的 TODO
     （另修了绑定节里过时的「M3/M5 未做」）；`AGENTS.md` / `MEMORY.md` / `docs/python-bindings.md` 里
     「Python 版仍在」的措辞一并改成「旧 Python 版（已删除）」并指向新文件。
-  - **源码里的 `// 对齐 Python 版 …` 注释未动**：那是当前行为的来由（历史注脚），不是需要同步的文档。
+  - **源码里的 `// 对齐 Python 版 …` 注释未动**：那是当前行为的来由（历史注脚），不是需要同步的文档。（⚠ 同日的「文档精简」条目已反转此决定：那批注脚现已同步去掉。）
 
 - **输入框的宽字符残影**（用户报：打一文字后按退格，输入行右边留蓝色方块 / 半个汉字；`6.png`）：
   - 机制：**ratatui 的 `BufferDiff` 永远不会重画宽字符的后半格**。`Buffer::set_stringn` 写宽字形时会把后面那格 `reset()`（= 普通空格），而 `Cell::eq` 比 symbol/underline_color/skip/fg/bg/modifier/diff_option → 它与真空格**完全相等** → 那格进不了 diff（`BufferDiff` 自带一处强制重发，但只在「前一格有底色或 REVERSED 之类可见修饰」时触发，普通汉字不满足）。于是那一格只要以前被写过东西——被删汉字的右半边、placeholder 里 `⏎`/`⇧` 的碎片、光标/选区涂过的 accent——就**永久残留**在终端上。实测（抓 App 写出的格子）：退格一次只写了 2 格（新光标 + 旧光标格），被删汉字的后半格一个字都没写；`6.png` 量像素也对上了：cell 13/15/17/19 各一格 accent（4 个宽字符的后半格）+ cell 10-11（光标压在宽字符上的 2 格）。
@@ -121,6 +122,11 @@
 
 ## 2026-09-23
 
+- **一批工具并发/串行（`parallel_tools`）**：`Session::aturn` 的执行旋钮之一，实现在 **`Session::tool_call`**（`model_call` 的姊妹：那边问模型，这边跑工具）——整批一起跑（并发度 = `calls.len()`）或按模型返回顺序串行（并发度 = 1，`buffer_unordered(limit)` 只决定「同时 poll 几个」）。
+  - 两条路**事件形状一致**：先把整批 `tool_call` 发出去，再按「谁先跑完谁先发」推 `tool_result`（被取消的推 `CANCEL_TEXT`）；消息**按调用顺序**回填（历史扁平序列与串行一致 → compaction 的 step 批次认定不受影响）；返回 `Vec<Option<String>>`（`None` = 被取消，调用方补 `CANCEL_TEXT`）。
+  - ⚠ `on_event` 不能进 future（`&mut dyn FnMut` 没实现 `Sync` → `aturn` 的 future 会不再是 `Send`，TUI 的 `tokio::spawn` 编不过）：future 只算结果，事件由轮询循环在完成当下推。
+  - ⚠ future 必须在 `for` 里造，**不能**写成 `map(|(i, c)| async move {…})`：闭包参数的生命周期会变成 HRTB，撞上 rustc 已知限制（#100013），报错却在调用方（`tokio::spawn`）一头雾水。
+  - ⚠ **有意不同于旧 Python 版**：`tool_result` 事件的 `text` **不再截 500 字**（旧版在 `loop._run_tool_call` 里 `clip_output(text, 500)`）——Session 只搬真话，少显示是展示层的事（TUI 按 `TOOL_BODY_LINES` 截、CLI 只取首行）、少回传是工具自己配容量上限的事。
 - **仓库转纯 Rust**：Python 实现（`src/pie/*.py` + `tests/*.py` + `pyproject.toml` + `uv.lock`）整体删除，`pie/` 的内容上提到仓库根（`src/`、`prompts/`、`bindings/`、`docs/`）。Python 版从此只是历史参照（`git show b188058^:src/pie/…`）。
 - **新增 `pie setup` 子命令**（用户要求）：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子（`prompts/memory.md`）。
   - **非交互**：Python 版那个 `setup` 是逐个问答模型/地址/key 的向导；这边只写默认值（默认值唯一来源就是 `Config::default()`），之后自己改。

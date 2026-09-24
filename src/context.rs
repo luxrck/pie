@@ -1,15 +1,14 @@
 //! 上下文管理层：三级压缩（工具级 / 轮次级 / 会话级）+ 原文落盘指针 + GC。
 //!
-//! 对齐 Python 版 `src/pie/context.py` 的语义。消息模型不同：那边是类层级
-//! （`UserMessage` / `AssistantMessage` / `ToolMessage` / …），这边是扁平 `Vec<Message>`，
-//! 靠 `role` + `compress_level` + `synthetic` 判定，三种压缩都以「就地改写消息列表」实现：
+//! 消息是扁平 `Vec<Message>`（没有类层级），靠 `role` + `compress_level` + `synthetic` 判定，
+//! 三种压缩都以「就地改写消息列表」实现：
 //!   - **工具级**（level 1）：`keep_last_steps` 个 step 批次**之外**的 tool 输出，行数超过
 //!     `head+tail` 就全文落盘 + 头部/尾部留预览，内容换成 `[工具输出全文已保存: <path>]` 指针；
 //!   - **轮次级**（level 2）：已完成的轮次（最后一个 user 之前的）压成一条摘要 assistant
 //!     （user 保留），原文落盘成 `[轮次原文已保存: <path>]`，摘要只留模型最终输出；
 //!   - **会话级**（level 3）：当前轮之前的整段历史落盘成**窗口块**
-//!     （`~/.pie/context/session-*.txt`，与 Python `write_raw` 同目录；被 manifest / 会话 meta 引用，
-//!     GC 不碰——Python 那个 `~/.pie/windows/` 是 `/clear` 归档用的，Rust 还没实现 `/clear`），
+//!     （`~/.pie/context/session-*.txt`；被 manifest / 会话 meta 引用，GC 不碰。`/clear` 归档的窗口块
+//!     另在 `~/.pie/windows/`，见 [`windows_dir`]），
 //!     插一条 `[历史窗口: <path>]` 摘要 system 消息，旧窗口摘要继续留在上下文里；
 //!   - 压缩级别**只升不降**；落盘按内容 hash 寻址（同内容只存一份）。
 //!
@@ -33,7 +32,7 @@ pub fn context_dir() -> PathBuf {
     pie_dir().join("context")
 }
 
-/// 窗口摘要消息的开头标记（Python 同款，便于识别）。
+/// 窗口摘要消息的开头标记（便于识别）。
 pub const WINDOW_SUMMARY_MARKER: &str = "[历史窗口:";
 
 /// 工具级压缩时中间省略的标记。
@@ -95,7 +94,7 @@ fn chars_div4(s: &str) -> i64 {
     s.chars().count() as i64 / 4
 }
 
-/// 单条消息的 token 估算（对齐 Python `Message.tokens()`）：
+/// 单条消息的 token 估算：
 /// 压缩过的消息按「当前长度 / 原始长度 × 原始 token」比例复原，其余按 content + 开销估算。
 pub fn message_tokens(m: &Message) -> i64 {
     if m.compress_level >= 1 {
@@ -131,7 +130,7 @@ pub fn content_hash(text: &str) -> String {
 /// 历史窗口块目录：`<PIE_DIR>/windows/`。
 ///
 /// **刻意放在 `context/` 之外**：那是压缩落盘 + `context gc` 的地盘，而窗口块是用户
-/// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它（与 Python `WINDOWS_DIR` 同款）。
+/// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它。
 pub fn windows_dir() -> PathBuf {
     crate::config::pie_dir().join("windows")
 }
@@ -179,7 +178,7 @@ pub fn write_manifest(manifest: &Path, entry: &Value) -> std::io::Result<()> {
 
 /// 压缩事件（写进 manifest，也交给 `on_compact` 回调）。
 ///
-/// `raw_hash` 取自**文件名**里的 hash（Python 同款）：它总是内容寻址得到的那段，
+/// `raw_hash` 取自**文件名**里的 hash：它总是内容寻址得到的那段，
 /// 而 shell 自带落盘的内容是 stdout 原文——若拿结果文本重算就对不上了。
 fn compact_event(level: u8, kind: &str, path: &Path, summary: &str) -> Value {
     let mut entry = serde_json::json!({
@@ -204,7 +203,7 @@ fn raw_hash_of(path: &Path) -> String {
         .to_string()
 }
 
-/// JSON 美化（缩进 1 空格，对齐 Python `json.dumps(..., indent=1)`）——落盘原文 / `--mode transcript` 用。
+/// JSON 美化（缩进 1 空格）——落盘原文 / `--mode transcript` 用。
 pub fn pretty_indent1(value: &Value) -> String {
     let mut buf = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
@@ -242,7 +241,7 @@ fn pointer_path(text: &str, prefixes: &[&str]) -> Option<PathBuf> {
 
 /// 工具输出落盘指针（`[工具输出全文已保存: <path>]`）→ 路径。
 ///
-/// 双保险（对齐 Python）：指针必然指向刚落盘的真实文件，文件不存在就当假指针——
+/// 双保险：指针必然指向刚落盘的真实文件，文件不存在就当假指针——
 /// 免得 `read` 回来的源码里恰好含这个格式的字符串被误判成压缩事件。
 /// 调用方：`mark_tool_spill`（loop 拿到 shell 结果后同步压缩元数据）。
 pub fn extract_spill_path(text: &str) -> Option<PathBuf> {
@@ -271,7 +270,7 @@ pub fn load_window_dicts(path: &Path) -> Vec<Value> {
 }
 
 /// 规则式会话摘要：保留开头 `head` 轮 + 末尾 `tail` 轮，每轮只留「用户输入 + 模型最终回复」，
-/// 中间被省略的轮次显式标注，编号保留原始轮次序号（对齐 Python `summarize_turns`）。
+/// 中间被省略的轮次显式标注，编号保留原始轮次序号。
 pub fn summarize_turns(dicts: &[Value], head: usize, tail: usize) -> String {
     // 先切轮次：一个非 synthetic 的 user 开启一轮，其后的无 tool_calls 的 assistant 文本是「最终输出」
     let mut turns: Vec<(String, String)> = Vec::new();
@@ -385,7 +384,7 @@ fn is_user(m: &Message) -> bool {
     m.role == "user" && !m.synthetic
 }
 
-/// 压缩落盘后给消息打上「原文指针」元数据（对齐 Python `Message._set_raw`）。
+/// 压缩落盘后给消息打上「原文指针」元数据。
 fn set_raw(m: &mut Message, path: &Path, blob: &str) {
     m.raw_path = Some(path.display().to_string());
     m.raw_hash = Some(raw_hash_of(path));
@@ -398,7 +397,7 @@ fn set_raw(m: &mut Message, path: &Path, blob: &str) {
 /// 结果里没有真指针（或文件已不在）→ `None`（不动消息）。
 ///
 /// ⚠ **只对 `shell` 调用**：read/edit/write 的结果文本里可能恰好含同样格式的字符串
-/// （比如刚读进来的源码字面量），全局搜会误判成落盘事件（Python 同款 gate）。
+/// （比如刚读进来的源码字面量），全局搜会误判成落盘事件。
 /// 不标这一下会出真问题：那份 `shell-*.txt` 不会被 manifest 与 `raw_path` 引用，
 /// `context gc` 会把它当垃圾删掉，历史里的指针就成了死链。
 pub fn mark_tool_spill(msg: &mut Message, tool_name: &str, text: &str) -> Option<Value> {
@@ -646,8 +645,8 @@ pub struct CompactStats {
 /// 按需压缩（自动）：**软阈值触发**，tools → turns → session，各级受对应子配置门控。
 ///
 /// 会话级压缩产出的**窗口块路径**通过 `on_compact` 事件（`level=3, kind=session, raw_path`）
-/// 回报——调用方（如会话层）据此登记；这里不再单开一个 `windows` 出参（Python 那条
-/// `maybe_compact(..., windows=)` 链路实际没有调用方传值）。
+/// 回报——调用方（如会话层）据此登记；这里不再单开一个 `windows` 出参
+/// （`maybe_compact(..., windows=)` 那条链路实际没有调用方传值）。
 pub fn maybe_compact(
     messages: &mut Vec<Message>,
     config: &Config,
@@ -698,7 +697,7 @@ pub fn maybe_compact(
 /// 手动压缩模式（`/compact`）。
 ///
 /// ⚠ `Tools` / `Turns` 暂时没人构造：`/compact` 是交互式命令，等 TUI / REPL 落地时接线
-/// （`compact()` 本身也是如此）；保留是为了与 Python 公共面（`context.compact` 的 mode）一致。
+/// （`compact()` 本身也是如此）；保留是为了与 `context.compact` 的 mode 口径一致。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactMode {
@@ -709,7 +708,7 @@ pub enum CompactMode {
 }
 
 /// **手动**压缩（`/compact`）：不看水位，按 `mode` 压；轮次级一路压到不能再压。
-/// 会话级（整窗口归档）不在手动范围内——那是 `/clear` 的事（与 Python 一致）。
+/// 会话级（整窗口归档）不在手动范围内——那是 `/clear` 的事。
 #[allow(dead_code)]
 pub fn compact(
     messages: &mut Vec<Message>,
@@ -789,7 +788,7 @@ pub fn referenced_raw_paths() -> HashSet<PathBuf> {
     refs
 }
 
-/// 相对路径按「当前目录」补全（与 Python `Path.resolve()` 同义，但不要求文件存在）。
+/// 相对路径按「当前目录」补全（不要求文件存在）。
 fn absolutize(path: &str) -> Option<PathBuf> {
     let p = PathBuf::from(path);
     if p.is_absolute() {

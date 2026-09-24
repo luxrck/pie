@@ -154,7 +154,7 @@ impl PySession {
         &self.path
     }
 
-    /// 历史（**dict 列表**，字段名与 JSONL / Python 版 `to_dict()` 一致，含压缩元数据）。
+    /// 历史（**dict 列表**，字段名与 JSONL 落盘一致，含压缩元数据）。
     #[getter]
     fn messages(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self.lock()?;
@@ -212,7 +212,7 @@ impl PySession {
         })
     }
 
-    /// 切模型：改配置 + 同步客户端实例 + **写回配置文件**；返回一句提示（与 Python `set_model` 同款）。
+    /// 切模型：改配置 + 同步客户端实例 + **写回配置文件**；返回一句提示。
     ///
     /// ⚠ 会写盘（写到 `Config.config_file`，没设就落 `~/.pie/config.toml`）。
     fn set_model(&self, name: &str) -> PyResult<String> {
@@ -251,7 +251,7 @@ impl PySession {
 
     // ------------------------------------------------------------ 写
 
-    /// 落盘（`~/.pie/sessions/<名字>.jsonl`，与 CLI / Python 版同格式）。
+    /// 落盘（`~/.pie/sessions/<名字>.jsonl`，与 CLI 同格式）。
     fn save(&self) -> PyResult<()> {
         self.lock()?.save().map_err(pie_error)
     }
@@ -302,12 +302,12 @@ impl PySession {
     /// 跑一个完整回合，返回最终答复。**阻塞**到回合结束（模型请求期间不持 GIL）。
     ///
     /// `on_event(event: dict)` 边跑边收事件（`content_delta` / `reasoning_delta` / `tool_call` /
-    /// `tool_result` / `answer`，形状与纯 Python 版 `loop.aturn` 的 `on_event` 一致）；
+    /// `tool_result` / `answer`，形状见 `docs/python-bindings.md`）；
     /// 事件在**调用线程**上回调（所以回调里能安全地 print / 更新自己的状态）。
     ///
     /// `max_steps=None` = 不限步数；`stream=None` = 默认流式（`False` 则一次性 complete，
     /// 只推一次 `answer`）；`parallel_tools=None` = 跟随 `Config.parallel_tools`（同一批
-    /// tool_calls 是否并发执行）。三个都与纯 Python 版 `loop.aturn` 的同名形参同义（**不是**配置项）。
+    /// tool_calls 是否并发执行）。三个都是**按次**的执行旋钮（**不是**配置项）。
     ///
     /// 模型请求失败（外部原因）抛 `pie.LlmError`，但**历史里已经补了一条 `[请求失败] <错误>` 的
     /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
@@ -534,7 +534,7 @@ fn busy_error_or(msg: &str) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(msg.to_string())
 }
 
-/// `TurnEvent` → dict（键名与纯 Python 版 `loop.aturn` 的 `on_event` dict 对齐）。
+/// `TurnEvent` → dict（键名与 JSONL / 事件形状对齐）。
 fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     match event {
@@ -549,7 +549,7 @@ fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
         TurnEvent::ToolCall { name, arguments } => {
             dict.set_item("type", "tool_call")?;
             dict.set_item("name", name)?;
-            // `arguments` 给解析后的 dict（与 Python 版一致），另附原文备查
+            // `arguments` 给解析后的 dict，另附原文备查
             dict.set_item("arguments", crate::json_to_py(py, &args_value(arguments))?)?;
             dict.set_item("arguments_raw", arguments)?;
         }
@@ -571,7 +571,7 @@ fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
     Ok(dict.into_any().unbind())
 }
 
-/// 工具参数是模型给的 JSON 字符串：能解析就用解析结果，否则退回 `{"raw": ...}`（Python 同款）。
+/// 工具参数是模型给的 JSON 字符串：能解析就用解析结果，否则退回 `{"raw": ...}`。
 fn args_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| {
         let mut map = serde_json::Map::new();
