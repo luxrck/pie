@@ -379,6 +379,10 @@ async fn run(cli: Cli) -> i32 {
             Ok(answer) => answer,
             Err(e) => {
                 eprintln!("\n{e}");
+                // 失败也把历史写回去：`aturn` 已经补了一条 `[请求失败] <错误>` 的 assistant，落盘
+                // 才留得住（否则这次提问连同失败原因一起消失，下次 resume 莫名其妙）。写不进去
+                // 就算了——失败原因可能正是磁盘 / 权限；退出码仍是 1。
+                let _ = session.save();
                 return 1;
             }
         };

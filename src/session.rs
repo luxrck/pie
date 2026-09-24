@@ -33,6 +33,10 @@ use crate::llm::{
 use crate::tools::{self, ToolRegistry};
 use sha2::{Digest, Sha256};
 
+/// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
+/// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
+const ERROR_TURN_PREFIX: &str = "[请求失败] ";
+
 /// 回合过程中推给调用方的事件（TUI / CLI 边跑边渲染用）。
 ///
 /// 与 Python 版 `loop.aturn` 的 `on_event` dict 一一对应（那边是 `{"type": …}` 裸 dict，
@@ -316,6 +320,21 @@ impl Session {
         });
     }
 
+    /// 模型请求失败（外部因素：网络 / 服务端错 / 协议错）→ 往历史里补一条 assistant 消息
+    /// （内容 = 错误信息）。
+    ///
+    /// 不补的话 `push_user` 那条 user 就成了**没有回答的悬空提问**：历史里出现连续两条 user、
+    /// resume 回放也莫名其妙（实测这种历史 API 收，但语义上是脏的）。与取消同款——
+    /// 取消补 `CANCEL_TEXT`，失败补 `[请求失败] <错误>`；调用方仍然拿到 `Err`（界面照旧报错），
+    /// 只是历史里这对 user/assistant 始终成对。
+    fn push_error_turn(&mut self, err: &LlmError) {
+        self.messages.push(Message {
+            role: "assistant".into(),
+            content: Some(Content::Text(format!("{ERROR_TURN_PREFIX}{err}"))),
+            ..Default::default()
+        });
+    }
+
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
     /// **不落盘会话**（由调用方 `save`）；压缩事件写进 manifest（`ephemeral` 会话不写）。
     ///
@@ -402,9 +421,16 @@ impl Session {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
-                        self.model_call(&specs, on_event, cancel, use_stream)
-                            .await?
+                        match self.model_call(&specs, on_event, cancel, use_stream).await {
+                            Ok(option) => option,
+                            Err(e) => {
+                                self.push_error_turn(&e);
+                                return Err(e);
+                            }
+                        }
                     } else {
+                        // 放弃前把错误写进历史（否则这条 user 就没人应答了，见 `push_error_turn`）
+                        self.push_error_turn(&e);
                         return Err(e);
                     }
                 }
@@ -810,10 +836,10 @@ impl Session {
             meta["files"] = json!(self.files);
         }
         let mut out = String::new();
-        out.push_str(&serde_json::to_string(&meta).map_err(|e| e.to_string())?);
+        out.push_str(&json_line(&meta)?);
         out.push('\n');
         for m in &self.messages {
-            out.push_str(&serde_json::to_string(m).map_err(|e| e.to_string())?);
+            out.push_str(&json_line(m)?);
             out.push('\n');
         }
         fs::write(&self.path, out).map_err(|e| format!("写入会话失败 {}: {e}", self.path.display()))
@@ -934,7 +960,12 @@ impl Session {
             .map(|m| json!(m))
             .collect();
         if !old.is_empty() {
-            let raw: String = old.iter().map(|d| format!("{d}\n")).collect();
+            // 窗口块也是**逐行 JSON**（`context::load_window_dicts` 按行读）→ 同样要转义控制符
+            let mut raw = String::new();
+            for d in &old {
+                raw.push_str(&json_line(d)?);
+                raw.push('\n');
+            }
             let path = context::write_window_block(&raw)
                 .map_err(|e| format!("写窗口块失败: {e}"))?;
             let (head, tail) = self.window_sizes();
@@ -1088,6 +1119,38 @@ impl Session {
             available_models: None,
         }
     }
+}
+
+/// 一条 JSONL 行（落盘共用）：`serde_json` 序列化 + **转义行分隔类控制符**（见下）。
+fn json_line<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    let json = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    Ok(escape_control_chars(json))
+}
+
+/// 把 JSON 文本里**裸的** C1 控制符（U+0080–U+009F）与 U+2028/U+2029 换成 `\uXXXX`。
+///
+/// `serde_json` 只转义 C0（U+0000–U+001F），C1 与两个 Unicode 行分隔符在 JSON 里合法、会原样落盘；
+/// 但按「Unicode 行边界」切行的读者（Python 的 `str.splitlines()` / `bytes.splitlines()`、部分编辑器与
+/// 日志工具）会把 **U+0085 当换行** → 一条消息被劈成两半、整份 JSONL 读不出来（工具输出里出现这些
+/// 字节一点不稀奇：转义序列 dump、二进制预览）。落盘前转义掉，读回来还是同一个字符。
+///
+/// 替换在整个 JSON 文本上做是安全的：结构部分是纯 ASCII，这些字符只可能出现在字符串字面量里。
+fn escape_control_chars(json: String) -> String {
+    fn needs_escape(c: char) -> bool {
+        matches!(c, '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}')
+    }
+    if !json.chars().any(needs_escape) {
+        return json; // 绝大多数消息没有 → 不重写
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    for c in json.chars() {
+        if needs_escape(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// 压缩 manifest 路径：`~/.pie/context/<会话名>.manifest.jsonl`（只记不读）。
@@ -2135,6 +2198,82 @@ mod tests {
         assert_eq!(back.messages[1].role, "user");
         assert_eq!(back.messages[2].role, "assistant");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 落盘把 C1 控制符 / U+2028 转义掉：否则按「Unicode 行边界」切行的读者（Python `splitlines()`）
+    /// 会把 U+0085 当换行 → 一条消息被劈成两半、整份 JSONL 读不出来。
+    #[test]
+    fn save_escapes_control_chars_that_break_line_readers() {
+        let config = Config::default();
+        let path = tmp("c1.jsonl");
+        let mut s = Session::at(path.clone(), &config, llm(), tools());
+        let payload = "a\u{85}b\u{2028}c\u{9f}d";
+        s.messages
+            .push(Message::tool_result("call_1", "bash", payload));
+        s.save().expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        for c in text.chars() {
+            assert!(
+                !matches!(c, '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}'),
+                "还有没转义的字符: U+{:04X}",
+                c as u32
+            );
+        }
+        assert!(text.contains(r"\u0085"), "{text}");
+        // 剩下的换行只有真正的行分隔 → 就是「splitlines 类读者也切不开」
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}"); // meta + system + tool
+        for line in &lines {
+            serde_json::from_str::<Value>(line).expect("每行都是合法 JSON");
+        }
+        // 转义对语义透明：读回来还是原来的字符
+        let back = Session::load(&path, &config, llm(), tools()).expect("load");
+        let Some(Content::Text(back_text)) = back.messages.last().unwrap().content.as_ref() else {
+            panic!("最后一条该是 tool 文本消息");
+        };
+        assert_eq!(back_text, payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 模型请求失败（外部因素）→ 历史里补一条带错误信息的 assistant 消息，**不留悬空提问**。
+    #[test]
+    fn failed_model_call_leaves_an_error_assistant_message() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            // 故意给个 reqwest 解析不了的地址：请求立刻失败、不联网、不重试
+            let config = Config {
+                base_url: "不是地址".into(),
+                max_retries: 0,
+                ..Config::default()
+            };
+            let mut s = Session::ephemeral(
+                &config,
+                LlmClient::new(&config).expect("client"),
+                tools(),
+            );
+            let err = s
+                .aturn(
+                    "看一下这个 bug",
+                    &mut |_| {},
+                    &Cancel::new(),
+                    None,
+                    Some(false),
+                    None,
+                )
+                .await
+                .expect_err("请求必定失败");
+            let last = s.messages.last().expect("有消息");
+            assert_eq!(last.role, "assistant", "失败后历史末尾该是一条 assistant");
+            let Some(Content::Text(text)) = last.content.as_ref() else {
+                panic!("错误回合该是纯文本 assistant");
+            };
+            assert!(text.starts_with(ERROR_TURN_PREFIX), "{text}");
+            assert!(text.contains(&err.to_string()), "{text} / {err}");
+            // user 后面跟着 assistant，不再是连续两条 user
+            let roles: Vec<&str> = s.messages.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(roles, vec!["system", "user", "assistant"], "{roles:?}");
+        });
     }
 
     /// 用量是「最近一次上报值 + calls 累计」（不求和），与 Python 版一致。

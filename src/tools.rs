@@ -829,13 +829,16 @@ impl Tool for Bash {
         };
 
         // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
-        // 「判成败」：Rust TUI 的 `history::tool_result_ok` 与 Python 版 TUI 都只看这一行，
-        // 所以它必须是**第一行的纯值** `[exit=N]`（没有任何头 = 按成功看待）。
+        // 「判成败」：Rust TUI 的 `history::tool_result_ok` 只看**第一行**，所以失败必须
+        // 从这行就能认出来——判据是「`[exit=` 开头且不是 `[exit=0`」= 失败（没有任何头 = 成功）。
+        // 三个字段挤在一行（2026-09-24 起）：这行只为「判成败」存在，一行就够，也少两行噪声。
         let mut headers: Vec<String> = Vec::new();
         if code != 0 {
-            headers.push(format!("[exit={code}]"));
-            headers.push(format!("[os={}]", std::env::consts::OS));
-            headers.push(format!("[shell={}]", Self::SHELL));
+            headers.push(format!(
+                "[exit={code}, os={}, shell={}]",
+                std::env::consts::OS,
+                Self::SHELL
+            ));
         }
 
         match head {
@@ -1112,6 +1115,16 @@ mod tests {
 
     fn builtin() -> ToolRegistry {
         ToolRegistry::new(HashMap::new())
+    }
+
+    /// bash 失败时的唯一一行头（`impl Bash` 里那行格式的**测试侧镜像**）：
+    /// os / shell 跟着平台走，所以按常量拼期望值，别把 `linux` / `bash` 写死。
+    fn fail_header(code: i32) -> String {
+        format!(
+            "[exit={code}, os={}, shell={}]",
+            std::env::consts::OS,
+            Bash::SHELL
+        )
     }
 
     #[test]
@@ -1586,10 +1599,11 @@ mod tests {
                 "bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        assert!(out.starts_with("[exit=3]"), "{out}");
+        // 没输出 → 结果就是那一行头
+        assert_eq!(out, fail_header(3), "{out}");
     }
 
-    /// 失败：`[exit=N]` + `[os=…]` + `[shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
+    /// 失败：只给一行头 `[exit=N, os=…, shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
     #[tokio::test]
     async fn shell_exit_headers_only_on_failure() {
         let reg = builtin();
@@ -1605,17 +1619,12 @@ mod tests {
             .unwrap();
         assert_eq!(silent, "", "成功且没输出：结果为空（没有 `[exit=0]` 可给）");
 
-        // 失败：三行头（os / shell 跟着平台走，所以按常量拼期望值，别把 linux/bash 写死）
-        let headers = format!(
-            "[exit=3]\n[os={}]\n[shell={}]",
-            std::env::consts::OS,
-            Bash::SHELL
-        );
+        let headers = fail_header(3);
         let bad = reg
             .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(bad, headers, "失败且没输出：只有三行头");
+        assert_eq!(bad, headers, "失败且没输出：只有一行头");
 
         let bad = reg
             .dispatch(
@@ -1626,8 +1635,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
-        // 第一行必须是纯值 `[exit=N]`：前端（Rust TUI / Python 版）只认它判成败
-        assert_eq!(bad.lines().next(), Some("[exit=3]"), "{bad}");
+        // 前端（Rust TUI 的 `history::tool_result_ok`）只拿**第一行**判成败：
+        // `[exit=` 开头且不是 `[exit=0…` = 失败（成功根本没有头）
+        let first = bad.lines().next().unwrap_or_default();
+        assert_eq!(first, headers, "{bad}");
+        assert!(
+            first.starts_with("[exit=") && !first.starts_with("[exit=0"),
+            "{bad}"
+        );
     }
 
     /// 被信号干掉（`code()` 拿不到）→ `[exit=-1]`（与 Python 版同款：都是「非正常退出」）。
@@ -1642,7 +1657,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.starts_with("[exit=-1]"), "{out}");
+        assert!(out.starts_with(&fail_header(-1)), "{out}");
     }
 
     #[tokio::test]

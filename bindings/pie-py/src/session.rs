@@ -308,6 +308,9 @@ impl PySession {
     /// `max_steps=None` = 不限步数；`stream=None` = 默认流式（`False` 则一次性 complete，
     /// 只推一次 `answer`）；`parallel_tools=None` = 跟随 `Config.parallel_tools`（同一批
     /// tool_calls 是否并发执行）。三个都与纯 Python 版 `loop.aturn` 的同名形参同义（**不是**配置项）。
+    ///
+    /// 模型请求失败（外部原因）抛 `pie.LlmError`，但**历史里已经补了一条 `[请求失败] <错误>` 的
+    /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
     #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
     pub(crate) fn aturn(
         &self,
