@@ -1108,7 +1108,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("pie-rs-test-{}-{name}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("pie-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

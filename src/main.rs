@@ -1,6 +1,6 @@
 //! pie 的 Rust 重构 —— 极简 agent harness（YOLO，内置 read / edit / write / shell）。
 //!
-//! 分阶段迁移进度（详见 pie-rs/README.md）：
+//! 分阶段迁移进度（详见 pie/README.md）：
 //!   ✅ config  —— 配置加载 + 分层 system prompt
 //!   ✅ llm     —— reqwest + 手写 SSE 的 OpenAI 兼容客户端（不含任何 SDK）
 //!   ✅ tools   —— read / edit / write / shell（统一 Headers\n\nBody 输出）
@@ -42,7 +42,7 @@ const THINKING_LEVELS: [&str; 8] = [
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "pie-rs", version, about = "pie 的 Rust 重构")]
+#[command(name = "pie", version, about = "pie 的 Rust 重构")]
 struct Cli {
     /// 指定配置文件（默认 ~/.pie/config.toml）
     #[arg(short = 'c', long = "config")]
@@ -246,7 +246,7 @@ async fn run(cli: Cli) -> i32 {
         return list_models(&config).await;
     }
 
-    // 任务：位置参数拼起来；没给就从 stdin 读（`echo "任务" | pie-rs`）；都空才打印帮助
+    // 任务：位置参数拼起来；没给就从 stdin 读（`echo "任务" | pie`）；都空才打印帮助
     let mut task = cli.task.join(" ");
     if task.trim().is_empty() && !std::io::stdin().is_terminal() {
         let mut buf = String::new();
@@ -296,7 +296,7 @@ async fn run(cli: Cli) -> i32 {
     if task.trim().is_empty() && !session_mode {
         // 非 TTY 且没给任务：对齐 Python（一行到 stderr + 退出码 2），别污染 stdout 管道
         eprintln!(
-            "pie-rs {}（配置 {}）",
+            "pie {}（配置 {}）",
             config.model,
             config.config_file
                 .as_deref()
@@ -309,7 +309,7 @@ async fn run(cli: Cli) -> i32 {
             config.context_budget(),
             config.reserved_tokens.unwrap_or(0)
         );
-        eprintln!("请提供任务描述（`pie-rs \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI");
+        eprintln!("请提供任务描述（`pie \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI");
         return 2;
     }
 
@@ -461,7 +461,7 @@ fn setup_main(cli: &Cli) -> i32 {
     0
 }
 
-/// `pie-rs sessions`：列出历史会话（文案对齐 Python `pie sessions`）。
+/// `pie sessions`：列出历史会话（文案对齐 Python `pie sessions`）。
 fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
     let rows = session::list_sessions(limit);
     if json {
@@ -614,7 +614,7 @@ fn read_text_or_path(value: &str) -> String {
     }
 }
 
-/// `pie-rs context info|verify|gc`：上下文压缩维护（与 Python 版同一套输出文案）。
+/// `pie context info|verify|gc`：上下文压缩维护（与 Python 版同一套输出文案）。
 fn context_main(action: &ContextAction) -> i32 {
     let dir = context::context_dir();
     if !dir.exists() {
@@ -679,7 +679,7 @@ fn context_main(action: &ContextAction) -> i32 {
     }
 }
 
-/// `pie-rs files list|gc`：图片上传件维护（文案对齐 Python 版 `pie files`）。
+/// `pie files list|gc`：图片上传件维护（文案对齐 Python 版 `pie files`）。
 async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
     match action {
         FilesAction::List { all } => {
@@ -741,7 +741,7 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
     }
 }
 
-/// `pie-rs files list --all`：列出服务端本账号的全部上传件（顺带标出哪个会话记着它）。
+/// `pie files list --all`：列出服务端本账号的全部上传件（顺带标出哪个会话记着它）。
 async fn files_remote_list(config: &config::Config) -> i32 {
     let client = match files_client(config) {
         Ok(c) => c,
@@ -763,7 +763,7 @@ async fn files_remote_list(config: &config::Config) -> i32 {
     }
     let index = session::file_id_index();
     println!(
-        "服务端上传件 {} 个（云端那份；本地记录见不带 --all 的 `pie-rs files list`）:",
+        "服务端上传件 {} 个（云端那份；本地记录见不带 --all 的 `pie files list`）:",
         files.len()
     );
     for f in files {
@@ -790,7 +790,7 @@ async fn files_remote_list(config: &config::Config) -> i32 {
     0
 }
 
-/// `pie-rs files gc --all`：调 Files API 清空服务端上传件（本地副本 / 会话记录不动）。
+/// `pie files gc --all`：调 Files API 清空服务端上传件（本地副本 / 会话记录不动）。
 /// 单个删除失败不中断，有失败返回 1。
 async fn files_gc_remote(config: &config::Config) -> i32 {
     let client = match files_client(config) {
@@ -911,7 +911,7 @@ mod tests {
     use super::*;
 
     fn cli(args: &[&str]) -> Cli {
-        Cli::parse_from(std::iter::once("pie-rs").chain(args.iter().copied()))
+        Cli::parse_from(std::iter::once("pie").chain(args.iter().copied()))
     }
 
     /// `-t off` 归一成配置口径的 `none`（对齐 Python `cli.py`），其余值原样透传。
@@ -929,10 +929,10 @@ mod tests {
     /// `-t` 只收 Python 那七档 + `none`；乱写的值在解析期就被拒（不静默发给服务端）。
     #[test]
     fn thinking_levels_are_validated() {
-        assert!(Cli::try_parse_from(["pie-rs", "-t", "off"]).is_ok());
-        assert!(Cli::try_parse_from(["pie-rs", "-t", "xhigh"]).is_ok());
-        assert!(Cli::try_parse_from(["pie-rs", "-t", "none"]).is_ok());
-        let err = Cli::try_parse_from(["pie-rs", "-t", "乱写"]).unwrap_err().to_string();
+        assert!(Cli::try_parse_from(["pie", "-t", "off"]).is_ok());
+        assert!(Cli::try_parse_from(["pie", "-t", "xhigh"]).is_ok());
+        assert!(Cli::try_parse_from(["pie", "-t", "none"]).is_ok());
+        let err = Cli::try_parse_from(["pie", "-t", "乱写"]).unwrap_err().to_string();
         assert!(err.contains("minimal"), "报错要列出合法值：{err}");
     }
 

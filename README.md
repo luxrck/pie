@@ -1,4 +1,4 @@
-# pie-rs
+# pie
 
 `pie` 是一个极简的 agent harness，**纯 Rust 实现**。它最初是一套纯 Python 实现（`python -m pie`），
 2026-09-23 整体重构为 Rust、Python 代码已从本仓库删除；那一段历史、当年的 oracle 迁移方式，
@@ -13,7 +13,7 @@
 | `tools` | ✅ | read / edit / **writ** / **bash**（后两个名字 2026-09-23 用户点名改，旧 Python 版叫 `write`/`shell`），统一 `Headers\n\nBody` 输出 |
 | `loop` | ✅ | 问模型 → 执行工具 → 再问；工具失败文本化回传（**已并入 `session`**：回合循环现在是 `Session::aturn`） |
 | `session` | ✅ | JSONL 持久化 + resume + 一回合的 agent 循环；`set_model`/`set_reasoning_effort`/`compact`/`usage_report` 等 API 齐 |
-| CLI | ✅ | 一次性模式 `pie-rs "任务"`（支持 stdin）；`-m/-t/--reserved-tokens/--mode/--max-steps/--no-stream/--cwd/--stat/--tools/--system-prompt` 等覆盖项；`-r/--resume`、`-s/--session`；子命令 `setup`/`sessions`/`context`/`files` |
+| CLI | ✅ | 一次性模式 `pie "任务"`（支持 stdin）；`-m/-t/--reserved-tokens/--mode/--max-steps/--no-stream/--cwd/--stat/--tools/--system-prompt` 等覆盖项；`-r/--resume`、`-s/--session`；子命令 `setup`/`sessions`/`context`/`files` |
 | `Tool` trait | ✅ | **结构体即参数**（serde + schemars 派生 schema），注册 `.with_tool::<T>("名字")` |
 | context | ✅ | 三级压缩（工具/轮次/会话级）+ 落盘指针 + manifest + `context info\|verify\|gc` |
 | 图片 | ✅ | read 标记 → 本地副本 → Files API 上传（`file` 块注入）；`files list\|gc [--all]`；**无 base64 回退** |
@@ -112,12 +112,12 @@ fn erased<T: Tool>(args: Value) -> BoxFuture<ToolResult> {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"          # 本机 cargo 不在默认 PATH
-export CARGO_TARGET_DIR=$HOME/.cache/pie-rs-target   # 源码在 /mnt/d(9p)，构建产物放到 Linux 原生盘
+export CARGO_TARGET_DIR=$HOME/.cache/pie-target      # 源码在 /mnt/d(9p)，构建产物放到 Linux 原生盘
 cargo build
 cargo test
 cargo run -- --models
 cargo run -- "用 shell 跑 date，把结果写进 /tmp/x.txt 再 read 验证"
-cargo run -- -s demo "记住：我在改 pie-rs"      # 新建/载入会话，跑完落盘
+cargo run -- -s demo "记住：我在改 pie"      # 新建/载入会话，跑完落盘
 cargo run -- -s demo "接着上面那件事"          # 载入同一会话继续（历史可恢复）
 cargo run -- -r "最近那条会话继续"               # 恢复最近的（同工作目录优先）
 cargo run -- --tools read,ls,grep "看看目录"      # 限制工具：read + 只允许 ls/grep 的 shell
@@ -167,7 +167,7 @@ TUI 按键：`Enter` 发送、`Shift+Enter`/`Ctrl+J` 换行（输入框是多行
 不开的话终端不会用 `\x1b[200~` 包住粘贴内容，多行文本会被拆成一个个按键（换行 = 回车）→ 在第一行就发出去。
 
 状态栏（最下方那一行）**左边**是常驻信息堆在一起的 `<模型> · <思考深度> · <目录> │ 上下文用量 │ 余额`
-（不带 `pie-rs` 前缀；窗口窄就从右往左截名字，`/thinking` 改了立刻变）；**右边**只有**活动指示**
+（不带 `pie` 前缀；窗口窄就从右往左截名字，`/thinking` 改了立刻变）；**右边**只有**活动指示**
 （转圈 + 计时）贴屏幕右边缘——它一直变，单独占一位，不会把左边的用量/余额推来推去。
 余额来自 `GET /user/balance`（启动时查一次、每回合结束后自动刷新，`/balance` 看明细）；
 拿不到（非 DeepSeek 端点没这个接口）就不显示这一块，也不会每回合白试。
@@ -184,7 +184,7 @@ TUI 按键：`Enter` 发送、`Shift+Enter`/`Ctrl+J` 换行（输入框是多行
 规划稿（含「为什么这样设计」与不要踩的坑）见 [`docs/python-bindings.md`](docs/python-bindings.md)。
 
 ```bash
-cd pie-rs/bindings/pie-py
+cd pie/bindings/pie-py
 export PATH="$HOME/.cargo/bin:$PATH"                       # maturin 要调 cargo
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python maturin pytest
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop          # 构建 + 装进 .venv（editable）

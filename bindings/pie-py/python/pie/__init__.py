@@ -1,4 +1,4 @@
-"""pie —— pie-rs（Rust 版 agent harness）的 Python 绑定。
+"""pie —— pie（Rust 版 agent harness）的 Python 绑定。
 
 与纯 Python 的 ``pie`` 包**并存**：那个是 Textual TUI 那套，这个是核心层（config / llm /
 tools / session / context）的原生扩展，两边共用同一份 ``~/.pie/``（配置文件、会话 JSONL、

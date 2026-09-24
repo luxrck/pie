@@ -2,12 +2,12 @@
 name = "pie-py"
 version = "0.1.0"
 edition = "2021"
-description = "pie-rs 的 Python 绑定（PyO3）：把 agent harness 暴露给 Python"
+description = "pie 的 Python 绑定（PyO3）：把 agent harness 暴露给 Python"
 license = "MIT"
 publish = false
 
-# 自己的 workspace root：它被父级 `pie-rs/Cargo.toml` 的 `exclude` 排除在外，
-# 免得 `cargo test` 在 pie-rs 里连带去建这个 cdylib（那要 Python 环境）。
+# 自己的 workspace root：它被父级 `pie/Cargo.toml` 的 `exclude` 排除在外，
+# 免得 `cargo test` 在 pie 里连带去建这个 cdylib（那要 Python 环境）。
 [workspace]
 
 [lib]
@@ -23,7 +23,7 @@ asyncio = ["dep:pyo3-async-runtimes"]
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 # 核心库：**default-features = false** → 不把 TUI（ratatui / crossterm / arboard…）编进来。
-pie-rs = { path = "../..", default-features = false }
+pie = { path = "../..", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
 # M5：`future_into_py` 把 tokio future 变成 Python 侧可 await 的对象（配 pyo3 0.29）。
 # 0.29 的 feature 叫 `tokio-runtime`（= 拉上 tokio 依赖），不是 `tokio`。

@@ -1,17 +1,17 @@
 [package]
-name = "pie-rs"
+name = "pie"
 version = "0.1.0"
 edition = "2021"
 description = "pie 的 Rust 重构：极简 agent harness（YOLO，内置 read/edit/write/shell）"
 license = "MIT"
 
 [workspace]
-# `bindings/` 是 Python 绑定（自己的 workspace）：它要 `pie-rs` 的 **lib**（`default-features = false`），
+# `bindings/` 是 Python 绑定（自己的 workspace）：它要 `pie` 的 **lib**（`default-features = false`），
 # 不能被卷进本 workspace 的“默认成员”里（否则 `cargo test` 会连带去建 cdylib、要 Python 环境）。
 # （上一版 `#[tool]` 属性宏的遗留 `macros/` 已于 2026-09-23 删除。）
 exclude = ["bindings"]
 
-# `pie-rs` 现在同时是 lib（外部 / 绑定用）与 bin（CLI）。
+# `pie` 现在同时是 lib（外部 / 绑定用）与 bin（CLI）。
 # lib 名 `pie`：bin 里 `use pie::…`；绑定侧直接用这个 crate（2026-09-23 由 `pie_rs` 改名）。
 [lib]
 name = "pie"

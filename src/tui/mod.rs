@@ -31,7 +31,7 @@ pub mod theme;
 
 use crate::session::Session;
 
-/// 跑 TUI（`pie-rs` 在 TTY 下不带任务时走这里）。
+/// 跑 TUI（`pie` 在 TTY 下不带任务时走这里）。
 ///
 /// `max_steps` / `stream` 是 CLI 传下来的**按次**执行旋钮，原样转给每次 `Session::aturn`
 /// （见它的文档）；`None` = 默认（不限步数 / 流式）。

@@ -829,7 +829,7 @@ mod tests {
     }
 
     fn pie_dir_tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pie-rs-ctx-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-ctx-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("PIE_DIR", &dir);
@@ -1107,7 +1107,7 @@ mod tests {
         assert!(!collect_context_garbage().contains(&raw));
 
         // 指针指向的文件不存在（如 read 回来的源码里恰好含这种字符串）→ 假指针，不动消息
-        let fake = "[工具输出全文已保存: /tmp/pie-rs-definitely-missing.txt]";
+        let fake = "[工具输出全文已保存: /tmp/pie-definitely-missing.txt]";
         let mut m = Message::tool_result("c2", "bash", fake);
         assert!(mark_tool_spill(&mut m, "bash", fake).is_none());
         assert_eq!(m.compress_level, 0);

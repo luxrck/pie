@@ -4,7 +4,7 @@
 第二次请求给最终答复。这样整条主链（流式解析 → 工具执行 → 事件回传 → 落库）都真的跑了一遍，
 但一个字节都不出网。
 
-跑法：`cd pie-rs/bindings/pie-py && .venv/bin/python -m pytest tests -q`
+跑法：`cd pie/bindings/pie-py && .venv/bin/python -m pytest tests -q`
 """
 
 from __future__ import annotations

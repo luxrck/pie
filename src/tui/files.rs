@@ -360,7 +360,7 @@ mod tests {
 
     /// 临时目录（用例自己用 `name` 错开；跑完不删，`/tmp` 里留着看也方便）。
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pie-rs-files-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-files-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("建临时目录");
         dir
