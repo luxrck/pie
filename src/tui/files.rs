@@ -12,6 +12,10 @@
 //!   - [`Index::matches`]：纯内存匹配（每帧都要算，所以匹配用的字符串都在建索引时预处理好）。
 //!   - [`token`] / [`PathSession`]：认「光标这一段的路径片段」的两种来源——`@` 打头（用户
 //!     显式开局），或目录候选接受后留下来的锚点（`@` 已吃掉，接着往下钻）。都是纯函数，好测。
+//!
+//! 索引之外还有**三档锚点**（[`external`]）：`@..` / `@/` / `@~/` 分别从上级目录 / 根目录 /
+//! 主目录列。索引只覆盖 cwd 子树，列不出它之外的目录 → 这三档走**实时 `read_dir`**（只列一层，
+//! 不做全树模糊），也因此**不依赖索引**——打完就能弹，不必等第一次扫盘回来。
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +24,8 @@ use ignore::WalkBuilder;
 /// 索引条数上限：cwd 万一是巨型目录（比如 `~`），截断总比把内存吃光好。
 pub const MAX_ENTRIES: usize = 20_000;
 
-/// 匹配上限。面板只显示 7 行，但候选是可以 ↓ 一路翻的；200 条足够翻、也不至于每帧白算。
+/// 匹配上限。面板一次只显示一屏（`palette::MAX_SHOWN` 行），但候选是可以 ↓ 一路翻的；
+/// 200 条足够翻、也不至于每帧白算。
 pub const MATCH_LIMIT: usize = 200;
 
 /// 索引里的一条。
@@ -172,18 +177,105 @@ impl Index {
             })
         });
         hits.truncate(limit);
-        hits.into_iter().map(|(_, e)| candidate(e)).collect()
+        hits.into_iter()
+            .map(|(_, e)| candidate(&e.path, e.is_dir))
+            .collect()
     }
 }
 
-/// 候选的（插入文本, 说明）：目录尾部补 `/`（接着往下打的锚点），文件不带说明
-/// （面板里插的就是**相对 cwd 的完整路径**，与 `read` 的入参口径一致）。
-fn candidate(entry: &Entry) -> (String, String) {
-    if entry.is_dir {
-        (format!("{}/", entry.path), "目录".to_string())
+/// 候选的（插入文本, 说明）：目录尾部补 `/`（接着往下打的锚点），文件不带说明。
+///
+/// 插入的就是**能直接给 `read` 用的路径**：索引那套是相对 cwd 的完整路径，
+/// `..` 是 `../…`，`/` 是绝对路径，`~` 已展开成主目录的绝对路径。
+fn candidate(path: &str, is_dir: bool) -> (String, String) {
+    if is_dir {
+        (format!("{path}/"), "目录".to_string())
     } else {
-        (entry.path.clone(), String::new())
+        (path.to_string(), String::new())
     }
+}
+
+// ---------------------------------------------------------------- 索引之外的锚点
+
+/// `@` 补全的候选入口：`..` / `/` / `~/` 三档**实时列目录**（见 [`external`]），其余走 `index`。
+///
+/// `index` 为 `None`（首次 `@` 那次后台扫盘还没回来）时，只有三档锚点有候选。
+/// 三档要列的目录按 `index` 自己的 root 解析（与索引覆盖的范围一致），没索引才退回 `root`。
+pub fn matches(
+    fragment: &str,
+    index: Option<&Index>,
+    root: &Path,
+    limit: usize,
+) -> Vec<(String, String)> {
+    let fragment = fragment.replace('\\', "/");
+    let root = index.map(Index::root).unwrap_or(root);
+    if let Some((dir, prefix, name)) = external(&fragment, root) {
+        return list_dir(&dir, &prefix, &name, limit);
+    }
+    index.map(|i| i.matches(&fragment, limit)).unwrap_or_default()
+}
+
+/// `..` / `/` / `~/` 三档锚点 → `(要列的目录, 插入文本前缀, 名字前缀)`；不是这三档返回 `None`。
+///
+/// 索引只扫 cwd 子树，列不出它之外的目录 → 这三档改成实时 `read_dir`：
+///   - `..` / `../…`：上级目录（插入文本保留相对写法，`read` 按相对路径能开）；
+///   - `/` / `/…`：根目录（本来就是绝对路径）；
+///   - `~` / `~/…`：主目录，**展开成绝对路径**——`read` 不认 `~`。
+pub fn external(fragment: &str, root: &Path) -> Option<(PathBuf, String, String)> {
+    let fragment = fragment.replace('\\', "/");
+    let (dir, name) = split_dir(&fragment);
+    let prefix = anchor_dir(dir)?;
+    // 相对前缀（`../`）按 root 解析；绝对前缀 join 会直接覆盖 root
+    Some((root.join(&prefix), prefix, name.to_lowercase()))
+}
+
+/// 拆出（目录段，**含尾斜杠**）+ 半截名字；整段就是锚点本身（`@..` / `@~`）时补成目录写法。
+fn split_dir(fragment: &str) -> (&str, &str) {
+    if let Some(i) = fragment.rfind('/') {
+        return fragment.split_at(i + 1);
+    }
+    match fragment {
+        ".." => ("../", ""),
+        "~" => ("~/", ""),
+        _ => ("", fragment),
+    }
+}
+
+/// 目录段属于三档锚点吗？是就返回**展开后**的目录段（`~` → 主目录），否则 `None`。
+fn anchor_dir(dir: &str) -> Option<String> {
+    if dir.starts_with('/') || dir.starts_with("../") {
+        return Some(dir.to_string());
+    }
+    let rest = dir.strip_prefix("~/")?;
+    let home = crate::config::home_dir().to_string_lossy().replace('\\', "/");
+    Some(format!("{home}/{rest}"))
+}
+
+/// 实时列**一层**目录（[`external`] 那三档的候选来源）：名字前缀过滤、字典序、取前 `limit` 条。
+///
+/// 点文件 / 点目录一概不收（与索引同口径）；读不了的目录（权限…）给空候选而不是报错。
+/// 不算忽略规则（`.gitignore` 是索引那套的事）——要的就是「如实列出这一层有什么」。
+fn list_dir(dir: &Path, prefix: &str, name: &str, limit: usize) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut hits: Vec<(String, bool)> = Vec::new();
+    for entry in entries.flatten() {
+        let child = entry.file_name().to_string_lossy().into_owned();
+        if child.starts_with('.') || !child.to_lowercase().starts_with(name) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        hits.push((child, is_dir));
+        if hits.len() >= MAX_ENTRIES {
+            break; // 巨型目录：截断总比把内存吃光好（与索引同上限）
+        }
+    }
+    hits.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    hits.truncate(limit);
+    hits.into_iter()
+        .map(|(child, is_dir)| candidate(&format!("{prefix}{child}"), is_dir))
+        .collect()
 }
 
 /// 从「光标所在行 + 行内字符列」里认出光标处的 `@` token：`(替换起点列, 片段)`。
@@ -325,6 +417,133 @@ mod tests {
         );
         assert!(!index.truncated());
         assert_eq!(index.root(), dir.as_path());
+    }
+
+    /// 三档锚点：`..` / `/` / `~/` 解析成（要列的目录, 插入文本前缀, 名字前缀）。
+    ///
+    /// 纯字符串解析——**不碰 env**（`HOME` 是进程级的，改它会把并行跑的用例拖下水），
+    /// 所以主目录那档直接拿 `config::home_dir()` 当期望值。
+    #[test]
+    fn external_anchors_resolve_parent_root_and_home() {
+        let root = Path::new("/tmp/pie-files-anchor/cwd"); // 不用真存在，只看解析
+        let home = crate::config::home_dir().to_string_lossy().replace('\\', "/");
+
+        // `..` / `../…`：相对 root（保留相对写法，`read` 照相对路径能开）
+        assert_eq!(
+            external("..", root),
+            Some((root.join("../"), "../".to_string(), String::new()))
+        );
+        assert_eq!(
+            external("../", root),
+            Some((root.join("../"), "../".to_string(), String::new()))
+        );
+        assert_eq!(
+            external("../../s", root),
+            Some((root.join("../../"), "../../".to_string(), "s".to_string()))
+        );
+        // `/` / `/…`：绝对路径，join 直接覆盖 root
+        assert_eq!(
+            external("/", root),
+            Some((PathBuf::from("/"), "/".to_string(), String::new()))
+        );
+        assert_eq!(
+            external("/usr/Lo", root),
+            Some((PathBuf::from("/usr"), "/usr/".to_string(), "lo".to_string()))
+        );
+        // `~` / `~/…`：展开成主目录（`read` 不认 `~`）
+        assert_eq!(
+            external("~", root),
+            Some((
+                crate::config::home_dir(),
+                format!("{home}/"),
+                String::new()
+            ))
+        );
+        assert_eq!(
+            external("~/Doc", root),
+            Some((
+                crate::config::home_dir(),
+                format!("{home}/"),
+                "doc".to_string()
+            ))
+        );
+        // `~/Doc/`（带斜杠）= 名字输入完了，该列 `~/Doc` 这一层了
+        assert_eq!(
+            external("~/Doc/", root),
+            Some((
+                PathBuf::from(format!("{home}/Doc")),
+                format!("{home}/Doc/"),
+                String::new()
+            ))
+        );
+        // 其余（含空片段）不归这三档 → 走索引
+        assert!(external("src/", root).is_none());
+        assert!(external("app", root).is_none());
+        assert!(external("", root).is_none());
+        assert!(external("./x", root).is_none());
+    }
+
+    /// 三档锚点实时列目录：一层、前缀过滤、点文件不收、目录带 `/`。
+    /// 关键：**没索引也有候选**（不必等 `@` 那次扫盘回来）。
+    #[test]
+    fn external_anchors_list_directories_without_an_index() {
+        let dir = tmp("external");
+        write(&dir, "a.txt", "");
+        write(&dir, "sub/b.txt", "");
+        write(&dir, ".hidden", "");
+        let cwd = dir.join("cwd");
+        fs::create_dir_all(&cwd).expect("建 cwd");
+        write(&dir, "cwd/inner.txt", "");
+
+        let ins = |frag: &str| -> Vec<String> {
+            matches(frag, None, &cwd, MATCH_LIMIT)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        // `@..`：列上级（= dir）的直接子项，字典序、点文件不收
+        assert_eq!(ins(".."), ["../a.txt", "../cwd/", "../sub/"]);
+        assert_eq!(ins("../"), ["../a.txt", "../cwd/", "../sub/"]);
+        // 前缀过滤（大小写不敏感）；目录候选带「目录」说明
+        assert_eq!(ins("../S"), ["../sub/"]);
+        assert_eq!(matches("../s", None, &cwd, MATCH_LIMIT)[0].1, "目录");
+        // 再往下钻：`../cwd/` 列的就是 cwd 自己那一层
+        assert_eq!(ins("../cwd/"), ["../cwd/inner.txt"]);
+        // `@/`：真列根目录——至少能给候选，且都是绝对路径
+        let root_items = matches("/", None, &cwd, MATCH_LIMIT);
+        assert!(!root_items.is_empty(), "根目录不会空");
+        assert!(root_items.iter().all(|(i, _)| i.starts_with('/')), "{root_items:?}");
+        // `@~/`：展开成主目录（不断言有多少条，只断言前缀对）
+        let home_pfx = format!("{}/", crate::config::home_dir().to_string_lossy().replace('\\', "/"));
+        let home_items = matches("~/", None, &cwd, MATCH_LIMIT);
+        assert!(
+            home_items.iter().all(|(i, _)| i.starts_with(&home_pfx)),
+            "{home_items:?}"
+        );
+        // 读不了的目录：空候选，不报错
+        assert!(matches("~/../__pie_nope__/", None, &cwd, MATCH_LIMIT).is_empty());
+        // 三档之外的片段没有索引 = 没候选（这一步本来就该等扫盘）
+        assert!(ins("src").is_empty());
+    }
+
+    /// 普通相对路径仍然走索引（三档锚点不把索引那套挤掉）。
+    #[test]
+    fn index_still_serves_plain_relative_fragments() {
+        let dir = tmp("both");
+        write(&dir, "src/tui/app.rs", "");
+        let index = Index::build(&dir);
+        let ins = |frag: &str| -> Vec<String> {
+            matches(frag, Some(&index), Path::new("/nope"), MATCH_LIMIT)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect()
+        };
+        // 有索引：片段走了索引（root 也用索引自己的 root，与 `/nope` 无关）
+        assert_eq!(ins("src/"), ["src/tui/"]);
+        assert_eq!(ins("app"), ["src/tui/app.rs"]);
+        // 三档锚点就算有索引也走实时列目录（`..` = tmp 的上级）
+        assert!(ins("..").iter().all(|i| i.starts_with("../")), "{:?}", ins(".."));
     }
 
     /// 三种匹配模式：模糊 basename / shell 式目录前缀 / 空片段只列根目录。

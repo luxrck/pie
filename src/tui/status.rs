@@ -1,10 +1,13 @@
 //! 状态栏 / 活动指示：模型、上下文占用、**思考计时**、spinner（渲染在界面**最下方**）。
 //!
+//! 窗口不在前台时整条一起变灰（`focused = false` → “活的”那两档从 accent 降成 muted），
+//! 与输入框上边框 / 光标同一口径（见 [`status_line`] / [`activity_line`]）。
+//!
 //! 状态栏只读 `Snapshot`（App 在回合开始时/结束时抓一份），回合进行中不去抢会话锁。
 
 use std::time::Instant;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use super::history::fmt_duration;
@@ -50,11 +53,15 @@ pub struct Snapshot {
 /// 活动指示文本：`⠹ Thinking… 3.4s`（空闲 → None）。
 ///
 /// 这是纯函数（`now` 由调用方给），方便单测与快照测试。
+///
+/// `focused = false`（终端窗口不在前台）→ 强调色降成 muted（`Palette::style_emphasis`）：整条
+/// 状态栏一起变灰，与输入框上边框 / 光标同一个口径。
 pub fn activity_line(
     palette: &Palette,
     activity: Activity,
     frame: u64,
     now: Instant,
+    focused: bool,
 ) -> Option<Line<'static>> {
     let (label, since) = match activity {
         Activity::Idle => return None,
@@ -64,28 +71,22 @@ pub fn activity_line(
         Activity::Stopping { since } => ("Stopping", since),
         Activity::Streaming { since } => ("Responding", since),
     };
+    let accent = palette.style_emphasis(focused);
     let elapsed = now.saturating_duration_since(since);
     Some(Line::from(vec![
-        Span::styled(
-            format!("{} ", spinner(frame)),
-            Style::default().fg(palette.accent),
-        ),
+        Span::styled(format!("{} ", spinner(frame)), accent),
         Span::styled(label.to_string(), palette.style_muted()),
-        Span::styled(
-            format!("… {}", fmt_duration(elapsed)),
-            Style::default().fg(palette.accent),
-        ),
+        Span::styled(format!("… {}", fmt_duration(elapsed)), accent),
     ]))
 }
 
-/// 状态栏：左边 `pie-rs · <模型> · <目录>`；右边的块（用量 / 活动指示 / 余额）**贴屏幕右边缘**。
-///
-/// `balance` = [`balance_text`] 的产物（拿不到就给 `None`，那一块就不画）。
-/// 状态栏：**左边**是常驻信息 `<模型> · <思考深度> · <目录> │ <上下文用量> │ <余额>`
+/// 状态栏：**左边**是常驻信息 `<模型> <思考深度> · <目录> │ <上下文用量> │ <余额>`
 /// （**不带 `pie-rs` 前缀**——用户点名去掉，省下的列给目录）；**右边**贴屏幕右边缘的只有
 /// **活动指示**（转圈 + 耗时）——它一直变，单独占右边一位，不会把用量/余额推来推去。
 ///
 /// `balance` = [`balance_text`] 的产物（拿不到就给 `None`，那一块就不画）。
+/// `focused = false`（窗口不在前台）→ 名字与活动指示一起降成 muted（与输入框上边框 / 光标同款）；
+/// 用量 / 余额本来就用 muted，不动。
 pub fn status_line(
     palette: &Palette,
     snap: &Snapshot,
@@ -94,6 +95,7 @@ pub fn status_line(
     now: Instant,
     width: u16,
     balance: Option<&str>,
+    focused: bool,
 ) -> Line<'static> {
     // 思考深度为空就不占位（不然会多一个空段落：`deepseek-flash  · /tmp`）
     let effort = snap.reasoning_effort.trim();
@@ -135,7 +137,7 @@ pub fn status_line(
     }
 
     // —— 右侧：只有活动指示（空闲 → 什么也没有）
-    let right = activity_line(palette, activity, frame, now);
+    let right = activity_line(palette, activity, frame, now, focused);
     let right_len = right
         .as_ref()
         .map(|line| line.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
@@ -144,12 +146,12 @@ pub fn status_line(
     // 名字按剩余宽度截尾（右侧块 + 尾部 + 两边空格 + 至少 1 格间隔）
     let name_max = (width as usize).saturating_sub(tail_len + right_len + 3);
     let name_text = trim_to(&name, name_max);
-    let mut spans = vec![Span::styled(
-        format!(" {name_text} "),
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD),
-    )];
+    // 名字是这一行里最「亮」的一档——窗口失焦时它跟活动指示一起变灰（连粗体一起去掉）。
+    let mut name_style = palette.style_emphasis(focused);
+    if focused {
+        name_style = name_style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![Span::styled(format!(" {name_text} "), name_style)];
     spans.extend(tail);
     // 中间填空：把活动指示顶到屏幕右边缘
     let used = name_text.chars().count() + 2 + tail_len;
@@ -258,11 +260,11 @@ mod tests {
         let palette = Palette::mocha();
         let now = Instant::now();
         let since = now - Duration::from_millis(3400);
-        let line = activity_line(&palette, Activity::Thinking { since }, 0, now).unwrap();
+        let line = activity_line(&palette, Activity::Thinking { since }, 0, now, true).unwrap();
         let text = line_text(&line);
         assert!(text.contains("Thinking"), "{text}");
         assert!(text.contains("3.4s"), "{text}");
-        assert!(activity_line(&palette, Activity::Idle, 0, now).is_none());
+        assert!(activity_line(&palette, Activity::Idle, 0, now, true).is_none());
     }
 
     #[test]
@@ -285,6 +287,7 @@ mod tests {
             Instant::now(),
             100,
             None,
+            true,
         ));
         assert!(text.contains("deepseek-flash"), "{text}");
         assert!(
@@ -307,6 +310,7 @@ mod tests {
             Instant::now(),
             100,
             None,
+            true,
         ));
         assert!(
             plain.contains("deepseek-flash · ~/Projects/pie"),
@@ -336,6 +340,7 @@ mod tests {
             Instant::now(),
             40,
             None,
+            true,
         ));
         assert!(text.contains("…"), "{text}");
         assert!(
@@ -379,6 +384,7 @@ mod tests {
             Instant::now(),
             100,
             Some(&text),
+            true,
         ));
         assert!(idle.starts_with(left), "用量/余额都挨着名字：{idle:?}");
         assert_eq!(idle.chars().count(), 100, "整行照旧填满：{idle:?}");
@@ -397,6 +403,7 @@ mod tests {
             Instant::now(),
             100,
             Some(&text),
+            true,
         ));
         assert!(busy.starts_with(left), "左边不动：{busy:?}");
         assert!(busy.ends_with("Waiting… 0.0s"), "活动指示在右边缘：{busy:?}");
@@ -411,6 +418,7 @@ mod tests {
             Instant::now(),
             40,
             Some(&text),
+            true,
         ));
         assert!(narrow.contains('…'), "名字截尾：{narrow:?}");
         assert!(narrow.contains("¥110.00"), "{narrow:?}");
@@ -471,6 +479,66 @@ mod tests {
         assert!(detail.contains("可调用 API：否"), "{detail}");
     }
 
+    /// 窗口失焦 → 状态栏里「亮」的几档（名字 / 转圈 / 耗时）一起降成 muted，与输入框上边框、
+    /// 光标同一口径；用量 / 余额本来就用 muted，不动。**只是颜色变，文本一个字不变**。
+    #[test]
+    fn status_line_dims_when_the_window_loses_focus() {
+        let palette = Palette::mocha();
+        let snap = Snapshot {
+            model: "deepseek-flash".into(),
+            reasoning_effort: "high".into(),
+            cwd: "/tmp".into(),
+            budget: 0, // 不显示用量，省得混进尾部的 muted 分隔符
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let line = |focused: bool| {
+            status_line(
+                &palette,
+                &snap,
+                Activity::Thinking { since: now },
+                0,
+                now,
+                100,
+                None,
+                focused,
+            )
+        };
+        let accent_spans = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .filter(|s| s.style.fg == Some(palette.accent))
+                .count()
+        };
+
+        let on = line(true);
+        assert_eq!(accent_spans(&on), 3, "聚焦：名字 + 转圈 + 耗时：{on:?}");
+        assert!(
+            on.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "聚焦：名字带粗体"
+        );
+
+        let off = line(false);
+        assert_eq!(accent_spans(&off), 0, "失焦：一个 accent 都不剩：{off:?}");
+        assert!(
+            !off.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "失焦：名字不再加粗（变灰就该真的变灰）"
+        );
+        assert_eq!(off.spans[0].style.fg, Some(palette.muted), "名字降成 muted");
+        assert!(
+            off.spans
+                .iter()
+                .all(|s| s.style.fg.is_none() || s.style.fg == Some(palette.muted)),
+            "失焦后整行只有 muted 一档：{off:?}"
+        );
+        assert_eq!(line_text(&on), line_text(&off), "变的是颜色，不是文本");
+
+        // 空闲（右边没活动指示）：失焦时名字一样变灰
+        let idle = status_line(&palette, &snap, Activity::Idle, 0, now, 100, None, false);
+        assert_eq!(accent_spans(&idle), 0, "{idle:?}");
+        assert_eq!(idle.spans[0].style.fg, Some(palette.muted));
+    }
+
     /// `Streaming` 也必须带自己的起点：之前拿 `now` 当 `since` → 一直显示 0.0s。
     #[test]
     fn streaming_counts_from_its_own_start() {
@@ -483,6 +551,7 @@ mod tests {
             },
             0,
             now,
+            true,
         )
         .expect("非空闲就有行");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -508,6 +577,7 @@ mod tests {
             Instant::now(),
             100,
             None,
+            true,
         ));
         assert!(text.contains("0/920,576 (0.0%)"), "{text}");
         assert!(!text.contains("calls"), "{text}");
@@ -526,6 +596,7 @@ mod tests {
             Instant::now(),
             100,
             None,
+            true,
         ));
         assert!(!text.contains("│"), "{text}");
         assert!(!text.contains("calls"), "{text}");

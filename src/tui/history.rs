@@ -16,7 +16,7 @@ use crate::llm::Message;
 use unicode_width::UnicodeWidthChar;
 
 /// 工具正文最多显示多少行（codex 那种紧凑风格；超出的按 §省略）。
-const TOOL_BODY_LINES: usize = 12;
+const TOOL_BODY_LINES: usize = 24;
 
 pub enum Cell {
     /// 用户输入（`› ` 前缀 + 亮色）
@@ -128,9 +128,10 @@ pub fn tool_summary(arguments: &str) -> String {
     one_line(arguments, 180)
 }
 
-/// 工具结果里能不能看出失败（`[exit=N]`；非 shell 工具没有退出码 → 都算成功）。
+/// 工具结果里能不能看出失败（`[exit=…]`；非 shell 工具没有退出码 → 都算成功）。
 ///
-/// 现在 `bash` **只在非 0 时**给这行头，所以「没头 = 成功」；`[exit=0]` 只可能来自旧会话
+/// 现在 `bash` **只在非 0 时**给这行头（一行里带 `exit` / `os` / `shell` 三个字段，2026-09-24 起），
+/// 所以「没头 = 成功」；判据只用到前缀，**不解析退出码**。`[exit=0]` 只可能来自旧会话
 /// （改之前录的）或 Python 版，所以还得认。
 pub fn tool_result_ok(content: &str) -> bool {
     match content.lines().next().unwrap_or("") {
@@ -781,6 +782,9 @@ mod tests {
         assert_eq!(tool_summary("不是 JSON"), "不是 JSON");
         assert!(tool_result_ok("[exit=0]\n\nhi"));
         assert!(!tool_result_ok("[exit=3]\n\nboom"));
+        // 新格式（2026-09-24 起三字段同挤一行）：只看第一行就能判成败
+        assert!(!tool_result_ok("[exit=3, os=linux, shell=bash]\n\nboom"));
+        assert!(!tool_result_ok("[exit=3, os=linux, shell=bash]"));
         assert!(!tool_result_ok("[工具错误] 文件不存在: x"));
         assert!(tool_result_ok("plain text"), "没有退出码就当成功");
         assert_eq!(fmt_duration(Duration::from_millis(63_400)), "1m03s");

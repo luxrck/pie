@@ -10,10 +10,11 @@
 //! 「显示行 → 逻辑行/字符」由 [`Input::hit`] 做（复用与 `desired_height` 同一套折行规则
 //! `WrapMode::Glyph`，并复刻控件的视口滚动偏移）。
 
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, Borders, Widget};
 use ratatui::Frame;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
@@ -48,6 +49,10 @@ pub struct Input {
     rect: Rect,
     /// 复刻控件的视口滚动偏移（复刻规则见 `scroll_top_row`）；命中测试要拿它换算内容行
     scroll_top: u16,
+    /// 上一帧每个**可见内容行**「写到最右的格数」（含行尾的光标格），[`StaleTail`] 用。
+    ///
+    /// 行数 / 尺寸对不上时按「整行都算脏」处理（缺省 = 整行宽度），最坏也只是多刷一帧空白。
+    last_used: Vec<u16>,
 }
 
 impl Default for Input {
@@ -80,6 +85,7 @@ impl Input {
             placeholder_style: Style::default(),
             rect: Rect::default(),
             scroll_top: 0,
+            last_used: Vec::new(),
         }
     }
 
@@ -369,6 +375,38 @@ impl Input {
         Some((line_no, start + offset))
     }
 
+    /// 插入符落在**屏幕的哪一格**（`(列, 行)`）；区域还没布局（宽 / 高为 0）时 `None`。
+    ///
+    /// 只在 [`Self::render`] 之后调（那时 `rect` / `scroll_top` 才是这一帧的值）。用途是
+    /// **把「文本光标在哪」告诉终端**：TUI 的光标块是自己画的，终端光标一直隐藏着，但输入法
+    /// 的候选框不看我们画的那一格——看的是**终端光标单元格**（VS Code 的 xterm 会在光标移动 /
+    /// 输入法起手时把隐藏 textarea 摆到那儿，Windows 就把候选框画在那个 textarea 的插入符上）。
+    /// 不显式摆位置，终端光标就停在上一帧 diff 最后写入的格子上（点一下消息流都会跑偏）。
+    /// 收口在 `App::run`：每帧 `draw` 之后把它交给 `Terminal::set_cursor_position`。
+    pub fn caret_position(&self) -> Option<(u16, u16)> {
+        let inner = self.inner_rect();
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        let rows = self.screen_rows(inner.width as usize);
+        let screen_row = self.cursor_screen_row(&rows);
+        let (line_no, start, _) = *rows.get(screen_row)?;
+        let DataCursor(_, col) = self.area.cursor();
+        // 行内显示列：从这一显示段的起点数到插入符（宽字符占两格）
+        let text = self.area.lines().get(line_no).cloned().unwrap_or_default();
+        let width: usize = text
+            .chars()
+            .skip(start)
+            .take(col.saturating_sub(start))
+            .map(char_width)
+            .sum();
+        let row = (screen_row as u16).saturating_sub(self.scroll_top);
+        Some((
+            (inner.x + width as u16).min(inner.right().saturating_sub(1)),
+            (inner.y + row).min(inner.bottom().saturating_sub(1)),
+        ))
+    }
+
     /// 内容区（`Borders::TOP` 只吃一行）。
     fn inner_rect(&self) -> Rect {
         Rect {
@@ -429,16 +467,23 @@ impl Input {
         *same.last().unwrap_or(&0)
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, palette: &Palette) {
+    /// 光标格的样式 + 上边框的聚焦色都由 [`Palette`] 决定（`style_caret` / `style_emphasis`）。
+    ///
+    /// 控件默认给的是裸 `REVERSED`（不带颜色）→ 颜色会跟着**所在行**的样式跑：空输入时那行是
+    /// placeholder 的 muted，反色后是一块**暗灰**（看着像没光标）；有文本时才借到正文色变亮。
+    /// 所以颜色**不能**交给控件（具体值在 [`Palette`]）：聚焦 = accent 亮块（与选中高亮同款），
+    /// 失焦 = muted 暗块——窗口不在前台时一眼能看出来。
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, palette: &Palette, focused: bool) {
         self.rect = area;
         // **聚焦高亮**：本 TUI 只有输入框一个可聚焦控件（键盘事件全归它），所以「聚焦」
         // 在视觉上就是常亮的 accent 上边框 —— 对齐 Python 版 `#input:focus`（border: accent）。
+        // 窗口**失焦**时降成 muted（见 [`Palette::style_emphasis`]：全界面同一口径，状态栏也用它）。
         // 例外：输入以 `!` 开头时切工具色（Python `#input.shell-mode`）——提醒这条会直接
-        // 当 shell 跑、不进上下文（`App::submit` 认的就是同一个判据）。
-        let border = if self.text().trim_start().starts_with('!') {
+        // 当 shell 跑、不进上下文（`App::submit` 认的就是同一个判据）；失焦时仍按 muted 显示。
+        let border = if focused && self.text().trim_start().starts_with('!') {
             palette.style_tool()
         } else {
-            palette.style_accent()
+            palette.style_emphasis(focused)
         };
         let block = Block::default()
             .borders(Borders::TOP)
@@ -447,21 +492,20 @@ impl Input {
         frame.render_widget(block, area);
         self.area.set_style(palette.style_assistant());
         // 选中高亮：控件默认是 `bg LightBlue`（浅蓝底 + 正文色字，深色终端下糊成一片）→
-        // 与 Python `#input .text-area--selection` 一致：accent 底 + accent_text 字。
+        // 与 Python `#input .text-area--selection` 一致（`Palette::style_selection`）。
         // 选区来源：`Shift+方向键` / `Ctrl+A`，或者**鼠标在输入框里拖**（见 `App::on_mouse`
         // 与 [`Input::hit`]——鼠标捕获开着，终端自己的选择用不了，那层屏幕坐标换算自己算）。
-        self.area.set_selection_style(
-            Style::default()
-                .bg(palette.accent)
-                .fg(palette.accent_text),
-        );
+        self.area.set_selection_style(palette.style_selection());
+        // **光标**：颜色自己给死（`Palette::style_caret`：聚焦 = accent 亮块、失焦 = muted），
+        // **不能**用控件默认的裸 `REVERSED`（理由写在那个方法的 doc 里）。
+        self.area.set_cursor_style(palette.style_caret(focused));
         // 复刻控件的**视口滚动偏移**（`widget.rs::next_scroll_top` 的同一规则）：命中测试
         // 要知道屏幕上这一行对应内容的第几行。控件每帧渲染时按同样的输入更新自己的视口，
         // 两边从 0 开始、用同一条公式，所以一直同步。
+        let rows = self.screen_rows(inner.width as usize);
         if self.area.is_empty() {
             self.scroll_top = 0; // 空输入显示 placeholder 时控件把视口归零
         } else {
-            let rows = self.screen_rows(inner.width as usize);
             let cursor = self.cursor_screen_row(&rows) as u16;
             let height = inner.height.max(1);
             self.scroll_top = if cursor < self.scroll_top {
@@ -473,11 +517,102 @@ impl Input {
             };
         }
         frame.render_widget(&self.area, inner);
+        // 擦掉上一帧留在「已写区间右边」的残影（宽字符后半格 / placeholder 碎片，见 `StaleTail`）。
+        let used = self.used_widths(inner, &rows);
+        frame.render_widget(
+            StaleTail {
+                used: &used,
+                prev: &self.last_used,
+                width: inner.width,
+            },
+            inner,
+        );
+        self.last_used = used;
+    }
+
+    /// 这一帧每个**可见内容行**写了多少格：折行后的文本宽度（宽字符算两格）+ 行尾的光标格。
+    ///
+    /// 空输入时 placeholder 占着第一行，所以那行按整行算——不然它消失（用户开始打字）时，
+    /// 提示里宽字符的后半格没人负责擦。
+    fn used_widths(&self, inner: Rect, rows: &[(usize, usize, usize)]) -> Vec<u16> {
+        let height = inner.height as usize;
+        let caret = self.caret_position();
+        let mut used = Vec::with_capacity(height);
+        for i in 0..height {
+            let mut w = if self.area.is_empty() {
+                if i == 0 {
+                    inner.width
+                } else {
+                    0
+                }
+            } else {
+                match rows.get(self.scroll_top as usize + i) {
+                    Some(&(line_no, start, len)) => self
+                        .area
+                        .lines()
+                        .get(line_no)
+                        .map(|line| {
+                            line.chars()
+                                .skip(start)
+                                .take(len)
+                                .map(char_width)
+                                .sum::<usize>() as u16
+                        })
+                        .unwrap_or(0),
+                    None => 0,
+                }
+            };
+            if let Some((col, row)) = caret {
+                if row == inner.y + i as u16 {
+                    w = w.max(col.saturating_sub(inner.x) + 1);
+                }
+            }
+            used.push(w.min(inner.width));
+        }
+        used
     }
 
     /// 光标放回行尾（提交/清空后）。
     pub fn move_cursor_end(&mut self) {
         self.area.move_cursor(CursorMove::End);
+    }
+}
+
+/// 把输入框里「已经写过的右边」那一段标成**这一帧必须重画**的小控件（只为擦掉宽字符留下的残影）。
+///
+/// 背景：宽字符的**后半格**在 ratatui 里就是个普通空格（`Buffer::set_stringn` 写宽字形时会把
+/// 后面那格 `reset()`），与真空格在 `Cell::eq`（比 symbol/underline_color/skip/fg/bg/modifier/
+/// diff_option）上**完全相等** → 那一格永远进不了 `BufferDiff`。于是只要它以前被写过东西——被删掉的
+/// 汉字右半边、placeholder 里 `⏎`/`⇧` 的碎片、光标 / 选区涂过的底色——就会**永久残留**在终端上
+/// （`BufferDiff` 自带的强制重发只覆盖「前一格有底色或 REVERSED 之类可见修饰」的情形，普通汉字不满足）。
+///
+/// `AlwaysUpdate` 会跳过相等判断、强制把这一格发给终端（ratatui 造它就是给「别人可能盖过同一块区域」
+/// 用的）；而 `Cell::reset()` 只对当帧有效（back buffer 每帧 `reset()`），所以只在「这一行比上一帧短」
+/// 时标一次，其余帧一个字节都不多花。
+///
+/// ⚠ 只标**已写区间之外**：正文里宽字符的后半格绝不能写——真终端上写它会把汉字擦掉半个。
+struct StaleTail<'a> {
+    /// 每显示行「写了多少格」（含行尾的光标格）
+    used: &'a [u16],
+    /// 上一帧同一个位置的值（缺省 / 越界 = 整行都算脏）
+    prev: &'a [u16],
+    /// 整行宽度（`prev` 缺省用）
+    width: u16,
+}
+
+impl Widget for StaleTail<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for (i, &used) in self.used.iter().enumerate() {
+            let y = area.y + i as u16;
+            if y >= area.bottom() {
+                break;
+            }
+            let used = used.min(self.width);
+            let prev = self.prev.get(i).copied().unwrap_or(self.width).min(self.width);
+            for x in (area.x + used)..(area.x + prev).min(area.right()) {
+                buf[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
     }
 }
 
@@ -541,6 +676,89 @@ mod tests {
     }
 
     #[test]
+    fn caret_position_is_the_screen_cell_of_the_insertion_point() {
+        let mut input = Input::new();
+        // 输入框整块：x = 3、y = 10、宽 20、高 3 → 内容区从 (3, 11) 起（只吃一行上边框）
+        input.rect = Rect {
+            x: 3,
+            y: 10,
+            width: 20,
+            height: 3,
+        };
+        assert_eq!(input.caret_position(), Some((3, 11)), "空输入 = 内容区左上角");
+        input.insert("你好，");
+        // 「你好，」占 6 个显示列（CJK 各两格）→ 插入符在第 7 格
+        assert_eq!(input.caret_position(), Some((9, 11)));
+    }
+
+    #[test]
+    fn caret_position_counts_wrapped_rows() {
+        let mut input = Input::new();
+        input.rect = Rect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 4,
+        };
+        input.insert("abcde");
+        // 宽 3 → 软换成 `abc` / `de`：插入符在第 2 显示行、行内第 3 格（内容区从 y = 1 起）
+        assert_eq!(input.caret_position(), Some((2, 2)));
+    }
+
+    /// 删掉宽字符时，它后面那格（终端上会留着汉字右半边 / 光标底色残影）必须被**主动**重画。
+    ///
+    /// 机制：宽字符的后半格在模型里就是个普通空格（`set_stringn` 会 `reset()` 它），与真空格在
+    /// `Cell::eq` 上全等 → `BufferDiff` 永远跳过它。所以 `render` 里用 `StaleTail` 在这一行变短时
+    /// 把「新行尾 .. 旧行尾」那一段标 `AlwaysUpdate`。这里直接比两帧 buffer 的 diff（终端拿到的
+    /// 就是它），顺便钉住「正文里那格不碰」——写它会把汉字擦掉半个。
+    #[test]
+    fn deleting_a_wide_char_repaints_the_stale_cell_behind_it() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let palette = Palette::mocha();
+        let mut input = Input::new();
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("terminal");
+        // 画一帧并把这一帧的 buffer 拿回来（终端下一帧要比的就是它）
+        let draw = |input: &mut Input, terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| input.render(frame, frame.area(), &palette, true))
+                .expect("draw")
+                .buffer
+                .clone()
+        };
+
+        // 帧 1：打「你好」（各占两格，插入符在 x=4）
+        input.insert("你好");
+        let prev = draw(&mut input, &mut terminal);
+        assert_eq!(prev[(0, 1)].symbol(), "你");
+        assert_eq!(prev[(4, 1)].bg, palette.accent, "插入符在 x=4");
+
+        // 帧 2：退格删掉「好」→ 正文变 `你`（x=0..1），插入符在 x=2
+        input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let next = draw(&mut input, &mut terminal);
+        let emitted: Vec<(u16, u16)> = prev.diff_iter(&next).map(|(x, y, _)| (x, y)).collect();
+
+        assert_eq!(next[(2, 1)].bg, palette.accent, "插入符退到 x=2");
+        assert!(
+            emitted.contains(&(3, 1)),
+            "被删汉字的后半格（x=3）必须重画，否则终端上留着它的右半边：{emitted:?}"
+        );
+        assert!(emitted.contains(&(4, 1)), "旧插入符号也要擦：{emitted:?}");
+        // 正文里宽字符的后半格（x=1 是「你」的后半格）**不能**写：写了真终端会把汉字擦掉半个
+        assert!(!emitted.contains(&(1, 1)), "正文里那格不该动：{emitted:?}");
+
+        // 静止的帧一个格子都不该发（否则就是每帧白刷那一段）。
+        // 注：擦完那一帧会有一次「回声」——上一帧 buffer 里那两格带着 `AlwaysUpdate` 标记，
+        // 而 `Cell::eq` 把 `diff_option` 也比 → 下一帧会再发一次；再往后就安静了。
+        let echo = draw(&mut input, &mut terminal);
+        let quiet = draw(&mut input, &mut terminal);
+        let emitted2: Vec<(u16, u16)> = echo.diff_iter(&quiet).map(|(x, y, _)| (x, y)).collect();
+        assert!(emitted2.is_empty(), "静止帧不该再发格子：{emitted2:?}");
+    }
+
+    #[test]
     fn newline_keeps_editing_multiline() {
         let mut input = Input::new();
         input.insert("第一行");
@@ -551,5 +769,63 @@ mod tests {
         // 回车只在提交时用：内容原样带走（多行不丢）
         assert_eq!(input.take(), "第一行\n第二行");
         assert!(input.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scratch {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn map(input: &mut Input, width: u16) -> String {
+        let palette = Palette::mocha();
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &palette, true))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for x in 0..width {
+            let cell = &buf[(x, 1)];
+            out.push(if cell.bg == palette.accent {
+                'A'
+            } else if cell.symbol() == " " || cell.symbol().is_empty() {
+                '.'
+            } else {
+                '#'
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn scratch_selection_over_blanks() {
+        let mut input = Input::new();
+        input.rect = Rect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 3,
+        };
+        // 「你好，明天」+ 一个半角空格 + 4 个全角空格 + 一个半角空格
+        input.set_text("你好，明天 \u{3000}\u{3000}\u{3000}\u{3000} ");
+        println!("1 未选中                  {}", map(&mut input, 24));
+        // 拖选尾部 6 个字符（第 1 内容行 = row 1；列 10 → 22）
+        input.selection_start(10, 1);
+        input.selection_extend(22, 1);
+        println!("2 拖选尾部 6 个字符       {}", map(&mut input, 24));
+        // 松手（pie 的 finish_drag：复制完留着选区）
+        println!("3 take_selection → {:?}", input.take_selection());
+        println!("4 松开后（选区留着）      {}", map(&mut input, 24));
+        // 按一次 Backspace
+        input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        println!("5 Backspace 之后          {}", map(&mut input, 24));
+        println!("   文本 = {:?}", input.text());
+        input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        println!("6 再按一次 Backspace      {}", map(&mut input, 24));
+        println!("   文本 = {:?}", input.text());
     }
 }
