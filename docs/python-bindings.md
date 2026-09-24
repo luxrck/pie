@@ -1,13 +1,14 @@
 # pie-rs：Python 绑定规划（PyO3 / maturin）
 
-> **进度**：M0 ✅（`src/lib.rs` + `tui` feature，118 单测全绿）·M1 ✅（`bindings/pie-py`：
-> `Config`/`LlmClient`/`ToolRegistry`/`Session`/`Cancel` + 事件回调 + 异常层级，10 个 pytest 全绿）
-> ·M2–M5 ⬜。实现时定的东西见 §11。
+> **进度**：M0–M3 + M5 ✅（`import pie` 可用：`Config`/`LlmClient`/`ToolRegistry`/`Session`/`Cancel`
+> /`run()`/`list_sessions()` + 事件回调 + 异常层级 + 类型存根 + `@pie.tool`）。**M4（abi3 wheel 分发）⬜**。
+> 实现时定的东西见 §11。
 >
-> 目标：把 `pie-rs` 的 harness 能力以原生扩展的形式给 Python 程序调用，
-> 与已有的纯 Python 包 `pie`（Textual TUI 那套）**并存**，不是替换它。
+> 目标：把 `pie-rs` 的 harness 能力以原生扩展的形式给 Python 程序调用。包名 `pie`（`import pie`）
+> ——它曾与**旧纯 Python 实现**（`python -m pie`，Textual TUI 那套）同名，但那个实现已于 2026-09-23
+> 删除（历史与差异见 [`python-legacy.md`](python-legacy.md)），本绑定就是它现在的对应物。
 >
-> 相关：`README.md`（迁移进度）、`../MEMORY.md`（决策记录）。
+> 相关：`README.md`（进度与用法）、`../MEMORY.md`（决策记录）、`python-legacy.md`（旧 Python 版历史）。
 
 ---
 
@@ -16,18 +17,18 @@
 ### 目标
 
 - Python 侧能完成「配一个模型 → 建工具集 → 开会话 → 丢一个任务 → 收事件/收答复」的完整闭环，
-  能力对齐纯 Python 版的 `run` / `aturn` / `Session` / `Config` / `ToolRegistry`。
+  能力对齐（已删除的）旧纯 Python 版的 `run` / `aturn` / `Session` / `Config` / `ToolRegistry`。
 - 会话文件、上下文压缩、图片 Files API 这些**跨语言共享**的资产继续共用 `~/.pie/`（两边已同格式）。
-- 用 Python 写自定义工具注册进 harness（对齐 Python 版 `@tool()` 的体验）。
+- 用 Python 写自定义工具注册进 harness（对齐旧 Python 版 `@tool()` 的体验）。
 - 可分发的 wheel（maturin 构建），至少覆盖本机 macOS，其次 Linux / Windows。
 
 ### 非目标
 
 - **TUI 不进绑定**：`src/tui/`（ratatui / crossterm / tui-markdown / arboard）不暴露、不依赖。
   交互界面继续走 `pie-rs` 二进制。
-- 不追求 1:1 覆盖 Python 版 `__all__`（31 项）；先覆盖「跑 agent」这条主链，其余按需补。
-- 不保证与 Python 版**行为逐字一致**——Rust 版已有几处有意差异（不回退内联 base64、shell 超限保留头部、
-  Toast 时长等），绑定继承 Rust 行为，文档需明示（对齐 `README.md` 的「已知差异」一节）。
+- 不追求 1:1 覆盖旧 Python 版 `__all__`（31 项）；先覆盖「跑 agent」这条主链，其余按需补。
+- 不保证与旧 Python 版**行为逐字一致**——Rust 版已有几处有意差异（不回退内联 base64、shell 超限保留头部、
+  Toast 时长等），绑定继承 Rust 行为，文档需明示（完整差异清单见 [`python-legacy.md`](python-legacy.md)）。
 
 ---
 
@@ -42,7 +43,7 @@
 
 另外两个既成事实要利用好：
 
-- `Message` / `Config` 等核心类型**已经全部 serde**（`Serialize + Deserialize`，字段名与 Python 版 `to_dict()` 逐字对齐）
+- `Message` / `Config` 等核心类型**已经全部 serde**（`Serialize + Deserialize`，字段名与旧 Python 版 `to_dict()` 逐字对齐）
   → 跨语言桥接优先走 JSON/dict，不必写逐字段转换。
 - `Session::aturn(&mut self, input, on_event: &mut (dyn FnMut(TurnEvent) + Send), cancel: &Cancel)` 的形状
   天然适合「事件推 channel + 主线程分发」的绑定方式（见 §5.3）。
@@ -115,10 +116,10 @@ tools.register(fetch)                 # 或 tools.register(name="x", schema={...
 |---|---|---|
 | `Session` / `Config` / `LlmClient` / `ToolRegistry` / `Cancel` | `#[pyclass]`（有方法、有身份） | 需要持有状态 |
 | `Message` | **dict**（`serde_json` → Python；可选 `pythonize` crate 零样板） | 字段多、含压缩元数据，逐字段 pyclass 维护成本高 |
-| `TurnEvent` | dict（`{"type": "tool_call", "name": …, "arguments": …}`） | 与 Python 版 `on_event` 的 dict 形状**一致**，两边代码可移植 |
+| `TurnEvent` | dict（`{"type": "tool_call", "name": …, "arguments": …}`） | 与旧 Python 版 `on_event` 的 dict 形状**一致**，两边代码可移植 |
 | `Usage` / `CompactStats` | dict | 同上 |
 | `Config` 的字段 | `to_dict()` / `update(dict)` + 少量 `#[getter]`/`#[setter]`（model / base_url / reasoning_effort / context_window / reserved_tokens / compaction / tools / tui） | 全字段属性太脆（Rust 结构体会变）；常用项给属性，其余走 dict |
-| 每回合的执行旋钮 | `aturn(input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None)`（**形参**，不在 Config 里） | 同纯 Python 版 `loop.aturn`；`max_steps=None` = 不限，`stream=None` = 默认流式，`parallel_tools=None` = 跟随 `Config.parallel_tools` |
+| 每回合的执行旋钮 | `aturn(input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None)`（**形参**，不在 Config 里） | 同旧纯 Python 版 `loop.aturn`；`max_steps=None` = 不限，`stream=None` = 默认流式，`parallel_tools=None` = 跟随 `Config.parallel_tools` |
 
 配套 `py.typed` + `pie/_pie_rs.pyi` 类型存根，把 dict 写成 `TypedDict`。
 
@@ -260,7 +261,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 - 调用：`Python::attach` → 把 args（JSON → Python dict）传进去 → 结果 `str` 直接用 / `dict` 序列化成 JSON /
   其它类型 `str()`；Python 异常 → `ToolError(格式化文本)`（工具失败本来就文本化回传，不中断回合）。
 - **schema 来源**两选一（先做①）：① 显式给 JSON schema；② `@tool` 装饰器从 `inspect.signature` +
-  类型注解 + docstring 推导（对齐纯 Python 版 `@tool()` 的 `parameters` 推导）。
+  类型注解 + docstring 推导（对齐旧纯 Python 版 `@tool()` 的 `parameters` 推导）。
 - 线程语义要写清：Python 函数在 **tokio worker 线程**上调用（持 GIL），阻塞式 I/O 会占住一个 worker；
   默认多线程 runtime 下可接受，重 I/O 的建议自己 await/线程池。
 
@@ -278,9 +279,9 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 ### 5.7 路径与共享资产
 
 - 继续用 `~/.pie/`（`sessions/` `context/` `files/` `memory.md` `config.toml`），
-  用 `PIE_DIR` / `PIE_CONFIG_FILE` 重定向（与 Python 版、CLI 完全一致）。
-- 这意味着**Python（纯 Python 版）/ pie-rs CLI / 绑定**三方共享同一批会话文件 —— 已经在做的同格式契约，
-  绑定侧只是多一个消费者；回归里要有一条「Rust 写的会话 Python 读得到」（已有先例可扩）。
+  用 `PIE_DIR` / `PIE_CONFIG_FILE` 重定向（与 CLI 完全一致）。
+- 这意味着**旧 Python 版 / pie-rs CLI / 绑定**共享同一批会话文件 —— 已经在做的同格式契约，
+  绑定侧只是多一个消费者；旧版写的会话文件现在仍能读（见 `python-legacy.md`）。
 
 ---
 
@@ -309,7 +310,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | Rust 单测 | 现有的 118 项保持不变（`cargo test`）——M0 的验收就是「一个不挂」 |
 | 绑定单测（不联网） | `pie` 侧 `Config.base_url` 指向**本地假 SSE 服务器**：pytest 里用 `http.server` 回放固定 chunk（tool_calls → 文本 → `[DONE]`）→ 端到端跑 aturn |
 | 工具/事件桥接 | 断言 `TurnEvent` 序列、Python 自定义工具被调用、异常 → `ToolError` 文本 |
-| 契约测试 | 与纯 Python `pie` 包对拍：同一台假服务器、同一任务 → 相同工具调用与文件布局（工具 schema 逐字对拍那条先例，已随 `fixtures/` 于 2026-09-23 移除） |
+| 契约测试 | 与旧纯 Python `pie` 包对拍：同一台假服务器、同一任务 → 相同工具调用与文件布局（**该包已于 2026-09-23 删除，此路不再可行**；工具 schema 逐字对拍那条先例也随 `fixtures/` 移除） |
 | 共享资产 | 「Rust 写会话 → Python 读」/「Python 写 → Rust 读」双向（已有 session 契约测试，扩到绑定） |
 | GIL 行为 | 起两条 Python 线程：一条跑 `aturn`（慢假服务器），另一条 `time.sleep` 计数 → 验证没被冻住 |
 
@@ -341,7 +342,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | 阻塞式 Python 工具占住 tokio worker | 并发下降、看似卡住 | 多线程 runtime + 文档；必要时 `spawn_blocking` |
 | 类型面漂移（Rust 字段改了、Python 没跟上） | 静默错误 | dict-first（JSON 自动同步）+ `.pyi` 由 Rust 测试对拍字段名 |
 | `pie-rs/` 未进 git | 大重构（方案 B）不可回退 | **M0 前先 `git add pie-rs/`** |
-| 与纯 Python 版行为分叉 | 用户预期落差 | 文档明确「有意差异」清单（README 已有），绑定的 docstring 里复述 |
+| 与旧 Python 版行为分叉 | 用户预期落差 | 文档明确「有意差异」清单（现收在 `docs/python-legacy.md`） |
 | PyO3 版本 API 变动（如 `Python::with_gil` → `Python::attach`） | 编译不过 | 动手时以锁定版本的文档为准，别照抄过时示例 |
 | abi3 + free-threading 目标不同 | wheel 矩阵变大 | 先只出 abi3 常规 wheel，3.13t 按需 |
 
@@ -353,7 +354,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 1. **包名 / 模块名**：`pie_rs`（扩展模块 `pie._pie_rs`）？还是叫 `pie.rust` / 别的？
    → 先用了 `pie_rs`，**2026-09-23 用户点名改成 `pie`**（外壳包 `pie/`、扩展模块 `pie._pie_rs`、
-   发行名也改成 `pie`）—— 与纯 Python 版同名，**别装进同一个环境**。
+   发行名也改成 `pie`）—— 曾与旧纯 Python 版同名（那个实现已删除，现无冲突）。
 2. **异步**：同步为主 + M5 补原生 async（推荐，见 §5.2；两者共用同一个内部实现，不冲突），
    还是 M1 就直接上 asyncio（少一轮 API 定形，但前面三周的 bug 面更大）？ → 已按 **同步为主**。
 3. **事件形态**：回调 + 迭代器都给（草案），还是只给回调？ → 已只给 **`on_event` 回调**（迭代器 / `async for` 留给 M5）。
@@ -405,10 +406,10 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 - 回调抛异常：记下来，**让回合跑完**再抛回去（半路撤会把历史写坏）；这条要有用例。
 - `s.stop()`：把当前回合的 `Cancel` 存在 `current: Mutex<Option<Cancel>>` 里供别的线程触发。
 
-### 与 Python 版不一致的地方（照实暴露，不偷偷改）
+### 与旧 Python 版不一致的地方（照实暴露，不偷偷改）
 
 - 核心 **`Config::default()` 里 compaction 是开着的**（`Some(CompactionConfig::default())`）
-  → 绑定的 `cfg.compaction` 布尔属性默认 **True**；Python 版是「不写 `[compaction]` 就不压」。
+  → 绑定的 `cfg.compaction` 布尔属性默认 **True**；旧 Python 版是「不写 `[compaction]` 就不压」。
   绑定照实反映默认值（要一致就让核心默认改 `None`，但那是另一件事）。
 - `CompactStats` **没有实现 Serialize**（核心只在内部用）→ 绑定里手工拼 dict；**加字段要两处都改**。
 - `Config` **没实现 Serialize** → `to_dict()` 要等给核心加上（或手写每个字段），所以 M1 只给了常用属性。
@@ -453,7 +454,7 @@ answer = await task
 - **核心一侧**：`Entry` 的名字改 `String`、调用体换成 `CallFn = Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult>>`
   （内置工具包 `erased::<T>` 的 fn 指针，Python 工具包绑定给的回调）→ **两条路共用同一条分发链**，
   模型看不出区别；`Debug` 手写（`dyn Fn` 不是 Debug）。
-- **schema 在 Python 侧算**（`pie/_tool.py` 的 `tool()` / `_type_to_schema`，与纯 Python 版**逐字同款**）：
+- **schema 在 Python 侧算**（`pie/_tool.py` 的 `tool()` / `_type_to_schema`，与旧纯 Python 版**逐字同款**）：
   实测同一批签名两边产出的 `definition()` **逐字相同**（`str/int/float/bool/list/dict/Optional`；
   下划线参数不进 schema；描述取 `description` → docstring 首行 → 函数名）。
 - **注册口是 `ToolRegistry.register(...)`**（写在 Rust 侧，因为原生类不能从 Python 加方法）：

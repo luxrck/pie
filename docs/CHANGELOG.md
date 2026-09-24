@@ -4,6 +4,92 @@
 
 ## 2026-09-24
 
+- **状态栏也跟着窗口焦点变灰**（用户：把输入框那种 unfocused 变灰的渲染也用到状态栏）：
+  `status::status_line` / `activity_line` 多一个 `focused` 形参（与 `Input::render` 同款），
+  失焦时那两档“活的”颜色从 accent 降成 muted：**名字**（本来 accent + BOLD，失焦连粗体一起去掉）与
+  **活动指示的转圈/耗时**；用量 / 余额本来就用 muted，不动——于是失焦后整条状态栏只剩 muted 一档。
+  测试：`status::status_line_dims_when_the_window_loses_focus`（断 accent span 3 → 0、BOLD 去掉、
+  整行只剩 muted、**文本一字不变**）与 `app::empty_input_caret_and_border_follow_window_focus`
+  扩到三处一起验（真渲染后读 buffer：光标块 / 上边框格 / 状态栏首字的 fg）。
+  - 收尾把那条规则收进色板（用户：「emphasis 是不是应该放到 theme.rs？input 是不是也应该用这个？」）：
+    `theme.rs` 新增 `Palette::style_emphasis(focused)`（accent / muted）、`style_selection()`
+    （accent 底 + accent_text 字）、`style_caret(focused)`（聚焦 = selection、失焦 = muted 底）。
+    于是：状态栏不再有本地 `emphasis`，`input.rs` 的上边框 / 选区 / 光标三处、`App::paint_selection`
+    都改成调色板的方法——**「失焦就 muted」只在色板里写一遍**（视图里再写就会各自跑偏）。
+    新增 `theme::focus_sensitive_styles_live_in_the_palette`（含“不是把 mocha 写死”：换个 flavor 也成立）。
+
+- **`@` 补全支持「索引之外」的三档锚点**（用户：默认只列当前目录，想要 `@..` 上级 / `@/` 根 / `@~/` 主目录）：
+  - 设计：`@` 那套本来是**cwd 索引**（`ignore` 扫一遍，按 `.gitignore` 排除），只管 cwd 子树——列不出它之外的目录；
+    而 `~/…` 那种树根本建不起索引。所以这三档走**实时 `read_dir`**（[`files::external`] + [`files::list_dir`]）：
+    只列一层、名字前缀过滤、字典序、点文件不收（与索引同口径），不算忽略规则。
+  - 插入的文本仍是**能直接给 `read` 用的路径**：`..` → `../…`（相对，保留用户写法）；`/` → 绝对；
+    `~` → **展开成主目录的绝对路径**（`read` 不认 `~`，原样插进去就是坏的）。
+  - 入口收敛成一个自由函数 `files::matches(fragment, index, root, limit)`：先看三档锚点（实时列目录），
+    否则才用索引——所以 `@~/` **不依赖索引**，打完就弹，不必等 `@` 那次后台扫盘回来。
+    连带的：`App::ensure_index` 遇到这三档直接早退（不为它们扫 cwd）——单测里没 runtime 也敢调它
+    （真去 `tokio::spawn` 就会炸），正好当“没扫盘”的证言。
+  - 接受目录后的「路径补全会话」照旧生效，所以 `@../src/` → `../src/tui/` → `../src/tui/app.rs` 能逐层钻。
+  - 测试：`files::external_anchors_resolve_parent_root_and_home`（纯字符串解析，**不改 `HOME`**——进程级 env 会
+    把并行用例拖下水）、`external_anchors_list_directories_without_an_index`（真目录：一层/前缀/点文件/无索引也能列）、
+    `index_still_serves_plain_relative_fragments`、`app::at_completion_handles_parent_and_root_without_an_index`（走完
+    `@..` 列目录 → Tab 接受 → 逐层钻 → 接受文件收场，并验 `ensure_index` 不建索引）。
+  - 顺手：`palette::MAX_SHOWN` 被用户并行改成 12（原 7）后，两个面板用例（样本写死 10 项、断言 `rows.len() == MAX_SHOWN`）
+    就对不上了；改成**样本 = `MAX_SHOWN + 8`、断言不写死数字**（验证过 3 / 7 / 12 / 20 都能过）。`files::MATCH_LIMIT`
+    的注释里那句「面板只显示 7 行」也改成不写数字（免得下次再过期）。
+
+- **文档按「Python 版已删除」的现状重整**（用户：「已经没有之前的 python 版本了，更新下相关文档描述」）：
+  新增 **`docs/python-legacy.md`**——把旧纯 Python 实现那一段收在一处：旧版长什么样（入口 / 工具名 /
+  模块 / Textual TUI / uv 打包）、当年「迁一块对一块」的 oracle 方法（查旧代码 `git show b188058^:src/pie/…`）、
+  **现行实现与旧版的逐条差异**（按工具 / 会话上下文 / 模型 / 图片 / TUI / 提示词分组）、旧格式现在还被认的
+  兼容点、以及旧版有而 Rust 版仍缺/有意不做的特性。
+  - README 的 `## 与 Python 版的已知差异` 整节（131 行）搬进该文件，README 只留一段指针 + 原本的 TODO
+    （另修了绑定节里过时的「M3/M5 未做」）；`AGENTS.md` / `MEMORY.md` / `docs/python-bindings.md` 里
+    「Python 版仍在」的措辞一并改成「旧 Python 版（已删除）」并指向新文件。
+  - **源码里的 `// 对齐 Python 版 …` 注释未动**：那是当前行为的来由（历史注脚），不是需要同步的文档。
+
+- **输入框的宽字符残影**（用户报：打一文字后按退格，输入行右边留蓝色方块 / 半个汉字；`6.png`）：
+  - 机制：**ratatui 的 `BufferDiff` 永远不会重画宽字符的后半格**。`Buffer::set_stringn` 写宽字形时会把后面那格 `reset()`（= 普通空格），而 `Cell::eq` 比 symbol/underline_color/skip/fg/bg/modifier/diff_option → 它与真空格**完全相等** → 那格进不了 diff（`BufferDiff` 自带一处强制重发，但只在「前一格有底色或 REVERSED 之类可见修饰」时触发，普通汉字不满足）。于是那一格只要以前被写过东西——被删汉字的右半边、placeholder 里 `⏎`/`⇧` 的碎片、光标/选区涂过的 accent——就**永久残留**在终端上。实测（抓 App 写出的格子）：退格一次只写了 2 格（新光标 + 旧光标格），被删汉字的后半格一个字都没写；`6.png` 量像素也对上了：cell 13/15/17/19 各一格 accent（4 个宽字符的后半格）+ cell 10-11（光标压在宽字符上的 2 格）。
+  - 修法（`src/tui/input.rs`）：新增小控件 `StaleTail`（实现 `Widget`，直接改 frame 的 buffer；`Frame` 这版没公开 `buffer_mut()`）——每帧算出「这一显示行写了多少格」（折行后的文本宽度 + 行尾光标格），**只在这一行比上一帧短**时把 `[新行尾, 旧行尾)` 标 `CellDiffOption::AlwaysUpdate`（跳过相等判断、强制发一格空白）。两个约束：**只标已写区间之外**（正文里宽字符的后半格绝不能写——真终端上写它会把汉字擦掉半个）；只在变短那帧标（`AlwaysUpdate` 只对当帧有效，back buffer 每帧 `reset()`）。空输入时 placeholder 占着第一行 → 那行按整行算，否则提示消失后它的宽字符碎片没人擦。
+  - 验证：单测 `input::tests::deleting_a_wide_char_repaints_the_stale_cell_behind_it`（拿 `CompletedFrame::buffer` 两帧比 `diff_iter`：x=3 必须发、x=1（正文里的后半格）不能发、静止帧一个格子都不发）；pty 复验（打字 / 连删 5 个汉字 / 折行两行 / 多行 + `←` 压宽字符 / 拖选后删，输入区再无游离 `·` 残影）；顺手量化静止帧开销：空输入 / 打字后 / 删字后都是 ~500 B/s（与改动前同量级，没有每帧白刷）。
+  - 有意保留：**光标压在宽字符上时是 2 格 accent**（控件把光标样式涂在字形那格上，与选区同款）——用户明确说这样很好，不动。
+
+- **bash 失败头三行并成一行**（2026-09-24 用户改的）：`[exit=N]` + `[os=…]` + `[shell=…]` → `[exit=N, os=…, shell=…]`，`tools.rs` 的 `Bash::call` 里那三行 `headers.push` 合一处。
+  - 安全性：所有消费者都只看**第一行**、只问「是不是 `[exit=` 开头且不是 `[exit=0`」——`tui::history::tool_result_ok`、`context`/`session` 的头区处理（按 `\n\n` 切、与头里几行无关）、`mark_tool_spill`（找指针行）都不关心头有几行；成功路径本来就是「没有头」。代价是那行**不再是纯值**：要退出码得按 `exit=` 到逗号 / `]` 切（旧 Python TUI 那种 `text[6:].split("]", 1)[0]` 会拿到 `3, os=linux, shell=bash`——Python 实现已不在仓库，只影响用旧版本读新会话）。
+  - 测试：`tools::tests::fail_header(code)` 成了期望值的单一口径（`os` / `shell` 按常量拼，不写死 linux/bash），`shell_reports_nonzero_exit_code` / `shell_exit_headers_only_on_failure` / `killed_shell_reports_minus_one` 改用 `assert_eq!`（比以前的 `starts_with` 更紧）；三行头时代的旧会话（`[exit=0]\n[os=…]\n…`）照旧被 `tool_result_ok` 认成成功。
+
+- **回合失败不再留「没人应答的提问」+ JSONL 落盘转义控制符**（用户看 `chat-1790218823-466873.jsonl` 时发现：末尾连着两条 user 后面直接是 cancel 占位，另有 `splitlines()` 读者在那条 397KB 的工具输出上解码失败）：
+  - 失败回合：`aturn` 开头就 `push_user`，而 `model_call` 出错是直接 `return Err` → 那条 user 永远没人回答，下次请求的历史里就是连续两条 user（实测 API 收，但语义脏；Python 版同毛病）。现在两处出错退出（首次请求 / file_id 失效后的重试再失败）都先 `push_error_turn` 补一条 `[请求失败] <错误>` 的 assistant 消息再抛 `Err`（前缀常量 `ERROR_TURN_PREFIX`）——调用方照旧拿 `Err`（TUI 的错误行不变），只是历史里 user/assistant 成对；与取消写 `CANCEL_TEXT` 同款。
+  - 控制符：`serde_json` 只转义 C0，工具输出里的裸 C1（U+0084/U+0085/U+0088… 转义序列 dump、二进制预览里很常见）与 U+2028/U+2029 会原样落盘——JSON 合法，但 `str.splitlines()` / `bytes.splitlines()` 那类读者把 U+0085 当换行，**一条消息被劈成两半、整份 JSONL 读不出来**（本次那份文件的第 61 行就中招）。新增 `session::json_line()`（= `serde_json::to_string` + `escape_control_chars`：把 C1 与 U+2028/9 换成 `\uXXXX`，读回来仍是同一字符），session 文件与 `/clear` 的窗口块（`~/.pie/windows/*.jsonl`）都改走它。
+  - 验证：`session::tests::failed_model_call_leaves_an_error_assistant_message`（故意给个 reqwest 解析不了的 `base_url`：失败后历史末尾是 `[请求失败] …` 的 assistant，不再是悬空 user）与 `save_escapes_control_chars_that_break_line_readers`（全文件无裸 C1/U+2028、行数不变、每行仍是合法 JSON、load 回来字符一致）；另拿出事的那份真会话（197 条）跑一遍 load→save：裸 C1 3 处 → 0、`\u0085` 出现 3 次、198 行全部可解析、除「重建 system + cwd + `reasoning_content` 补空串」外逐条一致。
+  - 顺带：**CLI 的会话模式（`-r`/`-s` + 任务）失败也落盘**（`main.rs` 的 `Err(e) => { eprintln!; let _ = session.save(); return 1 }`）。之前这条路径失败就直接 `return 1`，那轮提问连同失败原因一起消失；TUI 本来就是退出时一定 `save()`。实测：拿真会话做副本、故意给死端点跑 `-s … "任务"` → exit 1，且文件里确实多了 `user` + `[请求失败] 连接失败: …`（199 条）；成功路径仍照旧（追加 user+assistant 后 `save()`）。
+
+- **输入法候选框跑到鼠标点击处**（用户报的 bug：输入「你好，」后在消息流里点一下，候选框就不在输入框后面了）：
+  - 根因：**TUI 从不告诉终端「文本光标在哪」**。光标块是自己画的，终端光标一直隐藏、位置停在「上一帧 diff 最后写入的单元格」上；而 IME 的锚点正是**终端光标单元格**——VS Code 的 xterm（`@xterm/xterm` 6.1，藏在 `node_modules.asar`）把隐藏的 `.xterm-helper-textarea` 摆在终端光标处（`_syncTextArea`，在光标移动 / resize / `compositionstart` 时调），Windows 就把候选框画在那个 textarea 的插入符上。点消息流时 `App::paint_selection` 只为高亮重画了**被点的那一格** → 那一格成了 diff 最后写入的位置 → 终端光标跑到点击处 → 候选框跟着跑（输入法起手 `compositionstart` 还会再同步一次，所以它「粘」在那里）。
+  - 修法：`Input::caret_position()`（折行 + 视口滚动偏移都算上，宽字符按显示列）算出插入符的屏幕单元格，`App` 每帧记下（`caret`），`App::run` 在 `terminal.draw()` **之后** `terminal.set_cursor_position(...)` —— 放 draw 后面是因为挪光标的是 diff 本身，我们负责收尾。光标仍然隐藏（`Hide` 是 ratatui 每帧发的）→ 观感零变化；只有**位置**变了，终端据此摆 IME 的锚点。
+  - 验证：单测 `input::caret_position_*`（含软换行那一段）+ `app::caret_follows_the_input_insertion_point`；另用 pty 跑真 TUI：每帧字节流是 `[…]\x1b[?25l\x1b[22;1H`（hide 之后必有一个 CUP），输入 `你好` → `22;5H`、按 ← → `22;3H`，**点击消息流 `(10,5)` 时帧内仍会出现 `\x1b[5;10H`（高亮那一格），但每帧最后一个 CUP 始终是插入符**。
+- **输入框光标 + 上边框改成「聚焦亮、失焦暗」**（用户：空输入时光标是暗的；希望窗口被选中时高亮 → 随后又要求“上边框也同步这样”）：
+  - 根因（光标）：控件的光标样式是**裸 `REVERSED`（不带颜色）** → 颜色跟着**所在行**跑。空输入时那一行是 placeholder（muted + ITALIC）→ 反色后是一块**暗灰**；有文本时那一行是正文色才变亮。即「高亮与否」跟的是“行”，不是“聚焦”。
+  - 修法：光标样式就地写在 `Input::render` 里（`if focused { accent 底 + accent_text 字 } else { muted 底 }`，与选中高亮同款）→ `set_cursor_style`；上边框同理——原先是「恒 accent（`!` 开头工具色）」，现在先判焦点：失焦 → muted（盖过 `!` 的工具色）。
+  - 焦点从哪来：`tui::run` 开 `crossterm::event::EnableFocusChange`（退出时关），`Event::FocusGained/FocusLost` → `App::focused`。初值 `true`：**多数终端根本不发焦点事件**，收不到就当聚焦（否则所有终端都会常暗）。
+  - 验证：单测 `app::empty_input_caret_and_border_follow_window_focus`（渲染后数 accent 底格子 + 读上边框那格的颜色：聚焦 1/accent → 失焦 0/muted → 回前台 1/accent；`!ls` 时边框为工具色、失焦又回 muted），另用 pty 跑真 TUI：启动带 `38;2;137;180;250`（边框）+ `48;2;137;180;250`（光标块）；发 `\x1b[O`（FocusLost）后两者都消失、变成 `48;2;108;112;134`；发 `\x1b[I` 复原。
+  - 注意：终端侧的真实光标一直是隐藏的（ratatui 只在 `set_cursor_position` 后才显示）→ 屏幕上那个“光标”就是这个色块，不是终端自己的闪烁光标。
+
+- **内置色板改用 `catppuccin` crate**（用户：想基于 Catppuccin 官方配色来做）：`cargo add catppuccin`（v2.8，开 `ratatui` feature）→ `src/tui/theme.rs` 里那 11 个大写 RGB 字面量改成从 `catppuccin::PALETTE` 的槽位取。
+  - **行为基本不变**：旧值本来就逐个对得上 Mocha 槽位（accent=blue / user=ok=green / assistant=text / tool=teal / fail=red / cancelled=overlay2 / muted=overlay0 / warn=yellow / code_bg=base）——唯一“新颜色”是 `accent_text`：旧的自造值 `#06121f`（不在 Catppuccin 里）→ **`crust`**（accent 底上的深色文字，取官方最深槽）。
+  - `ratatui` feature 给的是 `impl From<catppuccin::Color> for ratatui_core::style::Color` → `Color::Rgb`；它锁的 ratatui-core 与我们 ratatui 0.30.2 的**同一份 0.1.2**（`cargo tree -i ratatui-core` 只一份）→ 类型直接对得上，**没有**任何额外新增依赖（`cargo tree --no-default-features -i catppuccin` 为空 → 绑定侧不进依赖图）。
+  - 实现形态：没有手写转换助手 —— 字段类型就是 `ratatui::style::Color`，`.into()` 自己就能推出目标类型，所以直接 `m.blue.into()`；“转换从哪来”写在 `from_flavor` 的 doc 里。（最初写过一个 `fn slot()` 转发，用户问「需要吗」→ 删。）
+  - 语义层不变：视图仍只认 `Palette` 的字段名，Catppuccin 槽位名只出现在 `theme.rs`。
+- **另外三个 flavor 一并搬进来**（用户：「再把 catppuccin 的其它几个 theme 也一并搬过来」）：新增 **`Palette::from_flavor(FlavorName)`**（唯一的槽位映射点；四个 flavor 的槽位名一致所以映射共用）+ 四个快捷构造 `mocha` / `macchiato` / `frappe` / `latte`（由深到浅）。
+  - `latte` 是唯一的**浅色**变体；其余三个都是深色。`Default` 仍是 `mocha`。
+  - 测试：`palette_uses_catppuccin_mocha_values`（Mocha 五个槽位的 hex + 默认 + 全真彩）与 `all_four_flavors_are_wired_to_catppuccin`（每个 flavor 的 blue/text 取样 vs 官方 `palette.json`，能同时抓「某个 flavor 没接上」与「四个都指向同一个 flavor」；另断言 latte ≠ mocha、`from_flavor` ∥快捷构造）。
+- **TUI 开始真的读 `Config.theme`**（用户：「tui 开始接入 Config.theme 吧」）：之前这个字段**只写不读**，现在启动时 `Palette::resolve(&session.config.theme)` 定色板。
+  - `Palette::from_name`：认具体 flavor（`mocha` / `macchiato` / `frappe` / `latte`）、Python 那种带族名的 `catppuccin-<flavor>`，以及族名 `catppuccin`；`trim` + `to_lowercase`，重音也容错（`Frappé` / `catppuccin-frappé`）。**族名不带变体 → `mocha`**：没有 OSC 11 背景探测，照 Python 版「探测不到按深色」的习惯；要浅色得写全名 `catppuccin-latte`。
+  - 认不出来：`Palette::resolve` 返回 `(mocha, Some("[theme] 认不出的主题 `x`，按 catppuccin-mocha 显示"))`；**告警文案住在 `theme.rs`**（哪些名字有效只有它知道），App 只负责在 `run()` 装好日志出口后再 `log::warn` —— 不能在 `App::new` 里提：那时已经 raw mode + 交替屏，写 stderr 会砸花屏幕（仓库头条踩坑）。
+  - 视图层零改动：App 只把 `Palette` 从 `Palette::default()` 换成解析结果；其它模块仍只认 `Palette` 的字段名。
+  - **仍缺**：OSC 11 探测（族名/明暗自适应）、`/theme` 运行中热切（色板启动时定下；真要热切还得让 `markdown` 的 `MarkdownCache` 按色板失效重绘）、`--theme` CLI 覆盖。（且**热切不会**改已发的工具结果——它们只是 `Cell`，颜色在渲染时现取。）
+  - 测试：`theme::from_name_accepts_flavor_and_family_spellings`、`theme::resolve_falls_back_to_mocha_and_carries_a_warning`、`app::tests::palette_follows_config_theme`（真建 App：五个名字的 `palette.assistant` 对得上；“dracula” → mocha + 告警，且告警经 `push_notice` 渲染成 `· [theme] …`）。全套 **175 例**（lib 171 + bin 4）全过。
+  - 实现位置：`App::new` 里多一步解析（`palette` 字段 + `theme_warning: Option<String>`）；app 测试辅助重构成 `app_with_rx_for(config)`（原来的 `app_with_rx()` 调它）。
+
 - **TUI 代码块开语法高亮**（用户：选 A）：恢复 `tui-markdown` 的默认特性 `highlight-code`（此前为躲 C 依赖而 `default-features = false`）。fence 代码块交给 syntect 高亮，主题用内置 Base16 Ocean Dark。
   - **代价（实测，有意接受）**：依赖树 584 → 619 节点（+35）；debug 二进制 50.0 → 53.7 MB。syntect 的 oniguruma 后端是**默认特性**（`default-onig` → `onig_sys`，C，靠 `cc` 编译），且 Cargo 特性是**并集**——即使我们自己再写一行 `default-features = false, features = ["default-fancy"]` 也躲不掉。构建只需 `cc`（本机有）。
   - **流式成本**：`MarkdownCache` 按内容失效 → 每个 delta 都整段重渲染（含 syntect）；release 下 300 行代码块 ≈ 8ms/次（短块可忽略）。
