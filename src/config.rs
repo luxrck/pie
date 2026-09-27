@@ -184,6 +184,23 @@ pub fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
     default_config_file()
 }
 
+/// 环境变量覆盖：`OPENAI_API_KEY` → `api_key`。空串视为没设（不覆盖配置文件里的值）。
+pub fn env_api_key() -> Option<String> {
+    non_empty_var("OPENAI_API_KEY")
+}
+
+/// 环境变量覆盖：`OPENAI_BASE_URL` → `base_url`。空串视为没设。
+pub fn env_base_url() -> Option<String> {
+    non_empty_var("OPENAI_BASE_URL")
+}
+
+fn non_empty_var(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
 /// `pie setup` 用：配置文件不存在就写一份默认的（父目录 `~/.pie` 也一起建）。
 ///
 /// 已存在**一律不覆盖**（里面可能有用户自己的 key / 注释），所以可以反复跑。
@@ -368,6 +385,10 @@ impl Default for Config {
 
 impl Config {
     /// 从配置文件加载。文件不存在 → 全默认值（要不要补齐默认件由 CLI 层负责）。
+    ///
+    /// 加载后按环境变量覆盖两项（空串 / 全空白视为没设 → 不动配置文件里的值）：
+    /// `OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`。
+    /// 只改内存、不写回配置文件（`save()` 照旧落盘当前值）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = resolve_config_file(explicit);
         let mut config = if path.exists() {
@@ -378,6 +399,12 @@ impl Config {
         } else {
             Config::default()
         };
+        if let Some(key) = env_api_key() {
+            config.api_key = key;
+        }
+        if let Some(url) = env_base_url() {
+            config.base_url = url;
+        }
         config.config_file = Some(path);
         Ok(config)
     }
@@ -900,8 +927,9 @@ lean = true
         let back = Config::load(Some(&path)).expect("读回默认配置");
         let dflt = Config::default();
         assert_eq!(back.model, dflt.model);
-        assert_eq!(back.base_url, dflt.base_url);
-        assert_eq!(back.api_key, dflt.api_key);
+        // `load` 会被 `OPENAI_*` 环境变量覆盖：预期值也要过同样的门
+        assert_eq!(back.base_url, env_base_url().unwrap_or_else(|| dflt.base_url.clone()));
+        assert_eq!(back.api_key, env_api_key().unwrap_or_else(|| dflt.api_key.clone()));
         assert_eq!(back.reserved_tokens, dflt.reserved_tokens);
         assert_eq!(back.context_window, dflt.context_window);
         assert_eq!(back.tui.lean, dflt.tui.lean);
@@ -912,6 +940,49 @@ lean = true
         assert!(!created, "已存在就不算新建");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \"mine\"\n");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `OPENAI_API_KEY` / `OPENAI_BASE_URL` 覆盖配置里对应的两项；**空串 / 全空白 = 没设**。
+    #[test]
+    fn env_overrides_api_key_and_base_url() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pie-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "base_url = \"https://file.example/\"\napi_key = \"sk-file\"\n",
+        )
+        .unwrap();
+
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        let prev_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        // 设了就用环境变量的值（压过配置文件）
+        std::env::set_var("OPENAI_API_KEY", "sk-env");
+        std::env::set_var("OPENAI_BASE_URL", "https://env.example/v1");
+        let config = Config::load(Some(&path)).expect("load");
+        assert_eq!(config.api_key, "sk-env");
+        assert_eq!(config.base_url, "https://env.example/v1");
+        assert_eq!(config.config_file.as_deref(), Some(path.as_path()));
+
+        // 空串 / 全空白 = 没设 → 保留配置文件里的值
+        std::env::set_var("OPENAI_API_KEY", "");
+        std::env::set_var("OPENAI_BASE_URL", "   ");
+        let config = Config::load(Some(&path)).expect("load");
+        assert_eq!(config.api_key, "sk-file");
+        assert_eq!(config.base_url, "https://file.example/");
+
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prev_url {
+            Some(v) => std::env::set_var("OPENAI_BASE_URL", v),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
