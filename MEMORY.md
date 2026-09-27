@@ -71,7 +71,7 @@
 
 ### 配置 / 提示词 / 记忆
 
-- 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）。默认值只写在各自 `impl Default` 里（不再有 `DEFAULT_*` 常量）；整数字段统一 `usize`；`reserved_tokens` 认不出的字符串按「不发 max_tokens」处理；未知键忽略。`Config.tools`（`[tools.read]` 这种）按下划线私有参数注入，只注入下划线且不覆盖显式传参。
+- 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）。默认值只写在各自 `impl Default` 里（不再有 `DEFAULT_*` 常量）；整数字段统一 `usize`；`reserved_tokens` 认不出的字符串按「不发 max_tokens」处理；未知键忽略。`Config::load` 读完后按环境变量覆盖 `OPENAI_API_KEY` → `api_key` 与 `OPENAI_BASE_URL` → `base_url`（空串/全空白 = 没设；只改内存、不写回文件；`Config::default()` 不受影响）。`Config.tools`（`[tools.read]` 这种）按下划线私有参数注入，只注入下划线且不覆盖显式传参。
 - 提示词分两类：`prompts/system.md` / `prompts/memory.md` 是**编译期 `include_str!`** 的内置正文（**小写文件名**），`SYSTEM.md` / `AGENTS.md` / `MEMORY.md` 是**运行时**从 cwd 往上找的文件（`find_project_root`：含任一提示词文件或 `.git` 的最近祖先）。本仓根没有 `SYSTEM.md` → 实际走内置那份；`AGENTS.md` 与 `MEMORY.md` 会被拼进 system prompt（改它们 = 改 agent 行为）。`ensure_global_memory()` 首跑写 `~/.pie/memory.md` 种子（已存在不覆盖）。
 - **时间只有一个时钟出口**（`config.rs`）：`config::now() -> Duration` 是唯一碰 `SystemTime` 的地方，其余是**纯函数**——`fmt_local`（展示，本地偏移走 `localtime_r`）、`civil`（Hinnant 的 civil_from_days，私有）。**落盘统一 unix 秒数字**（manifest `ts` / `uploaded_at`），显示层才格式化；旧 manifest 里的 ISO `ts` 只被原样打印，不解析。
 
@@ -81,7 +81,8 @@
 - 已落地 M0–M3 + M5：`Config` / `LlmClient` / `ToolRegistry`（含 `@pie.tool` 注册 Python 工具）/ `Session` / `Cancel` / `run()` / `list_sessions()` + 事件回调 + 异常层级 + 类型存根（`mypy --strict` 干净）+ `aturn_async` / `events()`。**M4（abi3 wheel 分发）未做**。
 - 三条约定：同步外观但**释放 GIL**（要并发用 `asyncio.to_thread`）；**一个 Session 同时只跑一个回合**（事件回调里别碰同一个 Session，要停就另线程 `stop()`）；`messages` / 事件都是 dict，字段名与 JSONL 一致。
 - 构建/测试：`maturin develop`（`cargo build` 直接编 cdylib 会报一堆 Python 符号 undefined）+ `pytest tests`（本地假 SSE 端点，不联网；当前 27 例全绿）。asyncio 胶水在 `pie/_async.py`（事件从 tokio 线程经 `call_soon_threadsafe` 入队；`task.cancel()` 后要调 `session.stop()`）。
-- ⚠ 本机 macOS 树里的 `bindings/pie-py/.venv` **是坏的**（`libpython3.12.dylib` 找不到，像是从 WSL 拷来的）→ 要跑绑定的 pytest 得另建 venv：`uv venv --python 3.12 /tmp/pie-py-venv` + `uv pip install --python … maturin pytest` + `VIRTUAL_ENV=… maturin develop`（实测 27 例全绿）。
+- ✅ 本机 `bindings/pie-py/.venv` 已用 uv 重建可用（CPython 3.12 + maturin/pytest，editable 安装）——直接 `.venv/bin/python -m pytest tests -q`（27 例全绿）。重建法：`uv venv --python 3.12 .venv` → `VIRTUAL_ENV=$PWD/.venv uv pip install maturin pytest` → `VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop`。改 Python 外壳（`python/pie/*.py`）即时生效，改 Rust 要重跑 `maturin develop`（默认 debug；要快就 `--release`）。
+- 陈旧残留：`python/pie_rs/`（无 `__init__.py`）是旧 module-name 时期的未跟踪 `.so`，被当 namespace package 收进来，`import pie_rs._pie_rs` 会加载过期二进制——与本包无关，别被它误导。
 
 ## 构建与环境（本机特有）
 

@@ -280,6 +280,8 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 
 - 继续用 `~/.pie/`（`sessions/` `context/` `files/` `memory.md` `config.toml`），
   用 `PIE_DIR` / `PIE_CONFIG_FILE` 重定向（与 CLI 完全一致）。
+- `Config.load()` 与 CLI 同样认 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 两个环境变量（覆盖配置文件里的
+  `api_key` / `base_url`；空串 = 没设）—— 想用 `OPENAI_*` 跑同一个脚本时不用改 TOML。
 - 这意味着**旧 Python 版 / pie CLI / 绑定**共享同一批会话文件 —— 已经在做的同格式契约，
   绑定侧只是多一个消费者；旧版写的会话文件现在仍能读（见 `python-legacy.md`）。
 

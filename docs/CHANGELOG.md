@@ -4,6 +4,11 @@
 
 ## 2026-09-24
 
+- **`Config::load` 认 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 环境变量**（用户：「Config 在加载 config file 的时候如果存在环境变量 OPENAI_API_KEY，Config.api_key 应用环境变量值。同理 … OPENAI_BASE_URL」）：
+  `load()` 读完 TOML（或落回 `Config::default()`）后按环境变量覆盖这两项——空串 / 全空白视为没设（不把配好的值冲掉），只改内存、**不写回配置文件**（`save()` 照旧落盘当前值），`Config::default()` 本身不受影响。新增 `config::env_api_key()` / `env_base_url()`（共用 `non_empty_var`）。
+  测试：`config::tests::env_overrides_api_key_and_base_url`（设了就用、空串/空白回落到文件里的值、`config_file` 不受影响；用例自己存取 `ENV_LOCK` 并恢复环境变量）与既有 `ensure_config_file_*` 改按 `env_*()` 算预期（否则有环境变量时那条会假失败）。
+  验证：起本地假端点，`OPENAI_BASE_URL=http://127.0.0.1:PORT/v1 OPENAI_API_KEY=sk-from-env pie --models` → 服务端看到 `GET /v1/models auth=Bearer sk-from-env`；不设环境变量时看到的是配置文件里的 `sk-from-file`。
+
 - **文档精简（AGENTS.md / README.md / MEMORY.md）**（用户：「简化、聚焦一下 AGENTS.md README.md MEMORY.md，多余的内容可以放到 CHANGELOG 里面」）：三份文件互相重复（TUI / 环境 / 已知限制在 `AGENTS.md` 与 `MEMORY.md` 各写一遍），且把大量属本文件的「历史决策 / 机制解释」也写进了正文。按分工收敛——`AGENTS.md`（会被拼进 system prompt）只留「怎么在本仓库干活」的规则（TUI 聚焦色板 / 宽字符残影 / IME 锚点等机制故事各压成一条规则）；`README.md` 面向人，TODO 只留简短列表；`MEMORY.md` 只保「当前状态」、约定一律指向 `AGENTS.md`。被删的机制细节此前多已在本文件记录，未记录的一并补上：`README.md` 原 TODO 里那大段 `parallel_tools` 实现细节搬到 2026-09-23（见下）。随后按用户「可以不提及之前的 Python 版本了，反正信息已经保存在 docs 里面」再做一轮：去掉三份文件里对**旧 Python 实现**的提及（工具名、会话 JSONL 格式、`[exit=0]` 兼容、TUI 行为等只保留与当前行为相关的规则；两版差异一律只在 `docs/python-legacy.md`）——**Python 绑定**是现役功能，不算旧版本，照留。同一轮又把**源码注释**也同步了（用户：「同步代码」）：`src/` 与 `bindings/` 里那批 `// 对齐 Python 版 …` 之类的**旧版注脚**一并去掉（保留「为什么这么写」的理由）；顺手修掉几处过时注释——`main.rs` 顶部那段「分阶段迁移进度」表（还写着旧工具名 `write`/`shell`、`⬜ TUI`）、`lib.rs` / `tools.rs` 模块头里的 `write`/`shell`、`context.rs` 里「Rust 还没实现 `/clear`」都按现状改写。`bindings/` 里指自身那层纯 Python 助手（`pie/_tool.py`）与「Python 绑定」本身的话照留。
 - **crate 名 `pie-rs` → `pie`**（用户：「我就是要把 pie-rs 改成 pie」）：根 `Cargo.toml` 的
   `package.name` 改成 `pie`（`[lib]` / `[[bin]]` 本来就都叫 `pie`），连带：`bindings/pie-py` 的

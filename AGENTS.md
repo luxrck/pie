@@ -141,6 +141,8 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 
 - 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）；加字段就写进
   `Default`（默认值一处定义，别另开 `DEFAULT_*` 常量）；`Config.tools` 按下划线私有参数注入工具默认值。
+- `Config::load` 之后再按环境变量覆盖两项：`OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`
+  （空串 / 全空白 = 没设，不动配置文件里的值；只改内存、不写回文件）。`Config::default()` 不受影响。
 - 提示词分两类，**别搞混**：`prompts/system.md` / `prompts/memory.md` 是**编译期嵌入**的内置正文
   （小写文件名，`include_str!`），`SYSTEM.md` / `AGENTS.md` / `MEMORY.md` 是**运行时**从 cwd 往上找的文件。
   本仓根没有 `SYSTEM.md` → 走内置那份；而 `AGENTS.md`（本文件）与 `MEMORY.md` 会被拼进 system prompt
