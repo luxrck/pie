@@ -132,9 +132,19 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   静止帧零开销；且**只标已写区间之外**——写正文里那格会把汉字擦掉半个）。
 - **终端光标位置 = 输入法的锚点**：每帧 `App::run` 在 `terminal.draw` **之后** `terminal.set_cursor_position(插入符)`，
   否则 IME 候选框会停在「上一帧 diff 最后写入的那一格」（点一下消息流候选框就会跑过去）。
-- 消息流**自己折行**（`history::layout` → 带逻辑行号的 `Row`）：滚动偏移按折行后的显示行算、复制按源文本切。
+- 消息流**自己折行**（`history::layout` → 带逻辑行号的 `Row`）：折行**只有一份** `history::wrap_segments`（`WRAP_MODE` 一档开关：
+  `WordOrGlyph` 默认 = 词级 UAX#29，英文词不断、中日韩字各自成块；`Glyph` = 逐字硬断），`PREFIX_CELLS` / `char_width` 也在那儿；
+  用户消息按 `width - PREFIX_CELLS` 折 + `› `/`  ` 悬挂缩进（行首装饰记在 `Row::indent`，`slice_text` 复制时跳过）。滚动偏移按折行后的
+  显示行算（`scroll_from_bottom` 两端都夹：0 = 贴底跟随、`max_scroll()` = 贴顶；`render` 里再按当帧夹一次，内容变短也不留旧偏移）。
+- **输入框是普通编辑器**（`input.rs`）：软换行固定 `WrapMode::Glyph`（逐字断，**不跟消息流的档位对齐**）、左边不留 gutter / `› `；
+  边框交控件渲染（`set_block`），内容区（`inner_rect()`）就是渲染时从同一个块里取的那块（记在 `Input::inner`，不再手推边框）；插入符位置问控件 `screen_cursor()`。它的 `screen_rows`
+  是**控件 Glyph 折行的复刻**（鼠标命中 / 框高 / 残影擦除 / 视口滚动复刻用），钉在 `input::screen_rows_matches_the_widget_wrapping`。
+  滚轮**按位置分派**：悬在输入框上且它真能滚（`Input::overflows`）→ 滚输入框，否则滚消息流。
   鼠标捕获为滚轮常开 → 框选/拖选都得自己做，写完剪贴板用长活 `Copier`（每帧新建再 drop 会砸屏 + 复制不生效）。
 - 多行粘贴必须自己 `EnableBracketedPaste`（`ratatui::init()` 不开）。
+- ⚠ `App::render` **每帧全量重排**：`history::layout` 走完全部 cells，再把全部行克隆给 `Paragraph`（唯一缓存是 markdown 渲染）。
+  每个终端事件 / 每个流式 delta / 每 66ms tick 都跑一帧，**没有 dirty 标记**（ratatui 的 diff 只省终端写入）；长会话是已知瓶颈
+  （实测与三条治法、以及「改用终端 scrollback」的取舍见 `docs/CHANGELOG.md` 2026-09-28）→ 别往 `render` 里再加 O(历史) 的活。
 - lean 模式（`[tui] lean`，默认 true）只压工具活动那一行；`/help` 文案由 `palette::COMMANDS` 生成。
 
 ### 配置、提示词、记忆

@@ -12,8 +12,10 @@
 //! 回合事件经 channel 回来 —— 所以界面不阻塞：**思考计时照走、能滚动、能看流式增量**。
 //! 回合中要读会话（`/status` 之类）用 `try_lock`，拿不到就提示「回合进行中」。
 //!
-//! `terminal.draw` 每帧只写**变化的单元格**（ratatui 的双缓冲 diff），
-//! 所以「不断追加增量」不会导致整屏重绘。
+//! `terminal.draw` 每帧只写**变化的单元格**（ratatui 的双缓冲 diff），所以「不断追加增量」不会让
+//! **终端**整屏重绘。但 ⚠ `render` 里 `history::layout` 是**每帧全量重排**（走完全部 cells，再把全部
+//! 行克隆给 `Paragraph`）——事件越密越贵（每个 delta / 每 66ms tick 都一帧），长会话是已知瓶颈，
+//! 治法与实测数据见 `docs/CHANGELOG.md` 2026-09-28 那条「每帧全量重排」。
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -332,8 +334,10 @@ impl App {
     /// **手势分发**：按下定下拖谁（顺便收掉另一个面的选区），拖动、松开都只交给它。
     fn on_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll(-3),
-            MouseEventKind::ScrollDown => self.scroll(3),
+            // 方向按**终端上报的事件名**走：`ScrollUp` → 往**贴底**方向、`ScrollDown` → 往历史更早处。
+            // 事件名跟「画面往哪动」不是一回事（各终端 / 系统设置不一样），别凭名字直觉改反。
+            MouseEventKind::ScrollUp => self.wheel(mouse, -3),
+            MouseEventKind::ScrollDown => self.wheel(mouse, 3),
             // 没按在任何一个面上（底栏 / 空白）就不起选区
             MouseEventKind::Down(MouseButton::Left) => {
                 self.drag = None;
@@ -1091,9 +1095,38 @@ impl App {
         }
     }
 
+    /// 滚轮：指针悬在**输入框**上、且输入框内容真的比框高 → 交给控件滚**输入框自己的视口**；
+    /// 其余情况（在消息流上、或者输入框没什么可滚的）滚消息流（`delta` 的符号口径见 [`Self::scroll`]）。
+    ///
+    /// 写「没什么可滚的就给消息流」是因为光标很容易停在输入框上：那时滚轮应该照旧翻对话，
+    /// 否则输入框会变成一块“死区”。
+    fn wheel(&mut self, mouse: MouseEvent, delta: i32) {
+        if self.surface_at(mouse.column, mouse.row) == Some(Surface::Input) && self.input.overflows() {
+            self.input.wheel(mouse);
+        } else {
+            self.scroll(delta);
+        }
+    }
+
+    /// 滚历史：`delta` 加到 `scroll_from_bottom`（离底行数）上——**正 = 往更早处滚、负 = 往底滚**。
+    /// 两端都夹住：**贴底（0）**与**贴顶**（[`Self::max_scroll`]）——不夹顶的话，滚到最上面后
+    /// 继续往更早处滚只是把状态越加越大（画面被 `offset` 那端的饱和收住了），想往回滚得先把
+    /// 这些「空转」的圈数滚回来。
     fn scroll(&mut self, delta: i32) {
-        let next = self.scroll_from_bottom as i32 + delta;
-        self.scroll_from_bottom = next.max(0) as u16;
+        let max = self.max_scroll() as i32;
+        let next = (self.scroll_from_bottom as i32 + delta).clamp(0, max);
+        self.scroll_from_bottom = next as u16;
+    }
+
+    /// 往上最多能滚多少行（贴底 = 0）：折行后的总显示行数 - 消息流可见高度。
+    ///
+    /// 读的是**上一帧**的排版与区域（`scroll` 在事件处理里跑，那时还没重排）。
+    fn max_scroll(&self) -> u16 {
+        self.layout
+            .rows
+            .len()
+            .saturating_sub(self.body.height as usize)
+            .min(u16::MAX as usize) as u16
     }
 
     fn push_notice(&mut self, text: &str) {
@@ -1175,6 +1208,10 @@ impl App {
         let total = layout.rows.len();
         // 滚动偏移按**显示行**算（`Paragraph::scroll` 跳过的是折行之后的行）
         let bottom = total.saturating_sub(body.height as usize);
+        // 内容变短时把偏移夹回可用范围（不然「往上滚了 N 行」会一直留着，得先滚回来才动）
+        self.scroll_from_bottom = self
+            .scroll_from_bottom
+            .min(bottom.min(u16::MAX as usize) as u16);
         let offset = bottom.saturating_sub(self.scroll_from_bottom as usize);
         // 鼠标框选要知道「屏幕坐标 ↔ 哪条显示行」，记下这一帧的几何信息与排版
         self.scroll_top = offset.min(u16::MAX as usize) as u16;
@@ -2061,7 +2098,8 @@ mod tests {
         app.render_to_string(80, 12); // 先渲染一帧：控件才会记下区域（命中测试用）
         let rect = app.input.rect();
         assert!(rect.height > 0, "渲染后才有区域");
-        let (x, y) = (rect.x, rect.y + 1); // 上边框下面就是第一行内容
+        // 内容区（上边框下面就是第一行内容）
+        let (x, y) = (app.input.inner_rect().x, rect.y + 1);
 
         // 输入框里按下 + 拖到第 5 格 → 选中 "hello"
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
@@ -2093,8 +2131,10 @@ mod tests {
         app.input.insert("第一行\n第二行");
         app.render_to_string(80, 12);
         let rect = app.input.rect();
-        let (x, y) = (rect.x, rect.y + 1);
-        let second = (rect.x, rect.y + 2);
+        // 内容区（上边框下面就是第一行内容）
+        let x = app.input.inner_rect().x;
+        let (x, y) = (x, rect.y + 1);
+        let second = (x, rect.y + 2);
 
         // 点第二行第 2 格：光标跟着走（上下行都能命中）
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), second.0 + 2, second.1));
@@ -2164,9 +2204,109 @@ mod tests {
         let text = app.take_selection_text().expect("拖过内容就有选区");
         assert_eq!(
             text.trim_end(),
-            "› hello world 这是一个很长的句子用来测试折行",
-            "软换行的长行复制回来是一行（字符一个不丢）：{text:?}"
+            "hello world 这是一个很长的句子用来测试折行",
+            "软换行的长行复制回来是一行（行首 `› ` 装饰不进内容、字符一个不丢）：{text:?}"
         );
+    }
+
+    /// 从 buffer 里读一行的文本（按终端读法：宽字符占两格，后半格是个空格 → 跳过）。
+    fn row_text(buf: &ratatui::buffer::Buffer, x: u16, y: u16, width: u16) -> String {
+        let mut out = String::new();
+        let mut col = x;
+        while col < x + width {
+            let symbol = buf[(col, y)].symbol();
+            let w = Line::from(symbol).width().max(1) as u16;
+            out.push_str(symbol);
+            col += w;
+        }
+        out.trim_end().to_string()
+    }
+
+    /// 滚到最上面后继续往更早处滚不该「空转」（用户：滚到最开始之后再往上滚，得先往下滚
+    /// **同样圈数**才真的动起来）。偏移现在两端都夹。
+    ///
+    /// 口径：`scroll_from_bottom` = 离底部的行数（0 = 贴底跟随，越大越靠历史开头）。
+    #[test]
+    fn scrolling_stops_at_the_top_instead_of_banking_extra_ticks() {
+        let mut app = test_app();
+        let long: String = (0..40).map(|i| format!("第 {i} 行\n")).collect();
+        app.cells.push(Cell::User(long));
+        app.render_to_string(60, 12); // 先渲染一帧：`scroll` 靠上一帧的排版算贴顶位置
+        let max = app.max_scroll();
+        assert!(max > 4, "内容得比可视区高：{max}");
+
+        // 一直往历史更早处滚（终端上报的 `ScrollDown`，见 `on_mouse`）：到头就夹住，不越界
+        for _ in 0..(max as usize / 3 + 5) {
+            app.on_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        }
+        assert_eq!(app.scroll_from_bottom, max, "滚到最开始就夹住");
+
+        // 立刻能往回滚（不用先把空转的圈数滚回来）
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+        assert_eq!(app.scroll_from_bottom, max - 3);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(app.scroll_from_bottom, max, "再往更早处还是顶");
+        // PageUp / PageDown 走同一个 `scroll`：往下翻也一样不会低于贴底
+        for _ in 0..(max as usize / 8 + 5) {
+            app.scroll(-8);
+        }
+        assert_eq!(app.scroll_from_bottom, 0, "滚到底就夹住");
+    }
+
+    /// 内容变短（工具行结算、`/clear` 之类）时，旧的偏移也得跟着夹回去——
+    /// 否则会「明明已经在最上面，却还得先往下滚几圈」。
+    #[test]
+    fn shrinking_the_history_clamps_the_scroll_offset() {
+        let mut app = test_app();
+        let long: String = (0..40).map(|i| format!("第 {i} 行\n")).collect();
+        app.cells.push(Cell::User(long));
+        app.render_to_string(60, 12);
+        for _ in 0..20 {
+            app.scroll(3);
+        }
+        assert!(app.scroll_from_bottom > 0, "先得真的滚到更早处了");
+
+        app.cells.clear();
+        app.cells.push(Cell::User("短".into()));
+        app.render_to_string(60, 12);
+        assert_eq!(app.scroll_from_bottom, 0, "内容变短 → 偏移夹回可用范围");
+    }
+
+    /// 滚轮按位置分派：悬在输入框上且**输入框真的能滚** → 滚输入框（不碰消息流）；
+    /// 输入框没什么可滚的（或指针在消息流上）→ 滚消息流。
+    #[test]
+    fn wheel_over_the_input_scrolls_the_input_unless_it_cannot_scroll() {
+        // ① 草稿比框高 → 滚轮给输入框
+        let mut app = test_app();
+        app.cells.push(Cell::User("消息流里的内容".into()));
+        let draft: String = (0..20).map(|i| format!("第 {i} 行\n")).collect();
+        app.input.set_text(draft.trim_end());
+        let buf = render_buffer(&mut app, 40, 24);
+        let inner = app.input.inner_rect();
+        let input_rows = |buf: &ratatui::buffer::Buffer| -> Vec<String> {
+            (0..inner.height)
+                .map(|i| row_text(buf, inner.x, inner.y + i, inner.width))
+                .collect()
+        };
+        let before = input_rows(&buf);
+        let flow_before = app.scroll_from_bottom;
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, inner.x + 1, inner.y));
+        let after = input_rows(&render_buffer(&mut app, 40, 24));
+        assert_ne!(before, after, "滚轮该滚输入框自己的视口");
+        assert_eq!(app.scroll_from_bottom, flow_before, "消息流不该被滚");
+
+        // ② 草稿装得下 → 滚轮照旧给消息流（光标常停在输入框上，不能变成一块死区）
+        let mut app = test_app();
+        let long: String = (0..40).map(|i| format!("第 {i} 行\n")).collect();
+        app.cells.push(Cell::User(long));
+        app.input.set_text("短");
+        app.render_to_string(40, 24);
+        assert!(app.max_scroll() > 4, "消息流得能滚，否则这条用例没意义");
+        app.scroll(3);
+        assert_eq!(app.scroll_from_bottom, 3);
+        let inner = app.input.inner_rect();
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, inner.x + 1, inner.y));
+        assert_eq!(app.scroll_from_bottom, 0, "滚轮该给消息流");
     }
 
     #[test]

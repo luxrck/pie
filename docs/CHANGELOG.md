@@ -2,6 +2,125 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-28
+
+- **判明「每帧全量重排」的底细**（用户连问：`App::render` 何时调用 / 滚轮会不会触发重排 / 能不能用终端自带的 scroll。**本轮不改行为**，只记录决策与数据）：
+  - **触发**：`App::run` 每轮循环开头**无条件** `terminal.draw`，而每轮由三类事件之一唤醒——终端事件（每个按键/鼠标/粘贴/焦点）、
+    回合事件（**每个流式增量** / 工具结果 / 重试进度）、tick（`TICK` ≈ 66ms，15fps）。**没有 dirty 标记**：什么都没改的事件也跑一整帧
+    `render`。ratatui 双缓冲 diff 只省「**终端写入**」，省不掉我们自己的 `render`。
+  - **成本**（`history::layout` 走完**全部** cells + 再把**全部行克隆**成 `Paragraph` 的行；唯一缓存是 markdown 渲染）：release、本机——
+    3.5k 行 → layout 2.5ms / 整帧 4.0ms；5k 行 → 4.1 / 6.5ms；20k 行 → 16.3 / 25.9ms（debug ≈ ×10）。**线性**；光 tick 就够触发（5k 行 ≈ 10% 一个核），
+    流式时每个 delta 一帧（50 tok/s ≈ 1/3 个核，且与按键同一线程）。
+  - **三条可选治法**（收益/复杂度排序）：① 复用 `Layout`（cells / `body.width` / `lean` / 配色没变就不重排——`App` 里本来就存着上一帧的
+    `self.layout`，tick 帧因此零成本）；② 流式只重排**尾部那个 cell**（`Vec<Row>` 追加 + per-cell 行数缓存，`total` 用累计和）；③ 喂 `Paragraph`
+    时只克隆**可见窗口**那几十行。①+③ 约 30～50 行，② 再 50～80 行。⚠ 首次 / 宽度变化仍得全量测一遍（不知道总行数就没法算滚动范围）。
+  - **「把历史交给终端 scrollback」（`pie -r` 时全量打印一次、之后只增量）技术可行**（ratatui 0.30 就有 `Viewport::Inline(h)` +
+    `Terminal::insert_before`，文档明说插进去的行直接进终端 scrollback），**但那是换屏幕模型、不是优化**：① 历史必须「定稿才印」
+    （我们的流有就地更新：助手回答流式增长并重新折行、`⟳`→`✓`、重试块就地改写、`lean`/主题改历史外观）→ 当前回合得留在底部活区；
+    ② 已打印的行是按当时宽度硬折的，resize 后旧行宽不再正确（现在是重排一遍、任何宽度都对）；③ 要放开**鼠标捕获**才能滚终端 scrollback
+    → 失去输入框内鼠标点选/拖选、滚轮按位置分派、自绘框选复制（换回终端原生选择），键盘 PgUp/PgDn 也失效；④ 换来每帧零重排 +
+    **原生 scrollback（退出后还能翻/搜/选）**，稳态性能与 ①②③ 等价。真要动就分两步：先 inline viewport + 定稿才 `insert_before`
+    （**保留**鼠标捕获），再决定要不要放开捕获。
+
+- **输入框回归「普通编辑器」：固定 Glyph、不要 `› `**（用户：「1. 输入框的 WrapModel 固定为 Glyph；2. 输入框其实不需要 ">"，简化一下 input 的代码吧」）：
+  **推翻的是上一条的「输入框所见 = 发送后所得」那层对齐**——不再值得为一个预览去维护「两边同档 + 同宽 + 逐字对拍」。
+  - `input.rs`：`set_wrap_mode(WrapMode::Glyph)` 写死（不再读 `history::WRAP_MODE`，也不再要 `WrapMode::widget()` 映射）；
+    去掉左边 `PREFIX_CELLS` 内边距与 gutter 里的 `› ` 绘制（`available_width` / marker 块 / `Paragraph`/`Span` import 一并删）
+    → 内容区 = 整块扣掉上边框那一行（渲染时从块里取一次记进 `Input::inner`，`inner_rect()` 直接读它）；`screen_rows` 回到**逐字断**的简单实现（只服务
+    鼠标命中 / 框高 / 残影擦除 / 视口滚动复刻，仍由 `screen_rows_matches_the_widget_wrapping` 钒着）；`desired_height` 直接数行数。
+  - `history.rs`：`WrapMode::widget()` 删（不再需要映射）；枚举/`WRAP_MODE`/`wrap_segments` 的文档改成「**消息流**的档位」，
+    `PREFIX_CELLS` 不再是「两边共用」；`wrap_segments` 的「输入框里折在哪，发出去就折在哪」全部删掉（历史里保留 `› ` 悬挂缩进不变）。
+  - `app.rs`：删掉 `the_input_box_previews_how_the_message_wraps_in_the_flow`（不变量没了）；插入符坐标断言回到 `x = 0` 起。
+  - ⚠ 代价（已知并接受）：同一段文字在输入框（逐字断）与消息流（词级断）**折在不同的地方**，宽度也差 `› ` 那 2 格。
+    消息流那边不动：词级 + CJK 友好仍是它的默认（`WRAP_MODE = WordOrGlyph`，修「中文长句第一行很短」靠的是它，跟输入框无关）。
+  - 顺手：上一条验证开关时把 `WRAP_MODE` 留成了 `Glyph`（与文档说的默认不符、测试也看不出来）→ 改回 `WordOrGlyph`。
+
+
+- **输入框把那三处「复刻」交回给控件**（用户：「做一下 1、2、3 吧」——即上一条分析里列的三步）：
+  1. **gutter 走控件的块内边距**：`render` 里 `self.area.set_block(Self::block(border))`（`Borders::TOP` +
+     `Padding::left(PREFIX_CELLS)`），**边框也交给控件画**；我们算几何统一走 `Self::block(Style::default()).inner(rect)`
+     —— 与控件内部同一个 `Block::inner`，不用各自再算一遍边框/内边距（以前是我们手算 `x+2`/`width-2`）。
+  2. **插入符位置不改我们的复刻**：`caret_position()` 改成读控件的 `screen_cursor() -> { row, col }`（它直接
+     给「光标在第几折行、行内第几列」，tab 也算得对）。⚠ 这使它**依赖控件那份屏幕表是当前帧的**（控件只在
+     渲染时按区域重建）→ 只能在 `render` 之后调（doc 已写明；两个用例改成先渲染一帧）。
+  3. **滚轮按位置分派**（补上缺口：以前无论指到哪都滚消息流）：`App::wheel` —— 指针在输入框里且
+     [`Input::overflows`]（内容真的比框高）→ `Input::wheel(mouse)` 转给控件（`MouseScrollUp/Down` → 视口 ±1 行 +
+     把光标收进视口）；否则滚消息流（**不留死区**：光标常停在输入框上，那时滚轮该照旧翻对话）。
+     ⚠ 控件挪的是视口**基础偏移**（每帧重算时以它为 `prev`）→ 复刻的 `scroll_top` 必须跟着一起挪
+     （同一个饱和加减），否则命中/残影擦除会差这么多行 —— `Input::wheel` 里就一并做了。
+  测试：`input::inner_rect_matches_where_the_widget_draws_the_text`（真渲染后对 `inner_rect` / 边框 / 文字起点 /
+  插入符位置）、`input::overflows_only_when_the_text_is_taller_than_the_box`、
+  `app::wheel_over_the_input_scrolls_the_input_unless_it_cannot_scroll`（两种指针位置各验一遍）；
+  两个 `caret_position_*` 用例改成「先渲染一帧再断言」（新口径的代价）。
+
+
+- **折行档位收成一个开关**（用户：「history 能使用 `WrapMode::Glyph` 嘛？目前的代码可以轻松切换不同 WrapMode 嘛」）：
+  能，但**不是 history 单方面的事**——输入框的渲染在控件里、消息流的折行在我们手里，两边档位一分叉就回到
+  「换行不一致」那个 bug。所以档位做成**一处开关**：
+  - `history::WrapMode`（只收两档：`WordOrGlyph` 默认 / `Glyph`）+ `history::WRAP_MODE` 常量：输入框
+    `new_area` 里 `set_wrap_mode(WRAP_MODE.widget())`、`wrap_segments` 也按它折 → **改这一行两边一起换**
+    （与 `ratatui-textarea` 的映射只有 `widget()` 一处）。
+  - 不收的档位与理由（写在枚举 doc 里）：`None`（水平滚动 = 另一套几何：`desired_height` / 命中 /
+    滚动复刻都不成立）、`Word`（超长词不切 → 行超出宽度；输入框那边控件裁掉、消息流的 `Paragraph`
+    会**二次折行** → `Row` ↔ 源文本的映射就错）。
+  - `wrap_segments_with(text, width, mode)` 是带档位的实现，`wrap_segments` 只是「按当前档位」的包一层
+    （唯一生产入口）；它 `pub(crate)` 只为让镜像用例逐档对拍 —— `input::screen_rows_matches_the_widget_wrapping`
+    现在**两档各跑一遍**（同一批文本 × 3 种宽度，拿真控件渲染出来的逐行对拍）。
+  - 验证：把 `WRAP_MODE` 临时改成 `Glyph` → 全套 192+4 全绿（`app::the_input_box_previews_how_the_message_
+    wraps_in_the_flow` 也绿 = 两边真的一起换了），再改回去同样全绿。要加用户可见的开关就把 `WRAP_MODE`
+    换成 `App` 的字段（从 `config.tui` 读，`[tui] lean` 那条路），并把 `mode` 传进 `history::layout`。
+
+- **折行 / 行首宽度收拢到一处**（用户：「history.rs 和 input.rs 关于 word wrap 这块的实现可以合并一下嘛？……`history::PREFIX_CELLS`
+  和 `input::GUTTER` 可以合并嘛？」）：两处的**实现**本来就只有一份（`input::screen_rows` / `desired_height` 直接调
+  `history::wrap_segments`），这次把剩下两样也合并：
+  - `input::GUTTER` 删掉 → 用 `history::PREFIX_CELLS`（转 `pub(crate) const`、类型改 `u16`）；`input::char_width` 删掉 →
+    用 `history::char_width`。于是「用户消息前几格」与「显示宽度尺子」都只有一处定义，`input.rs` 只从 `history.rs` 借
+    （与 `markdown.rs` 借 `wrap_line_into` 同一路数）。
+  - 给 `wrap_segments` 补直接用例 `history::wrap_segments_is_word_level_and_cjk_friendly`（ASCII 词整块 / 中文逐字 /
+    空白块装得下就留在上一行、否则挤到下一行 / 超长词硬断 / 空行 / 宽 0；并对一条长混排文本在宽 1..40 上验「拼回来 =
+    原文、无空段、非硬断不超宽」）。
+  - **合并不了的那一层**（已写在 `wrap_segments` 的 doc 里）：输入框的**渲染**在 `ratatui-textarea` 里（它按
+    `WrapMode::WordOrGlyph` 自己折），而它的 `wrap_word_chunks` 是私有的、也没有「给我屏幕行表」的公开 API
+    （只有 `screen_cursor()` 一个点）——所以我们只能**复刻**它来做几何（命中 / 插入符 / 高度 / 视口滚动复刻）。
+    这份复刻由 `input::screen_rows_matches_the_widget_wrapping`（拿真控件渲染出来的逐行对拍）钉住，分叉就会红。
+
+- **滚轮不会再「空转」**（用户：滚到最开始之后继续往上滚，得先往下滚同样圈数才真的动）：
+  `App::scroll` 原来只夹下界 0（贴底）——`scroll_from_bottom`（离底行数，越大越靠历史开头）滚过顶以后
+  还会一直加：画面上不动（`offset` 那边饱和了）、状态里却在掰圈数，得反着滚回来才见到效果。
+  现在两端都夹：`scroll` 用 `max_scroll()`（折行后的总显示行数 - 消息流可见高度，取上一帧排版）夹住；
+  `render` 里再按当帧的 `bottom` 兜一道（内容变短时把旧偏移夹回去，不然同样会「明明在最上面还得先往下滚几圈」）。
+  测试：`app::scrolling_stops_at_the_top_instead_of_banking_extra_ticks`（按终端上报的方向一路滚到最开始 →
+  夹在 `max_scroll`，立刻往回滚就见效；`PageUp/PageDown` 同路径）、`app::shrinking_the_history_clamps_the_scroll_offset`。
+  顺带把方向约定写在 `on_mouse` 那里：`ScrollUp` → 往**贴底**方向、`ScrollDown` → 往历史**更早**处
+  （事件名跟「画面往哪动」不是一回事，别凭直觉改反）。
+
+- **输入框所见 = 发送后所得（折行终于一致）**（用户：附截图「输出框中的文字换行和输入框的换行不一致」）：
+  两处不同步，叠起来能把同一段的断点错开 20 多格：
+  1. **断行规则**：消息流自己折行（`history`）只认**空白**断点（`soft = 最后一个空格`）——中文长句没有空格 →
+     整段被挪到下一行、上一行留一大片白（截图里第一行到 `YOLO` 就断了，还剩 20 多格用不上）；输入框则是
+     控件自带的 `WrapMode::Glyph`（按显示宽度逐字硬断，英文词会从中间切开）。
+  2. **可用宽度**：消息流里用户消息首行有 `› ` 前缀（吃 2 格），输入框没有它、用满整宽。
+  改法（三处一起抳）：
+  - 折行收敛成**唯一一份** `history::wrap_segments(text, width)` → `(起始字符下标, 字符数)` 列表，**词级、
+    CJK 友好**：分词走 `unicode-segmentation` 的 UAX#29（`split_word_bound_indices`，与
+    `ratatui-textarea` 的 `WrapMode::WordOrGlyph` **同一套**）——ASCII 词整块不切开、中日韩字与全角标点
+    各自成块，只有单块自己就超过整行宽（长 URL / 超长词）才按字硬断。`wrap_line_into`（消息流 +
+    `markdown::fit_tables` 的表格重排）与 `input::screen_rows` / `desired_height` 都调它 → 两边断点逐字一致。
+  - 输入框：`WrapMode::WordOrGlyph`；内容区左边让出 `GUTTER = 2` 格（`inner_rect` 统一扣，命中 / 插入符 /
+    折行 / 视口滚动全走它），并在那 2 格里画 `› `（颜色跟着上边框：聚焦 accent / 失焦 muted / `!cmd` 工具色；
+    视口滚动过头了就不画）——这就是消息流用户消息前缀的位置。
+  - 消息流：用户消息改成**悬挂缩进**——`› `（首个逻辑行）/ `  `（续行与其余逻辑行）落在**每条显示行**上，
+    正文按 `width - 2` 折。新增 `Row::indent`（行首装饰格数）→ `Layout::slice_text` 复制时跳过装饰，
+    于是复制用户消息拿到的是**正文**（那两类前缀都不进剪贴板，也不会多出缩进）。
+  - 顺带：`desired_height` 不再用 `ceil(总宽 / 可用宽)` 估算，改按真折行数算（精确，含空行）；
+    `unicode-segmentation` 走显式声明（已是 `ratatui-widgets` / `unicode-truncate` 的传递依赖，挂在 `tui` feature 下）。
+  测试：`input::wrap_width_keeps_room_for_the_gutter`、`input::screen_rows_matches_the_widget_wrapping`
+  （拿真控件渲染出来的每一行逐行对 `screen_rows`：中文长句 / 英文词 / 超长词 / 短句 × 3 种宽度 —— 它是
+  `wrap_word_chunks` 的复刻，两边一分叉命中与光标就会偏）、
+  `app::the_input_box_previews_how_the_message_wraps_in_the_flow`（同一段文字在消息流与输入框里**逐行逐字**
+  相等，含行首那 2 格）；`history::wrap_never_exceeds_the_width_and_keeps_every_char` 改成用 `slice_text`
+  验「不丢字符」；另更新受影响的插入符 / 高度 / 复制断言（都只差那 2 格）。
+
 ## 2026-09-24
 
 - **`Config::load` 认 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 环境变量**（用户：「Config 在加载 config file 的时候如果存在环境变量 OPENAI_API_KEY，Config.api_key 应用环境变量值。同理 … OPENAI_BASE_URL」）：
