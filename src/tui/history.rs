@@ -13,7 +13,14 @@ use super::theme::{Palette, Status};
 use crate::cancel::CANCEL_TEXT;
 use crate::context;
 use crate::llm::Message;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
+
+/// 用户消息的行首装饰宽度：首行 `› `、续行 `  `（悬挂缩进）。
+///
+/// 消息流按它给用户消息留悬挂缩进（正文折行宽度 = 整宽 - 它），首行画 `› `、续行留空格。
+/// （输入框**不**跟它对齐了：那是个普通编辑器，左边不留 gutter —— 见 `docs/CHANGELOG.md` 2026-09-28。）
+pub(crate) const PREFIX_CELLS: u16 = 2;
 
 /// 工具正文最多显示多少行（codex 那种紧凑风格；超出的按 §省略）。
 const TOOL_BODY_LINES: usize = 24;
@@ -253,6 +260,8 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
 pub struct Row {
     pub line: Line<'static>,
     pub src_line: usize,
+    /// 行首有多少格是**装饰**（用户消息的 `› ` / `  ` 前缀）→ 复制时跳过，不进内容。
+    pub indent: u16,
 }
 
 /// 消息流的排版结果：`rows` 是**已按宽度折好**的显示行。
@@ -284,7 +293,8 @@ impl Layout {
             } else {
                 (0, usize::MAX)
             };
-            let piece = crop_cells(&row_text(row), from, to);
+            // 行首装饰（`› ` / `  `）不是消息内容 → 复制从装饰右边开始切
+            let piece = crop_cells(&row_text(row), from.max(row.indent as usize), to);
             if prev == Some(row.src_line) {
                 out.push_str(&piece);
             } else {
@@ -323,27 +333,136 @@ fn crop_cells(text: &str, from: usize, to: usize) -> String {
     out
 }
 
-/// 字符占几个单元格（控制符算 0，与 ratatui 的渲染口径一致）。
-fn char_width(c: char) -> usize {
+/// 字符占几个单元格（控制符算 0）：ratatui 的渲染口径与输入框控件内部都是这把尺子。
+pub(crate) fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-/// 把一条逻辑行按显示宽度折成显示行，追加到 `out`（`src_line` = 逻辑行号）。
-fn wrap_line(line: &Line<'static>, src_line: usize, width: usize, out: &mut Vec<Row>) {
+/// 把一条逻辑行按显示宽度折成显示行，追加到 `out`（`src_line` = 逻辑行号、`indent` = 行首装饰格数）。
+fn wrap_line(line: &Line<'static>, src_line: usize, indent: u16, width: usize, out: &mut Vec<Row>) {
     for wrapped in wrap_line_into(line, width) {
         out.push(Row {
             line: wrapped,
             src_line,
+            indent,
         });
+    }
+}
+
+/// **消息流**的折行档位（全仓就这一处开关：[`WRAP_MODE`]）。
+///
+/// 只收这两档（共同点：**任何显示行都不超过宽度**）：
+///   - `WordOrGlyph`：词级断行 + 超长词按字硬断（英文词不断、中文逐字）——默认；
+///   - `Glyph`：逐字硬断（英文词也会从中间切开，行填得更满）。
+///
+/// 不收的档位及原因：`None`（不软换行 = 水平滚动：另一套几何）、`Word`（比整行宽的块原样留着
+/// → 行会超出宽度，而消息流的 `Paragraph` 会**二次折行**，`Row` ↔ 源文本的映射就错了）。
+///
+/// ⚠ 输入框**不跟这一档走**：它是普通编辑器，软换行固定 `WrapMode::Glyph`（见 `input.rs`）。
+#[allow(dead_code)] // 生产只构造 `WRAP_MODE` 那一档；另一档留着「换开关」与用例
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WrapMode {
+    Glyph,
+    WordOrGlyph,
+}
+
+/// 消息流的折行档位：**换这一行**即可（`layout` / `wrap_segments` 都按它折）。
+pub(crate) const WRAP_MODE: WrapMode = WrapMode::WordOrGlyph;
+
+/// 按**当前档位**折行：把 `text` 按显示宽度折成若干段，返回每段的 `(起始字符下标, 字符数)`。
+///
+/// 消息流（含 `markdown::fit_tables` 的表格重排）用它；输入框**不共用**（它固定 `Glyph`，自己
+/// 复刻控件那份，见 `input::screen_rows`）。词级档的规则见 [`wrap_segments_with`]。
+pub(crate) fn wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
+    wrap_segments_with(text, width, WRAP_MODE)
+}
+
+/// 按指定档位折行（`pub(crate)` 只为让用例能逐档钉规则；本职调用点一律走 [`wrap_segments`]）。
+///
+/// 词级档（`WordOrGlyph`）的分词走 UAX#29（`split_word_bound_indices`）：ASCII 词整块（不会从
+/// 中间切开）、中日韩字与全角标点各自成块 → 中文长句能逐字折，不会「整段挪到下一行、上一行留
+/// 一大片白」。宽度用 `UnicodeWidthChar`（与 ratatui 内部同一把尺子；制表符计 0，与 `Paragraph`
+/// 的渲染口径一致）。空行也占一行。
+pub(crate) fn wrap_segments_with(text: &str, width: usize, mode: WrapMode) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, 0)]; // 空行也占一行
+    }
+    if mode == WrapMode::Glyph {
+        // 逐字硬断：整行就是一块，直接走硬断那条路
+        let mut out = Vec::new();
+        hard_split(&chars, width, 0, &mut out);
+        return out;
+    }
+    // 分词 → 块：`(起始字符下标, 结束字符下标, 显示宽度)`
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    for (_, chunk) in text.split_word_bound_indices() {
+        let len = chunk.chars().count();
+        chunks.push((at, at + len, chunk.chars().map(char_width).sum()));
+        at += len;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut start = chunks[0].0;
+    let mut end = start;
+    let mut used = 0usize;
+    while i < chunks.len() {
+        let (chunk_start, chunk_end, chunk_width) = chunks[i];
+        if end == start {
+            start = chunk_start;
+        }
+        if used + chunk_width <= width {
+            end = chunk_end;
+            used += chunk_width;
+            i += 1;
+            continue;
+        }
+        if end > start {
+            // 这一行装不下了：断在块边界上（块自己一个字符不切）
+            out.push((start, end - start));
+            start = end;
+            used = 0;
+            continue;
+        }
+        // 单个块自己就比整行宽（超长英文词 / 长 URL）→ 按字硬断
+        hard_split(&chars[chunk_start..chunk_end], width, chunk_start, &mut out);
+        i += 1;
+        start = chunk_end;
+        end = chunk_end;
+        used = 0;
+    }
+    if end > start {
+        out.push((start, end - start));
+    }
+    out
+}
+
+/// 单个块自己就比整行宽：按字硬断（每行至少放一个字符，免得死循环）。
+fn hard_split(chars: &[char], width: usize, base: usize, out: &mut Vec<(usize, usize)>) {
+    let mut start = 0usize;
+    while start < chars.len() {
+        let mut end = start;
+        let mut used = 0usize;
+        while end < chars.len() {
+            let w = char_width(chars[end]);
+            if used + w > width && end > start {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
+        out.push((base + start, end - start));
+        start = end;
     }
 }
 
 /// 把一条逻辑行按显示宽度折成若干条显示行（`markdown::fit_tables` 重排单元格时也用它）。
 ///
-/// 断行策略：优先在**空白之后**断（空白留在上一行行尾，一个字符不丢）；一个词自己就超过
-/// 整行宽时硬断。空行也占一行（消息之间的空行就是这么来的）。
+/// 断行规则见 [`wrap_segments`]（词级、CJK 友好；断点处**不丢字符**，空白块能装下就留在上一行行尾、
+/// 装不下才挤到下一行——表格重排那头会把续行的行首空白剪掉）。空行也占一行（消息之间的空行就是这么来的）。
 pub(crate) fn wrap_line_into(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
     // 逐字符带样式展开：spans 会被折行切开，样式得跟着字符走
     let chars: Vec<(char, Style)> = line
         .spans
@@ -351,32 +470,13 @@ pub(crate) fn wrap_line_into(line: &Line<'static>, width: usize) -> Vec<Line<'st
         .flat_map(|s| s.content.chars().map(|c| (c, s.style)))
         .collect();
     if chars.is_empty() {
-        out.push(Line::default());
-        return out;
+        return vec![Line::default()];
     }
-    let mut start = 0usize;
-    while start < chars.len() {
-        let mut used = 0usize;
-        let mut soft = None; // 本行最后一个可断点（空白之后的下标）
-        let mut full = false; // 是不是「装不下才停的」（装得下就别在空白处断）
-        let mut end = start;
-        while end < chars.len() {
-            let w = char_width(chars[end].0);
-            if used + w > width && end > start {
-                full = true;
-                break; // 放不下了（至少得放一个字符，否则死循环）
-            }
-            used += w;
-            end += 1;
-            if chars[end - 1].0 == ' ' {
-                soft = Some(end);
-            }
-        }
-        let end = if full { soft.unwrap_or(end) } else { end };
-        out.push(rebuild_line(&chars[start..end], line));
-        start = end;
-    }
-    out
+    let text: String = chars.iter().map(|(c, _)| *c).collect();
+    wrap_segments(&text, width)
+        .into_iter()
+        .map(|(start, len)| rebuild_line(&chars[start..start + len], line))
+        .collect()
 }
 
 /// 用一段「字符 + 样式」重建一条 `Line`（相邻同样式合并成一个 span；行级样式照搛）。
@@ -401,33 +501,56 @@ fn rebuild_line(chars: &[(char, Style)], template: &Line<'static>) -> Line<'stat
 /// 执行的命令，输出本身就是要看的东西（`!cmd` 的两个盒子都 `lean=False`）。
 pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> Layout {
     let width = (width as usize).max(1);
-    // `out` 先装**逻辑行**（不折），最后统一折成显示行
-    let mut out: Vec<Line<'static>> = Vec::new();
+    // `out` 先装**逻辑行**（不折），最后统一折成显示行。
+    // 每项 = （逻辑行, 逻辑行号, 行首装饰格数）：同一条逻辑行折出来的显示行**共享**逻辑行号
+    // （复制时同一逻辑行直接拼接、不插换行）；行首装饰（`› `/`  `）复制时跳过。
+    let mut out: Vec<(Line<'static>, usize, u16)> = Vec::new();
+    let mut src = 0usize; // 逻辑行号：每追一条逻辑行自增 1
     for cell in cells.iter_mut() {
         match cell {
             Cell::User(text) => {
+                // `› `（续行 `  `）是**悬挂缩进**：每条显示行都带 → 正文的折行宽度比整宽少 2 格
+                // （就是 `PREFIX_CELLS`）。
+                let body_width = width.saturating_sub(PREFIX_CELLS as usize).max(1);
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "› " } else { "  " };
-                    out.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default()
-                                .fg(palette.accent)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(line.to_string(), palette.style_user()),
-                    ]));
+                    for (k, (start, len)) in wrap_segments(line, body_width).iter().enumerate() {
+                        let mut spans = vec![if k == 0 {
+                            Span::styled(
+                                prefix,
+                                Style::default()
+                                    .fg(palette.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            Span::raw("  ")
+                        }];
+                        spans.push(Span::styled(
+                            line.chars().skip(*start).take(*len).collect::<String>(),
+                            palette.style_user(),
+                        ));
+                        out.push((Line::from(spans), src, PREFIX_CELLS));
+                    }
+                    src += 1;
                 }
             }
             Cell::Assistant { text, md } => {
                 for line in md.get(text, width).lines.iter() {
-                    out.push(line.clone());
+                    out.push((line.clone(), src, 0));
+                    src += 1;
                 }
             }
-            Cell::Thought(d) => out.push(Line::from(Span::styled(
-                format!("• Thought for {}", fmt_duration(*d)),
-                palette.style_faint(),
-            ))),
+            Cell::Thought(d) => {
+                out.push((
+                    Line::from(Span::styled(
+                        format!("• Thought for {}", fmt_duration(*d)),
+                        palette.style_faint(),
+                    )),
+                    src,
+                    0,
+                ));
+                src += 1;
+            }
             Cell::Tool {
                 name,
                 summary,
@@ -436,11 +559,16 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
                 manual,
             } => {
                 let (mark, color) = palette.mark(*status);
-                out.push(Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::styled(name.clone(), palette.style_tool()),
-                    Span::styled(format!("({summary})"), palette.style_muted()),
-                ]));
+                out.push((
+                    Line::from(vec![
+                        Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        Span::styled(name.clone(), palette.style_tool()),
+                        Span::styled(format!("({summary})"), palette.style_muted()),
+                    ]),
+                    src,
+                    0,
+                ));
+                src += 1;
                 if let Some(body) = body {
                     // 简洁模式：成功的工具结果只留一行（正文丢弃）；失败/取消、以及手动 `!cmd`
                     // （用户主动执行）才展示。
@@ -449,16 +577,26 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
                         for line in body.lines().take(TOOL_BODY_LINES) {
                             // 正文块统一缩进两格（不再在首行放 `↳`）
                             let prefix = "  ";
-                            out.push(Line::from(Span::styled(
-                                format!("{prefix}{line}"),
-                                palette.style_muted(),
-                            )));
+                            out.push((
+                                Line::from(Span::styled(
+                                    format!("{prefix}{line}"),
+                                    palette.style_muted(),
+                                )),
+                                src,
+                                0,
+                            ));
+                            src += 1;
                         }
                         if total > TOOL_BODY_LINES {
-                            out.push(Line::from(Span::styled(
-                                format!("    …（已省略 {} 行）", total - TOOL_BODY_LINES),
-                                palette.style_faint(),
-                            )));
+                            out.push((
+                                Line::from(Span::styled(
+                                    format!("    …（已省略 {} 行）", total - TOOL_BODY_LINES),
+                                    palette.style_faint(),
+                                )),
+                                src,
+                                0,
+                            ));
+                            src += 1;
                         }
                     }
                 }
@@ -467,37 +605,53 @@ pub fn layout(cells: &mut [Cell], palette: &Palette, width: u16, lean: bool) -> 
                 // 多行提示（`/help` 文案、`/status` 报告）要真的分行——富文本里的 `\n` 不是换行
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "· " } else { "  " };
-                    out.push(Line::from(Span::styled(
-                        format!("{prefix}{line}"),
-                        palette.style_muted(),
-                    )));
+                    out.push((
+                        Line::from(Span::styled(
+                            format!("{prefix}{line}"),
+                            palette.style_muted(),
+                        )),
+                        src,
+                        0,
+                    ));
+                    src += 1;
                 }
             }
             Cell::Retry { text, .. } => {
                 // 重试进度：单个块，每次重试就地改写（不再一行一条）
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "⟳ " } else { "  " };
-                    out.push(Line::from(Span::styled(
-                        format!("{prefix}{line}"),
-                        palette.style_faint(),
-                    )));
+                    out.push((
+                        Line::from(Span::styled(
+                            format!("{prefix}{line}"),
+                            palette.style_faint(),
+                        )),
+                        src,
+                        0,
+                    ));
+                    src += 1;
                 }
             }
             Cell::Error(text) => {
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "✗ " } else { "  " };
-                    out.push(Line::from(Span::styled(
-                        format!("{prefix}{line}"),
-                        palette.style_error(),
-                    )));
+                    out.push((
+                        Line::from(Span::styled(
+                            format!("{prefix}{line}"),
+                            palette.style_error(),
+                        )),
+                        src,
+                        0,
+                    ));
+                    src += 1;
                 }
             }
         }
-        out.push(Line::default());
+        out.push((Line::default(), src, 0));
+        src += 1;
     }
     let mut rows = Vec::new();
-    for (i, line) in out.iter().enumerate() {
-        wrap_line(line, i, width, &mut rows);
+    for (line, src, indent) in &out {
+        wrap_line(line, *src, *indent, width, &mut rows);
     }
     Layout { rows }
 }
@@ -529,9 +683,82 @@ mod tests {
         layout(cells, &Palette::mocha(), width, false)
     }
 
+    /// [`wrap_segments`] 是**消息流**自己的断行实现（`markdown::fit_tables` 也用它；输入框是普通
+    /// 编辑器、固定 `Glyph`，不共用）→ 这里直接钉它的规则。
+    ///
+    /// 钉的是**各档的语义**（用 `wrap_segments_with`，所以改 `WRAP_MODE` 不会把用例改红）。
+    #[test]
+    fn wrap_segments_is_word_level_and_cjk_friendly() {
+        // 默认那一档（词级 + 超长词硬断）：下面这些断言都是它的
+        let word = |text: &str, width: usize| wrap_segments_with(text, width, WrapMode::WordOrGlyph);
+        // ASCII 词整块不切开（哪怕就差一格）：断点在不下的那个词前面，空白留在上一行行尾
+        assert_eq!(word("alpha beta", 9), vec![(0, 6), (6, 4)]);
+        // 中文逐字可断（旧实现会把整段揬到下一行、上一行留一大片白）
+        assert_eq!(word("中文中文", 4), vec![(0, 2), (2, 2)]);
+        // 中英混排：按块装，块内一个字符不切；空白块**装得下就留在上一行行尾**，否则挤到下一行
+        assert_eq!(
+            word("中文 ab 中文", 6),
+            vec![(0, 3), (3, 4), (7, 1)],
+            "`中文 ` / `ab 中` / `文`"
+        );
+        assert_eq!(
+            word("中文 ab 中文", 4),
+            vec![(0, 2), (2, 4), (6, 2)],
+            "`中文` / ` ab ` / `中文`（空白挤到下一行）"
+        );
+        // 单个块自己就比整行宽（长 URL / 超长词）→ 按字硬断，每行至少一个字符
+        assert_eq!(word("abcdefghij", 4), vec![(0, 4), (4, 4), (8, 2)]);
+        assert_eq!(word("中", 1), vec![(0, 1)], "宽字放不下也得放一个");
+        // 空行也占一行（消息之间的空行就是这么来的）；宽 0 当 1 用
+        assert_eq!(word("", 5), vec![(0, 0)]);
+        assert_eq!(word("ab", 0), vec![(0, 1), (1, 1)]);
+
+        // 另一档的区别（同一条输入）：`Glyph` 逐字硬断——英文词从中间切开
+        assert_eq!(
+            wrap_segments_with("alpha beta", 9, WrapMode::Glyph),
+            vec![(0, 9), (9, 1)],
+            "`alpha bet` / `a`"
+        );
+        // 两档都不让显示行超出宽度（超了消息流的 `Paragraph` 会二次折行 → 错行）
+        let long = "一个超级长的单词withoutanyspacesatall还有中文";
+        for mode in [WrapMode::Glyph, WrapMode::WordOrGlyph] {
+            let widest = wrap_segments_with(long, 12, mode)
+                .iter()
+                .map(|(s, len)| {
+                    long.chars()
+                        .skip(*s)
+                        .take(*len)
+                        .map(char_width)
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(widest <= 12, "{mode:?}：任何显示行都不该超宽（{widest}）");
+        }
+
+        // 不管怎么断，拼起来就是原文（一个字符不丢、不重复）+ 不超宽（`Word` 档那两处例外）
+        let text = "中文混排 english words 一起折行测试 /tmp/一个超级长的单词withoutspaces还有中文";
+        let chars: Vec<char> = text.chars().collect();
+        for mode in [WrapMode::Glyph, WrapMode::WordOrGlyph] {
+            for width in 1..40 {
+                let segs = wrap_segments_with(text, width, mode);
+                let joined: String = segs
+                    .iter()
+                    .flat_map(|(start, len)| chars[*start..start + len].iter())
+                    .collect();
+                assert_eq!(joined, text, "{mode:?} 宽 {width}：折行丢了/重了字符");
+                for (start, len) in &segs {
+                    assert!(*len > 0, "{mode:?} 宽 {width}：不能有空段");
+                    let w: usize = chars[*start..start + len].iter().map(|c| char_width(*c)).sum();
+                    assert!(w <= width.max(2), "{mode:?} 宽 {width}：段超宽（{w}）");
+                }
+            }
+        }
+    }
+
     #[test]
     fn wrap_never_exceeds_the_width_and_keeps_every_char() {
-        // 中英混排 + 超长单词：每一行都不能超宽，且拼起来必须是原文
+        // 中英混排 + 超长单词：每一行都不能超宽，拼回来（跳过行首装饰）必须是原文
         let samples = [
             "alpha beta gamma delta epsilon zeta",
             "中文混排 english words 一起折行的测试",
@@ -544,8 +771,13 @@ mod tests {
             for row in &l.rows {
                 assert!(row.line.width() <= 16, "超宽：{:?}", row_text(row));
             }
-            let joined: String = l.rows.iter().map(row_text).collect();
-            assert_eq!(joined, format!("› {text}"), "折行不能丢字符");
+            // 首行 `› `、续行 `  `（悬挂缩进）：每条显示行都占 2 格装饰
+            assert!(row_text(&l.rows[0]).starts_with("› "));
+            assert!(row_text(&l.rows[1]).starts_with("  "));
+            // 复制（装饰不进内容）= 原文，一个字符不丢
+            let last = l.rows.len() - 1;
+            let joined = l.slice_text(0, 0, last, 15);
+            assert_eq!(joined.trim_end(), text, "折行不能丢字符");
         }
     }
 
@@ -557,7 +789,7 @@ mod tests {
         let last = l.rows.len() - 1;
         // 全选（末尾列给够）：同一条逻辑行折出来的显示行要拼回一行
         let text = l.slice_text(0, 0, last, 19).trim_end().to_string();
-        assert_eq!(text, "› alpha beta gamma delta epsilon");
+        assert_eq!(text, "alpha beta gamma delta epsilon");
         assert!(!text.contains('\n'), "软换行不算换行：{text:?}");
     }
 
@@ -585,8 +817,8 @@ mod tests {
         assert_eq!(l.slice_text(0, 2, 0, 2), "中");
         // 起点落在“中”的右半格（第 3 格）→ 从**下一个**字开始
         assert_eq!(l.slice_text(0, 3, 0, 6), "文测");
-        // 末尾列给大也只会取到行尾
-        assert_eq!(l.slice_text(0, 0, 0, 999), "› 中文测试");
+        // 末尾列给大也只会取到行尾（`› ` 装饰不进内容）
+        assert_eq!(l.slice_text(0, 0, 0, 999), "中文测试");
     }
 
     #[test]

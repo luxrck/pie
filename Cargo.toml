@@ -35,6 +35,7 @@ tui = [
     "dep:tui-markdown",
     "dep:arboard",
     "dep:unicode-width",
+    "dep:unicode-segmentation",
     "dep:ignore",
     "dep:catppuccin",
 ]
@@ -88,6 +89,10 @@ crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 ratatui-textarea = { version = "0.9", optional = true }
 # 自己折行（history.rs）算字符显示宽度：与 ratatui 内部同一份 unicode-width（已是其传递依赖）。
 unicode-width = { version = "0.2", optional = true }
+# 折行的**分词**（UAX#29：ASCII 词整块、中日韩字各自成块）：**消息流**自己折行要用它
+# （`history::wrap_segments`）；输入框固定 `Glyph`、不用这套。
+# 同样已在这棵树里（ratatui-widgets / unicode-truncate 都依赖它），只是显式声明。
+unicode-segmentation = { version = "1", optional = true }
 # 剪贴板：粘贴文本 / 图片路径（图片本体走 session::store_blob）
 arboard = { version = "3", optional = true }
 # `@` 文件路径补全要按 `.gitignore` 扫目录：直接用 ripgrep 那套（嵌套 .gitignore、`!` 取反、

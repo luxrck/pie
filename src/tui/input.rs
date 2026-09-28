@@ -7,18 +7,20 @@
 //!
 //! **鼠标拖选**：消息流靠鼠标捕获滚轮（终端自己的选择就没了），所以输入框里的选择也得
 //! 自己算：控件只提供**字符坐标**（`CursorMove::Jump`），鼠标给的是**屏幕行列**，中间这层
-//! 「显示行 → 逻辑行/字符」由 [`Input::hit`] 做（复用与 `desired_height` 同一套折行规则
-//! `WrapMode::Glyph`，并复刻控件的视口滚动偏移）。
+//! 「显示行 → 逻辑行/字符」由 [`Input::hit`] 做（复用与 `desired_height` 同一套折行规则，
+//! 即控件固定的 `WrapMode::Glyph`，并复刻控件的视口滚动偏移）。
+//!
+//! 输入框就是个**普通编辑器**：软换行固定逐字断（`Glyph`，终端原生那种）、左边不留 `› ` ——
+//! 不去镜像消息流的词级折行（两者的取舍与由来见 `docs/CHANGELOG.md` 2026-09-28）。
 
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui::Frame;
-use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
-use unicode_width::UnicodeWidthChar;
+use ratatui_textarea::{CursorMove, DataCursor, ScreenCursor, TextArea, WrapMode};
 
+use super::history::char_width;
 use super::theme::Palette;
 
 /// 输入框为空时显示什么：App 每帧把它改成当前的**键位提示**（`status::hint_text`）——
@@ -47,6 +49,12 @@ pub struct Input {
     placeholder_style: Style,
     /// 上一帧控件占的整块区域（鼠标命中测试用；含上边框那一行）
     rect: Rect,
+    /// 上一帧的**内容区**（= 控件排版文字的那块 = 整块扣掉上边框）。
+    ///
+    /// 渲染时从块里算一次记下（`block.inner(area)`，与控件内部同一个调用），命中 / 插入符 /
+    /// 框高 / 残影测算都读它 —— 不自己再推一遍边框/内边距，也就不会跟控件分叉。
+    /// ⚠ 没渲染过时是 0（调用方都先判 `width`/`height` 或先渲染一帧）。
+    inner: Rect,
     /// 复刻控件的视口滚动偏移（复刻规则见 `scroll_top_row`）；命中测试要拿它换算内容行
     scroll_top: u16,
     /// 上一帧每个**可见内容行**「写到最右的格数」（含行尾的光标格），[`StaleTail`] 用。
@@ -68,9 +76,9 @@ impl Input {
         area.set_placeholder_style(style);
         area.set_placeholder_text(placeholder.to_string());
         area.set_cursor_line_style(Style::default().add_modifier(Modifier::BOLD));
-        // **软换行**：默认的 `WrapMode::None` 是水平滚动（光标越过右边界就整行左移，长行
-        // 只看得到尾巴）。`Glyph` = 按字形宽度逐字断（CJK 逐字、英文词也会断），与终端
-        // 原生换行一致，也让 `desired_height` 能按宽度精确折算显示行数。
+        // **软换行**固定逐字断（`Glyph`）：默认的 `WrapMode::None` 是水平滚动（光标越过右边界
+        // 就整行左移，长行只看得到尾巴），而 `Glyph` 就是终端原生那种填法 —— 输入框不去镜像
+        // 消息流的词级折行（消息流那边要英文词整块 + 中文逐字，见 `history::wrap_segments`）。
         area.set_wrap_mode(WrapMode::Glyph);
         area
     }
@@ -84,6 +92,7 @@ impl Input {
             placeholder: DEFAULT_PLACEHOLDER.to_string(),
             placeholder_style: Style::default(),
             rect: Rect::default(),
+            inner: Rect::default(),
             scroll_top: 0,
             last_used: Vec::new(),
         }
@@ -181,25 +190,11 @@ impl Input {
 
     /// 输入框想要的高度（**软换行后**的显示行数 + 上边框）。
     ///
-    /// 宽度要由调用方给：`App::render` 先算竖向布局、宽度就在手边，而控件拿到宽度要等到
-    /// 真正渲染那一刻（那时高度已经定死了）。`WrapMode::Glyph` 是按显示宽度逐字断行 →
-    /// 每个逻辑行的显示行数 = `ceil(显示宽度 / 可用宽度)`（含 tab 的行会略偏，控件自带
-    /// 内部滚动兜底）。
+    /// 宽度由调用方给（整块区域的宽）：`App::render` 先算竖向布局、宽度就在手边，而控件拿到
+    /// 宽度要等到真正渲染那一刻（那时高度已经定死了）。行数按 [`Self::screen_rows`] 逐行真折
+    /// ——与控件同规则，所以是精确的（含 tab 的行会略偏，控件自带内部滚动兜底）。
     pub fn desired_height(&self, width: u16) -> u16 {
-        let width = width.max(1) as usize;
-        let rows: usize = self
-            .area
-            .lines()
-            .iter()
-            .map(|line| {
-                let w = Line::from(line.as_str()).width();
-                if w == 0 {
-                    1
-                } else {
-                    w.div_ceil(width)
-                }
-            })
-            .sum();
+        let rows = self.screen_rows(width.max(1) as usize).len();
         (rows as u16 + 1).clamp(MIN_H, MAX_H)
     }
 
@@ -337,7 +332,7 @@ impl Input {
     /// 屏幕坐标（`column`, `row`）→ 控件的（逻辑行, 字符下标）；不在输入框里就 `None`。
     ///
     /// 鼠标给的是屏幕行列，控件只认字符坐标，中间这层换算就在这里：显示行由
-    /// [`Self::screen_rows`] 折行得出（与控件 `WrapMode::Glyph` 同规则），再叠上视口
+    /// [`Self::screen_rows`] 折行得出（与控件同规则、同档位），再叠上视口
     /// 滚动偏移 `scroll_top`。点在上边框那一行按「第一行内容」算。
     pub fn hit(&self, column: u16, row: u16) -> Option<(usize, usize)> {
         if self.rect.width == 0 || self.rect.height == 0 {
@@ -388,39 +383,29 @@ impl Input {
         if inner.width == 0 || inner.height == 0 {
             return None;
         }
-        let rows = self.screen_rows(inner.width as usize);
-        let screen_row = self.cursor_screen_row(&rows);
-        let (line_no, start, _) = *rows.get(screen_row)?;
-        let DataCursor(_, col) = self.area.cursor();
-        // 行内显示列：从这一显示段的起点数到插入符（宽字符占两格）
-        let text = self.area.lines().get(line_no).cloned().unwrap_or_default();
-        let width: usize = text
-            .chars()
-            .skip(start)
-            .take(col.saturating_sub(start))
-            .map(char_width)
-            .sum();
-        let row = (screen_row as u16).saturating_sub(self.scroll_top);
+        // 直接问控件：「光标在第几折行、行内第几列」。它自己算的（`col` 是显示列，tab 也对），
+        // 比我们再复刻一份列宽更准，也少一处会与它渲染分叉的地方。
+        let ScreenCursor { row, col, .. } = self.area.screen_cursor();
+        let row = (row as u16).saturating_sub(self.scroll_top);
         Some((
-            (inner.x + width as u16).min(inner.right().saturating_sub(1)),
+            (inner.x + col as u16).min(inner.right().saturating_sub(1)),
             (inner.y + row).min(inner.bottom().saturating_sub(1)),
         ))
     }
 
-    /// 内容区（`Borders::TOP` 只吃一行）。
-    fn inner_rect(&self) -> Rect {
-        Rect {
-            x: self.rect.x,
-            y: self.rect.y.saturating_add(1),
-            width: self.rect.width,
-            height: self.rect.height.saturating_sub(1),
-        }
+    /// 内容区 = 控件排版文字的那块（只扣掉上边框那一行）—— **上一帧渲染时记下的**
+    /// （见字段 [`Input::inner`]）。
+    ///
+    /// `pub(crate)`：命中测试自己用，`app` 的单测也要拿它算「内容从哪一列开始」。
+    pub(crate) fn inner_rect(&self) -> Rect {
+        self.inner
     }
 
     /// 折行后的显示行表：每行给出 `(逻辑行号, 起始字符下标, 字符数)`。
     ///
-    /// 与控件 `WrapMode::Glyph` 同规则（按显示宽度逐字断）。含 tab 的行会略偏——控件自己
-    /// 有内部滚动兜底，且 `desired_height` 的估算也是这个口径。
+    /// 与控件固定的 `WrapMode::Glyph` 同规则（按显示宽度逐字断，与终端原生换行一致）——
+    /// 它只是**几何**（鼠标命中 / 框高 / 残影擦除 / 视口滚动复刻）：输入框的**渲染**在控件里。
+    /// 含 tab 的行会略偏——控件自己有内部滚动兜底，且 `desired_height` 也是这个口径。
     fn screen_rows(&self, width: usize) -> Vec<(usize, usize, usize)> {
         let width = width.max(1);
         let mut rows = Vec::new();
@@ -485,11 +470,13 @@ impl Input {
         } else {
             palette.style_emphasis(focused)
         };
+        // 块（上边框）交给控件渲染；内容区从同一个块里取一次并记下（`inner` 字段）。
         let block = Block::default()
             .borders(Borders::TOP)
             .border_style(border);
         let inner = block.inner(area);
-        frame.render_widget(block, area);
+        self.inner = inner;
+        self.area.set_block(block);
         self.area.set_style(palette.style_assistant());
         // 选中高亮：控件默认是 `bg LightBlue`（浅蓝底 + 正文色字，深色终端下糊成一片）→
         // 统一到 `Palette::style_selection`。
@@ -516,7 +503,7 @@ impl Input {
                 self.scroll_top
             };
         }
-        frame.render_widget(&self.area, inner);
+        frame.render_widget(&self.area, area);
         // 擦掉上一帧留在「已写区间右边」的残影（宽字符后半格 / placeholder 碎片，见 `StaleTail`）。
         let used = self.used_widths(inner, &rows);
         frame.render_widget(
@@ -576,6 +563,30 @@ impl Input {
     pub fn move_cursor_end(&mut self) {
         self.area.move_cursor(CursorMove::End);
     }
+
+    /// 内容是否比框高（真的能滚）—— `App` 拿它决定滚轮该给谁：**不能滚就别占着滚轮**
+    /// （光标停在输入框上时，滚轮照样应该能翻消息流）。
+    pub fn overflows(&self) -> bool {
+        let inner = self.inner_rect();
+        if inner.width == 0 || inner.height == 0 {
+            return false;
+        }
+        self.screen_rows(inner.width as usize).len() > inner.height as usize
+    }
+
+    /// 滚轮：交给控件自己处理（`MouseScrollUp/Down` → 把它的视口挪一行，顺带把光标收进视口）。
+    ///
+    /// ⚠ 它挪的是**视口的基础偏移**（每帧重算时以它为 `prev`），所以复刻的 `self.scroll_top`
+    /// 得跟着一起挪（同一个饱和加减）——不然命中 / 残影擦除会比它差这么多行。
+    pub fn wheel(&mut self, mouse: crossterm::event::MouseEvent) {
+        let delta: i16 = match mouse.kind {
+            crossterm::event::MouseEventKind::ScrollUp => -1,
+            crossterm::event::MouseEventKind::ScrollDown => 1,
+            _ => 0,
+        };
+        self.scroll_top = self.scroll_top.saturating_add_signed(delta);
+        self.area.input(mouse);
+    }
 }
 
 /// 把输入框里「已经写过的右边」那一段标成**这一帧必须重画**的小控件（只为擦掉宽字符留下的残影）。
@@ -616,11 +627,6 @@ impl Widget for StaleTail<'_> {
     }
 }
 
-/// 字符占几个单元格（控制符算 0，与控件内部同一把尺子）。
-fn char_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,10 +659,59 @@ mod tests {
         assert_eq!(input.desired_height(80), MAX_H, "最多 9 行文本");
     }
 
+    /// `screen_rows` 是**复刻**控件折行的（鼠标命中 / 框高 / 视口滚动都用它）→ 必须与控件真渲染
+    /// 出来的逐行一致，否则命中和光标会偏。输入框固定 `WrapMode::Glyph`（逐字断）→ 拿最能分叉的
+    /// 几种文本各宽度比一遍：中文长句、英文词、超长词（Glyph 会从中间切开）、短句。
+    #[test]
+    fn screen_rows_matches_the_widget_wrapping() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let palette = Palette::mocha();
+        let samples = [
+            "这是一个很长的中文句子用来测试折行是不是逐字断的顺带混一点 english words 进来",
+            "alpha beta gamma delta epsilon zeta",
+            "一个超级长的单词withoutanyspacesatall还有中文",
+            "a b c d e f g h i j",
+            "短",
+        ];
+        for text in samples {
+            for width in [12u16, 20, 37] {
+                let mut input = Input::new();
+                input.set_text(text);
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("terminal");
+                terminal
+                    .draw(|frame| input.render(frame, frame.area(), &palette, true))
+                    .expect("draw");
+                let buf = terminal.backend().buffer().clone();
+                let inner = input.inner_rect();
+                let rows = input.screen_rows(inner.width as usize);
+                for (i, (line_no, start, len)) in
+                    rows.iter().enumerate().take(inner.height as usize)
+                {
+                    // 按终端读法拼这一行：宽字符占两格，下一格（buffer 里是个空格）跳过
+                    let mut shown = String::new();
+                    let mut x = inner.x;
+                    while x < inner.right() {
+                        let symbol = buf[(x, inner.y + i as u16)].symbol();
+                        shown.push_str(symbol);
+                        let w = symbol.chars().next().map(char_width).unwrap_or(0);
+                        x += if w > 1 { 2 } else { 1 };
+                    }
+                    let want: String = input.area.lines()[*line_no]
+                        .chars()
+                        .skip(*start)
+                        .take(*len)
+                        .collect();
+                    assert_eq!(shown.trim_end(), want.trim_end(), "宽 {width} 第 {i} 行（{text}）");
+                }
+            }
+        }
+    }
+
     #[test]
     fn height_counts_wrapped_rows_too() {
         let mut input = Input::new();
-        // 200 个 ASCII 字符，宽 40 → 折成 5 行（+ 上边框 = 6 行高）
+        // 200 个 ASCII 字符，宽 40 → 逐字填满 5 行（+ 上边框 = 6 行高）
         input.insert(&"a".repeat(200));
         assert_eq!(input.desired_height(40), 6);
         // 窗口很宽就不用折（高度停在最小 3 行）
@@ -666,6 +721,10 @@ mod tests {
         assert_eq!(input.desired_height(100), MIN_H + 1);
         // 上限仍生效（折行后很容易超）
         assert_eq!(input.desired_height(10), MAX_H);
+        // 宽字占两格也能数对：逐字断时右边界会剩半格，`div_ceil` 那种估算会少数一行
+        let mut input = Input::new();
+        input.insert(&"中".repeat(4));
+        assert_eq!(input.desired_height(3), MIN_H + 2, "宽 3：4 个字各自一行 → 5 行");
     }
 
     #[test]
@@ -677,32 +736,101 @@ mod tests {
 
     #[test]
     fn caret_position_is_the_screen_cell_of_the_insertion_point() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
         let mut input = Input::new();
+        // ⚠ 插入符位置现在直接问控件（`screen_cursor()`），它那份「屏幕行」表是**渲染时**按区域
+        // 重建的 → 用例必须像 App 那样先渲染一帧（以前我们自己折行，不渲染也算得出来）。
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).expect("terminal");
         // 输入框整块：x = 3、y = 10、宽 20、高 3 → 内容区从 (3, 11) 起（只吃一行上边框）
-        input.rect = Rect {
+        let rect = Rect {
             x: 3,
             y: 10,
             width: 20,
             height: 3,
         };
+        let mut draw = |input: &mut Input| {
+            let palette = Palette::mocha();
+            terminal
+                .draw(|frame| input.render(frame, rect, &palette, true))
+                .expect("draw");
+        };
+        draw(&mut input);
         assert_eq!(input.caret_position(), Some((3, 11)), "空输入 = 内容区左上角");
         input.insert("你好，");
+        draw(&mut input);
         // 「你好，」占 6 个显示列（CJK 各两格）→ 插入符在第 7 格
         assert_eq!(input.caret_position(), Some((9, 11)));
     }
 
     #[test]
     fn caret_position_counts_wrapped_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let palette = Palette::mocha();
         let mut input = Input::new();
-        input.rect = Rect {
-            x: 0,
-            y: 0,
-            width: 3,
-            height: 4,
-        };
         input.insert("abcde");
         // 宽 3 → 软换成 `abc` / `de`：插入符在第 2 显示行、行内第 3 格（内容区从 y = 1 起）
+        let mut terminal = Terminal::new(TestBackend::new(3, 4)).expect("terminal");
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &palette, true))
+            .expect("draw");
         assert_eq!(input.caret_position(), Some((2, 2)));
+    }
+
+    /// 内容区（`inner_rect()`）= 渲染时从块里取的那块 —— 这里对一遍它长什么样、文字与边框画在哪、
+    /// 插入符落在哪（命中 / 插入符 / 残影测算全读这一个值）。
+    #[test]
+    fn inner_rect_matches_where_the_widget_draws_the_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let palette = Palette::mocha();
+        let mut input = Input::new();
+        input.set_text("你好 xyz");
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).expect("terminal");
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &palette, true))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let inner = input.inner_rect();
+        assert_eq!(
+            inner,
+            Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 3
+            },
+            "只扣上边框那一行"
+        );
+        // 上边框由控件画：整行 `─`
+        assert_eq!(buf[(0, 0)].symbol(), "─");
+        assert_eq!(buf[(19, 0)].symbol(), "─");
+        // 文字从内容区左上角起（左边没有 gutter、也没有 `› `）
+        assert_eq!(buf[(inner.x, inner.y)].symbol(), "你");
+        // 插入符（`你好 xyz` = 8 个显示列）也在控件报的位置上
+        assert_eq!(input.caret_position(), Some((inner.x + 8, inner.y)));
+    }
+
+    /// 内容比框高才算「能滚」（`App` 据此决定滚轮给输入框还是给消息流）。
+    #[test]
+    fn overflows_only_when_the_text_is_taller_than_the_box() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let palette = Palette::mocha();
+        let mut input = Input::new();
+        input.set_text("一行");
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).expect("terminal");
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &palette, true))
+            .expect("draw");
+        assert!(!input.overflows(), "一行文本不溢出");
+        let many: String = (0..20).map(|i| format!("第 {i} 行\n")).collect();
+        input.set_text(many.trim_end());
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &palette, true))
+            .expect("draw");
+        assert!(input.overflows(), "20 行在 3 行高的内容区里当然溢出");
     }
 
     /// 删掉宽字符时，它后面那格（终端上会留着汉字右半边 / 光标底色残影）必须被**主动**重画。
@@ -729,7 +857,7 @@ mod tests {
                 .clone()
         };
 
-        // 帧 1：打「你好」（各占两格，插入符在 x=4）
+        // 帧 1：打「你好」（各占两格；内容区从 x=0 起 → 插入符在 x=4）
         input.insert("你好");
         let prev = draw(&mut input, &mut terminal);
         assert_eq!(prev[(0, 1)].symbol(), "你");
