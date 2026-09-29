@@ -13,7 +13,7 @@
 //! 回合中要读会话（`/status` 之类）用 `try_lock`，拿不到就提示「回合进行中」。
 //!
 //! `terminal.draw` 每帧只写**变化的单元格**（ratatui 的双缓冲 diff），所以「不断追加增量」不会让
-//! **终端**整屏重绘。但 ⚠ `render` 里 `history::layout` 是**每帧全量重排**（走完全部 cells，再把全部
+//! **终端**整屏重绘。但 ⚠ `render` 里 `pane::layout` 是**每帧全量重排**（走完全部 cells，再把全部
 //! 行克隆给 `Paragraph`）——事件越密越贵（每个 delta / 每 66ms tick 都一帧），长会话是已知瓶颈，
 //! 治法与实测数据见 `docs/CHANGELOG.md` 2026-09-28 那条「每帧全量重排」。
 
@@ -30,7 +30,9 @@ use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
@@ -41,7 +43,7 @@ use crate::session::{Session, TurnEvent};
 
 use super::clipboard;
 use super::files;
-use super::history::{self, Cell};
+use super::pane::{self, Cell, Pane};
 use super::input::Input;
 use super::palette;
 use super::status::{self, Activity, Snapshot};
@@ -92,16 +94,18 @@ struct Toast {
 ///
 /// 为什么不把它们合成一个「选区模型」：两者的**坐标、渲染、文本提取**本来就是两套——
 ///   - 消息流：`App` 自己持有 `(绝对显示行, 单元格列)`，因为折行与源文本的对应关系就在
-///     `history::Layout` 里（`slice_text` 按源文本切），高亮也是直接改 frame buffer；
+///     `pane::Row` 里（`Pane::slice_text` 按源文本切），高亮也是直接改 frame buffer；
 ///   - 输入框：选区在 `TextArea` 控件内部（**字符坐标**），折行、渲染、以及「输入替换
 ///     选区」都是控件白送的——搬出来反而要多写一套，还会丢掉那些语义。
 /// 所以只在**手势层**统一：按下时定下拖谁、拖动与松开都交给它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
-    /// 消息流（`App.selection` + `history::Layout`）
+    /// 消息流（`App.selection` + `pane::Row`）
     Log,
     /// 输入框（`TextArea` 自己的选区）
     Input,
+    /// 消息流右缘的滚动条（只跳/滚消息流，不产生选区）
+    Scrollbar,
 }
 
 /// 屏幕坐标在不在这个区域里（宽/高为 0 的未布局区域一律不算）。
@@ -131,16 +135,18 @@ pub struct App {
     cancel: Cancel,
     /// 距底部的滚动偏移（0 = 贴底跟随）
     scroll_from_bottom: u16,
-    /// 上一帧的消息流区域（鼠标坐标 → 显示行/列）
+    /// 上一帧的消息流**文本区**（鼠标坐标 → 显示行/列；**不含**右缘那列滚动条）
     body: Rect,
+    /// 上一帧的滚动条那一列（`body` 右边相邻的 1 格；宽度为 0 = 没留）
+    bar: Rect,
     /// 上一帧第一条可见的显示行号（同上；绝对行号 = `scroll_top` + 区域内行偏移）
     scroll_top: u16,
     /// 上一帧输入框插入符的屏幕单元格（[`Input::caret_position`]）：每帧 `draw` 之后把它
     /// 交给终端（`Terminal::set_cursor_position`）——终端光标一直隐藏着，但它是**输入法**
     /// 定位候选框的锚点，见 [`App::run`] 里的注释。
     caret: Option<(u16, u16)>,
-    /// 上一帧的排版（复制时按它切源文本）
-    layout: history::Layout,
+    /// 消息流面板的跨帧状态：上一帧的排版 + markdown 渲染缓存（复制 / 算滚动范围时按它切源文本）
+    pane: Pane,
     /// 鼠标框选：起点 / 终点（**绝对**显示行, 单元格列）；`None` = 没在选
     selection: Option<((u16, u16), (u16, u16))>,
     /// 左键正在拖哪个「文本面」（按下的那一刻定下，拖动中不变）
@@ -198,7 +204,7 @@ impl App {
         let snapshot = Snapshot::capture(&session);
         // resume 的历史：把已有对话回放进消息流（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
-        let cells = history::cells_from_history(&session.full_history());
+        let cells = Cell::from_messages(&session.full_history());
         // 主题：`Config.theme`（族名 / 具体 flavor 都认，见 `Palette::from_name`）。认不出来就用
         // 默认并留一句告警——`run()` 里装好出口后再说（此刻 raw mode + 交替屏，写 stderr 会砸花）。
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
@@ -216,9 +222,10 @@ impl App {
             cancel: Cancel::new(),
             scroll_from_bottom: 0,
             body: Rect::default(),
+            bar: Rect::default(),
             scroll_top: 0,
             caret: None,
-            layout: history::Layout::default(),
+            pane: Pane::default(),
             selection: None,
             drag: None,
             toast: None,
@@ -301,7 +308,11 @@ impl App {
                         self.on_terminal_event(event);
                     }
                 }
-                Some(event) = rx.recv() => self.on_turn_event(event),
+                // 处理一个之后把**已经积压**的一并吃掉（一轮只画一帧，但状态要追到队尾）
+                Some(event) = rx.recv() => {
+                    self.on_turn_event(event);
+                    self.drain_turn_events(&mut rx);
+                }
                 _ = ticker.tick() => {
                     self.frame = self.frame.wrapping_add(1);
                 }
@@ -352,6 +363,13 @@ impl App {
                         self.selection = self.cell_at(mouse.column, mouse.row).map(|pt| (pt, pt));
                         self.drag = self.selection.map(|_| Surface::Log);
                     }
+                    // 滚动条：点/拖都只改消息流的滚动偏移（不产生选区）
+                    Some(Surface::Scrollbar) => {
+                        self.input.clear_selection();
+                        self.selection = None;
+                        self.drag = Some(Surface::Scrollbar);
+                        self.scrollbar_jump(mouse.row);
+                    }
                     None => self.selection = None,
                 }
             }
@@ -364,6 +382,7 @@ impl App {
                         }
                     }
                 }
+                Some(Surface::Scrollbar) => self.scrollbar_jump(mouse.row),
                 None => {}
             },
             MouseEventKind::Up(MouseButton::Left) => {
@@ -375,15 +394,56 @@ impl App {
         }
     }
 
-    /// 这个屏幕坐标落在哪个「文本面」上（输入框优先：它压在消息流下面）。
+    /// 把 `rx` 里**已经积压**的回合事件一次性消化进状态，返回吃了几个。
+    ///
+    /// ⚠ 为什么必须这么做：`run` 的循环「一轮 = 一帧」，如果一轮只处理一个事件，UI 的消化速度就被
+    /// 帧率钉死（长历史 + debug 构建下一帧十几毫秒 → 每秒只吃几十个事件）。而模型一次长思考能吐
+    /// 几百上千个增量，工具调用就排在这些增量后面 → **队列越积越长，界面落后现实几秒到几十秒**，
+    /// 表现就是「工具已经在跑（文件都改了），状态栏还显示思考中，消息流里那条工具行也还没出现」。
+    /// 消化整队之后，滞后上界从「队列长度 ÷ 帧率」变成**一帧**。
+    ///
+    /// 事件的状态更新本身很便宜（`String::push_str` / 压一个 cell），真正贵的是**渲染**；一队只画
+    /// 一帧还顺带省掉了中间的 markdown 重解析。
+    fn drain_turn_events(&mut self, rx: &mut UnboundedReceiver<UiEvent>) -> usize {
+        let mut drained = 0;
+        while let Ok(event) = rx.try_recv() {
+            self.on_turn_event(event);
+            drained += 1;
+        }
+        drained
+    }
+
+    /// 这个屏幕坐标落在哪个「文本面」上（输入框优先：它压在消息流下面；滚动条其次：它就是
+    /// 消息流右缘那 1 格，不能让「点在它上面」被当成「在消息流里按下」而起了框选）。
     fn surface_at(&self, column: u16, row: u16) -> Option<Surface> {
         if inside(self.input.rect(), column, row) {
             Some(Surface::Input)
+        } else if inside(self.bar, column, row) {
+            Some(Surface::Scrollbar)
         } else if inside(self.body, column, row) {
             Some(Surface::Log)
         } else {
             None
         }
+    }
+
+    /// 点/拖滚动条：把屏幕行线性映到消息流的偏移——**只改 `scroll_from_bottom`**。
+    ///
+    /// 于是输入框 / 状态栏（各自在垂直布局的下面几行）跟本函数毫无关系，拖动滚动条不会碰它们；
+    /// 输入框自己的视口滚动只由「滚轮悬在它上面」驱动（[`Self::wheel`]）。
+    ///
+    /// 不按 thumb 尺寸做精确抓取（拖动时会“跳”到线性位置）——第一版够用，也不会因为
+    /// thumb 长度变化而抖。
+    fn scrollbar_jump(&mut self, row: u16) {
+        let height = self.body.height as usize;
+        let total = self.pane.total();
+        if height == 0 || total <= height {
+            return; // 没溢出：滚动条根本没画
+        }
+        let y = (row.saturating_sub(self.body.y) as usize).min(height - 1);
+        let max_off = total - height;
+        let offset = y * max_off / (height - 1).max(1);
+        self.scroll_from_bottom = (max_off - offset) as u16;
     }
 
     /// 松开鼠标：从**正在拖的那个面**取选区文本，写剪贴板 + 右下角弹一条提示。
@@ -395,6 +455,8 @@ impl App {
         let text = match target {
             Surface::Log => self.take_selection_text(),
             Surface::Input => self.input.take_selection(),
+            // 滚动条上没有文本可取（松开就是结束拖动了）
+            Surface::Scrollbar => None,
         };
         let Some(text) = text else {
             return;
@@ -463,9 +525,7 @@ impl App {
         } else {
             ((r2, c2), (r1, c1))
         };
-        let text = self
-            .layout
-            .slice_text(r1 as usize, c1 as usize, r2 as usize, c2 as usize);
+        let text = self.pane.slice_text(r1 as usize, c1 as usize, r2 as usize, c2 as usize);
         (!text.is_empty()).then_some(text)
     }
 
@@ -597,7 +657,7 @@ impl App {
                 };
                 self.cells.push(Cell::Tool {
                     name,
-                    summary: history::tool_summary(&arguments),
+                    summary: pane::tool_summary(&arguments),
                     status: Status::Running,
                     body: None,
                     manual: false,
@@ -605,7 +665,7 @@ impl App {
             }
             UiEvent::Turn(TurnEvent::ToolResult { name, content, .. }) => {
                 // 被取消的工具回的是哨兵文本（不是 `[exit=]` 头）→ 标 ⏹ 而不是 ✓
-                let status = history::tool_status(&content);
+                let status = pane::tool_status(&content);
                 Cell::finish_tool(&mut self.cells, &name, status, &content);
                 self.activity = Activity::Tool {
                     since: Instant::now(),
@@ -1122,9 +1182,8 @@ impl App {
     ///
     /// 读的是**上一帧**的排版与区域（`scroll` 在事件处理里跑，那时还没重排）。
     fn max_scroll(&self) -> u16 {
-        self.layout
-            .rows
-            .len()
+        self.pane
+            .total()
             .saturating_sub(self.body.height as usize)
             .min(u16::MAX as usize) as u16
     }
@@ -1202,10 +1261,25 @@ impl App {
         ])
         .areas(area);
 
+        // 消息流右缘留 1 列给滚动条（**固定**留：折行宽度与 markdown 缓存键都吃 `width`，
+        // 若「有溢出才留」，跨过阈值那一下会换宽度 → 整段重排 + 缓存全失效）。
+        // 窗口窄到剩不下正文时就别留了。
+        let bar_w = u16::from(body.width > 2);
+        let bar = Rect {
+            x: body.right() - bar_w,
+            width: bar_w,
+            ..body
+        };
+        let body = Rect {
+            width: body.width - bar_w,
+            ..body
+        };
+
         let now = Instant::now();
 
-        let layout = history::layout(&mut self.cells, &self.palette, body.width, self.lean);
-        let total = layout.rows.len();
+        self.pane
+            .layout(&self.cells, &self.palette, body.width, self.lean);
+        let total = self.pane.total();
         // 滚动偏移按**显示行**算（`Paragraph::scroll` 跳过的是折行之后的行）
         let bottom = total.saturating_sub(body.height as usize);
         // 内容变短时把偏移夹回可用范围（不然「往上滚了 N 行」会一直留着，得先滚回来才动）
@@ -1216,8 +1290,8 @@ impl App {
         // 鼠标框选要知道「屏幕坐标 ↔ 哪条显示行」，记下这一帧的几何信息与排版
         self.scroll_top = offset.min(u16::MAX as usize) as u16;
         self.body = body;
-        let lines: Vec<Line<'static>> = layout.rows.iter().map(|r| r.line.clone()).collect();
-        self.layout = layout;
+        self.bar = bar;
+        let lines: Vec<Line<'static>> = self.pane.iter().map(|r| r.line.clone()).collect();
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -1225,6 +1299,23 @@ impl App {
             body,
         );
         self.paint_selection(frame, body);
+        // 滚动条：**只有真的溢出才画**（否则 thumb 会铺满整条轨道，像块实心的）——
+        // 那一列宽度已经固定留出来了，画不画都不影响排版。
+        if bar_w > 0 && total > body.height as usize {
+            let mut state = ScrollbarState::new(total)
+                .position(self.scroll_top as usize)
+                .viewport_content_length(body.height as usize);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_symbol("▐")
+                    .track_symbol(None) // 只画 thumb（codex / claude code 那种极简风）
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .thumb_style(Style::default().fg(self.palette.cancelled)),
+                bar,
+                &mut state,
+            );
+        }
 
         if !panel.is_empty() {
             frame.render_widget(Paragraph::new(panel), palette_area);
@@ -2803,5 +2894,130 @@ mod tests {
         assert!(flat.contains("[exit=cancelled]"), "{flat}");
         assert!(flat.contains("用户手动终止"), "{flat}");
         assert!(!app.busy);
+    }
+
+    /// 队列里积压的回合事件要在**同一轮**全部落到状态上（不是一帧一个）——
+    /// 这是「工具已经在跑、界面还停在思考中」那个现象的根因，见 `App::drain_turn_events`。
+    #[test]
+    fn queued_turn_events_all_land_in_one_pass() {
+        let (mut app, mut rx) = app_with_rx();
+        for ev in [
+            TurnEvent::Reasoning("…".into()),
+            TurnEvent::AssistantText("正在".into()),
+            TurnEvent::AssistantText("改文件".into()),
+            TurnEvent::ToolCall {
+                name: "edit".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            },
+        ] {
+            app.tx.send(UiEvent::Turn(ev)).expect("send");
+        }
+        assert_eq!(app.drain_turn_events(&mut rx), 4, "四个事件一轮吃完");
+        assert!(rx.try_recv().is_err(), "队列被吃空");
+        // 状态追到了**最后一个**事件：状态栏显示工具在跑，消息流里那条工具行已经在了
+        assert!(
+            matches!(app.activity, Activity::Tool { .. }),
+            "末事件是工具调用 → 状态栏就该是工具"
+        );
+        assert!(
+            app.cells
+                .iter()
+                .any(|c| matches!(c, Cell::Tool { name, .. } if name == "edit")),
+            "工具行进了消息流"
+        );
+        assert!(
+            app.cells.iter().any(|c| matches!(c, Cell::Assistant { text, .. } if text == "正在改文件")),
+            "正文增量都攒在同一条上"
+        );
+        // 队列空着时不吃任何东西
+        assert_eq!(app.drain_turn_events(&mut rx), 0);
+    }
+
+    /// per-cell 缓存的直接收益：**同一帧再画一次不重排任何 cell**（tick / 打字 / 滚轮 / 框选那些帧）。
+    #[test]
+    fn a_second_identical_frame_relays_out_nothing() {
+        let mut app = test_app();
+        app.cells.push(Cell::User("问题".into()));
+        app.cells.push(Cell::assistant("**答**"));
+        app.render_to_string(80, 24);
+        assert!(app.pane.relaid() > 0, "第一帧得真的排过");
+        app.render_to_string(80, 24);
+        assert_eq!(app.pane.relaid(), 0, "输入没变：一条都不该重排");
+
+        // 流式追加 → 只重排被改的那一条（历史那部分不动）
+        Cell::push_assistant_text(&mut app.cells, "的补充");
+        render_buffer(&mut app, 80, 24);
+        assert_eq!(app.pane.relaid(), 1, "流式只该重排尾巴那一条");
+    }
+
+    /// 滚动条：右缘那列**一直**留着（宽度固定 → 不会因跨越溢出阈值而重排），
+    /// 但只有真的溢出才画 thumb。
+    #[test]
+    fn scrollbar_appears_only_when_the_stream_overflows() {
+        const W: u16 = 40;
+        let mut app = test_app();
+        app.cells.push(Cell::User("短消息".into()));
+        let buf = render_buffer(&mut app, W, 12);
+        assert_eq!(app.body.width, W - 1, "右缘固定留 1 列给滚动条");
+        let bar_x = app.body.right();
+        assert_eq!(app.bar, Rect { x: bar_x, width: 1, ..app.body }, "滚动条那列在消息流右缘");
+        let bar_col: Vec<&str> = (0..app.body.height)
+            .map(|y| buf[(bar_x, app.body.y + y)].symbol())
+            .collect();
+        assert!(bar_col.iter().all(|s| *s == " "), "没溢出就不画：{bar_col:?}");
+
+        // 撑到溢出（行数 > 视口高）→ 出现 thumb
+        for i in 0..40 {
+            app.cells.push(Cell::User(format!("第 {i} 行")));
+        }
+        let buf = render_buffer(&mut app, W, 12);
+        let drawn = (0..app.body.height)
+            .filter(|y| buf[(bar_x, app.body.y + y)].symbol() == "▐")
+            .count();
+        assert!(drawn > 0, "溢出时该画出 thumb");
+        assert!(drawn < app.body.height as usize, "thumb 不该铺满整条：{drawn}");
+    }
+
+    /// 点/拖滚动条**只改消息流的滚动偏移**：输入框（含它自己的视口与草稿）一点不动，
+    /// 也不产生选区/复制提示。
+    #[test]
+    fn dragging_the_scrollbar_scrolls_only_the_stream() {
+        let mut app = test_app();
+        app.cells.push(Cell::User("顶部".into()));
+        for i in 0..60 {
+            app.cells.push(Cell::User(format!("第 {i} 行")));
+        }
+        app.input.set_text("草稿");
+        render_buffer(&mut app, 40, 12);
+        let bar_x = app.body.right();
+        let input_before = app.input.rect();
+        assert_eq!(app.surface_at(bar_x, app.body.y), Some(Surface::Scrollbar));
+        assert_eq!(app.surface_at(bar_x - 1, app.body.y), Some(Surface::Log));
+
+        // 点在滚动条**顶部** → 跳到最早处
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar_x, app.body.y));
+        assert_eq!(app.scroll_from_bottom, app.max_scroll(), "顶部 = 贴顶");
+        assert!(app.selection.is_none(), "滚动条上不起选区");
+        render_buffer(&mut app, 40, 12); // `scroll_top` 只在渲染时重算
+        assert_eq!(app.scroll_top, 0, "重新渲染后 scroll_top 也跟着到顶");
+
+        // 拖到底 → 贴底
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            bar_x,
+            app.body.bottom() - 1,
+        ));
+        assert_eq!(app.scroll_from_bottom, 0, "拖到底 = 贴底跟随");
+
+        // 松手：不产生复制提示（滚动条上没有文本）
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            bar_x,
+            app.body.bottom() - 1,
+        ));
+        render_buffer(&mut app, 40, 12);
+        assert!(app.toast.is_none(), "滚动条不该弹复制提示");
+        assert_eq!(app.input.rect(), input_before, "输入框位置/尺寸不受影响");
+        assert_eq!(app.input.text(), "草稿", "输入框内容不受影响");
     }
 }

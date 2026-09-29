@@ -2,6 +2,262 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-29（把「pie 是 pi 的 Rust 实现」写进描述）
+
+- **三处描述统一交代 pie ↔ pi 的关系**（用户：「我想强调 pie 和 pi 的关系，pie 是一个类似 pi 的极简 agent，用 Rust 实现」，
+  并给了出处 `https://github.com/earendil-works/pi`）：
+  - 先**去查了 pi 的真实情况**（`api.github.com` + 它的 README）：*Pi Agent Harness*，TypeScript，拆成
+    `pi-ai`（统一多 provider LLM API）/ `pi-agent-core`（工具调用 + 状态）/ `pi-coding-agent`（交互式 CLI）/ `pi-tui`（差分渲染 TUI）
+    等包；**明确声明不内置权限系统**（"runs with the permissions of the user and process that launched it"，要隔离自己上容器）。
+    这条正好对得上 pie 的 YOLO 取舍，所以描述里可以点明「同样不内置权限系统」而不是泛泛说"类似"。
+  - `README.md` 首段重写：`pi` 的 **Rust 重实现** + 四条定位（OpenAI 兼容的统一 LLM 接口 / agent 循环 / 差分渲染 TUI / coding agent CLI）
+    + 「同样极简、同样不内置权限系统」+ **名字是 π 的谐音（π → pie）**。⚠ 没写"多 provider"（pie 只走 OpenAI 兼容端点）、
+    没写"可扩展"（pie 没有 pi 那套扩展/插件），只写了两边真正一致的东西。
+  - `Cargo.toml` 的 `description`：顺手修了两个**事实错误**——它写的是「**pie** 的 Rust 重构」（自指，应为 pi），工具名写的是
+    `write`/`shell`（本仓实际是 `writ`/`bash`）。
+  - `AGENTS.md` 首段 + `MEMORY.md` 的「项目定位与仓库」各加一句来历（未来的 agent 看到命名不用猜）。
+
+## 2026-09-29（TUI 更新不及时：一轮吃整队事件）
+
+- **修「工具已经在跑，状态栏还显示思考中、消息流里那条工具行也还没出现」**（用户报的现象：思考显示很久、明明已开始调工具、Pane 也没更新）：
+  - **根因不在渲染，在事件消化速度**：`App::run` 的主循环是「一轮 = 一帧」，而 `select!` 里 `rx.recv()` **一轮只取一个回合事件**。
+    模型一次长思考能吐几百上千个增量，工具调用排在这些增量**后面** → 队列越积越长，界面落后现实几秒到几十秒。
+    实测（19,200 行、接近用户会话规模）：**debug 一帧 ≈ 13ms**（layout 跳过 2.6ms + 全量克隆行 10.5ms，
+    用户跑的就是 dev 构建）→ 每秒只吃几十个事件；release 一帧 ≈ 5ms（克隆行占 5.0ms / 其余 0.2ms）。
+  - **修法**：新增 `App::drain_turn_events`（`try_recv` 把积压的整队一次消化），主循环收到一个事件后立刻调它。
+    滞后上界因此从「队列长度 ÷ 帧率」变成**一帧**；事件的状态更新本身很便宜（`String::push_str` / 压一个 cell），
+    贵的是渲染，而一队只画一帧还顺带省掉了中间的 markdown 重解析。
+  - 用例 `app::queued_turn_events_all_land_in_one_pass`：四个事件（reasoning / 两个正文增量 / 工具调用）一轮吃完，
+    状态落在**最后一个**事件上（状态栏 = 工具、消息流里已有那条工具行、正文增量攒在同一条 cell 里）。
+  - **仍未做**（这次量出来是每帧的大头）：`render` 里那句「把全部行克隆成 `Vec<Line>` 喂 `Paragraph`」在 19k 行时
+    是 10.5ms(debug) / 5.0ms(release)——治法 B（`Pane::window(offset, height)` 只借出可见那几十行）能把它降到 ~O(视口)，
+    用户此前说过 `Pane::window` 先不做，所以留着（这次有了数字，随时可以捡起来）。
+
+## 2026-09-29（README 补压缩一节）
+
+- **README 加了「上下文压缩」一节**（用户：「可以把我们的特色功能【上下文压缩】这块也写进 README.md 里面去」；
+  README 本身刚被用户手动精简过——删了「写一个工具」、构建依赖说明、绑定的构建步骤等，本节按精简后的风格写）：
+  三级（工具级 / 轮次级 / 会话级）各自「压什么 → 压成什么」一张表 + 自动/手动触发口径（可用输入预算 = `context_window - reserved_tokens`，
+  `soft_ratio 0.8` → `target_ratio 0.55` 迟滞）+ 只升不降 / 内容寻址 / 两个目录的分工 + 一段 `[compaction]` 的 TOML 示例。
+  事实逐条对着 `context.rs` 的模块文档与 `config.rs` 的默认值核过（`keep_last_steps=7`、`ToolCompaction{head:30,tail:50}`、
+  `CompactionConfig{soft_ratio:0.8,target_ratio:0.55}`、`compaction=false` 整段关、某级 `false` 只关那一级、
+  `/compact [tools|turns|auto]` 且**不含会话级**——会话级整窗归档是 `/clear` 的事）。
+  ⚠ `auto` 这条只有 `palette::COMMANDS` 的**描述**里有、候选表里没有对应条目（handler 落到 `_ => Auto`，所以能用）——顺手记下这个不一致。
+- **TOML 示例补全三级**（用户：「把 compaction 的 toml 写详细些，把 turn/session 级也加上」）：示例里现在顶层 `keep_last_steps`、
+  `[compaction]`（`turn` / `soft_ratio` / `target_ratio`）、`[compaction.tool]`（head/tail）、`[compaction.session]`（head/tail）都在，
+  每条带注释说明含义与默认值；表格里会话级那行也补了「摘要里留头 3 / 尾 5 轮」。
+  顺手**用真二进制验证**了这段 TOML：把它原样抠出来 `pie -c <tmp> context info` → exit 0（配置被接受）；
+  注释里承诺的几种写法也逐个试过——`compaction = false`、`compaction = true`、`[compaction] tool = false`、
+  `session = false` + `turn = false` 都能解析。
+
+## 2026-09-29（词级折行加回）
+
+- **`WrapMode::WordOrGlyph` 加回，生产档位回到词级**（用户：「现在，扩展 `wrap_segments` 函数，让它支持 `WrapMode::WordOrGlyph` 吧（类似
+  ratatui-textarea 里面的那样）」）：
+  - 算法**对齐 `ratatui-textarea 0.9.2` 的 `wrap_word_chunks`**：按 UAX#29 词边界（`split_word_bound_indices`）切块 → 贪心装块
+    （块自己一个字符不切）→ 只有「单个块就比整行宽」（超长英文词 / 长 URL）才退回按字硬断。这正是收口前那版的算法，所以 `WrapMode`
+    两档的用例期望值也是原来那批（`中文 ab 中文` 那两条、`abcdefghij` 那条都在）。
+  - `unicode-segmentation` 依赖随之加回（只服务这一档；注释里写明了）。
+  - **生产档位从 `Glyph` 换回 `WordOrGlyph`**（调用点那个字面量）：实测同一段内容，URL 不再从 token 中间被切开
+    （`https://` / `api.deepseek.com/chat/completions`，之前是 `https://api.de` / `epseek.com/...`）。想让生产走逐字断就改那一处字面量。
+  - 一处**已知差异**（写进 `WrapMode` 的 doc）：控件的逐字断走**字素簇**（`grapheme_indices`），pie 这边走**字符**（`chars()`）→
+    emoji 组合序列 / 组合记号在控件那边不会被劈开，在这儿可能被劈。要完全对齐得给 `grapheme_indices` 也留一条路（暂时不值当）。
+  - 副作用（恢复旧状态）：**消息流（词级）与输入框（`Glyph`）又折在不同位置了**——上一节「两边规则终于一致」那条收益随之取消；
+    AGENTS/MEMORY 已改回「不跟消息流对齐」的措辞。
+  - 用例：`wrap_segments_pins_both_modes`（两档各自的具体期望 + 两档共同的不变量：不超宽 / 不丢字符 / 无空段 / 空行占一行 / 宽 0 当 1）。
+    测试 203 + 4 全绿，clippy 14。
+
+## 2026-09-29（折行收口到逐字）
+
+- **消息流折行收口成只剩「逐字硬断」**（用户：「`wrap_segments` 收口成只支持 `WrapMode::Glyph` 吧。`WrapMode` 只保留 `Glyph`，
+  `wrap_line_into` 里面调用 `wrap_segments` 直接用 `WrapMode::Glyph`，移除 `WRAP_MODE` 常量」）：
+  - ⚠ 动手前 `WRAP_MODE` 已经是 `WrapMode::Glyph` —— **不是本轮改的**（早先它写的是 `WordOrGlyph`，是用户在工作区里手改的），
+    这次等于把那个手改**固化**下来。
+  - 落地时比字面请求更进一步：既然只剩一个档位，`WrapMode` 枚举 + `WRAP_MODE` 常量都是**单值仪式**，而「逐字硬断」的逻辑
+    **恰好就是原来那个 `hard_split`** → 于是三者一起消失，`wrap_segments(text, width)` 就是这个循环本身
+    （`wrap_line_into` 直接 `wrap_segments(&text, width)`）。`unicode-segmentation` 也不再被本仓使用 → 从 `Cargo.toml` 移除
+    （它仍在树里，是 `ratatui-textarea` 等的传递依赖）。
+  - **行为变化**（这是取舍，不是 bug）：CJK **完全不变**（汉字本来就各自成块，长句照样填满整行 —— 2026-09-28 修「中文长句第一行很短」
+    的那个收益保住了）；**英文词 / URL / 路径会从中间切开**（例：宽 9 下 `alpha beta` → `alpha bet` / `a`）。
+    另一个副作用是**消息流与输入框的规则终于一致了**（输入框一直固定 `WrapMode::Glyph`），2026-09-28 那条「两边折在不同地方」的
+    已知代价消失（几何仍不共用：输入框是控件自己的折行）。
+  - **跟进**（用户：「想留 `WrapMode` 当『以后再加档位』的钩子」）：把 `WrapMode` 类型留回来了——`enum WrapMode { Glyph }` +
+    `wrap_segments(text, width, mode)`，调用点显式传 `WrapMode::Glyph`（**仍不留 `WRAP_MODE` 常量**，那是用户上一轮明确要删的）。
+    `wrap_segments` 里那个 `match mode { Glyph => {} }` 不做事，作用是**分叉点**：加档位时编译器在这里报 non-exhaustive，逼着就地处理；
+    枚举的 doc 里记下了「曾经实现过的词级档去哪儿找」与「不收的档位及原因」，需要时照它恢复（连 `unicode-segmentation` 一起）。
+  - 用例：`wrap_segments_is_word_level_and_cjk_friendly` 改写成 `wrap_segments_breaks_by_glyph_and_is_cjk_friendly`
+    （逐档对拍的断言删掉，保留「不超宽 / 不丢字符 / 无空段 / 空行占一行 / 宽 0 当 1」这些不变量，另钉几条逐字断的具体期望）。
+    测试仍 203 + 4 全绿，clippy 14。
+
+## 2026-09-29（折行收口）
+
+- **`wrap_segments_with` 并入 `wrap_segments`**（用户：「`wrap_segments_with` 和 `hard_split` 是否可以直接合入 `wrap_segments`？」）：
+  - `wrap_segments_with(text, width, mode)` 原本只是「让用例能逐档钉规则」的一层包装（生产入口是 `wrap_segments` 那个 1 行转发）。
+    现在合成一个 `fn wrap_segments(text, width, mode)`，**唯一生产调用点**（`wrap_line_into`）显式传 `WRAP_MODE` ——
+    档位开关仍然只有那一处，但少一层间接。
+  - 顺带**整族降为模块私有**（`wrap_segments` / `wrap_line_into` / `WrapMode` / `WRAP_MODE`）：自 `fit_tables` 删掉后，
+    `markdown.rs` 不再借用它们（那只借了 `wrap_line_into`），全仓代码级的引用只剩 `pane.rs` 自己 ✓
+    （`input.rs` 里的 `WrapMode` 是 `ratatui_textarea::WrapMode`，另一个类型；本仓 `WRAP_MODE` 只剩注释提及）。
+    要换档位仍然是改 `pane.rs` 里的那一行常量。
+  - **`hard_split` 变成 `wrap_segments` 里的嵌套函数**（用户：「把 `hard_split` 函数放到 `wrap_segments` 做嵌套函数呢？」）：
+    它的两个调用点（`Glyph` 档整行硬断、词级档里「单个块比整行还宽」的回退）**都在 `wrap_segments` 体内**，参数齐全、
+    不捕获任何环境（所以是 `fn` 而不是闭包），`mod tests` 也不直接调它 → 嵌套是「作用域自证 + 读的时候不用跳」，
+    零成本（嵌套 `fn` 与顶层 `fn` 编出来的东西一样，只是可见范围小）。**没有**内联进主体：内联要复制两份，
+    两处逻辑一样但语义不同（整行 vs 退回单块）。
+    另一条被否掉的方案：把两档统一成「先切块再装块」（`Glyph` 档 = 每字符一块），那样只剩一个调用点，但那条路径
+    要为整行多分配一份逐字符 chunks（现在零额外分配），收益只是少一个 12 行的函数 → 不值。
+- **`rebuild_line` 并入 `wrap_line_into`**（用户：「`rebuild_line` 并入 `wrap_line_into` 吧」）：它只有一个调用点（`wrap_line_into`
+  末尾那个 `.map`），合并后 `chars[start..start + len].chunk_by(|a, b| a.1 == b.1)` 一组一段、每组拼一个 `Span` ——
+  语义与老实现逐字逐段合并完全一致（相邻同样式合一个 span），但少了一个函数、读的时候在一个函数里看全「展开 → 折 → 重装」三步。
+  - 顺手**补了一条以前没人钉的用例** `wrapping_keeps_per_char_styles_and_the_line_style`：折行切开 span 时每个字的样式要跟着走
+    （`aa`/`ab`/`bb` 逐行断言 span 数量与样式）、行级样式照搬、空行也占一行 —— 这正是 `rebuild_line` 存在的理由，以前只靠"重构时别改错"。
+  - 测试 202 → 203，clippy 仍 14。
+  - 验证：`cargo test` 202 + 4 全绿（逐档钉规则的那个用例一字未改，改的只是调用名）、clippy 14 不变。
+
+
+
+- **`tui-markdown` 0.3.9 → 0.3.10**（用户：「看一下 tui-markdown 是否可以升级到 0.3.10，我看它说修复了一些 markdown table 的 bug」）：
+  - 0.3.10 的 CHANGELOG 有 **`wrap tables to the configured width` (#200)**：新增 `Options::table_width(u16)` + `from_str_with_options`；
+    **默认 `None` = 表格保持自然宽度**（即 0.3.9 的行为），所以是**纯增量** API。
+  - 升级动作：`Cargo.toml` 的版本约束改 `0.3.10` + `cargo update -p tui-markdown`。实测：**204 + 4 测试全绿、clippy 不变**，
+    同一张表格在 TUI 里的渲染**逐行一致**（拿升级前后两张截图 diff 过）→ 对 pie 现有代码是行为中立的一跳。
+    顺带**少了 3 个依赖**（0.3.10 把测试 helper 改成 dev-dependency：`toml_parser` / `winnow` / `yansi` 从依赖树里掉出去）。
+  - **顺手删掉了 pie 自写的表格重排**（用户：「看起来我们的 `fit_tables` 相关可以删除了」）：
+    * `markdown.rs` 从 **584 行 → 247 行**：删掉 `fit_tables` / `shrink_table` / `border_kind` / `rule` / `render_row` /
+      `cell_width` / `padding` / `shrink_widths` / `split_cells` / `infer_alignments` / `edge_spaces` / `trim_spans` /
+      `line_text` 与那批边框常量、`Align`，以及只测这些私有助手的两个用例（`shrinks_the_widest_column_first` /
+      `trims_padding_but_keeps_inner_spaces`）。测试 204 → 202，其余**全绿**（含「宽表被收进宽度」「窄表原样」
+      「单元格样式保留」「畸形表不崩」四条——它们现在钉的是上游行为，正好当回归网）。
+    * `render()` 改成 `from_str_with_options(src, &Options::default().table_width(width.max(1) as u16))`；
+      `markdown.rs` 不再借用 `pane::wrap_line_into`（那份折行只剩消息流自己在用）。
+    * **收益不止删代码**：上游的预算是「含边框 + 内边距 + **外层引用/列表前缀**」，而老实现靠行首 `┌` 检测表格块、
+      预算里也不含 `> ` 前缀 → **引用块里的表格以前根本认不出来**。实测（tmux 46×26）：正文表与 `> ` 引用表都精确收在
+      46 列内（引用表 45 = 含 `> ` 前缀）。
+    * 差异（接受）：列宽取整与断行位置换成上游口径（同一张表 26/25 vs pie 的 25/26），两者都不超宽。
+
+
+
+- **修两个「只活在实时视图里的东西没进会话」的 bug**（用户：退出再 `pie -r` 回来，「• Thought for …」那行消失；`[请求失败]` 的行不再标红/带 `✗`）：
+  - 定位（对着那份真实会话核过：**351 个 tool 调用一个不少**，回放都会渲染——所以不是丢消息）：
+    | 实时视图 | 会话里有什么 | 回放原来的结果 |
+    |---|---|---|
+    | `• Thought for 3.4s`（**TUI 自己计时**） | 只有 `reasoning_content`（"思考过"，**没有时长**） | 整行消失 |
+    | `✗ [请求失败] …`（`Cell::Error`，红色） | 一条内容为 `[请求失败] …` 的 assistant 消息 | 当普通正文渲染（不红、没 `✗`） |
+  - **`Message.thought_ms`（新字段，只进会话文件）** + `session::ThoughtClock`：口径与 TUI 的 `settle_thought` **一致**
+    ——**首个 reasoning 增量**起算、**首个正文增量**停下；计时器作为参数传进 `model_call`，`aturn` 在 push 那条
+    assistant 消息时 `take_ms()` 写进去。`to_api()` 不带它（有单测钉住，否则就把本地元数据喂给模型了）。
+    ⚠ 第一版把计时包在**重试**那条路上（正常成功的回合量不到，真实跑一条才发现 `thought_ms=None`）→ 改成传 `&mut ThoughtClock`，
+    两条路都过它。
+  - **`Cell::from_messages` 补两条回放规则**：带 `thought_ms` 的 assistant 消息先补一行 `Cell::Thought(...)`（排在正文之前）；
+    正文以 `[请求失败]`（`session::ERROR_TURN_PREFIX`，为此外提成 `pub(crate)`）开头的走 `Cell::Error`（红 `✗`）。
+  - 实测：真跑一条带思考的回合 → 会话里 `thought_ms: 294` ✓；对那份真实会话的副本 `pie -s` 回放 → 失败行现在是
+    `✗ [请求失败] …`（抓 `capture-pane -e` 验证颜色 = RGB `243,139,168` = mocha `red`）✓；新建一条 `thought_ms=294` 的会话回放 →
+    `• Thought for 0.3s` 回来了 ✓。
+  - 用例：`pane::history_replay_restores_thought_line_and_error_turn`（Thought 行在正文之前 + 失败回合是 `Cell::Error`）、
+    `llm::thought_ms_stays_out_of_the_api_payload_and_survives_jsonl`（不进请求体 + 能落盘读回）。
+  - ⚠ **旧会话**里的思考行回不来（那时候没写 `thought_ms`）——从今往后的回合才有。另外顺手确认：这套「实时视图 vs 回放」的
+    差异只有三处，另两处**是有意如此**——`!cmd` 手动命令不进会话上下文（`palette` 的帮助里就这么写的）、`Notice`/`Retry`
+    是纯瞬态（权限告警、重试进度）。
+
+
+
+- **`history.rs` → `pane.rs`，并把排版下放到 `Cell`（用户：「history.rs 改名为 pane.rs。其它的按你的来」）**：
+  - **改名**：`src/tui/history.rs` → `src/tui/pane.rs`（`pane::` 前缀；`src/tui/mod.rs` / `app.rs` / `input.rs` / `markdown.rs` / `status.rs` /
+    `tools.rs` 的 `use` 与注释一并更新）。本文件里的历史条目**不动**（当时就叫 `history.rs`）。
+  - **`Row` 改成自描述**：`src_line: usize`（跨 cell 唯一的逻辑行号）→ `continues: bool`（「我是上一条显示行的软换行续行」）。
+    `src_line` 全程只被 `slice_text` 拿去比「相等」，而它需要跨 cell 唯一**只是为了表达续行**；换成每行自带的标记后，
+    「编号必须全局唯一」这条隐式契约消失——每条 cell 的首行与 cell 之间的空行都是 `continues = false`，跨 cell 复制不再有粘连风险。
+  - **排版下放到 `Cell`**：新增 `Cell::render(index, palette, &mut Pane)`——每个变体只回答「我要显示哪些**逻辑行**、行首装饰几格、首行的 mark 是什么」；
+    `Pane::push_line` 是**唯一的折行出口**（按 `width - indent` 折 → 给续行补等宽空白 → 写 `indent` / `continues`），`end_cell()` 负责 cell 之间的空行。
+    `pub fn layout(cells, palette, width, lean) -> Vec<Row>` 退化成十几行 driver（`cells.iter_mut()` + `render` + `end_cell`）。
+    - 顺带删掉 `Cell::User` 的**重复预折**（以前它得先自己按 `width - PREFIX_CELLS` 折一次，因为统一折行那一步传的是整宽）。
+    - `Pane` 是累加器（整个消息流一次分配），不是「每 cell 一个 `Vec<Row>`」。
+    - 折行仍**只有一份**（所有变体都走 `push_line` → `pane::wrap_segments`，`WRAP_MODE` 仍是一处开关）；
+      这条不变量是刻意守的：漏一条逻辑行、或折错宽度，`Paragraph` 就会二次折行、`Row` ↔ 源文本的映射就错了。
+  - **去掉 `Layout` 外壳**：`Layout { rows }` + `Layout::slice_text` → `pub fn slice_rows(&[Row], r1, c1, r2, c2) -> String`；
+    `App.layout: history::Layout` → `App.rows: Vec<Row>`（顺带解掉与 `ratatui::layout::Layout` 的撞名——以前只能写全路径）。
+    `slice_rows` 保持纯函数，单测直接喂 `&[Row]`（不必构造 `App`）。
+  - 实测：`cargo test` 198 例全绿（lib 194 + bin 4），含新增 `pane::tests::a_single_cell_renders_on_its_own`
+    ——单条 cell 现在可以直接钉（`Cell::render(index, palette, &mut Pane)`），不必经过整个 `layout`。
+  - **markdown 缓存从 `Cell` 搬到跨帧的 `Pane`**（用户：「MarkdownCache 是不是应该放在 Stream 里面？」）：
+    - **不能放每帧新建的 `Stream`**——那玩意儿 `Pane::layout` 里现造现丢，命中率会是 0；缓存的意义就在**跨帧**（未变的助手格每帧都得复用结果）。
+    - 所以新类型 `pub struct Pane { rows: Vec<Row>, md: HashMap<usize, MarkdownCache> }` 当**跨帧状态**（`App.rows` → `App.pane`），
+      `Pane::layout(&mut self, cells: &[Cell], palette, width, lean)` 是唯一入口。
+  - **`Stream` 并入 `Pane`**（用户：「你都有 Pane 了，那是不是 Stream 可以并入 Pane?」）：可以——`Stream` 原本只是为了把「本帧旋钮 + 借来的 `md`/`rows`」
+    打包给 `Cell::render`；`markdown_lines` 已经把行拷出来返回（借用当步结束），所以这些方法直接挂在 `Pane` 上不会撞借用。于是
+    `Pane { width, lean, rows, md }`（旋钮也住进去：折行宽度与缓存键本来就是同一个量），`push_line` / `end_cell` / `markdown_lines` 全归它，
+    全仓不再有 `Stream` 这个类型；`Cell::render(&self, index, palette, &mut Pane)` 拿到 palette（`Pane` 不能持有 `&Palette`——`Palette` 归 `App`，
+    自己存一份会与 `/theme` 热切打架）。
+    - 顺带三得：① `Cell` 回归**纯数据**（`Assistant { text }`，与其他变体同形；`assistant(text)` 不用再藏 `md: Default::default()`），
+      `Cell::render` 从 `&mut self` 降为 `&self`，`layout` 收 `&[Cell]`；② `rows` 不再每帧新分配（`self.rows.clear()` 复用容量）；
+      ③ 缓存键 = **cell 下标**（内容/宽度变了指纹就不符 → 重算；越界项（`/clear`）每次 `layout` 清掉），
+      于是 2026-09-28 那条治法①（复用上一帧排版）现在只需在 `Pane` 里比一下——`rows` 与它要用的缓存已经同居。
+    - 用例：`pane::markdown_cache_is_keyed_by_cell_index`（命中 / 内容变 / 宽度变 / 清越界项），另真终端（tmux 100×24）
+      拉一份带 markdown 助手消息的会话验了渲染（标题 + 加粗 + 表格重排都正常）。
+  - **消息流加滚动条**（用户：「pie 的 tui 能显示 scrollbar 吗？」→「可以的」）：
+    - ratatui 0.30 自带 `Scrollbar` / `ScrollbarState`（`ratatui::widgets`）；三个数现成：`content_length = pane.rows().len()`、
+      `viewport_content_length = body.height`、`position = scroll_top`。
+    - **右缘固定留 1 列**（`bar_w = body.width > 2`）：不能做成「有溢出才留」——折行宽度与 markdown 缓存键都吃 `width`，
+      一旦跨过溢出阈值就换了宽度 → 整段历史重排 + 全部缓存失效。因此改成“列一直留、只是不画”。
+    - 不溢出时**不画**（否则 `ScrollbarState` 会把 thumb 铺满整条轨道）；样式：thumb = `palette.cancelled`（overlay2）、
+      `track_symbol(None)`（只画 thumb，codex / claude code 那种极简风）。
+    - `Surface` 多了第三种 **`Scrollbar`**（`surface_at`：输入框 > 滚动条 > 消息流；`App.body` 现在已经是**不含**滚动条列的那块，
+      因此坐标/选区数学不用改）→ 在滚动条上点/拖不再被当成“在消息流里按下”而起框选，而是 `App::scrollbar_jump(row)`：
+      屏幕行 → 偏移的**线性**映射（不按 thumb 尺寸精确抓取；第一版够）。
+    - ⚠ 用户确认的语义：**拖动滚动条只改 `scroll_from_bottom`**，输入框（连同它自己的视口/草稿）与状态栏都在垂直布局的下方几行，
+      完全不受影响——已用 `app::dragging_the_scrollbar_scrolls_only_the_stream` 钉住（还断言了不产生选区/复制提示）。
+    - 用例：`app::scrollbar_appears_only_when_the_stream_overflows`（不溢出→右缘空白；溢出→有 thumb 但不铺满）；
+      真终端（tmux 60×16、40 组消息）验过渲染。
+  - **per-cell 排版缓存（治法②的骨架；`Pane::window` 按要求先不做）**（用户：「我感觉还是 per-cell cache 设计上好点。要不 `Pane::rows` 换成 `Vec<Vec<Row>>`？」→「暂时先不要 `Pane::window` 了」）：
+    - `Pane.rows: Vec<Row>` → `blocks: Vec<CellBlock>`（`CellBlock { rows: Vec<Row>, key: u64 }`，**与 `cells` 下标一一对应**）。用户说的是裸
+      `Vec<Vec<Row>>`；这里把「这一条的行」与「生成它的指纹」捆成一个结构体，免得两份并行数组（`rows`/`keys`）错位。
+    - **失效规则**：`frame_key`（`width` / `lean` / `palette`，为此给 `Palette` / `Status` 补了 `derive(Hash)`——`Color` 本来就 `Hash`）
+      变了 → **全部**重排；否则逐条比 `cell_key(cell)`（variant + `len` + 首尾 64 字节，退到字符边界——把 `markdown::floor_char_boundary`
+      提成 `pub(crate)` 复用，不再写第二份切字节的代码；`Tool` 另算 `status`/`manual`/`body.len()`）。
+      **指纹每帧现算 ⇒ App 那 ~20 个改 cells 的地方一处都不用碰**（否则得在每处 bump 版本号，漏一处就是"界面显示旧内容"）。
+    - `Cell::render` 的入口从 `&mut Pane` 收窄成 `&mut CellSink`（`{ palette, width, lean, md, rows: &mut Vec<Row> }`）：
+      per-cell 结构下写入口必须只写"当前这一条"。于是上一轮并进 `Pane` 的 `Stream` 以 `CellSink` 之名回来了（**部分回退是必要的**，
+      不是反复横跳）。
+    - 对外接口：`Pane::rows()` → `Pane::total()`（Σ 每块行数，O(#cell) 整数加法，不维护"运行总和"那份额外不变量）+ `Pane::iter()`
+      + `Pane::slice_text(...)`（原 `slice_rows` 的**逐行逻辑一字未改**，只是"第 n 行"先逐块定位；`Row` / `continues` / `indent` 全保留）。
+      `App` 只改 4 处（`max_scroll` / 滚动条 / 复制 / `render` 里那行克隆走 `iter()`）。
+    - 实测（release，3200 行 / 600 条 cell）：首次（含 markdown 解析 + 高亮）21ms；**全量重排（md 已缓存）2.6ms**（与 2026-09-28 那条基线对得上）；
+      **输入没变 → 24–39µs（≈100×）**；**只改尾巴一条 → 34µs（工具格）/ 96µs（助手格，含它自己的 markdown 重解析）**。
+    - 用例：`pane::only_changed_cells_are_relaid_out`（`#[cfg(test)] relaid` 计数钉住"没变的块被跳过"；宽度/简洁/配色变了必须全排）、
+      `pane::incremental_layout_matches_a_full_one`（含"往头部插一条 → 下标整体移位"也必须与全量逐行一致）、
+      `pane::a_tool_status_change_invalidates_that_cell`（漏判的后果是一直显示 `•`）、`pane::clearing_cells_drops_blocks_and_cache`、
+      `app::a_second_identical_frame_relays_out_nothing`。
+    - **仍未做**：`Pane::window()`（治法 B：只把可见那几十行借出去，干掉 `render` 里那行全量克隆——用户要求先不做）；窗口定位现在靠
+      逐块扫（O(#cell)），没上前缀和。
+
+  - **`CellSink` 并入 `CellBlock`（顺带消掉 `Pane.md`）**（用户：「可不可以把 `CellSink` 合并到 `CellBlock` 里面呢？」）：
+    - 合并的关键是**让 markdown 缓存跟着块走**：`CellBlock { rows, key, md: MarkdownCache }`（一条 cell 一个，本来就是这样）。
+      于是 `Pane.md: HashMap<usize, MarkdownCache>` 整个消失，「下标 → 缓存」那层映射与它的 `retain` 清理都不需要了。
+    - 写入方法（`push_line` / `end_cell` / `markdown_lines`）直接挂在 `CellBlock` 上，只需多收一个 `width`（本帧宽度）；
+      `Cell::render(&self, palette, width, lean, block: &mut CellBlock)`——**拿到 `&mut CellBlock` 就物理上只能写这一条**，
+      比原来"传 index + 借整个 Pane"更安全（也更少参数：`index` 不必再传）。
+    - `Pane` 因此缩到 `{ frame_key, blocks, #[cfg(test)] relaid }`：`width` / `lean` 两字段不必存（它们在 `frame_key` 里，
+      每帧按参数传给 `render`）；`CellSink<'a>` 这个带生命周期的类型彻底消失。
+    - 单 cell 用例因此更好写：直接 `CellBlock::default()` + `cell.render(&palette, 40, false, &mut b)`。
+
+  - **`Cell::render` 也收进 `CellBlock`**（用户：「`Cell::render` 是不是也应该移入 `CellBlock`？」）：可以，而且这次顺手把 `layout` 里那四步记账
+    一起收了——入口变成两个方法，语义各自清楚：
+    - `CellBlock::is_stale(&Cell) -> bool`（指纹对不上 ⇒ 这一块得重建）；
+    - `CellBlock::rebuild(&Cell, palette, width, lean)` = `rows.clear()` → `key = cell_key(cell)` → `render(...)` → `end_cell()`；
+    - `CellBlock::render(&mut self, cell, palette, width, lean)` 就是那个 per-variant 的 match（回答「这条消息长什么样」），
+      内部写行一律走 `self.push_line(...)` / `self.markdown_lines(...)`——**一条 cell 的全部排版知识（策略 + 折行 + 缓存）都在块上了**。
+    - `Pane::layout` 的循环因此只剩「判失效 → 计数 → 交给块重建」（原来是清空/记指纹/render/补空行四行散在循环里）。
+    - 单 cell 用例同步简化：`b.rebuild(&Cell::User("你好".into()), &palette, 40, false)`（`rebuild` 自带尾部空行，断言相应改）。
+
+  - 屏幕模型不变（继续用 alt screen；上一轮讨论过的 inline / 终端 scrollback 路线仍只是 `2026-09-28` 那条里的选项）。
+  - 顺手：`cells_from_history(&[Message])` → **`Cell::from_messages(&[Message]) -> Vec<Cell>`**（与 `push_assistant_text` / `finish_tool` /
+    `cancel_running` 一致：`Vec<Cell>` 级操作都挂在 `Cell` 上），调用点变成 `Cell::from_messages(&session.full_history())`。
+  - 顺手：`Cell::assistant()`（无参，造完还得在外面 `if let` 把正文塞进去）→ **`Cell::assistant(text: impl Into<String>)`**；
+    `push_assistant_text` / `from_messages` 里那两处「先造再填字段」的 dance 随之消失。`Cell::Assistant.md` 保持具体类型
+    `MarkdownCache`（**不**改成 `Option<MarkdownCache>`：缓存是纯 memoization，`None` 不表达任何状态，只为少写一个 `Default::default()` 不值得）。
+  - 顺手：把 `tool_result_ok`（`pub fn -> bool`）**合并进 `tool_status`**——它全仓只被 `tool_status` 自己与单测调用（`app.rs` 只用 `tool_status`），而且那个 `bool` 对取消哨兵返回 `true`（语义是错的）；
+    现在「取消 → ⏹ / `[exit=N]` 头 → ✓✗」只有一处判定，输出协议的说明也并到 `tool_status` 的 doc 里。
+
 ## 2026-09-28
 
 - **判明「每帧全量重排」的底细**（用户连问：`App::render` 何时调用 / 滚轮会不会触发重排 / 能不能用终端自带的 scroll。**本轮不改行为**，只记录决策与数据）：

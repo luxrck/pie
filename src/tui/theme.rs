@@ -9,7 +9,9 @@ use catppuccin::{FlavorName, PALETTE};
 use ratatui::style::{Color, Modifier, Style};
 
 /// 语义色板：视图代码只认这些名字，不直接写颜色。
-#[derive(Clone, Copy, Debug)]
+///
+/// `Hash` 是给 `Pane` 的输入指纹用的（换主题 ⇒ 整段重排；字段全是 `Color`，已 impl `Hash`）。
+#[derive(Clone, Copy, Debug, Hash)]
 pub struct Palette {
     /// 强调色（输入提示、用户消息前缀、活动指示）—— mocha `blue`
     pub accent: Color,
@@ -183,7 +185,7 @@ impl Palette {
 /// 工具活动的状态轴（盒子/单行/状态栏共用）。
 ///
 /// `Cancelled` 暂时没被构造（取消通路是下一步的事）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum Status {
     Running,

@@ -10,7 +10,7 @@ use std::time::Instant;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use super::history::fmt_duration;
+use super::pane::fmt_duration;
 use super::theme::{spinner, Palette};
 /// 当前活动（决定状态栏显示什么，也带着计时起点）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

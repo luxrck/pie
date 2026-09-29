@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-pie 是一个极简的 agent harness，**纯 Rust 实现**：
+pie 是一个极简的 agent harness，**纯 Rust 实现**（[`pi`](https://github.com/earendil-works/pi) 的 Rust 重实现，名字取自 π 的谐音）：
 内置 read / edit / **writ** / **bash** 四个工具（后两个名字是用户点名的，**不是笔误**）、YOLO 模式（无权限确认、
 不做沙箱）、模型走 OpenAI 兼容接口（DeepSeek / Qwen / vLLM / Ollama…）。
 
@@ -27,8 +27,8 @@ pie/
 │   ├── log.rs        # 告警出口（TUI 期间不能直接写 stderr）
 │   └── tui/          # ratatui 界面（模块划分见 src/tui/mod.rs 顶部注释）
 │       ├── app.rs        # 状态机 + 事件循环 + 全部渲染（最大的文件）
-│       ├── history.rs    # 消息流单元格 + **自己折行** + 选区切片
-│       ├── markdown.rs   # markdown → Text（按宽度缓存 + 超宽表格重排）
+│       ├── pane.rs       # 消息流面板：每消息一条 Cell + **自己折行** + 选区切片
+│       ├── markdown.rs   # markdown → Text（按宽度缓存；表格宽度交上游 table_width）
 │       ├── palette.rs    # `/` 命令补全（候选表是唯一事实来源，/help 由它生成）
 │       ├── files.rs      # `@` 文件路径补全（gitignore-aware 索引，后台建；`@..`/`@/`/`@~/` 实时列目录）
 │       ├── input.rs      # 输入框（ratatui-textarea，多行 + 软换行）
@@ -48,7 +48,7 @@ pie/
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"                  # 本机 cargo 不在默认 PATH
 export CARGO_TARGET_DIR=$HOME/.cache/pie-target       # 可选：产物放大盘（源码在 9p 盘时才必要）
-cargo test                                            # 168 例（lib 164 + bin 4），不联网
+cargo test                                            # 198 例（lib 194 + bin 4），不联网
 cargo build && cargo run -- --models                  # 端点可用模型
 cargo run                                             # 真 TTY + 无任务 → 进 TUI
 cargo run -- "任务"                                   # 一次性（子 agent；不落盘、stderr 静音）
@@ -101,8 +101,10 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **JSONL 落盘要转义「行分隔类」字符**（`session::json_line` / `escape_control_chars`）：serde_json 只转义 C0，
   C1（U+0080–U+009F）与 U+2028/U+2029 会裸着落盘——JSON 里合法，但 `splitlines()` 那一类读者会把
   **U+0085 当换行**，一条消息被劈成两半、整份会话读不出来。session 文件与 `/clear` 的窗口块都走 `json_line`。
-- 压缩元数据字段（`compress_level` / `raw_path` / `raw_hash` / `raw_len` / `raw_tokens` / `synthetic`）
-  **绝不能进 API 请求体**：发给模型前统一过 `Message::to_api()`。
+- 本地专有字段（`compress_level` / `raw_path` / `raw_hash` / `raw_len` / `raw_tokens` / `synthetic` / `thought_ms`）
+  **绝不能进 API 请求体**：发给模型前统一过 `Message::to_api()`。`thought_ms` = 这条回复「思考」了多久
+  （`session::ThoughtClock` 量：首个 reasoning 增量起算、首个正文增量停下）；**回放靠它还原**
+  `• Thought for 3.4s` 那行——不落盘的话退出再 `-r` 就没了（非流式没有增量事件 → None）。
 - 目录分工别混：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘），`/clear` 归档的窗口块在
   `~/.pie/windows/`（用户主动归档的原文，gc 不碰），本地图片副本在 `~/.pie/files/`（有 24h mtime 保护窗）。
 - **执行旋钮按次传**：`Session::aturn(input, on_event, cancel, max_steps, stream, parallel_tools)`；
@@ -132,17 +134,24 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   静止帧零开销；且**只标已写区间之外**——写正文里那格会把汉字擦掉半个）。
 - **终端光标位置 = 输入法的锚点**：每帧 `App::run` 在 `terminal.draw` **之后** `terminal.set_cursor_position(插入符)`，
   否则 IME 候选框会停在「上一帧 diff 最后写入的那一格」（点一下消息流候选框就会跑过去）。
-- 消息流**自己折行**（`history::layout` → 带逻辑行号的 `Row`）：折行**只有一份** `history::wrap_segments`（`WRAP_MODE` 一档开关：
-  `WordOrGlyph` 默认 = 词级 UAX#29，英文词不断、中日韩字各自成块；`Glyph` = 逐字硬断），`PREFIX_CELLS` / `char_width` 也在那儿；
-  用户消息按 `width - PREFIX_CELLS` 折 + `› `/`  ` 悬挂缩进（行首装饰记在 `Row::indent`，`slice_text` 复制时跳过）。滚动偏移按折行后的
+- 消息流**自己折行**（`Pane::layout` **增量**重排：`frame_key`（宽度/简洁/配色）+ 每条 cell 的 `cell_key` 都没变就整块复用；每条消息一个 `Cell`，`CellBlock::rebuild(&Cell, palette, width, lean)` 重建这一块）：折行**只有一份出口**
+  `CellBlock::push_line` → `pane::wrap_segments`（`WrapMode` 两档，**生产走 `WordOrGlyph`**：词级断行 + 超长词退回逐字硬断，规则对齐
+  `ratatui-textarea` 的 `wrap_word_chunks`；`Glyph` = 纯逐字硬断。没有 `WRAP_MODE` 常量，档位就是调用点那个字面量），`PREFIX_CELLS` / `char_width` 也在那儿；用户消息只交代 `indent = PREFIX_CELLS` + 首行 `› `（续行与其余逻辑行
+  由 `CellBlock` 补等宽空白），折行宽度 = `width - indent`。`Row` 自描述：`indent`（复制时跳过）+ `continues`（软换行的续行，复制时拼成一行，
+  `Pane::slice_text` 按它决定插不插换行）。**`Cell` 是纯数据**（`&[Cell]` 就能排）：markdown 渲染缓存不住 cell 里，而是与
+  **per-cell 的显示行 + 它自己的 markdown 缓存**（`blocks: Vec<CellBlock{rows,key,md}>`，与 `cells` 下标一一对应）同居 `App.pane`；`Pane::total()` 是显示行总数、`Pane::iter()` 按顺序迭代、越界项每次 `layout` 清掉。滚动偏移按折行后的
   显示行算（`scroll_from_bottom` 两端都夹：0 = 贴底跟随、`max_scroll()` = 贴顶；`render` 里再按当帧夹一次，内容变短也不留旧偏移）。
-- **输入框是普通编辑器**（`input.rs`）：软换行固定 `WrapMode::Glyph`（逐字断，**不跟消息流的档位对齐**）、左边不留 gutter / `› `；
+- **输入框是普通编辑器**（`input.rs`）：软换行固定 `WrapMode::Glyph`（逐字断，**不跟消息流的档位对齐**——它复刻的是控件那份折行）、左边不留 gutter / `› `；
   边框交控件渲染（`set_block`），内容区（`inner_rect()`）就是渲染时从同一个块里取的那块（记在 `Input::inner`，不再手推边框）；插入符位置问控件 `screen_cursor()`。它的 `screen_rows`
   是**控件 Glyph 折行的复刻**（鼠标命中 / 框高 / 残影擦除 / 视口滚动复刻用），钉在 `input::screen_rows_matches_the_widget_wrapping`。
   滚轮**按位置分派**：悬在输入框上且它真能滚（`Input::overflows`）→ 滚输入框，否则滚消息流。
   鼠标捕获为滚轮常开 → 框选/拖选都得自己做，写完剪贴板用长活 `Copier`（每帧新建再 drop 会砸屏 + 复制不生效）。
+- **滚动条**：消息流右缘**固定**留 1 列（`bar_w = body.width > 2`）——因为折行宽度与 markdown 缓存键都吃 `width`，
+  「有溢出才留」会让跨阈值那一下换宽度 → 整段重排 + 缓存全失效；因此没溢出时**只是不画**（`ScrollbarState` 的 thumb 会铺满，很难看）。
+  `surface_at` 有三种面：输入框 > 滚动条 > 消息流（`body` 已经是**不含**滚动条列的那块）；点/拖滚动条只改 `scroll_from_bottom`（[`App::scrollbar_jump`]，线性映射，不按 thumb 尺寸抓取）
+  → 输入框与状态栏在垂直布局的下面几行，完全不受影响。
 - 多行粘贴必须自己 `EnableBracketedPaste`（`ratatui::init()` 不开）。
-- ⚠ `App::render` **每帧全量重排**：`history::layout` 走完全部 cells，再把全部行克隆给 `Paragraph`（唯一缓存是 markdown 渲染）。
+- ⚠ `App::render` **每帧全量重排**：`Pane::layout` 走完全部 cells，再把全部行克隆给 `Paragraph`（唯一缓存是 markdown 渲染与 per-cell 显示行，住 `App.pane`）。
   每个终端事件 / 每个流式 delta / 每 66ms tick 都跑一帧，**没有 dirty 标记**（ratatui 的 diff 只省终端写入）；长会话是已知瓶颈
   （实测与三条治法、以及「改用终端 scrollback」的取舍见 `docs/CHANGELOG.md` 2026-09-28）→ 别往 `render` 里再加 O(历史) 的活。
 - lean 模式（`[tui] lean`，默认 true）只压工具活动那一行；`/help` 文案由 `palette::COMMANDS` 生成。
