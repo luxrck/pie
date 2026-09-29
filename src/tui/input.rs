@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, Widget};
 use ratatui::Frame;
 use ratatui_textarea::{CursorMove, DataCursor, ScreenCursor, TextArea, WrapMode};
 
-use super::history::char_width;
+use super::pane::char_width;
 use super::theme::Palette;
 
 /// 输入框为空时显示什么：App 每帧把它改成当前的**键位提示**（`status::hint_text`）——
@@ -78,7 +78,7 @@ impl Input {
         area.set_cursor_line_style(Style::default().add_modifier(Modifier::BOLD));
         // **软换行**固定逐字断（`Glyph`）：默认的 `WrapMode::None` 是水平滚动（光标越过右边界
         // 就整行左移，长行只看得到尾巴），而 `Glyph` 就是终端原生那种填法 —— 输入框不去镜像
-        // 消息流的词级折行（消息流那边要英文词整块 + 中文逐字，见 `history::wrap_segments`）。
+        // 消息流的词级折行（消息流那边要英文词整块 + 中文逐字，见 `pane::wrap_segments`）。
         area.set_wrap_mode(WrapMode::Glyph);
         area
     }

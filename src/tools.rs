@@ -829,7 +829,7 @@ impl Tool for Bash {
         };
 
         // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
-        // 「判成败」：Rust TUI 的 `history::tool_result_ok` 只看**第一行**，所以失败必须
+        // 「判成败」：Rust TUI 的 `pane::tool_status` 只看**第一行**，所以失败必须
         // 从这行就能认出来——判据是「`[exit=` 开头且不是 `[exit=0`」= 失败（没有任何头 = 成功）。
         // 三个字段挤在一行（2026-09-24 起）：这行只为「判成败」存在，一行就够，也少两行噪声。
         let mut headers: Vec<String> = Vec::new();
@@ -1635,7 +1635,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
-        // 前端（Rust TUI 的 `history::tool_result_ok`）只拿**第一行**判成败：
+        // 前端（Rust TUI 的 `pane::tool_status`）只拿**第一行**判成败：
         // `[exit=` 开头且不是 `[exit=0…` = 失败（成功根本没有头）
         let first = bad.lines().next().unwrap_or_default();
         assert_eq!(first, headers, "{bad}");

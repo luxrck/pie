@@ -84,6 +84,12 @@ pub struct Message {
     /// 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    /// 这条 assistant 回复前「思考」了多久（毫秒）：**只进会话文件、不进 API**（`to_api` 不带上它）。
+    ///
+    /// 实时视图里它是 TUI 现算的一行 `• Thought for 3.4s`；不落盘的话，退出再 `pie -r`
+    /// 回来这行就没了（`reasoning_content` 只说明"思考过"，没说明多久）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_ms: Option<u64>,
 }
 
 impl Message {
@@ -1021,6 +1027,25 @@ mod tests {
     use super::*;
     // 单线程的测试里用 `Cell` 计数就行（`Send` 约束只对 spawn 出去的 future 有意义）
     use std::cell::Cell;
+
+    /// `thought_ms` 是纯本地元数据：**绝不进 API 请求体**（回放才用它）。
+    #[test]
+    fn thought_ms_stays_out_of_the_api_payload_and_survives_jsonl() {
+        let m = Message {
+            role: "assistant".into(),
+            content: Some(Content::Text("hi".into())),
+            reasoning_content: Some("想过".into()),
+            thought_ms: Some(1234),
+            ..Default::default()
+        };
+        let api = m.to_api();
+        assert!(api.get("thought_ms").is_none(), "不许进请求体：{api}");
+        assert_eq!(api["content"], "hi");
+        assert_eq!(api["reasoning_content"], "想过");
+        // 落盘（会话 JSONL）要保住它，否则回放还原不出「• Thought for …」
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.thought_ms, Some(1234));
+    }
 
     #[test]
     fn retry_delay_prefers_retry_after_and_clamps() {

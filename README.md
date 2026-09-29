@@ -1,17 +1,7 @@
 # pie
 
-`pie` 是一个极简的 agent harness，**纯 Rust 实现**。内置 read / edit / **writ** / **bash** 四个工具、
-YOLO 模式（无权限确认、不做沙箱）、模型走 OpenAI 兼容接口（DeepSeek / Qwen / vLLM / Ollama…）。
-对外三样东西：可执行文件 `pie`（CLI + TUI）、库 `pie`、Python 绑定（`bindings/pie-py`，`import pie`）。
-
-## 安装
-
-```bash
-cargo install --path .     # 装成 ~/.cargo/bin/pie（更新已装的加 --force）
-```
-
-cargo 不在默认 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。构建依赖只要 `cc` —— TLS 走 rustls、
-图片用纯 Rust 的 `image`，**不需要** libssl / pkg-config / cmake。
+`pie` 是 [`pi`](https://github.com/earendil-works/pi)（TypeScript 写的 agent harness）的 **Rust 重实现**：一个极简的
+agent harness —— 内置 read / edit / **writ** / **bash** 四个工具。对外提供 cli 可执行文件、Rust API 库和相应的 Python 绑定。
 
 ## 命令行
 
@@ -57,24 +47,43 @@ pie [OPTIONS] [TASK]... [COMMAND]
 
 `pie <子命令> --help` 看细节。
 
-## 写一个工具
+## 上下文压缩
 
-**一个工具 = 一个结构体**：字段即参数、doc 首行即描述、非 `Option` 即必填，schema 由
-`#[derive(Deserialize, JsonSchema)]`（serde + schemars）派生。加工具 = 写结构体 + `impl Tool` +
-在 `ToolRegistry::new()` 里加一行 `.with_tool::<T>("名字")`。其余约定（trait 签名、schemars 的坑）
-见 `AGENTS.md`。
+长会话不靠「丢老消息」续命：pie 自己做**三级压缩**，把旧内容换成**指针 + 落盘原文**——模型看到的是摘要/预览，原文都在盘上，
+**可逆**（`-r` 恢复会话时会把指针展开成完整转录）。
 
-## Python 绑定（`import pie`）
+| 级别 | 压的是什么 | 压成什么 |
+| --- | --- | --- |
+| 工具级 | 最近 `keep_last_steps`（默认 7）个 step 批次**之外**、行数超过 `head+tail`（默认 30+50）的工具输出 | 头尾预览 + `[工具输出全文已保存: <path>]`，全文落盘 |
+| 轮次级 | 已完成的回合（最后一个 user 之前的） | 一条摘要 assistant（只留模型最终输出）+ `[轮次原文已保存: <path>]`，原文落盘 |
+| 会话级 | 当前轮之前的整段历史 | 一个窗口块（`~/.pie/context/session-*.txt`）+ 一条 `[历史窗口: <path>]` 摘要 system 消息（摘要里留头 3 / 尾 5 轮原文） |
 
-核心层（config / llm / tools / session / context）的原生扩展；**TUI 不进绑定**。规划见
-[`docs/python-bindings.md`](docs/python-bindings.md)。
+- 自动压缩看**可用输入预算**（`context_window - reserved_tokens`，后者就是发给 API 的 `max_tokens`）：超过 `soft_ratio`
+  （默认 0.8）就压到 `target_ratio`（默认 0.55）以下——软阈值 + 目标水位构成**迟滞**，不会压完又弹回去。
+  TUI 里可以 `/compact [tools|turns|auto]` 手动压一次（不看水位）；`pie --stat "任务"` 跑完会把上下文占用 / 压缩事件 / API 用量打到 stderr。
+- 压缩级别**只升不降**；落盘按内容 sha256 寻址（同一份内容只存一次）。维护用 `pie context info` / `verify` / `gc`（见上面的子命令表）。
+- 目录分工：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘）；`/clear` 归档的窗口块在 `~/.pie/windows/`（用户主动归档，GC 不碰）。
 
-```bash
-cd bindings/pie-py
-export PATH="$HOME/.cargo/bin:$PATH"
-uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python maturin pytest
-VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest tests -q   # 不联网，本地假 SSE
+```toml
+keep_last_steps = 7          # 顶层：最近 7 个 step 批次不动（工具级不碰它们）
+
+[compaction]                 # 写了即开启；整段 `compaction = false` = 完全不压，某级 `false` = 只关那一级
+turn         = true          # 轮次级（level 2）：已完成的回合 → 一条摘要（只留 user + 最终输出）；没参数，只能开关
+soft_ratio   = 0.8           # 超过可用输入预算的这个比例就自动压
+target_ratio = 0.55          # 压到这个水位以下（软阈值 + 目标水位 = 迟滞，不来回抖）
+
+[compaction.tool]            # 工具级（level 1）：工具输出超过 head+tail 行就全文落盘，头/尾留预览
+head = 30
+tail = 50
+
+[compaction.session]         # 会话级（level 3）：整段历史落成窗口块；摘要里保留头 head / 尾 tail 轮原文
+head = 3
+tail = 5
 ```
+
+## Python 绑定
+
+构建后 `import pie`（扩展模块是 `pie._pie_rs`，TUI 那堆依赖不进绑定）：
 
 ```python
 import pie
@@ -82,9 +91,6 @@ cfg = pie.Config.load()                          # ~/.pie/config.toml（只改�
 session = pie.Session.ephemeral(cfg, pie.LlmClient(cfg), pie.ToolRegistry.builtins(cfg))
 answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
 ```
-
-三条约定：**同步外观但释放 GIL**（并发用 `asyncio.to_thread`）；**一个 Session 同时只跑一个回合**；
-**`messages` / 事件都是 dict**，字段名与 JSONL 一致。
 
 ## 更多
 

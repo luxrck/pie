@@ -2,7 +2,7 @@
 name = "pie"
 version = "0.1.0"
 edition = "2021"
-description = "pie 的 Rust 重构：极简 agent harness（YOLO，内置 read/edit/write/shell）"
+description = "pi 的 Rust 实现：极简 agent harness（YOLO——无权限确认、无沙箱；内置 read/edit/writ/bash）"
 license = "MIT"
 
 [workspace]
@@ -87,11 +87,11 @@ crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 # 输入框：官方接手 tui-textarea 后的 crate（github.com/ratatui/ratatui-textarea）。老的
 # tui-textarea 0.7 已停更且**没有软换行**；0.9 起有 `set_wrap_mode`（长行不再水平滚动）。
 ratatui-textarea = { version = "0.9", optional = true }
-# 自己折行（history.rs）算字符显示宽度：与 ratatui 内部同一份 unicode-width（已是其传递依赖）。
+# 自己折行（pane.rs）算字符显示宽度：与 ratatui 内部同一份 unicode-width（已是其传递依赖）。
 unicode-width = { version = "0.2", optional = true }
-# 折行的**分词**（UAX#29：ASCII 词整块、中日韩字各自成块）：**消息流**自己折行要用它
-# （`history::wrap_segments`）；输入框固定 `Glyph`、不用这套。
-# 同样已在这棵树里（ratatui-widgets / unicode-truncate 都依赖它），只是显式声明。
+# 折行的**分词**（UAX#29 词边界）：只给 `WrapMode::WordOrGlyph` 档用（`pane::wrap_segments`，
+# 规则对齐 `ratatui-textarea` 的 `wrap_word_chunks`）；输入框固定逐字断、不用它。
+# 它本来就在这棵树里（`ratatui-textarea` 等依赖它），这里只是显式声明。
 unicode-segmentation = { version = "1", optional = true }
 # 剪贴板：粘贴文本 / 图片路径（图片本体走 session::store_blob）
 arboard = { version = "3", optional = true }
@@ -102,7 +102,7 @@ ignore = { version = "0.4", optional = true }
 # 开默认特性 `highlight-code`：代码块用 syntect 做语法高亮。⚠ 它的 syntect 依赖是**默认特性**
 # （`default-onig`）→ 会拉 oniguruma（C 库，靠 `cc` 编译）与 syntect 的语法/主题数据（几 MB）；
 # 这是**有意接受**的代价（换成自写高亮就能去掉，见 docs/CHANGELOG.md）。
-tui-markdown = { version = "0.3.9", optional = true }
+tui-markdown = { version = "0.3.10", optional = true }
 # 内置配色取自 Catppuccin 官方色板（`theme.rs` 里那套手写 RGB 本来就是「近似 Mocha」）。
 # 开 `ratatui` feature 才有 `impl From<catppuccin::Color> for ratatui_core::style::Color`
 # —— 它只多一条已经在树里的 ratatui-core 边（两边都是 0.1.x，类型是同一份），不引别的依赖。

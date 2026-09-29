@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
-const ERROR_TURN_PREFIX: &str = "[请求失败] ";
+pub(crate) const ERROR_TURN_PREFIX: &str = "[请求失败] ";
 
 /// 回合过程中推给调用方的事件（TUI / CLI 边跑边渲染用）。
 ///
@@ -89,6 +89,39 @@ pub struct Session {
     pub turn_count: usize,
     /// 启动时拉取的可用模型 id（`/model` 的候选；**不持久化**）。
     pub available_models: Option<Vec<String>>,
+}
+
+/// 「思考」计时：实时视图里那行 `• Thought for 3.4s` 的来源。
+///
+/// 口径与 TUI 的 `settle_thought` **一致**：**首个 reasoning 增量**起算、**首个正文增量**停下
+/// （中途插进来的工具调用不算停）。量到的毫秒数写进本回合的 assistant 消息（`thought_ms`，
+/// 只进会话文件），退出再 `pie -r` 回来才还原得出这一行——`reasoning_content` 只说"思考过"，
+/// 没说是多久。非流式没有增量事件 → 量不到（实时视图那边同样不显示这行）。
+#[derive(Default)]
+struct ThoughtClock {
+    started: Option<std::time::Instant>,
+    ms: Option<u64>,
+}
+
+impl ThoughtClock {
+    fn on(&mut self, ev: &TurnEvent) {
+        match ev {
+            TurnEvent::Reasoning(_) => {
+                self.started.get_or_insert_with(std::time::Instant::now);
+            }
+            TurnEvent::AssistantText(_) => {
+                if let Some(start) = self.started.take() {
+                    self.ms = Some(start.elapsed().as_millis() as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 取走本次量到的时长（写完那条 assistant 消息后就清空，下一个 model call 重新量）。
+    fn take_ms(&mut self) -> Option<u64> {
+        self.ms.take()
+    }
 }
 
 impl Session {
@@ -380,6 +413,8 @@ impl Session {
         let mut steps = 0usize;
         let mut answer: Option<String> = None;
         let mut done = false;
+        // 「思考」计时：见 [`ThoughtClock`]（量到的毫秒数会写进本回合的 assistant 消息）
+        let mut clock = ThoughtClock::default();
         let mut cancelled = false;
         loop {
             // 取消检查点（每步开头；请求/工具内部的 race 另算）
@@ -409,7 +444,7 @@ impl Session {
             );
 
             let specs = self.tools.specs();
-            let called = match self.model_call(&specs, on_event, cancel, use_stream).await {
+            let called = match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
                 Ok(option) => option,
                 Err(e) => {
                     // file_id 失效（服务端删了 / 中途换了 key）：把历史里的图片块降级成文本占位、
@@ -418,7 +453,7 @@ impl Session {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
-                        match self.model_call(&specs, on_event, cancel, use_stream).await {
+                        match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
                             Ok(option) => option,
                             Err(e) => {
                                 self.push_error_turn(&e);
@@ -456,6 +491,7 @@ impl Session {
                     .map(|c| Content::Text(c.to_string())),
                 tool_calls: (!tool_calls.is_empty()).then(|| tool_calls.clone()),
                 reasoning_content: result.reasoning_content.clone(),
+                thought_ms: clock.take_ms(), // 本次「思考」时长（None = 这轮模型没给 reasoning）
                 ..Default::default()
             });
 
@@ -534,6 +570,7 @@ impl Session {
         &self,
         specs: &[Value],
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        clock: &mut ThoughtClock,
         cancel: &Cancel,
         stream: bool,
     ) -> Result<Option<LlmResult>, LlmError> {
@@ -544,8 +581,17 @@ impl Session {
             if stream {
                 self.llm
                     .stream(&self.messages, specs, |chunk| match chunk {
-                        StreamChunk::Content(d) => on_event(TurnEvent::AssistantText(d)),
-                        StreamChunk::Reasoning(d) => on_event(TurnEvent::Reasoning(d)),
+                        // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
+                        StreamChunk::Content(d) => {
+                            let ev = TurnEvent::AssistantText(d);
+                            clock.on(&ev);
+                            on_event(ev);
+                        }
+                        StreamChunk::Reasoning(d) => {
+                            let ev = TurnEvent::Reasoning(d);
+                            clock.on(&ev);
+                            on_event(ev);
+                        }
                         StreamChunk::ToolCall { .. } => {}
                     })
                     .await
