@@ -2,14 +2,14 @@
 //!
 //! 按 ratatui 的习惯来（每帧 `draw` 只写变化的单元格、内容随流式增量追加、滚动自己算偏移）。
 //! 两点与「纯 ratatui 习惯」不同，都是为了复制：
-//! **消息流自己折行**（`history::layout`，而非 `Paragraph::wrap`）→ 知道每个显示行对应源文本的哪一段；
-//! **鼠标左键拖动框选、松开即复制**（`App::on_mouse` + `Layout::slice_text`）——鼠标捕获为了滚轮
+//! **消息流自己折行**（`pane::layout`，而非 `Paragraph::wrap`）→ 知道每个显示行对应源文本的哪一段；
+//! **鼠标左键拖动框选、松开即复制**（`App::on_mouse` + `Pane::slice_text`）——鼠标捕获为了滚轮
 //! 一直开着，终端自己的选择就不能用了，所以得自己做。
 //!
 //! 模块划分：
 //!   - `app`：状态机 + 事件循环（`select!`：终端事件 / 回合事件 / tick）
-//!   - `history`：消息流单元格（用户 / 助手 / 思考耗时 / 工具 / 提示）+ **折行与复制切片**
-//!     （`layout` 返回带逻辑行号的 `Row`，`Layout::slice_text` 按源文本切选区）
+//!   - `pane`：消息流面板（用户 / 助手 / 思考耗时 / 工具 / 提示各一条 `Cell`）+ **折行与复制切片**
+//!     （`Pane::layout` 增量重排，每块显示行 `Row` 自带 `indent` / `continues`；`Pane::slice_text` 按源文本切选区）
 //!   - `markdown`：markdown → `Text`（按单元格缓存，只重解析变化的那条）
 //!   - `status`：状态栏（模型、上下文占用、**思考计时**/spinner）与键位提示文案
 //!   - `palette`：`/` 命令补全候选表 + 匹配 + 面板渲染
@@ -22,7 +22,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod files;
-pub mod history;
+pub mod pane;
 pub mod input;
 pub mod markdown;
 pub mod palette;
