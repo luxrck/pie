@@ -2,6 +2,130 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-01（REPL 画布也有滚动条）
+
+用户：「tui Repl 也加个 scrollbar 吧」。
+
+- **画布右缘固定留 1 列**（与消息流同口径：画布也折行、也吃 `width`，不能「有溢出才留」），只有溢出才画 thumb；
+  画法抽成 `App::render_scrollbar`（消息流与画布各调一次，样式只有一处）。
+- 点/拖：`App::scrollbar_jump` 按 tab 分派 —— 消息流改 `App::scroll_from_bottom`，画布交给 `Repl::jump_to_row`
+  （同一套线性映射）。为此 `Repl` 在 `render` 里记下上一帧的 `total` / `top` / `viewport`，并给出
+  `total()` / `top()`（`App` 画 thumb 与换算偏移都要用）；画布视图下 `App.body` 仍是空的 → 画布本身不成
+  「文本面」（上面按下不起框选），`surface_at` 只多认右缘那 1 列；消息流那份偏移与输入框/状态栏完全不受影响。
+- 测试：`jumping_by_row_maps_the_scrollbar_onto_offsets` / `jumping_does_nothing_without_overflow`（`Repl` 层）
+  + `the_repl_canvas_has_its_own_scrollbar`（`App` 层：几何、`surface_at`、点/拖只动画布）。
+
+## 2026-10-01（改名：`src/tui/repl_view.rs` → `src/tui/repl.rs`，`ReplView` → `Repl`）
+
+用户：「repl_view.rs -> repl.rs, ReplView -> Repl」。
+
+- 模块声明 `pub mod repl;`（`src/tui/mod.rs`），类型/方法/测试全改 `Repl`；两处 `use`：
+  `app.rs` 的 `use super::repl::{Repl, Tab};`、`status.rs` 的 `use super::repl::Tab;`。
+- 与顶层 `src/repl.rs`（**repl 工具**）同名不同模块（`crate::tui::repl` vs `crate::repl`）——两边都没跨引，
+  不存在歧义；`Tab::Repl` 变体与 `Repl` 类型不同命名空间，也不冲突。
+- **视图指示是小写 `cr`**：接手这棵树时 `Tab::label()` 的返回值是 `"c"` / `"r"`，我先按上一节的 `CR`
+  改回了大写 → 用户确认**小写是他改的** → 翻回 `"c"` / `"r"`，状态栏文本断言（`status.rs` / `app.rs`）
+  与 `AGENTS.md` / `MEMORY.md` 一并同步（上一节那条写 `CR` 的已被这条取代）。
+
+## 2026-10-01（状态栏视图指示：`Chat │ REPL` → `CR`）
+
+用户：「我说的是 status_line 里面的 view_tabe 的显示从"Chat | REPL"变成"CR"两个字符。」
+
+- `Tab::label()`（`repl_view.rs`）从 `Chat` / `REPL` 变成**一个字符**（`C` / `R`），`status::view_tabs`
+  去掉中间那根 `│`：两档挨着显示成 ` CR `（4 格，原来 13 格），当前那档仍是 accent + 粗体、另一档 muted
+  （宽度仍参与 `status_line` 的填空计算：`view_len` 4）。新增用例 `view_tabs_marks_the_current_one` 钉住
+  「哪一档 accent / 哪一档 muted / 失焦全 muted」；pty 实测确认 `C`→`R` 切过去后是 `R` 亮。
+- 顺带修了三条**原本就红**的断言（与本次改动无关：期望串里的空格位置一直和真实渲染不符，我用临时
+  回插旧串验证过）：名字 span 自带尾空格 + tail 前缀 ` │ ` → **cwd 后是两个空格**、用量与余额之间**一个**
+  空格；`status_line_shows_zero_usage_before_any_report` 里 `│` 的计数 1 → 0（视图指示里那根也一起没了）。
+
+## 2026-10-01（修：REPL 画布的图小了一半、还浮在画布中间）
+
+用户贴了张 TUI 截图：「这是你现在的显示效果，很明显不对吧」——图小小一张压在代码中间，右下角那块浮层里空空的。
+
+**根因**：`Picker` 的 `FontSize` 是**猜**的（`halfblocks()` 自带 10×20）。iTerm2 协议是按**像素**发图的
+（`1337;File=…;width=Npx;height=Mpx`），终端就照这个像素数 **1:1** 画 —— 所以 `FontSize` 与终端真实字符格
+差多少，图就按那个比例缩错多少。本机 Kaku 的字符格是 **20×58**（`TIOCGWINSZ`：2580×1914 ÷ 129×33）：
+拿 10×20 算出来的 1210×440 图只有 **51×6 格**（应为 61×8 格，正好差一倍），而 `Image` 是**顶在**右下角
+浮层的左上角画的 —— 看上去就是「一张小图浮在画布中间、压着代码」。
+
+- `tui::pick_terminal_protocol`：字体尺寸改为**问终端**（`crossterm::terminal::window_size()`，只做
+  `TIOCGWINSZ`、不读 stdin），问不到才退回 10×20；构造走 `Picker::from_fontsize`（唯一能自定 `FontSize`
+  的入口，已 deprecated → `#[allow(deprecated)]`）。
+- 契约测试 `the_image_is_encoded_in_the_cells_of_the_real_terminal_font`：20×58 的格子里，1210×440
+  必须编成 **61×8 格** / `width=1220px;height=464px`（= 格数 × 每格像素，向上取整到整格）。
+- 图仍然按**原像素 1:1** 出屏（`Fit` 只缩不放）：129 列画布上图占 61 列、落右下角，正好避开 60 来列宽的代码正文。
+
+## 2026-10-01（REPL 画布的图：**浮**在右下角 + 放大）
+
+用户：「repl_view 的图片放在右下角，而且现在图太小了，放大点。」→「图片现在是浮在右下角那种，文本
+还是要占据全部 repl_view 画布的。图还是不够大。」
+
+- `ReplView::split`：文本**永远拿到整块画布**；有图时额外在**右下角浮**一块**固定 Rect**（不随滚动重传）。
+  浮层取画布 **4/5 宽 × 4/5 高**（`IMAGE_MAX_ROWS` 24 → 60）。图**压在文本上**（overlay），不再把文本挤上去。
+- `ReplView::render_image`：编码拿整个浮层当上限（`Fit` 只缩不放），再把编出来的 `Protocol`（`Protocol::size()`）
+  **贴到浮层右下角**——图比浮层小时靠右下沉、左上露出底下的文本，像浮在字上。
+- 效果（120×40 画布、10×20 字体）：宽图 77×16 → 96×20 格；方图 32×16 → 63×32 格。新增几何单测
+  `the_image_sits_in_the_bottom_right_corner`（断言图贴右下角、文本区 == 整块画布）。
+
+## 2026-10-01（REPL 画布贴图：`repl` 里的 matplotlib 图直接显示在 TUI 里）
+
+用户：「现在可以轻松实现 repl 渲染图片了吧」→「使用 Kitty graphics protocol 呢？它和 iterm 图片协议有啥区别？」
+→ 讨论后定案：**ratatui-image 11.1.0 + iTerm2 优先**。
+
+- **数据通道**（结构化，**不嗅探正文**）：`repl_driver.py` 在 `post_execute` 扫「还开着的 matplotlib figure」
+  → `savefig` 到临时目录（`PIE_REPL_IMAGE_DIR` 可覆盖，缺省系统临时目录；顺带清 1 小时前的旧图）→
+  `Reply.images` → `ToolOutput.images`（新字段，与 `spill` 同级）→ `TurnEvent::ToolResult.images` → `ReplView`。
+  **为什么在 `post_execute` 抓、而不 patch `plt.show`**：Agg 下 `show()` 是 no-op，而用户往往在
+  **同一个 cell** 里 `import` + `plot` + `show` —— 执行前 patch 来不及，执行后扫「还没关掉的 figure」一定抓得到。
+- **渲染**：画布下方固定区（约 2/5 高，最多 24 行）显示**跟随滚动位置**的那张图（用户：「图片应该也要可以
+  滚动吧？」）——`ReplView::Entry` 自己带 `images`，滚动时取「可见范围里最后一条记录」再往前找最近一张
+  （那条没图就沿用上面那张，比闪成空白/一直挂最新那张都自然）。布局用「画布里有**没有**图」判断，
+  不用「当前选中哪张」——否则滚到没图的区域时图区会忽现忽没，文本区高度跟着抖。
+  为什么不做「图像混在文本流里滚」（jupyter 那种）：iTerm2 无状态，位置一变就得重传整段 base64；
+  而且半张可见时没法安全裁剪（会贴到别处去）。固定 Rect + 换图时重编，代价最小。
+  `Protocol` 按区域编码一次；用无状态 `Image` widget——`StatefulImage` 在 render 时 resize + 编码 = **阻塞渲染线程**。
+- ⚠ **协议档位不用 IO 探测**：`Picker::from_query_stdio()` 把「写查询 + 读回应」放在**独立线程**，
+  超时（终端不回应很常见）后那个线程**杀不掉**，会继续跟 crossterm 抢 stdin —— 实测接线后 `←`/`→`
+  **完全失效**（普通字符侥幸能进）。改成 `tui::pick_terminal_protocol()` 按环境变量定：
+  kitty / ghostty → Kitty；iTerm2 / WezTerm / **Kaku**（WezTerm 的 fork，`TERM_PROGRAM` 不叫 WezTerm）/ rio / vscode → Iterm2；
+  其余 → Halfblocks。字体像素尺寸用 `halfblocks()` 自带的 10×20 估值（只影响缩放比例）。
+- **为什么 iTerm2 而不是 Kitty**（ratatui-image README 的兼容性矩阵）：WezTerm 系**只有 iTerm2 无 bug**
+  （kitty 的 unicode placeholder 实现不完整，作者在源码里主动拉黑）；Kitty/Ghostty 才用 Kitty 协议。
+  而我们的场景（固定 Rect、静态图、不滚动）本来也用不上 kitty 的杀手锏（placeholder / image id /
+  共享内存 / 压缩）——它真正值钱的地方是「图像随文本滚动」，而那正是我们绕开的。
+- **resume**：`ReplView::from_messages` 按历史重建 code/output（`Cell::from_messages` 的 repl 版）；
+  图**不回放**（运行时附件，不进会话文件）。
+- 依赖：`ratatui-image 11.1`（`default-features = false` + 只 `crossterm`；默认的 `chafa-dyn` 要
+  pkg-config + libchafa C 库，`image-defaults` 实测也不必）。
+- **验证**：单测 10 例（halfblocks 出块字符 / iTerm2 序列进 buffer / 图读不出来降级提示 / 无图不切图像区 /
+  只有 repl 进画布 / resume 回放 / 滚动选图 / 没图的记录往前找 / 图区不抖）；端到端跑 driver（同 cell
+  import+plot+show 也能抓到、无图的 cell 不误报、跨 cell 也行）；**pty 真机**：切到画布时终端里出现
+  1 次 iTerm2 序列；再用两张不同的图滚上滚下——滚动过程中确实出现了**两种**不同的图像数据
+  （固定 Rect + diff 生效：图没变就不重发）。
+
+## 2026-10-01（TUI：REPL 画布 tab —— `←`/`→` 切视图，`/repl` 进、`Esc` 回）
+
+用户：「感觉不是很好嵌入当前消息流；是不是可以新建一个屏幕（画布），在那里面单独更新 repl 的
+code/output。然后我们可以通过键盘的 pageLeft/pageRight 来切换，这样可行嘛？」→ 确认可行（比嵌消息流
+正确），键位改成 `←`/`→`，落地。
+
+- **两个视图（tab）**：`Chat`（消息流）/ `Repl`（REPL 画布）。新文件 `src/tui/repl_view.rs`：
+  `Tab` 枚举 + `ReplView`（记录 + 折行 + 滚动）。**不嵌消息流**的核心理由：独立画布 Rect 固定，
+  将来贴 matplotlib 图（ratatui-image）不会因为滚动被反复重传。
+- **数据零新通道**：`TurnEvent::ToolCall/ToolResult` 里 `name == "repl"` 的事件顺手喂给 `ReplView`
+  （工具层 / session 层一行未改）；消息流里那行工具摘要**照旧保留**。
+- **键位**：`←`/`→` **只在输入框为空时**切视图（非空时它们是输入框的光标键——必须让位，否则没法移光标）；
+  `/repl` 进、`Esc` 回（`Esc` 在画布里优先于其它 Esc 语义）；`PgUp`/`PgDn` / 滚轮作用于**当前**视图。
+  ⚠`PageLeft`/`PageRight` 在终端里**不存在**（crossterm 只有 `PageUp`/`PageDown`：`ESC[5~`/`ESC[6~`）。
+- **折行复用** `pane::wrap_segments` / `WrapMode`（两者改成 `pub(crate)`）——不引第二个折行实现
+  （`wrap_segments` 返回的是**字符下标**，调用方按 `chars()[start..start+len]` 切）。
+- 状态栏最左加视图指示 `Chat │ REPL`（当前那档 accent + 粗体，其余 muted）；`status::hint_text(busy, tab)`
+  按视图换 placeholder 文案。
+- **测试**：`repl_view` 单测 6 例 + `app` 集成 4 例（←/→ 只在空输入时切、`/repl`+`Esc`、
+  只有 repl 事件进画布、空画布有提示）。改状态栏布局后需同步 `status_line` 的断言（`name_span` 取模型名那个
+  span，不能拿 `spans[0]`）。
+
 ## 2026-10-01（新增 `repl` 工具：**会话内持久**的 IPython）
 
 用户：「增加一个工具 `repl`（python REPL，为了简便基于 IPython）……状态在当前 session 里可以保持。

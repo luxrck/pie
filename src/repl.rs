@@ -99,6 +99,10 @@ struct Reply {
     stderr: String,
     #[serde(default)]
     error: Option<String>,
+    /// 本次执行产出的图（driver 把 matplotlib 的 figure 存成 PNG 后的**绝对路径**）。
+    /// 只给界面用（模型看不到）——走结构化通道，不从正文里嗅探。
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 /// 一次执行的结果分类。
@@ -347,6 +351,13 @@ fn format_reply(
     max_lines: Option<i64>,
     max_bytes: Option<i64>,
 ) -> ToolOutput {
+    // 图像附件：只留**确实存在**的文件（driver 偶尔会把已被删掉的临时图报上来）。
+    let images: Vec<std::path::PathBuf> = reply
+        .images
+        .iter()
+        .map(|s| std::path::PathBuf::from(s.as_str()))
+        .filter(|p| p.is_file())
+        .collect();
     let mut body = String::new();
     for part in [
         reply.stdout.as_str(),
@@ -363,7 +374,7 @@ fn format_reply(
     }
 
     match tools::head_prefix(&body, max_lines, max_bytes) {
-        None => ToolOutput::text(body),
+        None => ToolOutput::text(body).with_images(images),
         Some(head) => {
             // 单元格输出一旦被消费就没了（不可再生）→ 超限落盘 + 指针，与 `bash` 同款。
             let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
@@ -376,6 +387,7 @@ fn format_reply(
             ToolOutput {
                 text: tools::format_output(&[format!("[工具输出全文已保存: {spill_txt}]")], &head),
                 spill,
+                images,
             }
         }
     }

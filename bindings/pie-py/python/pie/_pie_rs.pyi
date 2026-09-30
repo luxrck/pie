@@ -47,6 +47,8 @@ class ToolResultEvent(TypedDict):
     name: str
     text: str
     arguments: dict[str, Any]
+    # 工具产出的图像（本地文件路径）——模型看不到，只有界面用（现在只有 `repl` 给）
+    images: list[str]
 
 class AnswerEvent(TypedDict):
     type: Literal["answer"]

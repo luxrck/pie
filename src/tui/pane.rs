@@ -699,14 +699,16 @@ pub(crate) fn char_width(c: char) -> usize {
 /// 给 `grapheme_indices` 也留一条路（目前不值当）。
 #[allow(dead_code)] // 生产只走 `WordOrGlyph`；`Glyph` 留着「换档位」与用例（改调用点那个字面量即可）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum WrapMode {
+pub(crate) enum WrapMode {
     /// 逐字硬断：CJK 逐字天然友好（长句能填满整行），代价是英文词 / URL / 路径会从中间切开。
     Glyph,
     /// 词级断行 + 超长词按字硬断（英文词不断、中日韩字各自成块）——与 `ratatui-textarea` 同规则。
     WordOrGlyph,
 }
 
-/// **消息流**的折行：把 `text` 按显示宽度折成若干段，返回每段的 `(起始字符下标, 字符数)`。
+/// **消息流与 REPL 画布共用**的折行：把 `text` 按显示宽度折成若干段，返回每段的 `(起始字符下标, 字符数)`。
+///
+/// 返回的是**字符下标**（不是字节），所以调用方按 `chars()[start..start+len]` 切片。
 ///
 /// `mode` 由调用点给（`CellBlock::push_line` 走 [`WrapMode::WordOrGlyph`]）。宽度用
 /// `UnicodeWidthChar`（与 ratatui 内部同一把尺子；制表符计 0，与 `Paragraph` 的渲染口径一致）；
@@ -714,7 +716,7 @@ enum WrapMode {
 ///
 /// 输入框**不共用这个函数**（它固定逐字断、自己复刻控件那份，见 `input::screen_rows`）——所以
 /// 两边**可能折在不同位置**（那是有意为之：输入框是"普通编辑器"）。
-fn wrap_segments(text: &str, width: usize, mode: WrapMode) -> Vec<(usize, usize)> {
+pub(crate) fn wrap_segments(text: &str, width: usize, mode: WrapMode) -> Vec<(usize, usize)> {
     /// 单个块自己就比整行宽：按字硬断（每行至少放一个字符，免得死循环）。
     fn hard_split(chars: &[char], width: usize, base: usize, out: &mut Vec<(usize, usize)>) {
         let mut start = 0usize;

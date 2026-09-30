@@ -31,6 +31,7 @@ pie/
 │   └── tui/          # ratatui 界面（模块划分见 src/tui/mod.rs 顶部注释）
 │       ├── app.rs        # 状态机 + 事件循环 + 全部渲染（最大的文件）
 │       ├── pane.rs       # 消息流面板：每消息一条 Cell + **自己折行** + 选区切片
+│       ├── repl.rs       # REPL 画布（tab 视图：repl 工具的 code / 输出 + matplotlib 图的固定渲染区）
 │       ├── markdown.rs   # markdown → Text（按宽度缓存；表格宽度交上游 table_width）
 │       ├── palette.rs    # `/` 命令补全（候选表是唯一事实来源，/help 由它生成）
 │       ├── files.rs      # `@` 文件路径补全（gitignore-aware 索引，后台建；`@..`/`@/`/`@~/` 实时列目录）
@@ -155,6 +156,24 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 
 ### TUI
 
+- **视图是 tab**（`Chat` / `Repl`）：`←`/`→` 在**输入框为空时**切（非空时它们是输入框的光标键）、`/repl` 进、
+  `Esc` 回、`PgUp`/`PgDn`/滚轮滚**当前**视图；状态栏最左是 `cr` 视图指示（`Tab::label()` 各一个字符，
+  `c`=对话 / `r`=画布；当前那档 accent+bold、另一档 muted）。
+  REPL 画布 = `src/tui/repl.rs`（`Repl`；记录 `repl` 工具的 code/output），`App::render` 在 Repl tab **整块跳过**
+  消息流那条渲染路径（`else` 分支里）。**别把画布塞回消息流**：独立 Rect 是固定的 → 贴图
+  （ratatui-image）不会被滚动反复重传。
+- **REPL 画布能贴图**：`repl` 里 matplotlib 出的图走**结构化通道**（`repl_driver.py` 在 `post_execute`
+  扫还开着的 figure → `Reply.images` → `ToolOutput.images` → `TurnEvent::ToolResult.images` → **浮在画布右下角**的**固定 Rect**
+  （文本仍占**整块**画布；浮层为画布 4/5 宽、4/5 高且上限 60 行，`Image` 贴到该区右下角），
+  `ratatui-image` 渲染；显示的是**跟随滚动位置**的那张（滚到哪条记录就显示那条的图，那条没图就往前找最近
+  一张，见 `Repl::pick_image`）——固定 Rect 才不会因滚动重传，而 `Protocol` 编码一次、区域变了才重编）。⚠ 协议档位**只按环境变量定**
+  （`tui::pick_terminal_protocol`）：**别用 `Picker::from_query_stdio`** —— 它把「读终端回应」丢到独立
+  线程，超时后那个线程杀不掉、会跟 crossterm 抢 stdin（实测 `←`/`→` 直接失效）。WezTerm 系（含 Kaku）
+  只有 iTerm2 无 bug。
+- **贴图的 `FontSize` 必须等于终端真实字符格**（`pick_terminal_protocol` 用 `crossterm::terminal::window_size()`
+  的 `xpixel/ypixel ÷ 列/行` 现问，问不到才退回 10×20）：iTerm2 协议是按**像素**发图的
+  （`1337;File=…;width=Npx`），终端就照这个像素数 1:1 画 —— 猜错多少，图就按那个比例缩错多少
+  （本机 Kaku 是 20×58，用默认 10×20 算 → 图只有应有尺寸的一半，还顶在浮层左上角，看上去像「小图浮在画布中间」）。
 - **告警不能直接写 stderr**：raw mode + 交替屏下写 stderr 会砸花屏幕（ratatui 只重画变化的单元格，
   那些行永不恢复）。一律走 `log::warn`（`App::run` 装了出口就是消息流里一条 `· …`，没装就 `eprintln!`）。
 - **「聚焦才亮」的样式只在色板里定义一次**（`Palette::style_emphasis` / `style_caret` / `style_selection`）：
@@ -177,9 +196,12 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   是**控件 Glyph 折行的复刻**（鼠标命中 / 框高 / 残影擦除 / 视口滚动复刻用），钉在 `input::screen_rows_matches_the_widget_wrapping`。
   滚轮**按位置分派**：悬在输入框上且它真能滚（`Input::overflows`）→ 滚输入框，否则滚消息流。
   鼠标捕获为滚轮常开 → 框选/拖选都得自己做，写完剪贴板用长活 `Copier`（每帧新建再 drop 会砸屏 + 复制不生效）。
-- **滚动条**：消息流右缘**固定**留 1 列（`bar_w = body.width > 2`）——因为折行宽度与 markdown 缓存键都吃 `width`，
+- **滚动条（消息流与 REPL 画布各一份）**：当前视图右缘**固定**留 1 列（`bar_w = body.width > 2`）——因为折行宽度与 markdown 缓存键都吃 `width`，
   「有溢出才留」会让跨阈值那一下换宽度 → 整段重排 + 缓存全失效；因此没溢出时**只是不画**（`ScrollbarState` 的 thumb 会铺满，很难看）。
-  `surface_at` 有三种面：输入框 > 滚动条 > 消息流（`body` 已经是**不含**滚动条列的那块）；点/拖滚动条只改 `scroll_from_bottom`（[`App::scrollbar_jump`]，线性映射，不按 thumb 尺寸抓取）
+  画法只有一份 `App::render_scrollbar`；换算只有一份 `App::scrollbar_jump`（线性映射，不按 thumb 尺寸抓取），它按 tab 分派：
+  消息流改 `scroll_from_bottom`，画布交给 `Repl::jump_to_row`（行数/顶部行是 `Repl` 上一帧渲染时记的 `total` / `top`：
+  画布视图下 `App.body` 是空的，滚动条只能问它自己）。
+  `surface_at` 有三种面：输入框 > 滚动条 > 消息流（`body` 已经是**不含**滚动条列的那块；画布视图下 `body` 为空 → 画布本身不成框选面）
   → 输入框与状态栏在垂直布局的下面几行，完全不受影响。
 - 多行粘贴必须自己 `EnableBracketedPaste`（`ratatui::init()` 不开）。
 - ⚠ `App::render` **每帧全量重排**：`Pane::layout` 走完全部 cells，再把全部行克隆给 `Paragraph`（唯一缓存是 markdown 渲染与 per-cell 显示行，住 `App.pane`）。

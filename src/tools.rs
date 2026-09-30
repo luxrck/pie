@@ -24,15 +24,26 @@ use serde_json::{json, Value};
 pub struct ToolOutput {
     pub text: String,
     pub spill: Option<PathBuf>,
+    /// 给界面的**图像附件**（本地文件路径）——模型看不到，只有 TUI 的 REPL 画布用
+    /// （`repl` 里 matplotlib 出的图走这条）。和 `spill` 一样是**结构化**通道：
+    /// 不靠正文里贴一行路径去嗅探。
+    pub images: Vec<PathBuf>,
 }
 
 impl ToolOutput {
-    /// 只有正文（没有落盘）——绝大多数工具的返回。
+    /// 只有正文（没有落盘、没有图）——绝大多数工具的返回。
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             spill: None,
+            images: Vec::new(),
         }
+    }
+
+    /// 带图像附件（`repl` 用）：正文照旧，额外给界面一组图。
+    pub fn with_images(mut self, images: Vec<PathBuf>) -> Self {
+        self.images = images;
+        self
     }
 }
 
@@ -943,6 +954,7 @@ impl Tool for Bash {
                 Ok(ToolOutput {
                     text: format_output(&headers, &head),
                     spill,
+                    images: Vec::new(),
                 })
             }
         }

@@ -43,7 +43,10 @@ use crate::session::{Session, TurnEvent};
 
 use super::clipboard;
 use super::files;
+use ratatui_image::picker::Picker;
+
 use super::pane::{self, Cell, Pane};
+use super::repl::{Repl, Tab};
 use super::input::Input;
 use super::palette;
 use super::status::{self, Activity, Snapshot};
@@ -104,7 +107,7 @@ enum Surface {
     Log,
     /// 输入框（`TextArea` 自己的选区）
     Input,
-    /// 消息流右缘的滚动条（只跳/滚消息流，不产生选区）
+    /// 消息流 / REPL 画布右缘的滚动条（当前视图一份；只跳/滚当前视图，不产生选区）
     Scrollbar,
 }
 
@@ -140,7 +143,8 @@ pub struct App {
     scroll_from_bottom: u16,
     /// 上一帧的消息流**文本区**（鼠标坐标 → 显示行/列；**不含**右缘那列滚动条）
     body: Rect,
-    /// 上一帧的滚动条那一列（`body` 右边相邻的 1 格；宽度为 0 = 没留）
+    /// 上一帧的滚动条那一列（`body` 右边相邻的 1 格；宽度为 0 = 没留）。
+    /// 消息流与 REPL 画布**各有各的那一列**（看当前 tab，两个渲染分支各自赋值）。
     bar: Rect,
     /// 上一帧第一条可见的显示行号（同上；绝对行号 = `scroll_top` + 区域内行偏移）
     scroll_top: u16,
@@ -194,6 +198,10 @@ pub struct App {
     balance: Option<String>,
     /// 余额接口是否可用（查成功过）→ 回合结束后自动再查一次；失败过就不再每回合白试
     balance_supported: bool,
+    /// 当前顶层视图（`←` / `→` 切，`/repl` 进、`Esc` 回）。
+    tab: Tab,
+    /// REPL 画布：`repl` 工具的 code / 输出（与消息流**并行**维护一份）。
+    repl: Repl,
     /// 按次执行旋钮（CLI `--max-steps` / `--no-stream` 传下来，转给每次 `Session::aturn`）
     max_steps: Option<usize>,
     stream: Option<bool>,
@@ -201,14 +209,22 @@ pub struct App {
 
 impl App {
     /// 建 App + 取出事件接收端（`rx` 由主循环持有，避免和 `select!` 里的 `&mut self` 打架）。
-    pub fn new(session: Session, max_steps: Option<usize>, stream: Option<bool>) -> (Self, UnboundedReceiver<UiEvent>) {
+    pub fn new(
+        session: Session,
+        max_steps: Option<usize>,
+        stream: Option<bool>,
+        picker: Picker,
+    ) -> (Self, UnboundedReceiver<UiEvent>) {
         let (tx, rx) = unbounded_channel();
         let lean = session.config.tui.lean;
         let storage = session.config.storage.clone();
         let snapshot = Snapshot::capture(&session);
-        // resume 的历史：把已有对话回放进消息流（新会话只有 system → 什么都不做）。
+        // resume 的历史：把已有对话回放进消息流**与 REPL 画布**（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
-        let cells = Cell::from_messages(&session.full_history());
+        // （画布只回放 code/output——图是运行时附件，没进会话文件。）
+        let history = session.full_history();
+        let cells = Cell::from_messages(&history);
+        let repl = Repl::from_messages(&history).with_picker(picker);
         // 主题：`Config.theme`（族名 / 具体 flavor 都认，见 `Palette::from_name`）。认不出来就用
         // 默认并留一句告警——`run()` 里装好出口后再说（此刻 raw mode + 交替屏，写 stderr 会砸花）。
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
@@ -252,6 +268,8 @@ impl App {
             last_input: String::new(),
             balance: None,
             balance_supported: false,
+            tab: Tab::Chat,
+            repl,
             max_steps,
             stream,
         };
@@ -419,7 +437,7 @@ impl App {
     }
 
     /// 这个屏幕坐标落在哪个「文本面」上（输入框优先：它压在消息流下面；滚动条其次：它就是
-    /// 消息流右缘那 1 格，不能让「点在它上面」被当成「在消息流里按下」而起了框选）。
+    /// 当前视图右缘那 1 格，不能让「点在它上面」被当成「在消息流里按下」而起了框选）。
     fn surface_at(&self, column: u16, row: u16) -> Option<Surface> {
         if inside(self.input.rect(), column, row) {
             Some(Surface::Input)
@@ -432,7 +450,7 @@ impl App {
         }
     }
 
-    /// 点/拖滚动条：把屏幕行线性映到消息流的偏移——**只改 `scroll_from_bottom`**。
+    /// 点/拖滚动条：把屏幕行线性映到**当前视图**的滚动偏移（消息流 ↔ REPL 画布各滚各的）。
     ///
     /// 于是输入框 / 状态栏（各自在垂直布局的下面几行）跟本函数毫无关系，拖动滚动条不会碰它们；
     /// 输入框自己的视口滚动只由「滚轮悬在它上面」驱动（[`Self::wheel`]）。
@@ -440,6 +458,11 @@ impl App {
     /// 不按 thumb 尺寸做精确抓取（拖动时会“跳”到线性位置）——第一版够用，也不会因为
     /// thumb 长度变化而抖。
     fn scrollbar_jump(&mut self, row: u16) {
+        if self.tab == Tab::Repl {
+            // 画布那份：`Repl` 自己按上一帧的行数/高度换算（画布视图下 `self.body` 是空的）
+            self.repl.jump_to_row(row.saturating_sub(self.bar.y) as usize);
+            return;
+        }
         let height = self.body.height as usize;
         let total = self.pane.total();
         if height == 0 || total <= height {
@@ -534,6 +557,29 @@ impl App {
         (!text.is_empty()).then_some(text)
     }
 
+    /// 画当前视图的滚动条：**只有真的溢出才画**（否则 thumb 会铺满整条轨道，像块实心的）。
+    ///
+    /// 轨道那一列宽度是**固定**留出来的（见 `render`），画不画都不影响排版 —— 消息流与 REPL 画布
+    /// 各调一次，`total` / `top` / `height` 都是各自那一份。
+    fn render_scrollbar(&self, frame: &mut Frame, bar: Rect, total: usize, top: usize, height: u16) {
+        if bar.width == 0 || total <= height as usize {
+            return;
+        }
+        let mut state = ScrollbarState::new(total)
+            .position(top)
+            .viewport_content_length(height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_symbol("▐")
+                .track_symbol(None) // 只画 thumb（codex / claude code 那种极简风）
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(self.palette.cancelled)),
+            bar,
+            &mut state,
+        );
+    }
+
     /// 框选高亮：选中的单元格换成 accent 底 + accent_text 字（同终端选择 / 输入框选中）。
     ///
     /// 在消息流渲染**之后**直接改 buf 里的单元格样式——纯几何（跟屏幕上真正显示的行列一致），
@@ -578,9 +624,15 @@ impl App {
             // Ctrl+A = 全选（控件默认把它当跳到行首）
             (KeyCode::Char('a'), true, _) => self.input.select_all(),
             (KeyCode::Esc, _, _) => self.on_escape(),
+            // ← / → 切视图：**只在输入框为空时**（非空时它们是输入框的光标移动键）
+            (KeyCode::Left, ..) if self.input.is_empty() => self.switch_tab(-1),
+            (KeyCode::Right, ..) if self.input.is_empty() => self.switch_tab(1),
             // ⇧⏎ 在多数终端里就是 LF（= Ctrl+J），两个都认
             (KeyCode::Enter, _, true) | (KeyCode::Char('j'), true, _) => self.input.newline(),
             (KeyCode::Enter, _, false) => self.submit(),
+            // PgUp/PgDn：在 REPL 画布里滚画布，其余滚消息流（方向与消息流一致）
+            (KeyCode::PageUp, ..) if self.tab == Tab::Repl => self.repl.scroll(-8),
+            (KeyCode::PageDown, ..) if self.tab == Tab::Repl => self.repl.scroll(8),
             (KeyCode::PageUp, ..) => self.scroll(-8),
             (KeyCode::PageDown, ..) => self.scroll(8),
             // 补全面板开着时：Tab 接受候选、↑/↓ 切候选
@@ -660,6 +712,8 @@ impl App {
                 self.activity = Activity::Tool {
                     since: Instant::now(),
                 };
+                // REPL 画布并行记一份（消息流里仍留一行摘要）
+                self.repl.on_tool_call(&name, &arguments);
                 self.cells.push(Cell::Tool {
                     name,
                     summary: pane::tool_summary(&arguments),
@@ -668,9 +722,15 @@ impl App {
                     manual: false,
                 });
             }
-            UiEvent::Turn(TurnEvent::ToolResult { name, content, .. }) => {
+            UiEvent::Turn(TurnEvent::ToolResult {
+                name,
+                content,
+                images,
+                ..
+            }) => {
                 // 被取消的工具回的是哨兵文本（不是 `[exit=]` 头）→ 标 ⏹ 而不是 ✓
                 let status = pane::tool_status(&content);
+                self.repl.on_tool_result(&name, &content, status, &images);
                 Cell::finish_tool(&mut self.cells, &name, status, &content);
                 self.activity = Activity::Tool {
                     since: Instant::now(),
@@ -822,6 +882,7 @@ impl App {
                 });
             }
             "cd" => self.change_dir(arg),
+            "repl" => self.tab = Tab::Repl,
             "clear" => self.with_session_mut("切换窗口", |s| match s.clear_window() {
                 Ok(n) => {
                     let _ = s.save();
@@ -832,6 +893,7 @@ impl App {
             }),
             "reset" => {
                 self.cells.clear();
+                self.repl.clear();
                 self.scroll_from_bottom = 0;
                 self.with_session_mut("清空历史", |s| {
                     s.reset();
@@ -988,6 +1050,11 @@ impl App {
     }
 
     fn on_escape(&mut self) {
+        // 在 REPL 画布里：`Esc` 就是「返回对话」（其余 Esc 语义留给对话视图）
+        if self.tab == Tab::Repl {
+            self.tab = Tab::Chat;
+            return;
+        }
         if self.selection.is_some() {
             // 鼠标在窗口外松开时可能收不到 Up 事件 → 高亮会一直留着，Esc 先把选区收掉
             self.selection = None;
@@ -1016,6 +1083,14 @@ impl App {
             since: Instant::now(),
         };
         self.push_notice("已请求停止…");
+    }
+
+    /// 切视图：`delta` 负 = 往左、正 = 往右（只有两个 tab，两端夹住）。
+    fn switch_tab(&mut self, delta: i32) {
+        const TABS: [Tab; 2] = [Tab::Chat, Tab::Repl];
+        let current = TABS.iter().position(|t| *t == self.tab).unwrap_or(0) as i32;
+        let next = (current + delta).clamp(0, TABS.len() as i32 - 1) as usize;
+        self.tab = TABS[next];
     }
 
     // ---------------------------------------------------------------- 补全
@@ -1213,6 +1288,8 @@ impl App {
     fn wheel(&mut self, mouse: MouseEvent, delta: i32) {
         if self.surface_at(mouse.column, mouse.row) == Some(Surface::Input) && self.input.overflows() {
             self.input.wheel(mouse);
+        } else if self.tab == Tab::Repl {
+            self.repl.scroll(delta);
         } else {
             self.scroll(delta);
         }
@@ -1311,67 +1388,70 @@ impl App {
         ])
         .areas(area);
 
-        // 消息流右缘留 1 列给滚动条（**固定**留：折行宽度与 markdown 缓存键都吃 `width`，
-        // 若「有溢出才留」，跨过阈值那一下会换宽度 → 整段重排 + 缓存全失效）。
-        // 窗口窄到剩不下正文时就别留了。
-        let bar_w = u16::from(body.width > 2);
-        let bar = Rect {
-            x: body.right() - bar_w,
-            width: bar_w,
-            ..body
-        };
-        let body = Rect {
-            width: body.width - bar_w,
-            ..body
-        };
-
         let now = Instant::now();
+        if self.tab == Tab::Repl {
+            // REPL 画布：正文区整块归它（消息流这一帧不排版）；右缘照样**固定**留 1 列给它自己的
+            // 滚动条（画布也折行、也吃 `width`，同样不能「有溢出才留」）。
+            self.body = Rect::default();
+            self.scroll_top = 0;
+            let bar_w = u16::from(body.width > 2);
+            self.bar = Rect {
+                x: body.right() - bar_w,
+                width: bar_w,
+                ..body
+            };
+            let body = Rect {
+                width: body.width - bar_w,
+                ..body
+            };
+            self.repl.render(frame, body, &self.palette);
+            // 画布自己那份滚动条（行数/偏移都是它上一帧排版的记账）
+            self.render_scrollbar(frame, self.bar, self.repl.total(), self.repl.top(), body.height);
+        } else {
+            // 消息流右缘留 1 列给滚动条（**固定**留：折行宽度与 markdown 缓存键都吃 `width`，
+            // 若「有溢出才留」，跨过阈值那一下会换宽度 → 整段重排 + 缓存全失效）。
+            // 窗口窄到剩不下正文时就别留了。
+            let bar_w = u16::from(body.width > 2);
+            let bar = Rect {
+                x: body.right() - bar_w,
+                width: bar_w,
+                ..body
+            };
+            let body = Rect {
+                width: body.width - bar_w,
+                ..body
+            };
 
-        self.pane
-            .layout(&self.cells, &self.palette, body.width, self.lean);
-        let total = self.pane.total();
-        // 滚动偏移按**显示行**算（`Paragraph::scroll` 跳过的是折行之后的行）
-        let bottom = total.saturating_sub(body.height as usize);
-        // 内容变短时把偏移夹回可用范围（不然「往上滚了 N 行」会一直留着，得先滚回来才动）
-        self.scroll_from_bottom = self
-            .scroll_from_bottom
-            .min(bottom.min(u16::MAX as usize) as u16);
-        let offset = bottom.saturating_sub(self.scroll_from_bottom as usize);
-        // 鼠标框选要知道「屏幕坐标 ↔ 哪条显示行」，记下这一帧的几何信息与排版
-        self.scroll_top = offset.min(u16::MAX as usize) as u16;
-        self.body = body;
-        self.bar = bar;
-        let lines: Vec<Line<'static>> = self.pane.iter().map(|r| r.line.clone()).collect();
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll_top, 0)),
-            body,
-        );
-        self.paint_selection(frame, body);
-        // 滚动条：**只有真的溢出才画**（否则 thumb 会铺满整条轨道，像块实心的）——
-        // 那一列宽度已经固定留出来了，画不画都不影响排版。
-        if bar_w > 0 && total > body.height as usize {
-            let mut state = ScrollbarState::new(total)
-                .position(self.scroll_top as usize)
-                .viewport_content_length(body.height as usize);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_symbol("▐")
-                    .track_symbol(None) // 只画 thumb（codex / claude code 那种极简风）
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .thumb_style(Style::default().fg(self.palette.cancelled)),
-                bar,
-                &mut state,
+            self.pane
+                .layout(&self.cells, &self.palette, body.width, self.lean);
+            let total = self.pane.total();
+            // 滚动偏移按**显示行**算（`Paragraph::scroll` 跳过的是折行之后的行）
+            let bottom = total.saturating_sub(body.height as usize);
+            // 内容变短时把偏移夹回可用范围（不然「往上滚了 N 行」会一直留着，得先滚回来才动）
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .min(bottom.min(u16::MAX as usize) as u16);
+            let offset = bottom.saturating_sub(self.scroll_from_bottom as usize);
+            // 鼠标框选要知道「屏幕坐标 ↔ 哪条显示行」，记下这一帧的几何信息与排版
+            self.scroll_top = offset.min(u16::MAX as usize) as u16;
+            self.body = body;
+            self.bar = bar;
+            let lines: Vec<Line<'static>> = self.pane.iter().map(|r| r.line.clone()).collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll_top, 0)),
+                body,
             );
+            self.paint_selection(frame, body);
+            self.render_scrollbar(frame, bar, total, self.scroll_top as usize, body.height);
         }
 
         if !panel.is_empty() {
             frame.render_widget(Paragraph::new(panel), palette_area);
         }
         self.input
-            .set_placeholder(status::hint_text(self.busy), self.palette.style_faint());
+            .set_placeholder(status::hint_text(self.busy, self.tab), self.palette.style_faint());
         self.input.render(frame, input, &self.palette, self.focused);
         // 插入符的屏幕位置（上面 `render` 里刚更新过 `rect` / `scroll_top`）：`run` 每帧拿它去
         // 摆终端光标，好让输入法的候选框跟在输入框的光标上（见 [`App::run`]）。
@@ -1387,6 +1467,7 @@ impl App {
                 area.width,
                 self.balance.as_deref(),
                 self.focused,
+                self.tab,
             )),
             status_row,
         );
@@ -1630,6 +1711,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target);
     }
 
+    /// `←` / `→` 切视图：**只在输入框为空时**（非空时它们是输入框的光标移动键）。
+    #[test]
+    fn arrow_keys_flip_tabs_only_when_the_input_is_empty() {
+        let mut app = test_app();
+        assert_eq!(app.tab, Tab::Chat);
+
+        // 输入非空：← / → 留给输入框，视图不动
+        app.input.set_text("abc");
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Chat, "输入非空时不切视图");
+
+        // 输入为空：→ 去画布、← 回对话
+        app.input.set_text("");
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Repl);
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Chat);
+
+        // 已经在最右／最左：夹住，不循环
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Chat);
+    }
+
+    /// `/repl` 进画布、`Esc` 回对话（`Esc` 在画布里优先于其它 Esc 语义）。
+    #[test]
+    fn slash_repl_opens_the_canvas_and_esc_returns() {
+        let mut app = test_app();
+        app.input.set_text("/repl");
+        app.submit();
+        assert_eq!(app.tab, Tab::Repl, "`/repl` 应切到画布");
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Chat, "`Esc` 应回到对话");
+    }
+
+    /// 只有 `repl` 的调用/结果进画布；消息流里那行摘要照旧保留。
+    #[test]
+    fn repl_calls_land_in_the_canvas_and_other_tools_do_not() {
+        let mut app = test_app();
+        let call = |name: &str, args: &str| {
+            UiEvent::Turn(TurnEvent::ToolCall {
+                name: name.into(),
+                arguments: args.into(),
+            })
+        };
+
+        app.on_turn_event(call("bash", r#"{"command":"ls"}"#));
+        assert!(app.repl.is_empty(), "bash 不进画布");
+
+        app.on_turn_event(call("repl", r#"{"code":"print(42)"}"#));
+        app.on_turn_event(UiEvent::Turn(TurnEvent::ToolResult {
+            name: "repl".into(),
+            content: "42".into(),
+            arguments: r#"{"code":"print(42)"}"#.into(),
+            images: Vec::new(),
+        }));
+        assert!(!app.repl.is_empty());
+
+        app.tab = Tab::Repl;
+        let screen = app.render_to_string(60, 12);
+        assert!(screen.contains("❯ print(42)"), "{screen}");
+        assert!(screen.contains("42"), "{screen}");
+        let status = screen.lines().last().expect("状态栏在最后一行");
+        assert!(
+            status.starts_with(" cr "),
+            "状态栏左端是视图指示（两档都在；当前那一档靠颜色分）：{status:?}"
+        );
+
+        // 切回对话：画布内容不再出现（消息流里只有那行工具摘要）
+        app.tab = Tab::Chat;
+        let screen = app.render_to_string(60, 12);
+        assert!(!screen.contains("❯ print(42)"), "{screen}");
+    }
+
+    /// 画布空着时也要有提示（不然切过去是一片黑）。
+    ///
+    /// 宽字符在 buffer 里占两格、第二格是空白 → 拼出来会多空格，所以用 `squash` 比。
+    #[test]
+    fn empty_canvas_shows_a_hint() {
+        let mut app = test_app();
+        app.tab = Tab::Repl;
+        let screen = app.render_to_string(60, 12);
+        let squashed = squash(&screen);
+        assert!(squashed.contains("REPL画布还是空的"), "{screen}");
+        assert!(squashed.contains("←/→切换视图"), "{screen}");
+    }
+
     fn test_app() -> App {
         app_with_rx().0
     }
@@ -1652,7 +1821,13 @@ mod tests {
     fn app_with_rx_for(config: Config) -> (App, UnboundedReceiver<UiEvent>) {
         let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        App::new(Session::ephemeral(&config, llm, tools), None, None)
+        // 用例里不探终端：`halfblocks` 那一档永远可用（也不会去读写 stdin）
+        App::new(
+            Session::ephemeral(&config, llm, tools),
+            None,
+            None,
+            Picker::halfblocks(),
+        )
     }
 
     /// 断言用：把空白全去掉再比（`TestBackend` buffer 里宽字符占了两格，拼出来带空格）。
@@ -2090,7 +2265,7 @@ mod tests {
             content: Some(crate::llm::Content::Text("上次的回答".into())),
             ..Default::default()
         });
-        let mut app = App::new(session, None, None).0;
+        let mut app = App::new(session, None, None, Picker::halfblocks()).0;
         assert!(
             app.cells.iter().any(|c| matches!(c, Cell::User(_))),
             "历史消息要回放成单元格"
@@ -2641,9 +2816,12 @@ mod tests {
         })));
         let screen = app.render_to_string(w, h);
         let status = screen.lines().last().expect("状态栏在最后一行");
-        assert!(status.starts_with(" deepseek-flash high ·"), "{status:?}");
         assert!(
-            status.contains("0/920,576 (0.0%)  │ ¥110.00"),
+            status.starts_with(" cr deepseek-flash high ·"),
+            "{status:?}"
+        );
+        assert!(
+            status.contains("0/920,576 (0.0%) │ ¥110.00"),
             "余额紧跟在用量后面（都在左边）：{status:?}"
         );
         assert!(app.balance_supported, "查成功过 → 以后每回合刷新");
@@ -2654,7 +2832,10 @@ mod tests {
         };
         let screen = app.render_to_string(w, h);
         let status = screen.lines().last().unwrap();
-        assert!(status.starts_with(" deepseek-flash high ·"), "{status:?}");
+        assert!(
+            status.starts_with(" cr deepseek-flash high ·"),
+            "{status:?}"
+        );
         assert!(status.ends_with("Waiting… 0.0s"), "{status:?}");
         assert!(status.contains("¥110.00"), "{status:?}");
 
@@ -2688,7 +2869,13 @@ mod tests {
         };
         let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
-        let mut app = App::new(Session::ephemeral(&config, llm, tools), None, None).0;
+        let mut app = App::new(
+            Session::ephemeral(&config, llm, tools),
+            None,
+            None,
+            Picker::halfblocks(),
+        )
+        .0;
 
         let before = app.render_to_string(90, 16);
         assert!(
@@ -2706,8 +2893,8 @@ mod tests {
         assert!(!after.contains(" high "), "旧深度要消失：{after}");
         let status = after.lines().last().expect("状态栏在最后一行");
         assert!(
-            status.starts_with(" deepseek-flash"),
-            "前缀去掉就是去掉（行首就是模型名）：{status:?}"
+            status.starts_with(" cr deepseek-flash"),
+            "模型名紧跟视图指示（不再有 `pie` 前缀）：{status:?}"
         );
         assert!(
             dir.join("config.toml").exists(),
@@ -3124,5 +3311,65 @@ mod tests {
         assert!(app.toast.is_none(), "滚动条不该弹复制提示");
         assert_eq!(app.input.rect(), input_before, "输入框位置/尺寸不受影响");
         assert_eq!(app.input.text(), "草稿", "输入框内容不受影响");
+    }
+
+    /// REPL 画布也有自己的滚动条：在画布右缘、点它只滚画布（消息流那份偏移一个数不动）。
+    #[test]
+    fn the_repl_canvas_has_its_own_scrollbar() {
+        let mut app = test_app();
+        app.tab = Tab::Repl;
+        for i in 0..40 {
+            let args = format!(r#"{{"code":"print({i})"}}"#);
+            app.on_turn_event(UiEvent::Turn(TurnEvent::ToolCall {
+                name: "repl".into(),
+                arguments: args.clone(),
+            }));
+            app.on_turn_event(UiEvent::Turn(TurnEvent::ToolResult {
+                name: "repl".into(),
+                content: "x".into(),
+                arguments: args,
+                images: Vec::new(),
+            }));
+        }
+        render_buffer(&mut app, 40, 12);
+        assert_eq!(app.body, Rect::default(), "画布视图下不占消息流那份几何");
+        assert_eq!(app.bar.width, 1, "画布右缘留 1 列给滚动条");
+        assert_eq!(app.bar.x, 39, "就在屏幕最右缘");
+        assert_eq!(app.surface_at(app.bar.x, app.bar.y), Some(Surface::Scrollbar));
+        assert_eq!(app.surface_at(app.bar.x - 1, app.bar.y), None, "画布本身不成框选面");
+        let total = app.repl.total();
+        assert!(total > app.bar.height as usize, "内容该溢出：total={total}");
+        // thumb 真的画在那一列（`▐`），且没铺满整条
+        let buf = render_buffer(&mut app, 40, 12);
+        let drawn = (0..app.bar.height)
+            .filter(|y| buf[(app.bar.x, app.bar.y + y)].symbol() == "▐")
+            .count();
+        assert!(
+            drawn > 0 && drawn < app.bar.height as usize,
+            "溢出时该画出 thumb，且不铺满：{drawn}"
+        );
+
+        // 点滚动条顶端 → 画布贴顶；消息流那份偏移不动
+        let stream = app.scroll_from_bottom;
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), app.bar.x, app.bar.y));
+        assert!(app.selection.is_none(), "滚动条上不起选区");
+        render_buffer(&mut app, 40, 12); // `top` 只在渲染时重算
+        assert_eq!(app.repl.top(), 0, "画布贴顶");
+        assert_eq!(app.scroll_from_bottom, stream, "消息流那份不受影响");
+
+        // 拖到最底 → 画布贴底；松手不弹复制提示
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.bar.x,
+            app.bar.bottom() - 1,
+        ));
+        render_buffer(&mut app, 40, 12);
+        assert_eq!(app.repl.top(), total - app.bar.height as usize, "拖到底 = 贴底");
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            app.bar.x,
+            app.bar.bottom() - 1,
+        ));
+        assert!(app.toast.is_none(), "滚动条不该弹复制提示");
     }
 }
