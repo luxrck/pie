@@ -7,14 +7,49 @@
 //!   - bash 必须独立进程组 + killpg（否则取消/超时会被孙进程持有的管道卡住）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub type ToolResult = Result<String, ToolError>;
+/// 工具执行的产出：正文 + **落盘全文的路径**（`spill`）。
+///
+/// `spill` 只在工具把全文写到盘上时给（现在只有 `bash` 超 `_max_lines` / `_max_bytes` 时）
+/// —— 消息层据此**进历史前**就把 `raw_path` / `compress_level` 设好（`Message::mark_compressed`），
+/// 不用事后拿正文里那行 `[工具输出全文已保存: …]` 去嗅探。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub spill: Option<PathBuf>,
+}
+
+impl ToolOutput {
+    /// 只有正文（没有落盘）——绝大多数工具的返回。
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            spill: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// 直接当 `&str` 用（`out.starts_with(…)` / `out.lines()` / `format!("{out}")`…）。
+impl std::ops::Deref for ToolOutput {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+pub type ToolResult = Result<ToolOutput, ToolError>;
 
 /// 工具失败：回给模型看的一句话（不是 panic）。
 #[derive(Debug)]
@@ -236,16 +271,18 @@ impl Tool for Read {
             let dim_txt = dim
                 .map(|(w, h)| format!(", dim={w}x{h}"))
                 .unwrap_or_default();
-            return Ok(format!(
+            return Ok(ToolOutput::text(format!(
                 "[图片已读取: path={path}, mime={mime}, size={size}{dim_txt}]"
-            ));
+            )));
         }
 
         let content = match std::fs::read_to_string(p) {
             Ok(c) => c,
             Err(_) => {
                 let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-                return Ok(format!("[二进制文件，大小 {size} 字节，无法按文本读取]"));
+                return Ok(ToolOutput::text(format!(
+                    "[二进制文件，大小 {size} 字节，无法按文本读取]"
+                )));
             }
         };
         let lines: Vec<&str> = content.lines().collect();
@@ -311,7 +348,7 @@ impl Tool for Read {
                 start + picked.len() + 1
             ));
         }
-        Ok(format_output(&headers, &body))
+        Ok(ToolOutput::text(format_output(&headers, &body)))
     }
 }
 
@@ -601,10 +638,10 @@ impl Tool for Edit {
         if let Err(e) = std::fs::write(p, out) {
             return err(format!("写入失败 {path}: {e}"));
         }
-        Ok(format_output(
+        Ok(ToolOutput::text(format_output(
             &[format!("[已替换 {} 处: {path}]", edits.len())],
             "",
-        ))
+        )))
     }
 }
 
@@ -629,14 +666,14 @@ impl Tool for Writ {
             }
         }
         match std::fs::write(p, &content) {
-            Ok(()) => Ok(format_output(
+            Ok(()) => Ok(ToolOutput::text(format_output(
                 &[format!(
                     "[已写入 {path}（{} 字符，{} 行）]",
                     content.chars().count(),
                     content.matches('\n').count() + 1
                 )],
                 "",
-            )),
+            ))),
             Err(e) => err(format!("写入失败 {path}: {e}")),
         }
     }
@@ -775,14 +812,14 @@ impl Tool for Bash {
                             // 超时：杀**整个进程组**。只 kill 本体杀不掉持有管道写端的子孙进程，
                             // 而管道不 EOF 就会把等待卡到子孙自然退出（实测能卡满 timeout）。
                             kill_group();
-                            return Ok(format!(
+                            return Ok(ToolOutput::text(format!(
                                 "[bash] 命令超过 {t}s 超时，可能仍在后台运行：{command}"
-                            ));
+                            )));
                         }
                     },
                     _ = &mut cancel_waiter => {
                         kill_group();
-                        return Ok(crate::cancel::CANCEL_TEXT.to_string());
+                        return Ok(ToolOutput::text(crate::cancel::CANCEL_TEXT));
                     }
                 }
             }
@@ -793,7 +830,7 @@ impl Tool for Bash {
                 },
                 _ = &mut cancel_waiter => {
                     kill_group();
-                    return Ok(crate::cancel::CANCEL_TEXT.to_string());
+                    return Ok(ToolOutput::text(crate::cancel::CANCEL_TEXT));
                 }
             },
         };
@@ -845,23 +882,23 @@ impl Tool for Bash {
         }
 
         match head {
-            None => Ok(format_output(&headers, &out)),
+            None => Ok(ToolOutput::text(format_output(&headers, &out))),
             Some(head) => {
-                // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针，指针是取回
-                // 被截掉那部分的唯一途径。落盘走 `Storage::store`（内容 hash 寻址，按内容去重）。
-                let spill = ctx
-                    .storage
-                    .store(crate::config::StoreType::Raw {
-                        prefix: "bash",
-                        body: &out,
-                    })
-                    .map(|s| s.path.display().to_string())
-                    .unwrap_or_else(|e| format!("(落盘失败: {e})"));
-                headers.push(format!("[工具输出全文已保存: {spill}]"));
-                Ok(format_output(
-                    &headers,
-                    &head,
-                ))
+                // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针（模型据此读回），
+                // 同时把路径**结构化**地放进 `ToolOutput.spill`（消息层构造时就带上 `raw_path`）。
+                // 落盘走 `Storage::store`（内容 hash 寻址，按内容去重）。
+                let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
+                    prefix: "bash",
+                    body: &out,
+                }) {
+                    Ok(path) => (Some(path.clone()), path.display().to_string()),
+                    Err(e) => (None, format!("(落盘失败: {e})")),
+                };
+                headers.push(format!("[工具输出全文已保存: {spill_txt}]"));
+                Ok(ToolOutput {
+                    text: format_output(&headers, &head),
+                    spill,
+                })
             }
         }
     }
@@ -1441,12 +1478,12 @@ mod tests {
 
     impl Tool for Demo {
         async fn call(self, _ctx: ToolCtx) -> ToolResult {
-            Ok(format!(
+            Ok(ToolOutput::text(format!(
                 "{}:{}:{}",
                 self.text,
                 self.count.unwrap_or(0),
                 self.hidden.is_some()
-            ))
+            )))
         }
     }
 
@@ -1479,7 +1516,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "hi:2:true");
+        assert_eq!(out.text, "hi:2:true");
 
         // 未知工具：带上可用列表（对模型有用）
         let e = reg
@@ -1596,7 +1633,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "out\nerr\n", "成功：纯正文、没有退出码头：{out:?}");
+        assert_eq!(
+            out.text, "out\nerr\n",
+            "成功：纯正文、没有退出码头：{out:?}"
+        );
         // stderr 已合并到 stdout（顺序稳定：同一个管道）
     }
 
@@ -1608,7 +1648,7 @@ mod tests {
             .await
             .unwrap();
         // 没输出 → 结果就是那一行头
-        assert_eq!(out, fail_header(3), "{out}");
+        assert_eq!(out.text, fail_header(3), "{out}");
     }
 
     /// 失败：只给一行头 `[exit=N, os=…, shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
@@ -1619,20 +1659,23 @@ mod tests {
             .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(ok, "hi\n", "成功：只有正文");
+        assert_eq!(ok.text, "hi\n", "成功：只有正文");
 
         let silent = reg
             .dispatch("bash", &json!({"command": "true"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(silent, "", "成功且没输出：结果为空（没有 `[exit=0]` 可给）");
+        assert_eq!(
+            silent.text, "",
+            "成功且没输出：结果为空（没有 `[exit=0]` 可给）"
+        );
 
         let headers = fail_header(3);
         let bad = reg
             .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(bad, headers, "失败且没输出：只有一行头");
+        assert_eq!(bad.text, headers, "失败且没输出：只有一行头");
 
         let bad = reg
             .dispatch(
@@ -1642,7 +1685,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(bad, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
+        assert_eq!(bad.text, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
         // 前端（Rust TUI 的 `pane::tool_status`）只拿**第一行**判成败：
         // `[exit=` 开头且不是 `[exit=0…` = 失败（成功根本没有头）
         let first = bad.lines().next().unwrap_or_default();
@@ -1690,6 +1733,13 @@ mod tests {
             .find_map(|l| l.strip_prefix("[工具输出全文已保存: ")?.strip_suffix(']'))
             .expect("有落盘指针");
         let full = std::fs::read_to_string(spill).expect("落盘文件可读");
+        // 结构化：路径也随结果交出来（消息层据此**构造时**就设 `raw_path`，不再靠文本嗅探）
+        let spilled = out.spill.clone().expect("落盘 → ToolOutput.spill 有值");
+        assert_eq!(
+            spilled,
+            PathBuf::from(spill),
+            "结构化路径与正文里的指针一致"
+        );
         assert!(
             full.starts_with("1\n") && full.contains("200\n"),
             "落盘内容不完整"
@@ -1710,7 +1760,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "1\n2\n3\n4\n5\n", "成功且未超限：纯正文，没有头也没有指针");
+        assert_eq!(
+            out.text, "1\n2\n3\n4\n5\n",
+            "成功且未超限：纯正文，没有头也没有指针"
+        );
 
         // 字节预算：每行 "1\n" 实打实 2 字节 → 6 字节装 3 行
         let out = reg

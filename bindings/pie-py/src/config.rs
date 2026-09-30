@@ -122,15 +122,6 @@ impl PyConfig {
     }
 
     #[getter]
-    fn keep_last_steps(&self) -> usize {
-        self.inner.keep_last_steps
-    }
-    #[setter]
-    fn set_keep_last_steps(&mut self, value: usize) {
-        self.inner.keep_last_steps = value;
-    }
-
-    #[getter]
     fn auto_compact_threshold(&self) -> Option<usize> {
         self.inner.auto_compact_threshold
     }
@@ -188,10 +179,6 @@ impl PyConfig {
 
     fn soft_limit(&self) -> usize {
         self.inner.soft_limit()
-    }
-
-    fn target_limit(&self) -> usize {
-        self.inner.target_limit()
     }
 
     /// 工具默认私有参数（`[tools.<name>]` 段），如 `{"read": {"_max_lines": 200}}`。

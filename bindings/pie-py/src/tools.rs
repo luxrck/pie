@@ -168,7 +168,8 @@ impl PyToolRegistry {
                             ))
                         })
                     })();
-                    out.map_err(|e| ToolError(format!("{e}")))
+                    out.map(|text| tools::ToolOutput::text(text))
+                        .map_err(|e| ToolError(format!("{e}")))
                 })
             })
         });

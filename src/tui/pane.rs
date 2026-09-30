@@ -18,7 +18,6 @@ use ratatui::text::{Line, Span};
 use super::markdown::{floor_char_boundary, MarkdownCache};
 use super::theme::{Palette, Status};
 use crate::cancel::CANCEL_TEXT;
-use crate::context;
 use crate::llm::Message;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
@@ -123,7 +122,7 @@ impl Cell {
                     if m.synthetic {
                         continue;
                     }
-                    let text = context::content_text(m.content.as_ref());
+                    let text = m.content_text();
                     if !text.trim().is_empty() {
                         cells.push(Cell::User(text));
                     }
@@ -133,7 +132,7 @@ impl Cell {
                     if let Some(ms) = m.thought_ms {
                         cells.push(Cell::Thought(Duration::from_millis(ms)));
                     }
-                    let text = context::content_text(m.content.as_ref());
+                    let text = m.content_text();
                     if !text.trim().is_empty() {
                         // 请求失败的回合（`[请求失败] …`）在实时视图里是红色的 `✗` 行，不是普通正文
                         if text.starts_with(crate::session::ERROR_TURN_PREFIX) {
@@ -155,7 +154,7 @@ impl Cell {
                     }
                 }
                 "tool" => {
-                    let content = context::content_text(m.content.as_ref());
+                    let content = m.content_text();
                     let status = tool_status(&content);
                     let body = Some(content.trim().to_string());
                     match pending.remove(&m.tool_call_id.clone().unwrap_or_default()) {
@@ -209,11 +208,11 @@ pub fn tool_summary(arguments: &str) -> String {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) {
         for key in KEYS {
             if let Some(v) = value.get(key).and_then(|v| v.as_str()) {
-                return one_line(v, 180);
+                return one_line(v, 240);
             }
         }
     }
-    one_line(arguments, 180)
+    one_line(arguments, 240)
 }
 
 /// 工具结果的状态：取消哨兵文本 → `⏹`，否则看**第一行**的 `[exit=N]` 头（非 shell 工具没有
@@ -542,7 +541,13 @@ impl Pane {
     /// 执行的命令，输出本身就是要看的东西（`!cmd` 的两个盒子都 `lean=False`）。
     pub fn layout(&mut self, cells: &[Cell], palette: &Palette, width: u16, lean: bool) {
         let width = (width as usize).max(1);
-        let frame_key = frame_key(palette, width, lean);
+        // 一帧的输入指纹里「与 cells 无关」的那半：宽度 / 简洁模式 / 配色
+        let frame_key = {
+            let mut h = DefaultHasher::new();
+            (width, lean).hash(&mut h);
+            palette.hash(&mut h);
+            h.finish()
+        };
         let all = frame_key != self.frame_key; // 宽度 / 简洁模式 / 配色变了 → 全部重排
         self.frame_key = frame_key;
         #[cfg(test)]
@@ -590,20 +595,29 @@ impl Pane {
                 if r > r2 {
                     return out;
                 }
-                push_selected_row(&mut out, row, r, r1, c1, r2, c2, &mut seen);
+                // 逐行规则：按「行是不是选区首/末行」决定切到哪一列；行首装饰（`Row::indent`）
+                // 不进内容；软换行的续行（`Row::continues`）**不插换行**（粘回去就是原文）。
+                let end_col = c2.saturating_add(1); // 含光标所在格 → 切到它右边
+                let (from, to) = if r1 == r2 {
+                    (c1, end_col)
+                } else if r == r1 {
+                    (c1, usize::MAX)
+                } else if r == r2 {
+                    (0, end_col)
+                } else {
+                    (0, usize::MAX)
+                };
+                let piece = crop_cells(&row_text(row), from.max(row.indent as usize), to);
+                if !row.continues && seen {
+                    out.push('\n');
+                }
+                out.push_str(&piece);
+                seen = true;
             }
             base = end;
         }
         out
     }
-}
-
-/// 一帧的输入指纹里「与 cells 无关」的那半：宽度 / 简洁模式 / 配色。
-fn frame_key(palette: &Palette, width: usize, lean: bool) -> u64 {
-    let mut h = DefaultHasher::new();
-    (width, lean).hash(&mut h);
-    palette.hash(&mut h);
-    h.finish()
 }
 
 /// 一条 cell 的排版指纹（**只看影响它自己显示行的东西**，O(1)）。
@@ -639,39 +653,6 @@ fn cell_key(cell: &Cell) -> u64 {
     h.finish()
 }
 
-/// 把一条**落在选区里**的显示行接进 `out`（[`Pane::slice_text`] 的逐行部分）。
-///
-/// 逐行规则：按「行是不是选区首/末行」决定切到哪一列，行首装饰（[`Row::indent`]）不进内容，
-/// 软换行的续行（[`Row::continues`]）**不插换行**（粘回去就是原文）。
-#[allow(clippy::too_many_arguments)] // 逐行接线参数天然多：行号 + 两个坐标区间 + 累积状态
-fn push_selected_row(
-    out: &mut String,
-    row: &Row,
-    r: usize,
-    r1: usize,
-    c1: usize,
-    r2: usize,
-    c2: usize,
-    seen: &mut bool,
-) {
-    let end_col = c2.saturating_add(1); // 含光标所在格 → 切到它右边
-    let (from, to) = if r1 == r2 {
-        (c1, end_col)
-    } else if r == r1 {
-        (c1, usize::MAX)
-    } else if r == r2 {
-        (0, end_col)
-    } else {
-        (0, usize::MAX)
-    };
-    // 行首装饰（`› ` / `  `）不是消息内容 → 复制从装饰右边开始切
-    let piece = crop_cells(&row_text(row), from.max(row.indent as usize), to);
-    if !row.continues && *seen {
-        out.push('\n');
-    }
-    out.push_str(&piece);
-    *seen = true;
-}
 
 /// 一条显示行的纯文本（复制用）。
 fn row_text(row: &Row) -> String {

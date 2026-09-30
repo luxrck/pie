@@ -60,24 +60,20 @@ impl Default for Storage {
     }
 }
 
-/// 落盘请求：写哪个子目录、名字怎么起、用什么策略，都在这层定。
+/// 落盘请求：写哪个子目录、名字怎么起，都在这层定。
 ///
-/// 两种策略**别合并**：`Blob` / `Raw` 是内容寻址（同内容一份、已存在则不动），
-/// `Window` 是**每次新建**（名字带 unix 秒）——它要留住每一次 `/clear` 归档，且不进 gc。
+/// 三种都**内容寻址**（名字里都是 sha256 前 16 位：同内容 ⇒ 同名字 ⇒ 已存在则不动、只落一份）；
+/// 区别只在目录、前缀与权限。⚠ `Window`（`/clear` 归档）本来名字带 unix 秒「每次新建」，2026-09-29
+/// 起改成内容寻址——同名 ⇒ 同内容，重复归档同一段内容不会多出文件（"什么时候清的"由会话流水的
+/// `ts` 记着）。
 pub enum StoreType<'a> {
-    /// 图片副本 → `files/`：`img-<sha256[:16]><ext>`（0o600、原子写）。
+    /// 图片副本 → `files/`：`img-<hash><ext>`（0o600、原子写）。
+    /// **只有它留扩展名**：那是用户数据（可能被双击 / 拖出去打开），扩展名是"格式"的唯一载体。
     Blob { data: &'a [u8], mime: &'a str },
-    /// 压缩落盘文本 → `context/`：`<prefix>-<hash>.txt`（`prefix` = 工具名 / `turn` / `session`）。
+    /// 压缩落盘文本 → `context/`：`<prefix>-<hash>`（`prefix` = 工具名 / `turn` / `session`）。
     Raw { prefix: &'a str, body: &'a str },
-    /// `/clear` 归档的窗口块 → `windows/`：`window-<unix 秒>-<hash>.jsonl`。
+    /// `/clear` 归档的窗口块 → `windows/`：`window-<hash>`。
     Window(&'a str),
-}
-
-/// 落盘产物：`id` 是文件名主干（不含扩展名），`path` 是完整路径。
-pub struct Stored {
-    /// `img-<hash>` / `<prefix>-<hash>` / `window-<unix 秒>-<hash>`。
-    pub id: String,
-    pub path: PathBuf,
 }
 
 impl Storage {
@@ -115,106 +111,134 @@ impl Storage {
     }
 
     /// 内容寻址落盘：`Blob` 图片副本 / `Raw` 压缩原文 / `Window` 窗口块，见 [`StoreType`]。
-    pub fn store(&self, what: StoreType<'_>) -> std::io::Result<Stored> {
-        match what {
-            StoreType::Blob { data, mime } => {
-                let id = image_hash_id(data);
-                let dir = self.files();
-                let path = dir.join(format!("{id}{}", image_ext(mime)));
-                write_atomic(&dir, &path, data, Some(0o600))?;
-                Ok(Stored { id, path })
-            }
-            StoreType::Raw { prefix, body } => {
-                let dir = self.context();
-                let id = format!("{prefix}-{}", content_hash(body));
-                let path = dir.join(format!("{id}.txt"));
-                write_atomic(&dir, &path, body.as_bytes(), None)?;
-                Ok(Stored { id, path })
-            }
-            StoreType::Window(body) => {
-                let dir = self.windows();
-                let id = format!("window-{}-{}", now().as_secs(), content_hash(body));
-                let path = dir.join(format!("{id}.jsonl"));
-                write_atomic(&dir, &path, body.as_bytes(), None)?;
-                Ok(Stored { id, path })
+    ///
+    /// 返回**落盘路径**——文件名主干就是 id（`img-<hash>` / `<prefix>-<hash>` / `window-<hash>`，
+    /// 全是内容寻址的：同内容只落一份，已存在则不动），要 hash 段用 [`hash_of`]。
+    pub fn store(&self, what: StoreType<'_>) -> std::io::Result<PathBuf> {
+        /// mime → 扩展名（图片副本是用户数据，名字里带扩展名才能双击打开；白名单之外给空串）。
+        fn image_ext(mime: &str) -> &'static str {
+            match mime {
+                "image/jpeg" => ".jpg",
+                "image/png" => ".png",
+                "image/gif" => ".gif",
+                "image/webp" => ".webp",
+                "image/bmp" => ".bmp",
+                _ => "",
             }
         }
+
+        let (dir, name, body, mode): (PathBuf, String, &[u8], Option<u32>) = match what {
+            StoreType::Blob { data, mime } => (
+                self.files(),
+                format!("img-{}{}", hash_id(data), image_ext(mime)),
+                data,
+                Some(0o600),
+            ),
+            StoreType::Raw { prefix, body } => (
+                self.context(),
+                format!("{prefix}-{}", hash_id(body.as_bytes())),
+                body.as_bytes(),
+                None,
+            ),
+            StoreType::Window(body) => (
+                self.windows(),
+                format!("window-{}", hash_id(body.as_bytes())),
+                body.as_bytes(),
+                None,
+            ),
+        };
+        let path = dir.join(name);
+        self.write_atomic(&path, body, mode)?;
+        Ok(path)
+    }
+
+    /// 写文件：先写**同目录**临时件再 rename（读者不会看到写了一半的文件）；已存在则不动
+    /// （名字都是内容寻址的：同名 ⇒ 同内容）。`mode` 只在 unix 生效（图片副本是用户数据 → 0o600）。
+    ///
+    /// 目录从 `path` 推（`store` 那边已经 join 好了），所以不用单独传。
+    fn write_atomic(&self, path: &Path, body: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+        /// 给 io 错误补上路径上下文：std 的 `io::Error` 不带路径，而上层再包一层就又成了
+        /// 「每个调用点手写 message」——所以写一次，所有 `store()` 的调用者都受益。
+        fn with_path(path: &Path, e: std::io::Error) -> std::io::Error {
+            std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+        }
+        if path.exists() {
+            return Ok(());
+        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|e| with_path(dir, e))?;
+        let tmp = dir.join(format!(
+            ".{}.tmp-{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        std::fs::write(&tmp, body).map_err(|e| with_path(&tmp, e))?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        std::fs::rename(&tmp, path).map_err(|e| with_path(path, e))
     }
 }
 
-/// 内容寻址：sha256 前 16 位（同内容只落一份）。
-pub fn content_hash(text: &str) -> String {
+// ---------------------------------------------------------------- 落盘名字（id）
+
+/// 内容 id：sha256 前 16 位十六进制——**内容寻址的唯一依据**（同内容 ⇒ 同名字 ⇒ 同一份）。
+///
+/// 这一处三个一队（[`Storage::store`] 的命名约定：`<前缀>-<hash>[.扩展名]`）：
+///   - [`hash_id`]：**内容 → hash**（起名用）；
+///   - [`name_of`]：**路径 → 文件名主干**（= id，如 `img-<hash>` / `chat-<秒>-<微秒>`）；
+///   - [`hash_of`]：**路径 → hash 段**（主干里最后一段，metadata 只想要 hash 时用）。
+pub fn hash_id(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
+    hasher.update(data);
     hex::encode(hasher.finalize())[..16].to_string()
 }
 
-/// 图片内容 id：`img-<sha256[:16]>`。
-pub fn image_hash_id(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("img-{}", &hex::encode(hasher.finalize())[..16])
+/// 从落盘路径取回**文件名主干**（= id，[`Storage::store`] 命名的正解）：
+/// `img-<hash>` / `<前缀>-<hash>` / `chat-<秒>-<微秒>`（扩展名不算）。
+///
+/// ⚠ 别拿它当 [`hash_of`] 用：主干是整个 id（带 `img-` 那截前缀），`hash_of` 才只取 hash 段。
+/// 消费方：图片副本的 id（`session.rs`，与 `__meta__.files` 的键同形）、会话列表的 id（`cli.rs`）。
+pub fn name_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
-/// mime → 扩展名（`files/` 里的副本要能双击打开；白名单之外给空串）。
-fn image_ext(mime: &str) -> &'static str {
-    match mime {
-        "image/jpeg" => ".jpg",
-        "image/png" => ".png",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/bmp" => ".bmp",
-        _ => "",
-    }
+/// 从落盘路径取回 hash 段（[`Storage::store`] 那套命名的**逆运算**：`<前缀>-<hash>[.扩展名]`）。
+///
+/// 落盘只给路径、不返回 id，要 hash 的地方（`raw_hash` 之类的元数据）就靠这个反推；
+/// 消费方：`session.rs` 的压缩流水（`__meta__.compaction_events`）与窗口块元数据。
+pub fn hash_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit('-').next())
+        .unwrap_or_default()
+        .to_string()
 }
 
-/// 写文件：先写同目录临时文件再 rename（读者不会看到写了一半的文件），已存在则不动
-/// （路径都是内容寻址的：同名 ⇒ 同内容）。`mode` 只在 unix 生效（图片副本是用户数据 → 0o600）。
-fn write_atomic(dir: &Path, path: &Path, body: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, body)?;
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    std::fs::rename(&tmp, path)
-}
 
-/// 数据根目录：`PIE_DIR` → 当前目录下的 `.pie`（**存在**才算）→ `~/.pie`。
+/// 数据根目录：`PIE_DIR`（非空才算）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造）→ `~/.pie`。
+///
+/// 就这三步、都写在这儿：**别为了好测把顺序拆成单独的函数**（要测就改环境变量测能测的那两档，
+/// 见用例；`<cwd>/.pie` 那档得改进程 cwd，代价比收益大）。
 pub fn pie_dir() -> PathBuf {
-    pick_root(
-        std::env::var_os("PIE_DIR"),
-        std::env::current_dir().ok(),
-        &home_dir(),
-    )
-}
-
-/// 搜索顺序的**纯函数**（`pie_dir` 只负责去问环境）：`PIE_DIR`（非空）→ `<cwd>/.pie`
-/// （真的存在才算，不凭空造）→ `<home>/.pie`。抽出来是为了能直接测顺序、不必改进程 cwd。
-fn pick_root(env: Option<std::ffi::OsString>, cwd: Option<PathBuf>, home: &Path) -> PathBuf {
-    if let Some(v) = env {
-        if !v.is_empty() {
-            return PathBuf::from(v);
+    if let Some(dir) = std::env::var_os("PIE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
         }
     }
-    if let Some(cwd) = cwd {
+    if let Ok(cwd) = std::env::current_dir() {
         let local = cwd.join(".pie");
         if local.is_dir() {
             return local;
         }
     }
-    home.join(".pie")
+    home_dir().join(".pie")
 }
 
 pub fn default_config_file() -> PathBuf {
@@ -239,16 +263,35 @@ pub fn now() -> Duration {
 
 /// unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`（`pie sessions` / `files list` 的时间列）。
 ///
-/// 只给人看、不参与任何判断。本地偏移来自 `localtime_r`（含夏令时）；非 unix 没这套 → 显示成 UTC。
+/// 只给人看、不参与任何判断；换算就两步——先加本地时区偏移，再把 unix 秒拆成年月日时分。
+/// （这两步原本拆成 `civil` / `local_utc_offset` 两个私有函数，消费方只有这里 → 按「别给单一消费者
+/// 造私有辅助函数」合并了进来；日历换算那几行的来历见下面的注释。）
 pub fn fmt_local(secs: i64) -> String {
-    let t = civil(secs + local_utc_offset(secs)); // "YYYY-MM-DDTHH:MM:SS"
-    format!("{} {}", &t[..10], &t[11..16])
-}
+    /// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。
+    ///
+    /// 用 `localtime_r`（POSIX，线程安全）拿到带 DST 的 `struct tm`，取 `tm_gmtoff`；
+    /// 非 unix 平台没这套东西 → 回退 0（显示成 UTC）：比引一个带时区库的依赖划算。
+    /// ⚠ 它**不会**自己重读 `TZ`（glibc 下得显式 `tzset()`）——用例里改 `TZ` 后必须调一次。
+    #[cfg(unix)]
+    fn local_utc_offset(secs: i64) -> i64 {
+        // SAFETY: `localtime_r` 把结果写进我们给的 `tm`（返回的不是共享缓冲）
+        unsafe {
+            let t = secs as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            if libc::localtime_r(&t, &mut tm).is_null() {
+                return 0;
+            }
+            tm.tm_gmtoff as i64
+        }
+    }
+    #[cfg(not(unix))]
+    fn local_utc_offset(_secs: i64) -> i64 {
+        0
+    }
 
-/// unix 秒 → `YYYY-MM-DDTHH:MM:SS`（**纯函数**；Howard Hinnant 的 civil_from_days，不引日期库）。
-///
-/// `div_euclid`/`rem_euclid` 向下取整，负值（1970 前）也对。
-fn civil(secs: i64) -> String {
+    let secs = secs + local_utc_offset(secs);
+    // unix 秒 → 年月日：Howard Hinnant 的 `civil_from_days`（不引日期库）。
+    // `div_euclid`/`rem_euclid` 向下取整，负值（1970 前）也对。
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let z = days + 719_468;
@@ -262,33 +305,10 @@ fn civil(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
         tod / 3600,
-        (tod % 3600) / 60,
-        tod % 60
+        (tod % 3600) / 60
     )
-}
-
-/// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。只服务展示。
-///
-/// 用 `localtime_r`（POSIX，线程安全）拿到带 DST 的 `struct tm`，取 `tm_gmtoff`。
-/// 非 unix 平台没这套东西 → 回退 0（显示成 UTC）：比引一个带时区库的依赖划算。
-#[cfg(unix)]
-fn local_utc_offset(secs: i64) -> i64 {
-    // SAFETY: `localtime_r` 把结果写进我们给的 `tm`（返回的不是共享缓冲）
-    unsafe {
-        let t = secs as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return 0;
-        }
-        tm.tm_gmtoff as i64
-    }
-}
-
-#[cfg(not(unix))]
-fn local_utc_offset(_secs: i64) -> i64 {
-    0
 }
 
 /// 千分位（`1234567` → `1,234,567`）：Rust 的 format 没有千分位语法，只能自己加。
@@ -390,11 +410,17 @@ pub fn ensure_config_file(explicit: Option<&Path>) -> Result<(PathBuf, bool), Co
 pub struct ToolCompaction {
     pub head: usize,
     pub tail: usize,
+    /// 保护窗口：最近 N 个 step 批次**不碰**（跨批次滚动保护——只工具级有这个概念）。
+    pub keep_last_steps: usize,
 }
 
 impl Default for ToolCompaction {
     fn default() -> Self {
-        Self { head: 30, tail: 50 }
+        Self {
+            head: 30,
+            tail: 50,
+            keep_last_steps: 7,
+        }
     }
 }
 
@@ -449,8 +475,6 @@ pub struct CompactionConfig {
     pub session: Option<SessionCompaction>,
     /// 软阈值比例（相对可用输入预算），触发自动压缩。
     pub soft_ratio: f64,
-    /// 压缩后的目标水位（迟滞防抖，应小于 soft_ratio）。
-    pub target_ratio: f64,
 }
 
 impl Default for CompactionConfig {
@@ -460,7 +484,6 @@ impl Default for CompactionConfig {
             turn: true,
             session: Some(SessionCompaction::default()),
             soft_ratio: 0.8,
-            target_ratio: 0.55,
         }
     }
 }
@@ -490,7 +513,6 @@ pub struct Config {
     #[serde(deserialize_with = "de_reserved_tokens")]
     pub reserved_tokens: Option<usize>,
     pub context_window: usize,
-    pub keep_last_steps: usize,
     /// `None` = 不做任何上下文压缩。
     #[serde(deserialize_with = "de_compaction")]
     pub compaction: Option<CompactionConfig>,
@@ -533,7 +555,6 @@ impl Default for Config {
             reasoning_effort: "high".to_string(),
             reserved_tokens: Some(128_000),
             context_window: 1024 * 1024,
-            keep_last_steps: 7,
             compaction: Some(CompactionConfig::default()),
             timeout_seconds: 60.0,
             max_retries: 5,
@@ -587,38 +608,18 @@ impl Config {
             .max(1)
     }
 
-    /// 软 / 目标比例：没写 `[compaction]` 就用**默认那套**的比例（值与 `CompactionConfig::default()` 同源）。
-    fn ratio(&self, soft: bool) -> f64 {
-        let c = self.compaction.clone().unwrap_or_default();
-        if soft {
-            c.soft_ratio
-        } else {
-            c.target_ratio
-        }
+    /// 软阈值比例（未配置 `[compaction]` 时给**默认那套**的值）——触发自动压缩的水位，`/stat` 也展示它。
+    pub fn soft_ratio(&self) -> f64 {
+        self.compaction.clone().unwrap_or_default().soft_ratio
     }
 
     /// 软阈值：触发自动压缩的 token 水位。
-    /// 软阈值比例（未配置 `[compaction]` 时给默认值）——`/stat` 展示用。
-    pub fn soft_ratio(&self) -> f64 {
-        self.ratio(true)
-    }
-
-    /// 目标水位比例（同上）。
-    pub fn target_ratio(&self) -> f64 {
-        self.ratio(false)
-    }
-
     pub fn soft_limit(&self) -> usize {
         // CLI 一次性覆盖（`--auto-compact-threshold`）优先
         if let Some(n) = self.auto_compact_threshold {
             return n.max(1);
         }
-        (((self.context_budget() as f64) * self.ratio(true)).max(1.0)) as usize
-    }
-
-    /// 目标水位：压缩后应降到该值以下。
-    pub fn target_limit(&self) -> usize {
-        (((self.context_budget() as f64) * self.ratio(false)).max(1.0)) as usize
+        (((self.context_budget() as f64) * self.soft_ratio()).max(1.0)) as usize
     }
 
     /// 工具私有默认参数（下划线开头，由 dispatch 注入）。
@@ -694,7 +695,6 @@ impl Config {
             },
         );
         put("context_window", V::Integer(self.context_window as i64));
-        put("keep_last_steps", V::Integer(self.keep_last_steps as i64));
         put(
             "compaction",
             match &self.compaction {
@@ -726,7 +726,6 @@ impl Config {
                         },
                     );
                     comp.insert("soft_ratio".to_string(), V::Float(c.soft_ratio));
-                    comp.insert("target_ratio".to_string(), V::Float(c.target_ratio));
                     V::Table(comp)
                 }
                 None => V::Boolean(false),
@@ -927,44 +926,71 @@ pub fn build_system_prompt(
 mod tests {
     use super::*;
 
-    /// 数据根目录的搜索顺序：`PIE_DIR` → `<cwd>/.pie`（存在才算）→ `<home>/.pie`。
+    /// 数据根目录：`PIE_DIR`（非空）→ `<cwd>/.pie`（存在才算）→ `<home>/.pie`。
+    ///
+    /// 只测「问环境」那两档：`<cwd>/.pie` 那档要改进程 cwd（会污染并行跑的用例），
+    /// 而给 `pie_dir` 开注入参数是为了测试拆代码（不干）——那几行直接读代码。
     #[test]
-    fn pie_dir_prefers_env_then_local_then_home() {
-        let home = PathBuf::from("/tmp/pie-home-stub");
-        let cwd = std::env::temp_dir().join(format!("pie-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        let local = cwd.join(".pie");
-        std::fs::create_dir_all(&local).unwrap();
+    fn pie_dir_prefers_env_then_home() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_dir = std::env::var_os("PIE_DIR");
+        let old_home = std::env::var_os("HOME");
 
-        let env = |s: &str| Some(std::ffi::OsString::from(s));
+        // 1) `PIE_DIR` 非空 → 直接用它（本地就算有 `.pie` 也不看）
+        std::env::set_var("PIE_DIR", "/tmp/pie-from-env");
+        assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-from-env"));
 
-        // 1) PIE_DIR 非空 → 直接用它（本地就算有 .pie 也不看）
-        assert_eq!(
-            pick_root(env("/tmp/pie-from-env"), Some(cwd.clone()), &home),
-            PathBuf::from("/tmp/pie-from-env")
-        );
-        // 2) PIE_DIR 没设 / 空串 → 当前目录下的 .pie
-        assert_eq!(pick_root(None, Some(cwd.clone()), &home), local);
-        assert_eq!(pick_root(env(""), Some(cwd.clone()), &home), local);
-        // 3) 当前目录没有 .pie（或问不到 cwd）→ ~/.pie
-        let bare = cwd.join("bare");
-        std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(pick_root(None, Some(bare), &home), home.join(".pie"));
-        assert_eq!(pick_root(None, None, &home), home.join(".pie"));
+        // 2) 空串 = 没设 → 往下走；cwd 没有 `.pie` 时就是 `$HOME/.pie`
+        std::env::set_var("PIE_DIR", "");
+        std::env::set_var("HOME", "/tmp/pie-home-stub");
+        let cwd_has_pie = std::env::current_dir()
+            .map(|d| d.join(".pie").is_dir())
+            .unwrap_or(false);
+        if !cwd_has_pie {
+            assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-home-stub/.pie"));
+        }
 
-        let _ = std::fs::remove_dir_all(&cwd);
+        match old_dir {
+            Some(v) => std::env::set_var("PIE_DIR", v),
+            None => std::env::remove_var("PIE_DIR"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
-    /// `civil` 是纯函数（unix 秒 → 文本，不碰时区）；`fmt_local` 只断言形状
-    /// （不硬编码跑测试的机器时区）。
+    /// `fmt_local` 的日历换算钉住已知时刻：`TZ` 用 **POSIX 串**（`UTC0` / `CST-8`，不依赖 tzdata，
+    /// 后者就是 UTC+8），并且**必须显式 `tzset()`**——glibc 的 `localtime_r` 不会自己重读 `TZ`。
+    #[cfg(unix)]
     #[test]
-    fn civil_matches_known_instants() {
-        assert_eq!(civil(0), "1970-01-01T00:00:00");
-        assert_eq!(civil(1_700_000_000), "2023-11-14T22:13:20");
-        assert_eq!(civil(-1), "1969-12-31T23:59:59"); // 负值（1970 前）不炸
-        let local = fmt_local(0);
-        assert_eq!(local.len(), 16, "{local}");
-        assert!(local[10..].starts_with(' '), "{local}");
+    fn fmt_local_matches_known_instants() {
+        // `libc` crate 只在 windows 那份里声明了 `tzset`（unix 那份没有）→ 自己声明
+        extern "C" {
+            fn tzset();
+        }
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("TZ");
+        let set_tz = |tz: &str| {
+            std::env::set_var("TZ", tz);
+            // SAFETY: 只动 libc 的时区缓存；`ENV_LOCK` 保证没有别的用例同时读它
+            unsafe { tzset() };
+        };
+
+        set_tz("UTC0");
+        assert_eq!(fmt_local(0), "1970-01-01 00:00");
+        assert_eq!(fmt_local(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(fmt_local(-1), "1969-12-31 23:59"); // 负值（1970 前）也对
+        set_tz("CST-8"); // POSIX 串里的符号与 `date +%z` 相反：`CST-8` = UTC+8
+        assert_eq!(fmt_local(0), "1970-01-01 08:00");
+        assert_eq!(fmt_local(1_700_000_000), "2023-11-15 06:13");
+
+        match old {
+            Some(v) => std::env::set_var("TZ", v),
+            None => std::env::remove_var("TZ"),
+        }
+        unsafe { tzset() };
     }
 
     #[test]
@@ -986,10 +1012,6 @@ mod tests {
             config.context_window - 128_000
         );
         assert_eq!(config.soft_limit(), (config.context_budget() as f64 * 0.8) as usize);
-        assert_eq!(
-            config.target_limit(),
-            (config.context_budget() as f64 * 0.55) as usize
-        );
     }
 
     #[test]
@@ -1002,7 +1024,6 @@ api_key = "sk-x"
 reasoning_effort = "high"
 reserved_tokens = 128000
 context_window = 1048576
-keep_last_steps = 7
 timeout_seconds = 60.0
 max_retries = 5
 parallel_tools = true
@@ -1010,7 +1031,6 @@ parallel_tools = true
 [compaction]
 turn = true
 soft_ratio = 0.8
-target_ratio = 0.55
 
 [compaction.tool]
 head = 30
@@ -1062,7 +1082,6 @@ lean = true
         let comp = back.compaction.as_ref().expect("compaction");
         assert!(comp.tool.is_none(), "tool = false 读回 None（该级关闭）");
         assert!(comp.session.is_some(), "session 没关就还是表");
-        assert_eq!(back.keep_last_steps, config.keep_last_steps);
         assert_eq!(back.max_retries, config.max_retries);
         let _ = std::fs::remove_dir_all(&dir);
     }

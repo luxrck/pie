@@ -2,10 +2,10 @@
 //!
 //! 回合循环原来在独立的 `loop.rs`（`run_turn`），已并进 `Session::aturn`：两者本来就是一件事的
 //! 两半，分开只会让每次调用在两模块之间穿 7 个参数（其中 4 个还是 `self` 的字段）。
-//! 一次性模式改走 `Session::ephemeral()`（不落盘、不写 manifest）。
+//! 一次性模式改走 `Session::ephemeral()`（不落盘、压缩事件只在内存）。
 //!
 //! **持久化契约**：
-//!   - 一行一条 JSON：首行 `__meta__`（usage / windows / cwd / title），之后每行一条消息；
+//!   - 一行一条 JSON：首行 `__meta__`（usage / windows / cwd / title / files / compaction_events），之后每行一条消息；
 //!   - 恢复时**丢弃文件里的 system 消息**，按当前 SYSTEM.md / AGENTS.md / MEMORY.md 重建
 //!     （提示词会变，历史里那份旧 system 没有意义）；
 //!   - 会话目录是 `~/.pie/sessions/`，resume 按 mtime 选最新、「同 cwd 优先」（读 meta 里的 `cwd`；
@@ -28,7 +28,7 @@ use crate::context;
 use crate::llm::{
     self, Content, LlmClient, LlmError, LlmResult, Message, StreamChunk, ToolCall, UsageTracker,
 };
-use crate::tools::{self, ToolRegistry};
+use crate::tools::{self, ToolOutput, ToolRegistry};
 
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
@@ -66,14 +66,19 @@ pub enum TurnEvent {
 pub struct Session {
     /// 会话 JSONL 自身的路径（也是 `save` 的默认目标）。
     pub path: PathBuf,
-    /// 配置快照（压缩水位 / `keep_last_steps` / `compaction` 都从它取）。
+    /// 配置快照（压缩水位 / 压缩参数（含保护窗口）/ 数据目录都从它取）。
     pub config: Config,
     /// 模型后端（会话自己持有）。
     pub llm: LlmClient,
     /// 工具集（`--tools` 裁剪过的注册表就从这里进来）。
     pub tools: ToolRegistry,
-    /// 压缩 manifest（`~/.pie/context/<会话名>.manifest.jsonl`）；`None` = 不记账（`ephemeral`）。
-    pub manifest: Option<PathBuf>,
+    /// 压缩事件流水（每条落盘成 `{kind, ts, path, hash, summary?}`，`kind` 就是类型标签；
+    /// 旧会话里的键是 `raw_path` / `raw_hash`，靠 `CompactEvent` 的 serde alias 读回）。
+    ///
+    /// 以前单独 append 到 `~/.pie/context/<会话名>.manifest.jsonl`；现在**只住内存**，
+    /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `raw_path` 指针
+    /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
+    pub compaction_events: Vec<context::CompactEvent>,
     /// 完整历史（`messages[0]` 是当前 system prompt）。
     pub messages: Vec<Message>,
     /// 用量：token 是最近一次上报值，`calls` 累计（见 `UsageTracker`）。
@@ -133,19 +138,17 @@ impl Session {
         Self::at(resolve_path(&config.storage.sessions(), id), config, llm, tools)
     }
 
-    /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
+    /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`，压缩事件也就不会落盘），其余完全一样。
     ///
     /// 既然回合循环已经并在 `Session` 上，
     /// 就用“不记账的 Session”表达同一件事。
     pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
-        let mut session = Self::at(
+        Self::at(
             config.storage.sessions().join(format!("ephemeral-{}.jsonl", timestamp())),
             config,
             llm,
             tools,
-        );
-        session.manifest = None;
-        session
+        )
     }
 
     /// 拉取端点可用模型 id 并缓存（`/model` 的候选列表；失败不动旧缓存）。
@@ -225,6 +228,17 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default();
+                // 压缩事件流水（与消息里的 `raw_path` 同车落盘）
+                // 逐条解析：单条坏（手改过？）只丢那条，不让整份流水变空
+                session.compaction_events = value
+                    .get("compaction_events")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 // 图片 id 表（hash_id → 上传记录）
                 session.files = value
                     .get("files")
@@ -287,16 +301,12 @@ impl Session {
             if !block.exists() {
                 continue; // 窗口块没了（被 gc 清掉？）→ 不硬塞死链
             }
-            let raw = std::fs::read_to_string(block).unwrap_or_default();
             let mut msg = Message::system(context::build_window_summary(
                 block,
                 session_config.head,
                 session_config.tail,
             ));
-            msg.compress_level = 3;
-            msg.raw_path = Some(block.display().to_string());
-            msg.raw_len = Some(raw.chars().count() as i64);
-            msg.raw_tokens = Some(raw.chars().count() as i64 / 4);
+            msg.mark_compressed(3, Some(block.as_path()));
             out.push(msg);
         }
         out
@@ -337,11 +347,7 @@ impl Session {
     /// 典型场景（synthetic 那套）：模型这一轮什么也没改，就在历史里补一条 assistant 再补一条
     /// user 提醒，然后**接着跑**下一个 `aturn`。计 `turn_count` 只数用户消息，这里不动它。
     pub fn push_assistant(&mut self, text: &str) {
-        self.messages.push(Message {
-            role: "assistant".into(),
-            content: Some(Content::Text(text.to_string())),
-            ..Default::default()
-        });
+        self.messages.push(Message::assistant(text));
     }
 
     /// 模型请求失败（外部因素：网络 / 服务端错 / 协议错）→ 往历史里补一条 assistant 消息
@@ -352,15 +358,12 @@ impl Session {
     /// 取消补 `CANCEL_TEXT`，失败补 `[请求失败] <错误>`；调用方仍然拿到 `Err`（界面照旧报错），
     /// 只是历史里这对 user/assistant 始终成对。
     fn push_error_turn(&mut self, err: &LlmError) {
-        self.messages.push(Message {
-            role: "assistant".into(),
-            content: Some(Content::Text(format!("{ERROR_TURN_PREFIX}{err}"))),
-            ..Default::default()
-        });
+        self.messages
+            .push(Message::assistant(format!("{ERROR_TURN_PREFIX}{err}")));
     }
 
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
-    /// **不落盘会话**（由调用方 `save`）；压缩事件写进 manifest（`ephemeral` 会话不写）。
+    /// **不落盘会话**（由调用方 `save`）；压缩事件攒在 `compaction_events`，随 `save` 一起落盘。
     ///
     /// 回合语义：工具失败文本化后照常回传、达到 `max_steps` 就把
     /// 最后一段 assistant 文本当答复（不额外追加消息）、`tool` 结果与 `tool_call_id` 严格配对。
@@ -387,17 +390,8 @@ impl Session {
         parallel_tools: Option<bool>,
     ) -> Result<String, LlmError> {
         self.push_user(input);
-        let manifest = self.manifest.clone();
-        // 会话级压缩的窗口块：从 on_compact 事件（level=3）里收集，跑完再登记进 self.windows
-        let mut new_windows: Vec<PathBuf> = Vec::new();
-        let mut on_compact = |entry: Value| {
-            if entry.get("level").and_then(Value::as_u64) == Some(3) {
-                if let Some(path) = entry.get("raw_path").and_then(Value::as_str) {
-                    new_windows.push(PathBuf::from(path));
-                }
-            }
-            record_compact(manifest.as_deref(), &entry);
-        };
+        // 压缩事件先攒在本地（`self.messages` 这会儿正被借出去跑回合）→ 回合末并进字段
+        let mut compacted: Vec<context::CompactEvent> = Vec::new();
 
         // 配置值拷出来（不长期借 `self.config`：后面还要 `&mut self` 做注入/降级）
         // `stream: None` = 用默认（客户端都实现了流式）
@@ -418,8 +412,15 @@ impl Session {
             }
             if let Some(max) = max_steps {
                 if steps >= max {
-                    // 达到步数上限：不再问模型，把历史里最后一段 assistant 文本当最终答复
-                    answer = last_assistant_text(&self.messages);
+                    // 达到步数上限：不再问模型，把历史里最后一段非空 assistant 文本当最终答复
+                    answer = self.messages.iter().rev().find_map(|m| match &m.content {
+                        Some(Content::Text(t))
+                            if m.role == "assistant" && !t.trim().is_empty() =>
+                        {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    });
                     if !use_stream {
                         on_event(TurnEvent::Answer(answer.clone().unwrap_or_default()));
                     }
@@ -429,13 +430,10 @@ impl Session {
             }
             steps += 1;
 
-            // 请求前：按**估算**水位压一次（`config.compaction` 未配置就什么都不做）
-            context::maybe_compact(
-                &mut self.messages,
-                &self.config,
-                None,
-                Some(&mut on_compact as &mut dyn FnMut(Value)),
-            );
+            // 请求前：拿上一次 API 上报的水位判一次（本次会话还没发过请求 → 不压）
+            let (_, mut events) =
+                context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            compacted.append(&mut events);
 
             let specs = self.tools.specs();
             let called = match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
@@ -446,6 +444,35 @@ impl Session {
                     if e.is_stale_file_error() && self.downgrade_file_blocks() {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
+                        ));
+                        match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
+                            Ok(option) => option,
+                            Err(e) => {
+                                self.push_error_turn(&e);
+                                return Err(e);
+                            }
+                        }
+                    } else if e.is_context_overflow() {
+                        // 水位判据失手（本次会话还没上报过 / 单条输入就撑满窗口）：
+                        // **无视水位**强压一次（工具级 + 轮次级）再发——手动 `compact` 正是不看水位那条路。
+                        let (stats, mut events) = context::compact(
+                            &mut self.messages,
+                            &self.config,
+                            context::CompactMode::Auto,
+                        );
+                        compacted.append(&mut events);
+                        if stats.tools == 0 && stats.turns == 0 {
+                            // 工具级 / 轮次级都压不动了 → **不自动归档**：换窗口是用户的动作，
+                            // 自动做会让模型在回合中途莫名「失忆」（当前轮的工作记忆只剩摘要）
+                            crate::log::warn(
+                                "[warn] 上下文超限且已无可压：可以 `/clear` 开新窗口，或调小单条工具输出上限",
+                            );
+                            self.push_error_turn(&e);
+                            return Err(e);
+                        }
+                        crate::log::warn(format!(
+                            "[warn] 上下文超限，已强制压缩（工具级 {} 条 / 轮次级 {} 轮）并重试一次",
+                            stats.tools, stats.turns
                         ));
                         match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
                             Ok(option) => option,
@@ -468,15 +495,10 @@ impl Session {
 
             let tool_calls = result.tool_calls.clone();
             self.usage.record(&result.usage);
-            // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再压一次
-            if let Some(prompt_tokens) = self.usage.prompt_tokens {
-                context::maybe_compact(
-                    &mut self.messages,
-                    &self.config,
-                    Some(prompt_tokens),
-                    Some(&mut on_compact as &mut dyn FnMut(Value)),
-                );
-            }
+            // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再判一次
+            let (_, mut events) =
+                context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            compacted.append(&mut events);
             self.messages.push(Message {
                 role: "assistant".into(),
                 content: result
@@ -508,27 +530,25 @@ impl Session {
             let mut batch_results: Vec<String> = Vec::with_capacity(tool_calls.len());
             let mut interrupted = false;
             for (call, outcome) in tool_calls.iter().zip(outcomes) {
-                let text = match outcome {
-                    Some(text) => text,
+                let out = match outcome {
+                    Some(out) => out,
                     // 被取消：每个 tool_call_id 都要有配对的 tool 消息，否则回放这段历史时
                     // API 会拒）；结果事件已在 `tool_call` 里推过
                     None => {
                         interrupted = true;
-                        CANCEL_TEXT.to_string()
+                        ToolOutput::text(CANCEL_TEXT)
                     }
                 };
-                let mut msg = Message::tool_result(&call.id, &call.function.name, text.clone());
-                if call.function.name == "bash" {
-                    // bash 超限自带落盘：把 spill 指针同步成压缩元数据 + manifest 事件
-                    //（只 bash 会落盘 → 按工具名 gate；不然 read 回来的源码字面量会被误判）
-                    if let Some(entry) =
-                        context::mark_tool_spill(&mut msg, &call.function.name, &text)
-                    {
-                        on_compact(entry);
-                    }
+                let name = call.function.name.as_str();
+                // 工具自带落盘（bash）→ 消息**进历史前**就带上原文指针（工具级），
+                // 并同步一条压缩流水（gc 靠它保住那份落盘原文）
+                if let Some(path) = &out.spill {
+                    compacted.push(context::CompactEvent::tool(name, path));
                 }
+                let mut msg = Message::tool_result(&call.id, name, out.text.clone());
+                msg.mark_compressed(1, out.spill.as_deref());
                 self.messages.push(msg);
-                batch_results.push(text);
+                batch_results.push(out.text);
             }
             if interrupted {
                 cancelled = true;
@@ -539,16 +559,17 @@ impl Session {
             self.inject_read_images(&tool_calls, &batch_results).await;
         }
 
-        drop(on_compact); // 显式收尾：下面要 move `new_windows`
-        self.windows.extend(new_windows);
+        // 会话级压缩（level 3）产出的窗口块 → 登记进 `self.windows`
+        self.windows
+            .extend(compacted.iter().filter_map(|e| match e {
+                context::CompactEvent::Session { path, .. } => Some(path.clone()),
+                _ => None,
+            }));
+        self.compaction_events.append(&mut compacted);
 
         if cancelled {
             // 历史里留一条终止消息，并把它当本轮答复
-            self.messages.push(Message {
-                role: "assistant".into(),
-                content: Some(Content::Text(CANCEL_TEXT.to_string())),
-                ..Default::default()
-            });
+            self.messages.push(Message::assistant(CANCEL_TEXT));
             if !use_stream {
                 on_event(TurnEvent::Answer(CANCEL_TEXT.to_string()));
             }
@@ -680,7 +701,7 @@ impl Session {
         parallel: bool,
         cancel: &Cancel,
         on_event: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Option<ToolOutput>> {
         for call in calls {
             on_event(TurnEvent::ToolCall {
                 name: call.function.name.clone(),
@@ -703,14 +724,20 @@ impl Session {
                 } else {
                     match serde_json::from_str::<Value>(&call.function.arguments) {
                         // 比 serde 的英文报错有用：把原文回给模型（上限 500 字）
-                        Err(_) => Some(format!(
+                        Err(_) => Some(ToolOutput::text(format!(
                             "[参数解析失败] 模型返回了非法 JSON: {}",
                             call.function.arguments.chars().take(500).collect::<String>()
-                        )),
+                        ))),
                         Ok(args) => {
-                            let text =
-                                dispatch_tool(registry, call, &args, cancel, &self.config.storage).await;
-                            (text != CANCEL_TEXT).then_some(text) // shell 被杀 → 哨兵 → 算取消
+                            // 取消信号与数据目录随 ctx 进工具层（shell 会在等待时 race 它、
+                            // 也可能要把 stdout 落盘）；**单个工具失败不拖累其他工具**——
+                            // 任何异常都文本化后回传模型，让它自己修。
+                            let ctx = tools::ToolCtx::with_cancel(cancel.clone(), self.config.storage.clone());
+                            let out = match registry.dispatch(&call.function.name, &args, ctx).await {
+                                Ok(out) => out,
+                                Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
+                            };
+                            (out.text != CANCEL_TEXT).then_some(out) // shell 被杀 → 哨兵 → 算取消
                         }
                     }
                 };
@@ -722,13 +749,16 @@ impl Session {
         let limit = if parallel { calls.len().max(1) } else { 1 };
         let mut stream = stream::iter(futures).buffer_unordered(limit);
 
-        let mut outcomes: Vec<Option<String>> = vec![None; calls.len()];
+        let mut outcomes: Vec<Option<ToolOutput>> = vec![None; calls.len()];
         while let Some((index, outcome)) = stream.next().await {
             // 文本**原样**推给嵌入方（不在这里截断）：要少显示是展示层的事（TUI 按行截、
             // CLI 只取首行），要少回传给模型是工具自己配容量上限的事。
             on_event(TurnEvent::ToolResult {
                 name: calls[index].function.name.clone(),
-                content: outcome.clone().unwrap_or_else(|| CANCEL_TEXT.to_string()),
+                content: outcome
+                    .clone()
+                    .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT))
+                    .text,
                 arguments: calls[index].function.arguments.clone(),
             });
             outcomes[index] = outcome;
@@ -792,17 +822,19 @@ impl Session {
         if !enabled {
             return None;
         }
-        let (image_hash, local) = match self
+        let local = match self
             .config
             .storage
             .store(config::StoreType::Blob { data, mime })
         {
-            Ok(s) => (s.id, s.path),
+            Ok(path) => path,
             Err(e) => {
                 crate::log::warn(format!("[warn] 图片本地副本写入失败: {e}"));
                 return None;
             }
         };
+        // 文件名主干就是 id（`img-<hash>`）——扫描 `files/` 时也是这么反推的
+        let image_hash = config::name_of(&local);
         if let Some(entry) = self.files.get(&image_hash) {
             if entry_is_usable(entry, &base_url, &key_fp) {
                 return entry
@@ -877,6 +909,9 @@ impl Session {
             // 空表不写：别把每个会话文件都撑起来
             meta["files"] = json!(self.files);
         }
+        if !self.compaction_events.is_empty() {
+            meta["compaction_events"] = json!(self.compaction_events);
+        }
         let mut out = String::new();
         out.push_str(&json_line(&meta)?);
         out.push('\n');
@@ -894,29 +929,10 @@ impl Session {
 
     /// 手动压缩（`/compact`）：不看水位，按 `mode` 压；轮次级一路压到不能再压。
     /// **不含会话级**（整窗口归档是 `/clear` 的事）。
-    #[allow(dead_code)] // 入口是交互层的 `/compact`
     pub fn compact(&mut self, mode: context::CompactMode) -> context::CompactStats {
-        let manifest = self.manifest.clone();
-        context::compact(
-            &mut self.messages,
-            &self.config,
-            mode,
-            Some(&mut |entry: Value| record_compact(manifest.as_deref(), &entry)),
-        )
-    }
-
-    /// 本会话的压缩事件（读 manifest；没有就空）——`/stat` 与调试用。
-    pub fn compression_history(&self) -> Vec<Value> {
-        let Some(manifest) = &self.manifest else {
-            return Vec::new();
-        };
-        let Ok(text) = std::fs::read_to_string(manifest) else {
-            return Vec::new();
-        };
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .collect()
+        let (stats, events) = context::compact(&mut self.messages, &self.config, mode);
+        self.compaction_events.extend(events);
+        stats
     }
 
     /// 完整转录：按消息顺序**展开压缩指针**——工具级还原落盘全文，轮次级 / 会话级还原原始消息序列。
@@ -925,7 +941,7 @@ impl Session {
     /// 真正出现过的内容。落盘文件不在（被 `context gc` 收走）
     /// 就退回压缩形式本身。
     ///
-    /// 不再把 manifest 里「已不在消息中」的原文追加到末尾——那些原文要么仍在消息
+    /// 不再把压缩流水里「已不在消息中」的原文追加到末尾——那些原文要么仍在消息
     /// 里（各自展开）、要么属于已归档的窗口块（走 `windows` 重建的摘要消息），另追加一遍只会让回放
     /// 顺序错乱。
     pub fn full_history(&self) -> Vec<Message> {
@@ -953,7 +969,7 @@ impl Session {
                 // 头区（`[exit=N]` / 指针行）不在落盘件里，从压缩后的消息里补回来——否则回放的
                 // bash 行看不到退出码，会被当成成功（回放里失败的命令显示 〼 且不带正文）。
                 (1, Some(path)) if m.role == "tool" => {
-                    let pointer = context::content_text(m.content.as_ref());
+                    let pointer = m.content_text();
                     let headers = pointer.split_once("\n\n").map_or(
                         pointer.as_str(), // 只有头区（没空行）时整段都是头
                         |(head, _)| head,
@@ -982,109 +998,56 @@ impl Session {
         self.messages.truncate(1);
     }
 
-    /// `/clear`：把当前窗口（system 与**既有窗口摘要**除外）写成一块**窗口块**落盘，开新窗口。
+    /// `/clear`：把当前窗口（system 与**既有窗口摘要**除外）整块写进 `~/.pie/windows/` 落盘，开新窗口。
     ///
-    /// 新窗口 = 当前 system prompt + **所有**窗口块的「摘要 + 指针」（不只最新一块）：
-    /// 可见上下文立刻瘦下来，原文仍在 `~/.pie/windows/`
+    /// 新窗口 = 重建的 system prompt + **所有**窗口块的「摘要 + 指针」（旧摘要原地留着，
+    /// 末尾接上刚归档那一块的新摘要）：可见上下文立刻瘦下来，原文仍在 `~/.pie/windows/`
     /// 可经指针回查（`full_history` / resume 都能展开）。
+    ///
+    /// 这就是**第三级（会话级）压缩**，只是**只由用户手动触发**（自动压缩只做工具级 / 轮次级）：
+    /// 换窗口会让当前轮的工作记忆只剩摘要，自动做会让模型莫名「失忆」。
     ///
     /// 返回归档后手上的窗口块**总数**（调用方拿去提示）；落盘失败则原样返回、**不动窗口**
     ///（宁可不清，也不能把历史弄丢）。
-    pub fn clear_window(&mut self) -> Result<usize, String> {
-        // 既有窗口摘要不再入档：它们在 `self.windows` 里、由 `window_summary_messages` 统一重建
-        //（否则会「摘要的摘要」层层嵌套，旧窗口的信息反而从可见上下文里掉出去）
-        let old: Vec<Value> = self
-            .messages
-            .iter()
-            .skip(1)
-            .filter(|m| !(m.role == "system" && m.compress_level == 3))
-            .map(|m| json!(m))
-            .collect();
-        if !old.is_empty() {
-            // 窗口块也是**逐行 JSON**（`context::load_window_dicts` 按行读）→ 同样要转义控制符
-            let mut raw = String::new();
-            for d in &old {
-                raw.push_str(&json_line(d)?);
-                raw.push('\n');
-            }
-            let path = self
-                .config
-                .storage
-                .store(config::StoreType::Window(&raw))
-                .map_err(|e| format!("写窗口块失败: {e}"))?
-                .path;
-            let (head, tail) = self.window_sizes();
-            // 与上下文压缩同一条 manifest（`pie context info` / `/stat` 看的就是它）
-            record_compact(
-                self.manifest.as_deref(),
-                &json!({
-                    "ts": config::now().as_secs() as i64,
-                    "level": 3,
-                    "kind": "session",
-                    "raw_path": path.display().to_string(),
-                    "raw_hash": config::content_hash(&raw),
-                    "summary": context::summarize_turns(&old, head, tail)
-                        .chars()
-                        .take(200)
-                        .collect::<String>(),
-                }),
-            );
-            self.windows.push(path);
-        }
-        // 新窗口：只留「当前 system prompt + 各窗口块的摘要/指针」（提示词顺便重建一次）
-        self.messages = std::iter::once(Message::system(config::build_system_prompt(
-            &self.config,
-            self.config.system_prompt.as_deref(),
-            &self.config.append_system_prompt,
-        )))
-        .chain(self.window_summary_messages())
-        .collect();
-        Ok(self.windows.len())
-    }
-
-    /// 窗口块摘要的 head/tail（会话级压缩没配就用默认值）。
-    fn window_sizes(&self) -> (usize, usize) {
-        match self
+    pub fn clear_window(&mut self) -> std::io::Result<usize> {
+        // `[compaction.session]` 没配就用默认值（head/tail 只影响摘要保留几轮）
+        let session_config = self
             .config
             .compaction
             .as_ref()
-            .and_then(|c| c.session.as_ref())
+            .and_then(|c| c.session.clone())
+            .unwrap_or_default();
+        if let Some((path, event)) =
+            context::compact_session(&mut self.messages, &session_config, &self.config.storage)?
         {
-            Some(sc) => (sc.head, sc.tail),
-            None => {
-                let d = config::SessionCompaction::default();
-                (d.head, d.tail)
-            }
+            self.compaction_events.push(event);
+            self.windows.push(path);
         }
+        // `/clear` 的特性（兜底没有）：system prompt 顺便重建一次（cwd / 记忆变化要反映进来）
+        self.messages[0] = Message::system(config::build_system_prompt(
+            &self.config,
+            self.config.system_prompt.as_deref(),
+            &self.config.append_system_prompt,
+        ));
+        Ok(self.windows.len())
     }
 
     /// `/stat` 的报告文本：
-    /// 上下文占用 / 水位 / 输入预算 / 各角色估算 / 压缩事件 / API 用量。
+    /// 上下文占用（API 上报）/ 水位 / 输入预算 / 各角色条数 / 压缩事件 / API 用量。
     pub fn usage_report(&self) -> String {
-        let (total, label) = match self.usage.prompt_tokens {
-            Some(reported) => (reported, "当前上下文占用（API 上报）："),
-            None => (
-                context::messages_tokens(&self.messages),
-                "当前上下文占用（估算）：",
-            ),
-        };
         let limit = self.config.context_budget();
         let reserved = match self.config.reserved_tokens {
             Some(n) => config::thousands(n as i64),
             None => "服务端默认".to_string(),
         };
-        let pct = if limit > 0 {
-            total as f64 * 100.0 / limit as f64
-        } else {
-            0.0
-        };
+        // 各角色**条数**（不是 token：不做估算，token 只有服务端上报那一个来源）
         let mut roles: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
         for m in &self.messages {
-            *roles.entry(m.role.clone()).or_default() += context::message_tokens(m);
+            *roles.entry(m.role.clone()).or_default() += 1;
         }
         let roles_txt = roles
             .iter()
-            .map(|(k, v)| format!("{k} {}", config::thousands(*v)))
+            .map(|(k, v)| format!("{k} {v}"))
             .collect::<Vec<_>>()
             .join(" | ");
 
@@ -1092,39 +1055,44 @@ impl Session {
         if self.path.exists() {
             parts.push(format!("会话文件：{}", self.path.display()));
         }
+        match self.usage.prompt_tokens {
+            Some(reported) => {
+                let pct = if limit > 0 {
+                    reported as f64 * 100.0 / limit as f64
+                } else {
+                    0.0
+                };
+                parts.push(format!(
+                    "当前上下文占用（API 上报）：{} / {} tokens ({pct:.1}%)",
+                    config::thousands(reported),
+                    config::thousands(limit as i64)
+                ));
+            }
+            None => parts.push("当前上下文占用：尚无 API 上报（本次会话还没发过请求）".to_string()),
+        }
         parts.push(format!(
-            "{label}{} / {} tokens ({pct:.1}%)",
-            config::thousands(total),
-            config::thousands(limit as i64)
-        ));
-        parts.push(format!(
-            "软阈值 {} ({:.0}%) | 目标水位 {} ({:.0}%)",
+            "软阈值 {} ({:.0}%)",
             config::thousands(self.config.soft_limit() as i64),
-            self.config.soft_ratio() * 100.0,
-            config::thousands(self.config.target_limit() as i64),
-            self.config.target_ratio() * 100.0
+            self.config.soft_ratio() * 100.0
         ));
         parts.push(format!(
             "输入预算 {} = 上下文窗口 {} − 输出预留 {reserved}",
             config::thousands(limit as i64),
             config::thousands(self.config.context_window as i64)
         ));
-        parts.push(format!("各角色占用（估算）：{roles_txt}"));
+        parts.push(format!("各角色条数：{roles_txt}"));
 
-        let events = self.compression_history();
         let mut counts = [0i64; 3];
         let mut evicted: i64 = 0;
-        for e in &events {
-            match e.get("level").and_then(Value::as_i64) {
-                Some(1) => counts[0] += 1,
-                Some(2) => counts[1] += 1,
-                Some(3) => counts[2] += 1,
+        for e in &self.compaction_events {
+            match e.level() {
+                1 => counts[0] += 1,
+                2 => counts[1] += 1,
+                3 => counts[2] += 1,
                 _ => {}
             }
-            if let Some(raw) = e.get("raw_path").and_then(Value::as_str) {
-                if let Ok(meta) = std::fs::metadata(raw) {
-                    evicted += meta.len() as i64 / 4;
-                }
+            if let Ok(meta) = std::fs::metadata(e.raw_path()) {
+                evicted += meta.len() as i64;
             }
         }
         parts.push(format!(
@@ -1132,8 +1100,8 @@ impl Session {
             counts[0], counts[1], counts[2]
         ));
         parts.push(format!(
-            "本会话已压缩 {} 次 (当前为压缩视图)，落盘原文约 {} tokens (可经指针恢复)",
-            events.len(),
+            "本会话已压缩 {} 次 (当前为压缩视图)，落盘原文 {} 字节 (可经指针恢复)",
+            self.compaction_events.len(),
             config::thousands(evicted)
         ));
         parts.push(format!(
@@ -1144,13 +1112,12 @@ impl Session {
     }
 
     fn at(path: PathBuf, config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
-        let manifest = Some(manifest_path_of(&config.storage, &path));
         Self {
             path,
             config: config.clone(),
             llm,
             tools,
-            manifest,
+            compaction_events: Vec::new(),
             messages: vec![Message::system(config::build_system_prompt(
                 config,
                 config.system_prompt.as_deref(),
@@ -1198,151 +1165,11 @@ fn escape_control_chars(json: String) -> String {
     out
 }
 
-/// 压缩 manifest 路径：`~/.pie/context/<会话名>.manifest.jsonl`（只记不读）。
-fn manifest_path_of(storage: &config::Storage, session_path: &Path) -> PathBuf {
-    let stem = session_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    storage.context().join(format!("{stem}.manifest.jsonl"))
-}
-
-/// 单个工具失败不拖累其他工具：任何异常都文本化后回传模型，让它自己修。
-async fn dispatch_tool(
-    registry: &ToolRegistry,
-    call: &ToolCall,
-    args: &Value,
-    cancel: &Cancel,
-    storage: &config::Storage,
-) -> String {
-    // 取消信号与数据目录随 ctx 传进工具层（shell 会在等待时 race 它、也可能要把 stdout 落盘）
-    let ctx = tools::ToolCtx::with_cancel(cancel.clone(), storage.clone());
-    match registry.dispatch(&call.function.name, args, ctx).await {
-        Ok(text) => text,
-        Err(e) => format!("[工具错误] {e}"),
-    }
-}
-
-/// 历史里最后一段非空 assistant 文本（达到 `max_steps` 时拿来当「最终答复」）。
-fn last_assistant_text(messages: &[Message]) -> Option<String> {
-    messages.iter().rev().find_map(|m| {
-        if m.role != "assistant" {
-            return None;
-        }
-        match &m.content {
-            Some(Content::Text(t)) if !t.trim().is_empty() => Some(t.clone()),
-            _ => None,
-        }
-    })
-}
-
-/// 历史会话概览（`pie sessions` 用）。
-#[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub id: String,
-    pub path: PathBuf,
-    /// 文件 mtime（unix 秒）——列表按它降序。
-    pub mtime: i64,
-    pub size: u64,
-    /// 真实用户消息数（`synthetic` 的图片消息不算）。
-    pub turns: usize,
-    /// `__meta__.usage.calls`（累计 API 请求数）。
-    pub api_calls: i64,
-    /// 标题（`__meta__.title`），没有就用首个用户消息。
-    pub first_query: String,
-}
-
-/// 列出历史会话（按 mtime 降序；`limit = None` = 全部）。
-pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<SessionInfo> {
-    let Ok(entries) = std::fs::read_dir(storage.sessions()) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(i64, PathBuf, u64)> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| {
-            let meta = p.metadata().ok()?;
-            let mtime = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs() as i64;
-            Some((mtime, p, meta.len()))
-        })
-        .collect();
-    files.sort_by_key(|f| std::cmp::Reverse(f.0));
-    if let Some(limit) = limit {
-        files.truncate(limit);
-    }
-    files
-        .into_iter()
-        .map(|(mtime, path, size)| {
-            let mut turns = 0usize;
-            let mut api_calls = 0i64;
-            let mut first_query = String::new();
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    let Ok(v) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-                    if v.get("__meta__").is_some() {
-                        api_calls = v
-                            .get("usage")
-                            .and_then(|u| u.get("calls"))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0);
-                        if let Some(t) = v.get("title").and_then(Value::as_str) {
-                            first_query = t.to_string();
-                        }
-                    } else if v.get("role").and_then(Value::as_str) == Some("user")
-                        && !v.get("synthetic").and_then(Value::as_bool).unwrap_or(false)
-                    {
-                        turns += 1;
-                        if first_query.is_empty() {
-                            if let Some(c) = v.get("content").and_then(Value::as_str) {
-                                first_query = c.trim().to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            SessionInfo {
-                id: file_stem(&path),
-                path,
-                mtime,
-                size,
-                turns,
-                api_calls,
-                first_query,
-            }
-        })
-        .collect()
-}
-
-/// 压缩事件 → manifest（`ephemeral` 会话没有 manifest 就跳过）。
-fn record_compact(manifest: Option<&Path>, entry: &Value) {
-    if let Some(manifest) = manifest {
-        if let Err(e) = context::write_manifest(manifest, entry) {
-            crate::log::warn(format!("[context] manifest 写入失败: {e}"));
-        }
-    }
-}
-
 // ---------------------------------------------------------------- 图片文件管理
 //
 // 本地那一侧的事都在这里（`llm.rs` 只放 Files API 协议）：内容寻址副本、`__meta__.files`
 // 记录表、本地副本的 GC 清单。目录本身住 `config::Storage`（`sessions()` /
 // `files()`）——磁盘布局一处可见。
-
-/// 本地副本的 GC 保护窗口（小时）：比这新的未引用副本一概先留着。
-///
-/// 理由：“未被引用”不等于“没人用”—— 刚粘进 `files/` 的图在它被某次 `read` 登记进
-/// `__meta__.files` 之前没有任何引用，但路径可能正躺在输入框 / 某条命令里。
-pub const GC_PROTECT_HOURS: u64 = 24;
-
-
 
 /// 记录还能不能直接用：同一 key / base_url + 未过期（`expires_at` 缺失 = 服务端永久保留）。
 pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
@@ -1361,103 +1188,6 @@ pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
     config::now().as_secs_f64() < expires_at - 60.0 // 留 1 分钟余量，别卡在过期边缘
 }
 
-/// 遍历所有会话记录里的图片条目：`(会话文件, hash_id, 条目)`。
-pub fn iter_session_files(sessions_dir: &Path) -> Vec<(PathBuf, String, Value)> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
-        return out;
-    };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect();
-    files.sort();
-    for file in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        // meta 是第一行，读完就够
-        let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<Value>(first) else {
-            continue;
-        };
-        if !meta
-            .get("__meta__")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(map) = meta.get("files").and_then(Value::as_object) else {
-            continue;
-        };
-        for (hash, entry) in map {
-            if entry.is_object() {
-                out.push((file.clone(), hash.clone(), entry.clone()));
-            }
-        }
-    }
-    out
-}
-
-/// `file_id` → 记着它的会话名（`files list --all` 标“谁传的”用）。
-pub fn file_id_index(storage: &config::Storage) -> HashMap<String, Vec<String>> {
-    let mut index: HashMap<String, Vec<String>> = HashMap::new();
-    for (file, _, entry) in iter_session_files(&storage.sessions()) {
-        if let Some(id) = entry.get("file_id").and_then(Value::as_str) {
-            index
-                .entry(id.to_string())
-                .or_default()
-                .push(file_stem(&file));
-        }
-    }
-    index
-}
-
-/// `~/.pie/files/` 下没有被任何会话引用、且已经放了 `protect_hours` 小时的副本。
-///
-/// 副本是**跳会话共享**的（同一内容一个文件），所以“删会话”不会自动删副本 —— 回收靠这次
-/// 无状态扫描；服务端那份由上传时的 `expires_after`（默认 30 天）自行过期。
-pub fn collect_file_garbage(storage: &config::Storage, protect_hours: u64) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(storage.files()) else {
-        return Vec::new();
-    };
-    let referenced: std::collections::HashSet<PathBuf> = iter_session_files(&storage.sessions())
-        .into_iter()
-        .filter_map(|(_, _, e)| e.get("local").and_then(Value::as_str).map(PathBuf::from))
-        .collect();
-    let now = config::now();
-    let mut garbage: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            !p.file_name()
-                .map(|n| n.to_string_lossy().starts_with('.'))
-                .unwrap_or(false)
-        })
-        .filter(|p| !referenced.contains(p))
-        .filter(|p| {
-            // 保护窗口内 → 留着
-            p.metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|mtime| now.saturating_sub(mtime).as_secs() >= protect_hours * 3600)
-        })
-        .collect();
-    garbage.sort();
-    garbage
-}
-
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
 
 /// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
 fn resolve_path(dir: &Path, id: Option<&str>) -> PathBuf {
@@ -1533,12 +1263,11 @@ mod tests {
         config::Storage::default()
     }
 
-    /// 落一张图片副本 → `(id, 路径)`（`StoreType::Blob` 的薄包装，只为测试读起来短）。
-    fn blob(data: &[u8], mime: &str) -> (String, PathBuf) {
-        let s = storage()
+    /// 落一张图片副本 → 路径（`StoreType::Blob` 的薄包装，只为测试读起来短）。
+    fn blob(data: &[u8], mime: &str) -> PathBuf {
+        storage()
             .store(config::StoreType::Blob { data, mime })
-            .unwrap();
-        (s.id, s.path)
+            .unwrap()
     }
 
     /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，仅供测试）。
@@ -1546,7 +1275,6 @@ mod tests {
         storage()
             .store(config::StoreType::Raw { prefix, body })
             .unwrap()
-            .path
     }
 
     /// 改进程级 `PIE_DIR` 的用例共用 `config::ENV_LOCK`（跟 `context` 的测试串行化）。
@@ -1605,10 +1333,14 @@ mod tests {
     }
 
     /// `tool_call` 的结果 → 可断言的文本（`None` = 被取消）。
-    fn texts(outcomes: &[Option<String>]) -> Vec<String> {
+    fn texts(outcomes: &[Option<ToolOutput>]) -> Vec<String> {
         outcomes
             .iter()
-            .map(|o| o.clone().unwrap_or_else(|| "[cancelled]".into()))
+            .map(|o| {
+                o.clone()
+                    .map(|o| o.text)
+                    .unwrap_or_else(|| "[cancelled]".into())
+            })
             .collect()
     }
 
@@ -1749,27 +1481,54 @@ mod tests {
         for needle in ["第一问", "第一答", "第二问"] {
             assert!(raw.contains(needle), "块里丢了 {needle}：{raw}");
         }
-        assert!(
-            block.file_stem().unwrap().to_string_lossy().ends_with(&config::content_hash(&raw)),
-            "hash 要放文件名最后一段：{block:?}"
+        assert_eq!(
+            block.file_name().unwrap().to_string_lossy(),
+            format!("window-{}", config::hash_of(&block)),
+            "窗口块名 = `window-<hash>`（与 `context/`、`files/` 同一套命名）：{block:?}"
+        );
+        // 内容寻址：同一段内容再归档一次 → 还是那个文件（已存在则不动）
+        assert_eq!(
+            storage()
+                .store(config::StoreType::Window(&raw))
+                .unwrap(),
+            block,
+            "同内容同路径"
         );
         // 摘要有窗口指针标记 + 首尾轮次
-        let text = context::content_text(s.messages[1].content.as_ref());
+        let text = s.messages[1].content_text();
         assert!(text.contains("[历史窗口:"), "{text}");
         assert!(text.contains("第一问"), "{text}");
 
-        // manifest 里记了一条 level=3 的会话级事件
-        let manifest = manifest_path_of(&s.config.storage, &s.path);
-        let entries: Vec<Value> = std::fs::read_to_string(&manifest)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
+        // 压缩流水里记了一条会话级事件（就在 `Session.compaction_events`，随 save 落盘）
+        let events: Vec<&context::CompactEvent> = s
+            .compaction_events
+            .iter()
+            .filter(|e| matches!(e, context::CompactEvent::Session { .. }))
             .collect();
-        assert!(
-            entries.iter().any(|e| e["level"] == 3 && e["kind"] == "session"),
-            "{entries:?}"
+        assert_eq!(events.len(), 1, "{:?}", s.compaction_events);
+        let (hash, path) = match events[0] {
+            context::CompactEvent::Session { hash, path, .. } => (hash, path),
+            other => panic!("期望会话级事件：{other:?}"),
+        };
+        // `raw_hash` 是从落盘路径反推的（`store` 只返回路径）→ 必须等于文件名里那段
+        assert_eq!(
+            hash,
+            &config::hash_of(&block),
+            "raw_hash 要跟文件名一致：{:?}",
+            s.compaction_events
         );
+        assert_eq!(path, &block);
+
+        // save → load：流水跟着 `__meta__` 一起往返（与消息里的指针同一趟车）
+        s.save().expect("save");
+        // 落盘形状：类型看 `kind` 标签，不再写冗余的 `level`
+        let saved = std::fs::read_to_string(&s.path).unwrap();
+        let meta = saved.lines().next().unwrap_or_default();
+        assert!(meta.contains("\"kind\":\"session\""), "{meta}");
+        assert!(!meta.contains("\"level\""), "{meta}");
+        let back = Session::load(&s.path, &s.config, s.llm.clone(), s.tools.clone()).expect("load");
+        assert_eq!(back.compaction_events.len(), s.compaction_events.len());
+        assert_eq!(back.compaction_events[0].raw_path(), events[0].raw_path());
 
         // 归档的信息一条不少（展开回原样）
         let full = s.full_history();
@@ -1800,7 +1559,7 @@ mod tests {
             assert!(text.len() > 500, "工具输出本来就很长：{} 字", text.len());
             match &events[1] {
                 TurnEvent::ToolResult { content, .. } => {
-                    assert_eq!(content, &text, "事件里的文本要原样（不截断）")
+                    assert_eq!(content, &text.text, "事件里的文本要原样（不截断）")
                 }
                 other => panic!("第 2 个事件该是结果：{other:?}"),
             }
@@ -1885,14 +1644,15 @@ mod tests {
     fn blob_is_content_addressed_and_0600() {
         let _g = env_lock();
         let dir = pie_dir_tmp("blob");
-        let (h1, p1) = blob(b"same-bytes", "image/png");
-        let (h2, p2) = blob(b"same-bytes", "image/png");
-        assert_eq!(h1, h2, "同内容同 id");
-        assert_eq!(p1, p2, "幂等：同一份副本");
-        assert!(h1.starts_with("img-") && h1.len() == 20, "{h1}");
+        let p1 = blob(b"same-bytes", "image/png");
+        let p2 = blob(b"same-bytes", "image/png");
+        assert_eq!(p1, p2, "内容寻址：同内容落到同一份副本");
+        // 文件名主干就是 id：`img-<sha256[:16]>`（图片那一档留扩展名，是给用户双击用的）
+        let stem = p1.file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(stem.starts_with("img-") && stem.len() == 20, "{stem}");
         assert!(p1.to_string_lossy().ends_with(".png"), "{p1:?}");
         assert_eq!(std::fs::read(&p1).unwrap(), b"same-bytes");
-        assert_ne!(config::image_hash_id(b"other"), h1);
+        assert_ne!(stem, blob(b"other", "image/png").file_stem().unwrap().to_string_lossy(), "不同内容不同 id");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1929,41 +1689,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn garbage_needs_no_reference_and_past_protect_window() {
-        let _g = env_lock();
-        let dir = pie_dir_tmp("gc");
-        std::fs::create_dir_all(storage().sessions()).unwrap();
-        let (_, referenced) = blob(b"referenced", "image/png");
-        let (_, orphan_old) = blob(b"orphan-old", "image/png");
-        let (_, orphan_fresh) = blob(b"orphan-fresh", "image/png");
-        // 把孤儿副本的 mtime 拨到 2 天前（超出 24h 保护窗口）
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&orphan_old)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        // 一个会话的 meta 引用 referenced
-        let meta = json!({
-            "__meta__": true,
-            "files": {"img-x": {"file_id": "f1", "local": referenced.display().to_string()}}
-        });
-        std::fs::write(storage().sessions().join("s.jsonl"), format!("{meta}\n")).unwrap();
-
-        // 会话记录（`files list` 的数据源）读得出来，file_id 索引也建得出
-        let rows = iter_session_files(&storage().sessions());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "img-x");
-        assert!(file_id_index(&storage()).contains_key("f1"));
-
-        let garbage = collect_file_garbage(&storage(), GC_PROTECT_HOURS);
-        assert!(garbage.contains(&orphan_old), "{garbage:?}");
-        assert!(!garbage.contains(&referenced), "被会话引用 → 不能收");
-        assert!(!garbage.contains(&orphan_fresh), "保护窗口内 → 不能收");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// 没开 `files_api`（或模型不支持）时不注入、也不落副本（更不碰网络）。
     ///
@@ -2025,7 +1750,7 @@ mod tests {
         assert_eq!(s.messages[0].role, "system");
         assert_eq!(s.messages[0].compress_level, 0, "第一条是当前提示词");
         assert_eq!(s.messages[1].compress_level, 3, "窗口摘要要重建回来");
-        let text = context::content_text(s.messages[1].content.as_ref());
+        let text = s.messages[1].content_text();
         assert!(text.starts_with(context::WINDOW_SUMMARY_MARKER), "{text}");
         assert!(text.contains("旧问题") && text.contains("旧答复"), "{text}");
         assert_eq!(s.messages[2].role, "user");
@@ -2053,8 +1778,7 @@ mod tests {
                 spill.display()
             ),
         );
-        tool.compress_level = 1;
-        tool.raw_path = Some(spill.display().to_string());
+        tool.mark_compressed(1, Some(&spill));
         s.messages.push(tool);
 
         // 轮次级：落盘的是整段原文（JSON 数组，首条是 user）
@@ -2075,16 +1799,11 @@ mod tests {
         )
         .unwrap();
         let turn = raw(&blob, "turn");
-        let mut summary = Message {
-            role: "assistant".into(),
-            content: Some(Content::Text(format!(
-                "[轮次原文已保存: {}]\n\n旧答复",
-                turn.display()
-            ))),
-            ..Default::default()
-        };
-        summary.compress_level = 2;
-        summary.raw_path = Some(turn.display().to_string());
+        let mut summary = Message::assistant(format!(
+            "[轮次原文已保存: {}]\n\n旧答复",
+            turn.display()
+        ));
+        summary.mark_compressed(2, Some(&turn));
         s.messages.push(summary);
 
         let full = s.full_history();
@@ -2092,12 +1811,12 @@ mod tests {
             .iter()
             .find(|m| m.tool_call_id.as_deref() == Some("call_1"))
             .expect("工具级消息还在");
-        let text = context::content_text(expanded.content.as_ref());
+        let text = expanded.content_text();
         assert!(text.ends_with(full_text), "工具级展开成落盘全文：{text}");
         assert!(text.starts_with("[exit=0]"), "头区（退出码）要保住：{text}");
         assert!(
             full.iter().any(|m| m.role == "assistant"
-                && context::content_text(m.content.as_ref()) == "旧答复"),
+                && m.content_text() == "旧答复"),
             "轮次级展开成原文序列：{full:?}"
         );
         assert!(
@@ -2117,22 +1836,15 @@ mod tests {
         let mut s = Session::ephemeral(&config, llm(), tools());
 
         let turn = raw("[]", "turn");
-        let mut summary = Message {
-            role: "assistant".into(),
-            content: Some(Content::Text(format!(
-                "[轮次原文已保存: {}]\n\n旧答复",
-                turn.display()
-            ))),
-            ..Default::default()
-        };
-        summary.compress_level = 2;
-        summary.raw_path = Some(turn.display().to_string());
+        let mut summary =
+            Message::assistant(format!("[轮次原文已保存: {}]\n\n旧答复", turn.display()));
+        summary.mark_compressed(2, Some(&turn));
         s.messages.push(summary);
         std::fs::remove_file(&turn).unwrap();
 
         let full = s.full_history();
         assert!(
-            full.iter().any(|m| context::content_text(m.content.as_ref())
+            full.iter().any(|m| m.content_text()
                 .contains("[轮次原文已保存")),
             "退回压缩形式：{full:?}"
         );
@@ -2215,6 +1927,53 @@ mod tests {
         assert_eq!(back.messages[0].role, "system");
         assert_eq!(back.messages[1].role, "user");
         assert_eq!(back.messages[2].role, "assistant");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 压缩事件的读回：旧键名（`raw_path` / `raw_hash` / 冗余 `level`）与新键名（`path` / `hash`）
+    /// 都能读（前者靠 `#[serde(alias)]`）；类型看 `kind`，坏的那条（未知 `kind`）只丢它自己。
+    #[test]
+    fn legacy_and_current_event_keys_both_load() {
+        let config = Config::default();
+        let path = tmp("legacy-events.jsonl");
+        let old_path = PathBuf::from("/tmp/pie-legacy/context/bash-0123456789abcdef");
+        let new_path = PathBuf::from("/tmp/pie-legacy/context/bash-fedcba9876543210");
+        let meta = json!({
+            "__meta__": true,
+            "compaction_events": [
+                {"ts": 1, "level": 1, "kind": "tool", "tool": "bash",
+                 "raw_path": old_path.display().to_string(), "raw_hash": "0123456789abcdef"},
+                {"ts": 2, "level": 3, "kind": "session",
+                 "raw_path": "/tmp/pie-legacy/context/session-ff", "raw_hash": "ff", "summary": "旧摘要"},
+                {"ts": 3, "kind": "tool", "tool": "bash",
+                 "path": new_path.display().to_string(), "hash": "fedcba9876543210"},
+                {"ts": 4, "kind": "some-future-kind"},
+            ]
+        });
+        std::fs::write(&path, format!("{meta}\n")).expect("write");
+
+        let s = Session::load(&path, &config, llm(), tools()).expect("load");
+        assert_eq!(
+            s.compaction_events.len(),
+            3,
+            "未知 kind 只丢那条：{:?}",
+            s.compaction_events
+        );
+        assert_eq!(s.compaction_events[0].level(), 1);
+        assert_eq!(
+            s.compaction_events[0].raw_path(),
+            old_path.as_path(),
+            "旧键 raw_path"
+        );
+        match &s.compaction_events[1] {
+            context::CompactEvent::Session { summary, .. } => assert_eq!(summary, "旧摘要"),
+            other => panic!("期望会话级事件：{other:?}"),
+        }
+        assert_eq!(
+            s.compaction_events[2].raw_path(),
+            new_path.as_path(),
+            "新键 path"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

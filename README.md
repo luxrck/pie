@@ -36,7 +36,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | `--reserved-tokens <N>` | 为输出预留的 token（= API 的 `max_tokens`；如 `128k` / `auto`） |
 | `--max-steps <N>` | 单回合最多问几次模型 |
 | `--no-stream` | 强制非流式（一次性 `complete`） |
-| `--auto-compact-threshold <N>` | 上下文估算超过该值即自动压缩 |
+| `--auto-compact-threshold <N>` | 服务端上报的上下文超过该值即自动压缩 |
 | `--timeout-seconds` / `--max-retries` / `--max-retry-delay-seconds` | HTTP 超时 / 重试次数 / 重试等待上限 |
 | `--cwd <目录>` | 工具的工作目录（默认当前目录） |
 | `--tools <名单>` | 限制可用工具，如 `read,ls,grep`（自带名 `read/edit/writ/bash` 启用对应工具，其余当 shell 子命令白名单） |
@@ -56,27 +56,29 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | --- | --- | --- |
 | 工具级 | 最近 `keep_last_steps`（默认 7）个 step 批次**之外**、行数超过 `head+tail`（默认 30+50）的工具输出 | 头尾预览 + `[工具输出全文已保存: <path>]`，全文落盘 |
 | 轮次级 | 已完成的回合（最后一个 user 之前的） | 一条摘要 assistant（只留模型最终输出）+ `[轮次原文已保存: <path>]`，原文落盘 |
-| 会话级 | 当前轮之前的整段历史 | 一个窗口块（`~/.pie/context/session-*.txt`）+ 一条 `[历史窗口: <path>]` 摘要 system 消息（摘要里留头 3 / 尾 5 轮原文） |
+| 会话级 | 当前窗口的整段历史（system 与旧窗口摘要除外） | 一个窗口块（`~/.pie/windows/window-<hash>`）+ 一条 `[历史窗口: <path>]` 摘要 system 消息（摘要里留头 3 / 尾 5 轮原文）；**只由用户手动 `/clear` 触发** |
 
-- 自动压缩看**可用输入预算**（`context_window - reserved_tokens`，后者就是发给 API 的 `max_tokens`）：超过 `soft_ratio`
-  （默认 0.8）就压到 `target_ratio`（默认 0.55）以下——软阈值 + 目标水位构成**迟滞**，不会压完又弹回去。
+- 自动压缩**只看服务端上报的水位**（最近一次 `usage.prompt_tokens`，相对可用输入预算 `context_window - reserved_tokens`，后者就是发给 API 的 `max_tokens`）：
+  超过 `soft_ratio`（默认 0.8）就把**工具级 / 轮次级**压到不能再压。**不做 token 估算**——
+  本次会话还没发过请求（没有上报）时不压。**会话级（整窗口归档）只由用户手动 `/clear` 触发**：
+  换窗口会让当前轮的工作记忆只剩摘要（模型「失忆」），自动做不合适；服务端 400 被认成「上下文超限」时
+  只会再强压一次工具级/轮次级，压不动就报错（`log::warn` 提示 `/clear`）。
   TUI 里可以 `/compact [tools|turns|auto]` 手动压一次（不看水位）；`pie --stat "任务"` 跑完会把上下文占用 / 压缩事件 / API 用量打到 stderr。
 - 压缩级别**只升不降**；落盘按内容 sha256 寻址（同一份内容只存一次）。维护用 `pie context info` / `verify` / `gc`（见上面的子命令表）。
 - 目录分工：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘）；`/clear` 归档的窗口块在 `~/.pie/windows/`（用户主动归档，GC 不碰）。
 
 ```toml
-keep_last_steps = 7          # 顶层：最近 7 个 step 批次不动（工具级不碰它们）
-
 [compaction]                 # 写了即开启；整段 `compaction = false` = 完全不压，某级 `false` = 只关那一级
 turn         = true          # 轮次级（level 2）：已完成的回合 → 一条摘要（只留 user + 最终输出）；没参数，只能开关
-soft_ratio   = 0.8           # 超过可用输入预算的这个比例就自动压
-target_ratio = 0.55          # 压到这个水位以下（软阈值 + 目标水位 = 迟滞，不来回抖）
+soft_ratio   = 0.8           # 上报的占用超过可用输入预算的这个比例就自动压（各级压到不能再压）
 
 [compaction.tool]            # 工具级（level 1）：工具输出超过 head+tail 行就全文落盘，头/尾留预览
 head = 30
 tail = 50
+keep_last_steps = 7          # 保护窗口：最近 7 个 step 批次不碰（只有工具级有这个概念）
 
-[compaction.session]         # 会话级（level 3）：整段历史落成窗口块；摘要里保留头 head / 尾 tail 轮原文
+[compaction.session]         # 会话级（level 3）：把历史落成窗口块；摘要里保留头 head / 尾 tail 轮原文
+                             # （只影响 `/clear` 与超限兜底；自动压缩不做这一级）
 head = 3
 tail = 5
 ```

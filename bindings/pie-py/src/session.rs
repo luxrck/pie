@@ -198,7 +198,7 @@ impl PySession {
     /// `/clear`：把当前窗口归档成**窗口块**（`~/.pie/windows/`）后开新窗口，
     /// 返回手上的窗口块总数。历史不丢——原文留在块里，可经指针回查（`full_history` 能展开）。
     fn clear_window(&self) -> PyResult<usize> {
-        self.lock()?.clear_window().map_err(pie_error)
+        Ok(self.lock()?.clear_window()?)
     }
 
     /// 当前配置的**快照**（`pie.Config`）。
@@ -243,10 +243,10 @@ impl PySession {
         crate::json_to_py(py, &Value::Array(values))
     }
 
-    /// 压缩历史（manifest 里的每条事件，dict 列表）。
+    /// 压缩历史（会话首行 `__meta__.compaction_events` 的每条事件，dict 列表）。
     fn compression_history(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self.lock()?;
-        crate::to_py(py, &guard.compression_history())
+        crate::to_py(py, &guard.compaction_events)
     }
 
     // ------------------------------------------------------------ 写
@@ -279,10 +279,8 @@ impl PySession {
         let stats = guard.compact(mode);
         // `CompactStats` 没实现 Serialize（核心侧只内部用）→ 在这儿手工拼 dict。
         let dict = PyDict::new(py);
-        dict.set_item("saved_tokens", stats.saved_tokens)?;
         dict.set_item("turns", stats.turns)?;
         dict.set_item("tools", stats.tools)?;
-        dict.set_item("session", stats.session)?;
         dict.set_item("skipped", stats.skipped)?;
         Ok(dict.into_any().unbind())
     }
