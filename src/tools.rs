@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -81,21 +82,56 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 //
 // ---------------------------------------------------------------- 工具上下文
 
-/// 工具执行上下文：装**取消信号**与**数据目录**（将来放实时进度回调也走这条链）。
+/// 会话级工具状态槽：**同一 `Session` 的所有工具调用共享一份**，不同 `Session` 各一份。
 ///
-/// 按值传（内部是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
+/// 用途：给「有状态的工具」存长活对象（如 `repl` 的 IPython 子进程）。按类型分区
+/// （`TypeId → Arc<T>`）——`ToolCtx` 因此不必认识任何具体工具。
+#[derive(Default)]
+pub struct SessionState {
+    slots: std::sync::Mutex<HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>>,
+}
+
+impl SessionState {
+    /// 取本会话里类型 `T` 的共享状态；没有就用 `init` 建一个（**仅第一次**）。
+    pub fn get_or_init<T: Send + Sync + 'static>(&self, init: impl FnOnce() -> T) -> Arc<T> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .entry(std::any::TypeId::of::<T>())
+            .or_insert_with(|| Box::new(Arc::new(init())))
+            .downcast_ref::<Arc<T>>()
+            .expect("会话状态槽的类型不一致")
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState").finish_non_exhaustive()
+    }
+}
+
+/// 工具执行上下文：装**取消信号**、**数据目录**与**会话级状态槽**（将来放实时进度回调也走这条链）。
+///
+/// 按值传（内部都是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
 #[derive(Clone, Default)]
 pub struct ToolCtx {
     pub cancel: Option<crate::cancel::Cancel>,
     /// 数据目录（bash 全文落盘要用；默认从 `PIE_DIR` 解析）。
     pub storage: crate::config::Storage,
+    /// 会话级工具状态槽（有状态的工具用它存长活对象；调用方每轮把它 clone 进 ctx）。
+    pub state: Arc<SessionState>,
 }
 
 impl ToolCtx {
-    pub fn with_cancel(cancel: crate::cancel::Cancel, storage: crate::config::Storage) -> Self {
+    pub fn with_cancel(
+        cancel: crate::cancel::Cancel,
+        storage: crate::config::Storage,
+        state: Arc<SessionState>,
+    ) -> Self {
         Self {
             cancel: Some(cancel),
             storage,
+            state,
         }
     }
 }
@@ -167,9 +203,9 @@ fn strip_schema_noise(value: &mut Value) {
 
 /// 统一「Headers\n\nBody」：headers 一行一个 `[...]`；body 非空时用空行分隔。
 ///
-/// 四个工具都用它 → 留在这儿，「输出格式只有一处定义」。
+/// 内置工具都用它 → 留在这儿，「输出格式只有一处定义」。
 /// 没有头区就直接给正文（`bash` 成功时就是这种）——否则会以空串 join 出一个多余的空行。
-fn format_output(headers: &[String], body: &str) -> String {
+pub(crate) fn format_output(headers: &[String], body: &str) -> String {
     if headers.is_empty() {
         return body.to_string();
     }
@@ -179,6 +215,40 @@ fn format_output(headers: &[String], body: &str) -> String {
     } else {
         format!("{head}\n\n{body}")
     }
+}
+
+/// 超限只保留**开头**连续段（未超限 → `None`）。
+///
+/// 取头部而不是尾部：`cat 大文件` / 一大段 `print`，开头才是你要看的那部分；被截掉的尾巴由
+/// `[工具输出全文已保存: …]` 指针给出。`bash` 与 `repl` 共用（两者输出都不可再生 + 都要落盘）。
+pub(crate) fn head_prefix(
+    out: &str,
+    max_lines: Option<i64>,
+    max_bytes: Option<i64>,
+) -> Option<String> {
+    if max_lines.is_none() && max_bytes.is_none() {
+        return None;
+    }
+    let lines: Vec<&str> = out.split_inclusive('\n').collect();
+    let mut cap = lines.len();
+    if let Some(m) = max_lines {
+        cap = cap.min(m.max(0) as usize);
+    }
+    if let Some(m) = max_bytes {
+        // 字节预算：这些行**已含** `\n`，按实际字节累计即可（`read` 那边行不含换行，所以是 len+1）
+        let mut sz: i64 = 0;
+        let mut n = 0usize;
+        for line in &lines {
+            let b = line.len() as i64;
+            if sz + b > m && n > 0 {
+                break;
+            }
+            sz += b;
+            n += 1;
+        }
+        cap = cap.min(n);
+    }
+    (cap < lines.len()).then(|| lines[..cap].concat())
 }
 
 // ---------------------------------------------------------------- 工具实现
@@ -840,33 +910,8 @@ impl Tool for Bash {
         let out: String = chunks.concat();
 
         // —— 超限只保留**开头**连续段（未超限用原文，也不落盘）——
-        // 取头部而不是尾部：`cat 大文件` 这类命令，开头才是你要看的那部分；被截掉的尾巴
-        // 由下面的 `[工具输出全文已保存: …]` 指针给出。
-        let head = if _max_lines.is_none() && _max_bytes.is_none() {
-            None
-        } else {
-            let lines: Vec<&str> = out.split_inclusive('\n').collect();
-            let mut cap = lines.len();
-            if let Some(m) = _max_lines {
-                cap = cap.min(m.max(0) as usize);
-            }
-            if let Some(m) = _max_bytes {
-                // 字节预算：这些行**已含** `\n`，按实际字节累计即可；
-                // `read` 那边行不含换行，所以是 len+1）
-                let mut sz: i64 = 0;
-                let mut n = 0usize;
-                for line in &lines {
-                    let b = line.len() as i64;
-                    if sz + b > m && n > 0 {
-                        break;
-                    }
-                    sz += b;
-                    n += 1;
-                }
-                cap = cap.min(n);
-            }
-            (cap < lines.len()).then(|| lines[..cap].concat())
-        };
+        // 截断规则见 `head_prefix`（与 `repl` 共用，别在这儿再写一份）。
+        let head = head_prefix(&out, _max_lines, _max_bytes);
 
         // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
         // 「判成败」：Rust TUI 的 `pane::tool_status` 只看**第一行**，所以失败必须
@@ -999,6 +1044,7 @@ impl ToolRegistry {
             .with_tool::<Edit>("edit")
             .with_tool::<Writ>("writ")
             .with_tool::<Bash>("bash")
+            .with_tool::<crate::repl::Repl>("repl")
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -1056,14 +1102,14 @@ impl ToolRegistry {
 /// 按 `--tools` 说明构建可用工具集（无 spec / 空串 → 默认全量）。
 ///
 /// 解析优先级：内置工具名 > shell 子命令。
-///   - 名字 ∈ 内置（read/edit/writ/bash）→ 启用该工具；
+///   - 名字 ∈ 内置（read/edit/writ/bash/repl）→ 启用该工具；
 ///   - 其他名字 → 收集成 shell 允许的子命令白名单，并隐式启用**受限 shell**；
 ///   - 未显式列 shell 且没有任何非内置名 → shell 工具禁用。
 ///
 /// 示例：`"read"` → 仅 read；`"read,bash"` → read + 不限子命令的 bash；
 /// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash；`"ls,grep"` → 仅受限 bash。
 pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table>) -> ToolRegistry {
-    const BUILTINS: [&str; 4] = ["read", "edit", "writ", "bash"];
+    const BUILTINS: [&str; 5] = ["read", "edit", "writ", "bash", "repl"];
 
     let mut enabled: Vec<&'static str> = Vec::new();
     let mut allow_cmds: Vec<String> = Vec::new();
@@ -1119,6 +1165,7 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
             "read" => reg.with_tool::<Read>("read"),
             "edit" => reg.with_tool::<Edit>("edit"),
             "writ" => reg.with_tool::<Writ>("writ"),
+            "repl" => reg.with_tool::<crate::repl::Repl>("repl"),
             _ => reg.with_tool::<Bash>("bash"),
         };
     }
@@ -1460,7 +1507,10 @@ mod tests {
     /// 内置工具的注册名与顺序（`writ` / `bash` 是用户点名改的名，别再改回去）。
     #[test]
     fn builtin_tool_names() {
-        assert_eq!(builtin().names(), vec!["read", "edit", "writ", "bash"]);
+        assert_eq!(
+            builtin().names(),
+            vec!["read", "edit", "writ", "bash", "repl"]
+        );
     }
 
     // 自测工具（非内置）：验证 `.with_tool` 这条公开路径。
@@ -1544,9 +1594,13 @@ mod tests {
         let all = tools_from_spec(None, HashMap::new());
         let mut names = all.names();
         names.sort();
-        assert_eq!(names, vec!["bash", "edit", "read", "writ"]);
+        assert_eq!(names, vec!["bash", "edit", "read", "repl", "writ"]);
 
-        // 四个内置全列且无白名单 → 也走全量（未受限）
+        // 内置全列且无白名单 → 也走全量
+        let reg = tools_from_spec(Some("read,edit,writ,bash,repl"), HashMap::new());
+        assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash", "repl"]);
+
+        // 只列老四件 → 不给 repl（没列就不给）
         let reg = tools_from_spec(Some("read,edit,writ,bash"), HashMap::new());
         assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash"]);
 

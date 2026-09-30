@@ -415,7 +415,7 @@ def test_llm_error_carries_status(env):
 def test_tool_registry_specs_and_tool_defaults():
     cfg = pie.Config()
     names = pie.ToolRegistry.builtins(cfg).names()
-    assert names == ["read", "edit", "writ", "bash"]
+    assert names == ["read", "edit", "writ", "bash", "repl"]
     limited = pie.ToolRegistry.from_spec("read,ls", cfg)
     assert limited.names() == ["read", "bash"]  # 非内置名 → 受限 bash
 

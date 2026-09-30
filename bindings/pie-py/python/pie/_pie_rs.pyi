@@ -206,7 +206,7 @@ class ToolRegistry:
 
     @staticmethod
     def builtins(config: Config) -> ToolRegistry:
-        """内置工具（read / edit / writ / bash）。"""
+        """内置工具（read / edit / writ / bash / repl）。"""
 
     @staticmethod
     def from_spec(spec: str, config: Config | None = ...) -> ToolRegistry:

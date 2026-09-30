@@ -5,7 +5,7 @@
 ## 项目概述
 
 pie 是一个极简的 agent harness，**纯 Rust 实现**（[`pi`](https://github.com/earendil-works/pi) 的 Rust 重实现，名字取自 π 的谐音）：
-内置 read / edit / **writ** / **bash** 四个工具（后两个名字是用户点名的，**不是笔误**）、YOLO 模式（无权限确认、
+内置 read / edit / **writ** / **bash** / **repl** 五个工具（`writ` / `bash` 的名字是用户点名的，**不是笔误**）、YOLO 模式（无权限确认、
 不做沙箱）、模型走 OpenAI 兼容接口（DeepSeek / Qwen / vLLM / Ollama…）。
 
 本仓库对外有三样东西：可执行文件 `pie`（CLI + TUI）、库 `pie`（核心层，lib 名 `pie`）、
@@ -20,7 +20,8 @@ pie/
 │   ├── main.rs       # CLI：一次性（子 agent）/ TUI 入口 + sessions/context/files 子命令
 │   ├── config.rs     # ~/.pie/config.toml + 数据存储（Storage：目录 + 落盘）+ 分层 system prompt + 全局记忆种子 + 项目根/时间工具
 │   ├── llm.rs        # OpenAI 兼容客户端（reqwest + 手写 SSE，**无 SDK**）+ 重试 + Files API + 余额
-│   ├── tools.rs      # 工具层：Tool trait + ToolRegistry + read/edit/writ/bash
+│   ├── tools.rs      # 工具层：Tool trait + ToolRegistry + read/edit/writ/bash（+ `SessionState` 会话级状态槽）
+│   ├── repl.rs       # repl 工具：会话内持久的 IPython（长活子进程 + owner task；驱动在 src/repl_driver.py）
 │   ├── session.rs    # 会话 JSONL + resume + 回合循环（Session::aturn）+ 图片记录/本地副本
 │   ├── cli.rs        # 磁盘维护：会话 / 图片 / 压缩原文的列表与 GC（`pie sessions` / `files list|gc` /
 │   │                 #   `context info|verify|gc` 的数据源；只读磁盘，不改会话状态。TUI 与绑定同样用它）
@@ -80,7 +81,11 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   加工具 = 写结构体 + `impl Tool` + `ToolRegistry::new()` 里加一行 `.with_tool::<T>("名字")`。
 - 实现**直接写在 `impl Tool` 的 `call` 里**（`let Self { .. } = self;` 解构，没有 `_impl` 转发层）；
   只服务单个工具的辅助逻辑（图片嗅探、字节预算、头部截断、全文落盘、edit 诊断）都就地写，
-  模块级只留 `format_output` 这种被所有工具共用的小事。
+  模块级只留 `format_output` / `head_prefix` 这种被多个工具共用的小事。
+- **会话级工具状态**：`ToolCtx.state: Arc<SessionState>`（`Session` 建一份、每次工具调用 clone 进去）。
+  有状态的工具（`repl` 的长活 IPython）用 `ctx.state.get_or_init::<T>(…)` 存长活对象——同一 `Session`
+  共享、不同 `Session` 各一份。**别把它放 `ToolRegistry`**：registry 会被多个 session 复用（绑定的常见用法）
+  → 状态会串台。
 - 两条编译器定的规矩：trait 里必须写 `-> impl Future<Output=…> + Send`（`async fn` 表达不出 `Send`；
   impl 里仍可写 `async fn`）；`#[schemars(...)]` 必须写在 `#[derive(JsonSchema)]` **之后**。
   schemars 另有两个坑：doc 的单换行会被合并成空格（多行描述用 `#[schemars(description=…)]`）、

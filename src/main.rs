@@ -1,4 +1,4 @@
-//! pie —— 极简 agent harness（YOLO，内置 read / edit / writ / bash）的 CLI 入口。
+//! pie —— 极简 agent harness（YOLO，内置 read / edit / writ / bash / repl）的 CLI 入口。
 //!
 //! 这里只做参数解析与分发：一次性（子 agent）/ 会话 / TUI 三种形态，外加 `sessions` /
 //! `context` / `files` / `setup` 维护类子命令。核心逻辑都在 `pie` 库（见 `src/lib.rs`）。
@@ -93,7 +93,7 @@ struct Cli {
     #[arg(long)]
     models: bool,
 
-    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash）启用该工具，其他名字当 shell 子命令白名单
+    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash/repl）启用该工具，其他名字当 shell 子命令白名单
     /// （如 `--tools read,ls,grep` = read + 只允许 ls/grep 的受限 bash）
     #[arg(long)]
     tools: Option<String>,

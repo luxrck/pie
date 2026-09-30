@@ -1,4 +1,4 @@
-//! `ToolRegistry`：发给模型的工具集 —— 内置四件套 + **从 Python 注册的工具**（M3）。
+//! `ToolRegistry`：发给模型的工具集 —— 内置工具 + **从 Python 注册的工具**（M3）。
 //!
 //! 注册进来的工具走核心的 `ToolRegistry::with_dynamic`：名字/描述/schema 由 Python 侧给
 //!（`@pie.tool` 从函数签名 + 类型注解生成），调用体就是下面这段「往 Python 里再叫一次」。
@@ -40,7 +40,7 @@ pub struct PyToolRegistry {
 
 #[pymethods]
 impl PyToolRegistry {
-    /// 空注册表（自己往里 `register(...)`）。内置四件套用 `builtins()`。
+    /// 空注册表（自己往里 `register(...)`）。内置工具用 `builtins()`。
     #[new]
     fn new() -> Self {
         Self {
@@ -48,7 +48,7 @@ impl PyToolRegistry {
         }
     }
 
-    /// 内置工具集（read / edit / write / shell），私有参数从配置的 `[tools.<名字>]` 段注入。
+    /// 内置工具集（read / edit / writ / bash / repl），私有参数从配置的 `[tools.<名字>]` 段注入。
     #[staticmethod]
     fn builtins(config: &PyConfig) -> Self {
         Self {

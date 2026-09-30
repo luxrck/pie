@@ -2,6 +2,35 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-01（新增 `repl` 工具：**会话内持久**的 IPython）
+
+用户：「增加一个工具 `repl`（python REPL，为了简便基于 IPython）……状态在当前 session 里可以保持。
+具体怎么实现我还没想好，调研分析一下给报告」→ 报告 `docs/repl-tool.md`；用户选**路线 B**、要求落地。
+
+- **路线选型**：长活子进程 + `IPython.core.interactiveshell.InteractiveShell.run_cell`（**路线 B**）。
+  对比过路线 A（jupyter_client + ipykernel，真 kernel）并**实测了整套 ZMQ/消息协议**（连接文件、
+  `<IDS|MSG>` 帧、HMAC 签名、iopub 序列、`interrupt_request`、stdin 通道）。结论：
+  **A2（Python 侧 `jupyter_client` 代理）的 Rust 侧与 B 一模一样**（同一套定长协议），只是多了
+  依赖/进程/端口——所以先上 B，`Repl` 接口不变，将来要 kernel 语义只换 Python 脚本。
+- **状态落点**：`ToolCtx` 新增 `state: Arc<tools::SessionState>`（`TypeId → Arc<T>` 泛型槽），
+  `Session` 建一份、`tool_call` 每轮 clone 进去。**不放 `ToolRegistry`**（绑定里 `builtins(cfg)` 会被
+  多个 session 复用 → 状态串台）、**不放全局 map**（生命周期/清理没答案）。
+- **`src/repl.rs` + `src/repl_driver.py`**：驱动用 `InteractiveShell.instance()` + `capture_output`；
+  实测后关掉两处“污染”：`displayhook.write_output_prompt`（去掉 `Out[n]: ` 前缀，避免与 `res.result`
+  重复）与 `showtraceback`（IPython 自带的带色 traceback 直接写 stdout，改由驱动给一份纯文本
+  traceback）。输出 = stdout + stderr + traceback。
+- **进程/并发**：子进程归一个 **owner task** 独占（读帧**永不进 `select!`**——`read_exact` 非 cancel-safe，
+  半帧会错位）；工具只发 `mpsc` 请求 + 等 `oneshot`；同一会话用 `tokio::sync::Mutex` 串行。
+  取消/超时给**进程组**发 `SIGINT`（保状态），停不住再 `SIGKILL`（丢状态、下次重启）。`kill_on_drop(true)`。
+- **对齐现有契约**：异常**不算工具失败**（是 REPL 正常输出，不打 `[exit=…]`）；超限走新抽出的
+  `tools::head_prefix` + `Storage::store(Raw{prefix:"repl"})` 落盘 + 指针（与 bash 同款，bash 也改用 `head_prefix`）。
+  缺 IPython / 解释器起不来 → 把子进程 stderr 文本化回给模型（`[工具错误] …`），不崩。
+- **`_python` 支持 `~`**：开头的 `~` / `~/…` 展开成 $HOME（`Command::new` 不自己展开；不展开就会
+  「启动解释器失败: No such file or directory」）。
+- **测试**：`repl.rs` 内 9 例用**假驱动**（不依赖 IPython）盖状态保持/不串台/错误合并/截断落盘/缺解释器/
+  取消/超时；另手动用真 IPython 跑通端到端（状态、`math.sqrt`、`%timeit`、traceback）。`builtin_tool_names`、
+  `tools_from_spec_*` 与绑定的 `builtins()` 用例同步更新。
+
 ## 2026-09-30（`compact_session` / `clear_window` 改用 `std::io::Result`：错误上下文在底层只写一次）
 
 用户：「`compact_session` 返回 `Result` 这 ok，但是它可以返回 `std::io::Result` 吗？我不想手写 error message。」

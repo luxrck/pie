@@ -72,6 +72,8 @@ pub struct Session {
     pub llm: LlmClient,
     /// 工具集（`--tools` 裁剪过的注册表就从这里进来）。
     pub tools: ToolRegistry,
+    /// 会话级工具状态（同一 Session 的所有工具调用共享；`repl` 的 IPython 子进程就挂这儿）。
+    pub tool_state: std::sync::Arc<crate::tools::SessionState>,
     /// 压缩事件流水（每条落盘成 `{kind, ts, path, hash, summary?}`，`kind` 就是类型标签；
     /// 旧会话里的键是 `raw_path` / `raw_hash`，靠 `CompactEvent` 的 serde alias 读回）。
     ///
@@ -732,7 +734,11 @@ impl Session {
                             // 取消信号与数据目录随 ctx 进工具层（shell 会在等待时 race 它、
                             // 也可能要把 stdout 落盘）；**单个工具失败不拖累其他工具**——
                             // 任何异常都文本化后回传模型，让它自己修。
-                            let ctx = tools::ToolCtx::with_cancel(cancel.clone(), self.config.storage.clone());
+                            let ctx = tools::ToolCtx::with_cancel(
+                                cancel.clone(),
+                                self.config.storage.clone(),
+                                self.tool_state.clone(),
+                            );
                             let out = match registry.dispatch(&call.function.name, &args, ctx).await {
                                 Ok(out) => out,
                                 Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
@@ -1117,6 +1123,7 @@ impl Session {
             config: config.clone(),
             llm,
             tools,
+            tool_state: std::sync::Arc::new(crate::tools::SessionState::default()),
             compaction_events: Vec::new(),
             messages: vec![Message::system(config::build_system_prompt(
                 config,
