@@ -55,6 +55,8 @@ pub enum TurnEvent {
         name: String,
         content: String,
         arguments: String,
+        /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
+        images: Vec<PathBuf>,
     },
     /// 最终答复。
     ///
@@ -759,13 +761,12 @@ impl Session {
         while let Some((index, outcome)) = stream.next().await {
             // 文本**原样**推给嵌入方（不在这里截断）：要少显示是展示层的事（TUI 按行截、
             // CLI 只取首行），要少回传给模型是工具自己配容量上限的事。
+            let finished = outcome.clone().unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
             on_event(TurnEvent::ToolResult {
                 name: calls[index].function.name.clone(),
-                content: outcome
-                    .clone()
-                    .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT))
-                    .text,
+                content: finished.text.clone(),
                 arguments: calls[index].function.arguments.clone(),
+                images: finished.images.clone(),
             });
             outcomes[index] = outcome;
         }

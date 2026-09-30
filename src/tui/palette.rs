@@ -30,6 +30,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/compact turns", "只做轮次级压缩"),
     ("/clear", "归档当前窗口，开新窗口"),
     ("/cd", "切换工作目录（/cd <路径>；数据目录跟着走）"),
+    ("/repl", "切到 REPL 画布（看 repl 工具的 code / 输出）"),
     ("/save", "保存会话"),
     ("/reset", "清空对话历史"),
     ("/exit", "退出"),

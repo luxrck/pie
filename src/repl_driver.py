@@ -8,11 +8,14 @@
 parent 一死，stdin 就 EOF → 本进程自杀（孤儿进程防护）。
 """
 
+import glob
 import io
 import json
 import os
 import struct
 import sys
+import tempfile
+import time
 import traceback
 
 # 协议走真 stdin/stdout 的 **fd 副本**；把 sys.stdin 换成空的，让用户代码里的 input()
@@ -43,6 +46,64 @@ shell.displayhook.write_output_prompt = lambda: None
 # 关掉 IPython 自带的带色 traceback 打印：异常由我们统一成一份纯文本（见下）。
 shell.showtraceback = lambda *_args, **_kwargs: None
 
+# ---------------------------------------------------------------- 图像捕获（matplotlib）
+#
+# 图落到哪个目录：Rust 侧用 `PIE_REPL_IMAGE_DIR` 指定（缺省用系统临时目录）。
+_IMAGE_DIR = os.environ.get("PIE_REPL_IMAGE_DIR") or os.path.join(
+    tempfile.gettempdir(), "pie-repl-images"
+)
+try:
+    os.makedirs(_IMAGE_DIR, exist_ok=True)
+    # 顺手清掉一小时之前的旧图：会话一多，这里就是个垃圾场。
+    _cutoff = time.time() - 3600
+    for _f in glob.glob(os.path.join(_IMAGE_DIR, "*.png")):
+        try:
+            if os.path.getmtime(_f) < _cutoff:
+                os.remove(_f)
+        except OSError:
+            pass
+except OSError:
+    _IMAGE_DIR = None
+
+# 本次执行产出的图（每轮开始清空；帧里带给 Rust 侧）。
+_images = []
+
+
+def _capture_figures():
+    """把当前**还开着**的 matplotlib figure 存成 PNG。
+
+    为什么在 `post_execute` 扫、而不去 patch `plt.show`：无显示后端下 `show()` 是 no-op，
+    而用户往往在**同一个 cell** 里 `import` + `plot` + `show` —— 执行前 patch 来不及。
+    执行后扫「还没关掉的 figure」则一定抓得到（`show()` 在 Agg 下不会关它们）。
+    """
+    if _IMAGE_DIR is None:
+        return
+    plt = sys.modules.get("matplotlib.pyplot")
+    if plt is None:
+        return
+    try:
+        nums = plt.get_fignums()
+    except Exception:
+        return
+    for n in nums:
+        try:
+            fig = plt.figure(n)
+            path = os.path.join(_IMAGE_DIR, f"fig-{int(time.time() * 1000)}-{n}.png")
+            fig.savefig(path, dpi=110)
+            _images.append(path)
+        except Exception:
+            pass
+    try:
+        plt.close("all")  # 关掉才不会下一轮重复抓
+    except Exception:
+        pass
+
+
+try:
+    shell.events.register("post_execute", _capture_figures)
+except Exception:
+    pass  # 老版本 IPython 没有 events 就放弃（图就看不到，但工具照常工作）
+
 
 def _read_exact(n):
     buf = b""
@@ -70,6 +131,7 @@ while True:
     except EOFError:
         break  # 父进程没了 → 退出
 
+    _images.clear()
     try:
         with capture_output() as cap:
             result = shell.run_cell(code, store_history=True)
@@ -85,7 +147,12 @@ while True:
             if exc is not None:
                 error = _format_exc(exc)
                 break
-        payload = {"stdout": stdout, "stderr": cap.stderr, "error": error}
+        payload = {
+            "stdout": stdout,
+            "stderr": cap.stderr,
+            "error": error,
+            "images": list(_images),
+        }
     except BaseException as exc:  # KeyboardInterrupt / 驱动自身异常：也要回一帧，别让 Rust 卡住
-        payload = {"stdout": "", "stderr": "", "error": _format_exc(exc)}
+        payload = {"stdout": "", "stderr": "", "error": _format_exc(exc), "images": []}
     _send(payload)

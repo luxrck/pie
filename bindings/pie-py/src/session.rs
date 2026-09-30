@@ -555,11 +555,20 @@ fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
             name,
             content,
             arguments,
+            images,
         } => {
             dict.set_item("type", "tool_result")?;
             dict.set_item("name", name)?;
             dict.set_item("text", content)?;
             dict.set_item("arguments", crate::json_to_py(py, &args_value(arguments))?)?;
+            // 工具产出的图（本地路径；现在只有 `repl` 给）——留在后端看的，模型看不到
+            dict.set_item(
+                "images",
+                images
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+            )?;
         }
         TurnEvent::Answer(text) => {
             dict.set_item("type", "answer")?;
