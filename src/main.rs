@@ -13,7 +13,7 @@ use serde_json::Value;
 use pie::llm::LlmClient;
 use pie::session::{Session, TurnEvent};
 use pie::tools::{tools_from_spec, ToolRegistry};
-use pie::{cancel, config, context, session, tui};
+use pie::{cancel, cli, config, context, tui};
 
 /// 一次性模式的输出格式（`text` / `json` / `transcript`）。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,11 +171,11 @@ enum FilesAction {
 
 #[derive(Subcommand, Debug)]
 enum ContextAction {
-    /// 列出所有压缩事件
+    /// 列出所有压缩事件（存在会话文件首行 `__meta__.compaction_events` 里；只查默认 sessions 目录）
     Info,
-    /// 校验 manifest 引用的原文文件是否存在
+    /// 校验压缩流水 / 消息引用的原文文件是否都在（同上，只查默认 sessions 目录）
     Verify,
-    /// 列出 / 删除未被引用的 context 文件
+    /// 列出 / 删除未被引用的 context 文件（同上，只统计默认 sessions 目录里的会话）
     Gc {
         /// 真正删除未引用文件
         #[arg(long)]
@@ -390,7 +390,7 @@ async fn run(cli: Cli) -> i32 {
         return 0;
     }
 
-    // 一次性模式：临时会话（不落盘、不写 manifest），跑完就扔；
+    // 一次性模式：临时会话（不落盘、压缩事件也只在内存），跑完就扔；
     // 回合循环现在就在 `Session::aturn` 里（原 loop.rs 已并入）；
     // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 config
     let mut session = Session::ephemeral(&config, client, registry);
@@ -459,7 +459,7 @@ fn setup_main(cli: &Cli) -> i32 {
 
 /// `pie sessions`：列出历史会话。
 fn sessions_main(storage: &config::Storage, limit: Option<usize>, json: bool) -> i32 {
-    let rows = session::list_sessions(storage, limit);
+    let rows = cli::list_sessions(storage, limit);
     if json {
         let values: Vec<Value> = rows
             .iter()
@@ -612,43 +612,60 @@ fn read_text_or_path(value: &str) -> String {
 
 /// `pie context info|verify|gc`：上下文压缩维护。
 fn context_main(storage: &config::Storage, action: &ContextAction) -> i32 {
-    let dir = storage.context();
-    if !dir.exists() {
-        println!("暂无压缩记录（{} 不存在）", dir.display());
-        return 0;
-    }
     match action {
         ContextAction::Info => {
-            let mut manifests: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            // 压缩事件流水住在**会话文件首行**（`__meta__.compaction_events`）——它跟消息里的
+            // `raw_path` 指针是同一趟车落盘的，所以不再有单独一份 manifest 文件要扫。
+            let mut sessions: Vec<std::path::PathBuf> = std::fs::read_dir(storage.sessions())
                 .into_iter()
                 .flatten()
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p.to_string_lossy().ends_with(".manifest.jsonl"))
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
                 .collect();
-            manifests.sort();
-            for manifest in manifests {
-                let name = manifest
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                println!("# {name}");
-                if let Ok(text) = std::fs::read_to_string(&manifest) {
-                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                        println!("  {line}");
-                    }
+            sessions.sort();
+            let mut shown = 0usize;
+            for session in sessions {
+                let Ok(text) = std::fs::read_to_string(&session) else {
+                    continue;
+                };
+                let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
+                    continue;
+                };
+                let Ok(meta) = serde_json::from_str::<Value>(first) else {
+                    continue;
+                };
+                let Some(events) = meta.get("compaction_events").and_then(Value::as_array) else {
+                    continue;
+                };
+                if events.is_empty() {
+                    continue;
                 }
+                println!(
+                    "# {}",
+                    session
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                );
+                for e in events {
+                    println!("  {e}");
+                }
+                shown += events.len();
+            }
+            if shown == 0 {
+                println!("暂无压缩记录（只查 {} 里的会话）", storage.sessions().display());
             }
             0
         }
         ContextAction::Verify => {
-            let mut missing: Vec<std::path::PathBuf> = context::referenced_raw_paths(storage)
+            let mut missing: Vec<std::path::PathBuf> = cli::referenced_raw_paths(storage)
                 .into_iter()
                 .filter(|p| !p.exists())
                 .collect();
             missing.sort();
             if missing.is_empty() {
-                println!("OK：所有 manifest 引用的原文文件都在");
+                println!("OK：压缩流水 / 消息引用的原文文件都在");
                 0
             } else {
                 println!("缺失 {} 个原文文件:", missing.len());
@@ -659,8 +676,14 @@ fn context_main(storage: &config::Storage, action: &ContextAction) -> i32 {
             }
         }
         ContextAction::Gc { delete } => {
-            let garbage = context::collect_context_garbage(storage);
-            println!("未引用文件 {} 个:", garbage.len());
+            let garbage = cli::collect_context_garbage(storage);
+            // 引用集只来自 `sessions/` 里的会话（压缩流水与消息指针都在会话文件里）；
+            // 用 `-s <其它路径>` 存在别处的会话不在这份统计里 —— 说清楚，别让人以为它是全量的。
+            println!(
+                "未引用文件 {} 个（只统计 {} 里的会话）:",
+                garbage.len(),
+                storage.sessions().display()
+            );
             for p in &garbage {
                 println!("  {}", p.display());
             }
@@ -682,7 +705,7 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             if *all {
                 return files_remote_list(config).await;
             }
-            let rows = session::iter_session_files(&config.storage.sessions());
+            let rows = cli::iter_session_files(&config.storage.sessions());
             if rows.is_empty() {
                 println!(
                     "暂无图片记录（会话 __meta__.files 为空；副本目录 {}）",
@@ -714,11 +737,11 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             0
         }
         FilesAction::Gc { delete, all } => {
-            let garbage = session::collect_file_garbage(&config.storage, session::GC_PROTECT_HOURS);
+            let garbage = cli::collect_file_garbage(&config.storage, cli::GC_PROTECT_HOURS);
             println!(
                 "可回收的本地副本 {} 个（未被任何会话引用、且已放置超过 {} 小时）:",
                 garbage.len(),
-                session::GC_PROTECT_HOURS
+                cli::GC_PROTECT_HOURS
             );
             for path in &garbage {
                 println!("  {}", path.display());
@@ -757,7 +780,7 @@ async fn files_remote_list(config: &config::Config) -> i32 {
         println!("服务端没有上传件（云端为空）");
         return 0;
     }
-    let index = session::file_id_index(&config.storage);
+    let index = cli::file_id_index(&config.storage);
     println!(
         "服务端上传件 {} 个（云端那份；本地记录见不带 --all 的 `pie files list`）:",
         files.len()

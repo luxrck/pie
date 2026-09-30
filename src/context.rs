@@ -1,4 +1,5 @@
-//! 上下文管理层：三级压缩（工具级 / 轮次级 / 会话级）+ 原文落盘指针 + GC。
+//! 上下文管理层：三级压缩（工具级 / 轮次级 / 会话级）+ 原文落盘指针。
+//! （`context/` 的维护——引用扫描与垃圾判定——在 [`crate::cli`]，与图片副本那份同类。）
 //!
 //! 消息是扁平 `Vec<Message>`（没有类层级），靠 `role` + `compress_level` + `synthetic` 判定，
 //! 三种压缩都以「就地改写消息列表」实现：
@@ -7,18 +8,22 @@
 //!   - **轮次级**（level 2）：已完成的轮次（最后一个 user 之前的）压成一条摘要 assistant
 //!     （user 保留），原文落盘成 `[轮次原文已保存: <path>]`，摘要只留模型最终输出；
 //!   - **会话级**（level 3）：当前轮之前的整段历史落盘成**窗口块**
-//!     （`~/.pie/context/session-*.txt`；被 manifest / 会话 meta 引用，GC 不碰。`/clear` 归档的窗口块
+//!     （`~/.pie/context/session-<hash>`；被会话 meta 的 `compaction_events` 引用，GC 不碰。`/clear` 归档的窗口块
 //!     另在 `~/.pie/windows/`，见 [`crate::config::Storage::windows`]），
 //!     插一条 `[历史窗口: <path>]` 摘要 system 消息，旧窗口摘要继续留在上下文里；
 //!   - 压缩级别**只升不降**；落盘按内容 hash 寻址（同内容只存一份）。
 //!
-//! 两个驱动入口：`maybe_compact`（自动，看软阈值：相对「可用输入预算」的 `soft_ratio`，
-//! 压到 `target_ratio` 以下）与 `compact`（手动 `/compact`，不看水位）。
+//! 两个驱动入口：`maybe_compact`（自动，**只看 API 上报的水位**：上一次 `usage.prompt_tokens`
+//! ≥「可用输入预算」的 `soft_ratio` 就压，各级压到不能再压）与 `compact`（手动 `/compact`，不看水位）。
+//!
+//! **不做 token 估算**：水位只有两个来源 —— 服务端上报的 `prompt_tokens`（准），以及
+//! 「还没有任何上报」（首次请求前）时**不压**。单条消息的有界由工具层负责
+//! （`read` / `bash` 的 `_max_lines` / `_max_bytes` + 超限落盘），服务端预检算最后一道。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Config, Storage, StoreType};
@@ -34,129 +39,101 @@ pub const WINDOW_SUMMARY_MARKER: &str = "[历史窗口:";
 /// 工具级压缩时中间省略的标记。
 const TOOL_GAP: &str = "...[中间省略]...";
 
-/// 服务端规则：图片按约 1300×1300 折成 token 后**单图上限 1024**（内联与 Files API 同一个上界）。
-const IMAGE_TOKENS_MAX: i64 = 1024;
-
-// ---------------------------------------------------------------- content 归一与估算
-
-/// 把 content 归一为可读文本：纯文本原样；多模态 parts 拼 text 片段、图片用 `[图片]` 占位
-/// （data URI 不进人读文本）。摘要 / 标题 / 日志都走这里。
-pub fn content_text(content: Option<&Content>) -> String {
-    match content {
-        Some(Content::Text(t)) => t.clone(),
-        Some(Content::Parts(parts)) => parts
-            .iter()
-            .filter_map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("text") => p.get("text").and_then(Value::as_str).map(str::to_string),
-                Some("image_url") | Some("file") => Some("[图片]".to_string()),
-                _ => None,
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
-    }
-}
-
-/// content 的 token 估算：文本按字符/4；图片按单图上界（data URI 粗估后封顶）。
-fn content_tokens(content: Option<&Content>) -> i64 {
-    match content {
-        Some(Content::Text(t)) => chars_div4(t),
-        Some(Content::Parts(parts)) => parts
-            .iter()
-            .map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("image_url") => {
-                    let url = p
-                        .get("image_url")
-                        .and_then(|v| v.get("url"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if url.starts_with("data:") {
-                        IMAGE_TOKENS_MAX.min(800 + url.chars().count() as i64 / 256)
-                    } else {
-                        IMAGE_TOKENS_MAX
-                    }
-                }
-                Some("file") => IMAGE_TOKENS_MAX,
-                Some("text") => chars_div4(p.get("text").and_then(Value::as_str).unwrap_or("")),
-                _ => 0,
-            })
-            .sum(),
-        None => 0,
-    }
-}
-
-fn chars_div4(s: &str) -> i64 {
-    s.chars().count() as i64 / 4
-}
-
-/// 单条消息的 token 估算：
-/// 压缩过的消息按「当前长度 / 原始长度 × 原始 token」比例复原，其余按 content + 开销估算。
-pub fn message_tokens(m: &Message) -> i64 {
-    if m.compress_level >= 1 {
-        if let (Some(len), Some(raw_tokens)) = (m.raw_len, m.raw_tokens) {
-            let cur = content_tokens(m.content.as_ref());
-            return 1.max((cur as f64 / len.max(1) as f64 * raw_tokens as f64).round() as i64);
-        }
-    }
-    let mut n = content_tokens(m.content.as_ref()) + 12;
-    if let Some(calls) = &m.tool_calls {
-        n += chars_div4(&serde_json::to_string(calls).unwrap_or_default());
-    }
-    if let Some(r) = &m.reasoning_content {
-        n += chars_div4(r);
-    }
-    n
-}
-
-/// 整个历史的 token 估算。
-pub fn messages_tokens(messages: &[Message]) -> i64 {
-    messages.iter().map(message_tokens).sum()
-}
-
 // ---------------------------------------------------------------- 落盘
 //
 // 落盘本身住 `config::Storage`（`store()`：内容寻址 + 原子写都在那儿）——这里只管
 // 「什么时候写、写哪个前缀」，即 `context/`（压缩原文）与 `windows/`（窗口块）两个目录的用法。
 
-/// 追加一条压缩事件到 manifest（jsonl）。
-pub fn write_manifest(manifest: &Path, entry: &Value) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = manifest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(manifest)?;
-    writeln!(f, "{entry}")
-}
-
-/// 压缩事件（写进 manifest，也交给 `on_compact` 回调）。
+/// 一次压缩的记录（`Session.compaction_events` 的一条，随会话落盘）。
 ///
-/// `raw_hash` 取自**文件名**里的 hash：它总是内容寻址得到的那段，
+/// 类型由 variant 决定，落盘写成 `kind` 标签（`#[serde(tag = "kind")]`）——不再另存冗余的
+/// `level`（要数字用 [`CompactEvent::level`]）；旧会话里多出来的 `level` 键被 serde 忽略，照读。
+///
+/// 字段名不带 `raw_` 前缀（`path` / `hash`）：事件本身已经说明这是压缩件。旧会话里叫
+/// `raw_path` / `raw_hash` → `#[serde(alias)]` 兜住。
+///
+/// `hash` 取自**文件名**里的 hash：它总是内容寻址得到的那段，
 /// 而 shell 自带落盘的内容是 stdout 原文——若拿结果文本重算就对不上了。
-fn compact_event(level: u8, kind: &str, path: &Path, summary: &str) -> Value {
-    let mut entry = serde_json::json!({
-        "ts": crate::config::now().as_secs() as i64,
-        "level": level,
-        "kind": kind,
-        "raw_path": path.display().to_string(),
-        "raw_hash": raw_hash_of(path),
-    });
-    if !summary.is_empty() {
-        entry["summary"] = Value::String(summary.chars().take(200).collect());
-    }
-    entry
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CompactEvent {
+    /// 工具级（level 1）：工具输出落盘。`tool` 是触发落盘的工具名。
+    Tool {
+        ts: i64,
+        tool: String,
+        #[serde(alias = "raw_path")]
+        path: PathBuf,
+        #[serde(alias = "raw_hash")]
+        hash: String,
+    },
+    /// 轮次级（level 2）：已完成的轮次压成摘要。
+    Turn {
+        ts: i64,
+        #[serde(alias = "raw_path")]
+        path: PathBuf,
+        #[serde(alias = "raw_hash")]
+        hash: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+    },
+    /// 会话级（level 3）：整段历史落盘成窗口块。
+    Session {
+        ts: i64,
+        #[serde(alias = "raw_path")]
+        path: PathBuf,
+        #[serde(alias = "raw_hash")]
+        hash: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+    },
 }
 
-/// `<prefix>-<hash>.txt` 里的 hash 段。
-fn raw_hash_of(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.rsplit('-').next())
-        .unwrap_or_default()
-        .to_string()
+impl CompactEvent {
+    /// 工具级事件（level 1）。
+    pub fn tool(tool: &str, path: &Path) -> Self {
+        Self::Tool {
+            ts: crate::config::now().as_secs() as i64,
+            tool: tool.to_string(),
+            path: path.to_path_buf(),
+            hash: crate::config::hash_of(path),
+        }
+    }
+
+    /// 轮次级事件（level 2）。摘要只留前 200 字。
+    pub fn turn(path: &Path, summary: &str) -> Self {
+        Self::Turn {
+            ts: crate::config::now().as_secs() as i64,
+            path: path.to_path_buf(),
+            hash: crate::config::hash_of(path),
+            summary: summary.chars().take(200).collect(),
+        }
+    }
+
+    /// 会话级事件（level 3）。摘要只留前 200 字。
+    pub fn session(path: &Path, summary: &str) -> Self {
+        Self::Session {
+            ts: crate::config::now().as_secs() as i64,
+            path: path.to_path_buf(),
+            hash: crate::config::hash_of(path),
+            summary: summary.chars().take(200).collect(),
+        }
+    }
+
+    /// 压缩级别（1 工具级 / 2 轮次级 / 3 会话级，与 `Message.compress_level` 同口径）。
+    pub fn level(&self) -> u8 {
+        match self {
+            Self::Tool { .. } => 1,
+            Self::Turn { .. } => 2,
+            Self::Session { .. } => 3,
+        }
+    }
+
+    /// 落盘原文的路径。
+    pub fn raw_path(&self) -> &Path {
+        match self {
+            Self::Tool { path, .. } | Self::Turn { path, .. } | Self::Session { path, .. } => path,
+        }
+    }
 }
 
 /// JSON 美化（缩进 1 空格）——落盘原文 / `--mode transcript` 用。
@@ -168,41 +145,6 @@ pub fn pretty_indent1(value: &Value) -> String {
         return String::new();
     }
     String::from_utf8(buf).unwrap_or_default()
-}
-
-// ---------------------------------------------------------------- 指针解析
-
-/// 在文本里找 `[<前缀>已保存: <path>]` 形式的指针（不引 regex：格式是固定的）。
-/// `prefixes` 传前缀名（不含 `[`），空前缀表示 `[…已保存:` 直接跟 `[`。
-fn pointer_path(text: &str, prefixes: &[&str]) -> Option<PathBuf> {
-    const SUFFIX: &str = "已保存: ";
-    for (pos, _) in text.match_indices(SUFFIX) {
-        let before = &text[..pos];
-        let after = &text[pos + SUFFIX.len()..];
-        let Some(end) = after.find(']') else { continue };
-        let hit = before.ends_with('[')
-            || prefixes
-                .iter()
-                .any(|p| before.ends_with(p) && before[..before.len() - p.len()].ends_with('['));
-        if !hit {
-            continue;
-        }
-        let path = after[..end].trim();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-/// 工具输出落盘指针（`[工具输出全文已保存: <path>]`）→ 路径。
-///
-/// 双保险：指针必然指向刚落盘的真实文件，文件不存在就当假指针——
-/// 免得 `read` 回来的源码里恰好含这个格式的字符串被误判成压缩事件。
-/// 调用方：`mark_tool_spill`（loop 拿到 shell 结果后同步压缩元数据）。
-pub fn extract_spill_path(text: &str) -> Option<PathBuf> {
-    let path = pointer_path(text, &["工具输出全文", "shell 输出全文"])?;
-    path.exists().then_some(path)
 }
 
 // ---------------------------------------------------------------- 窗口块读取与摘要
@@ -237,8 +179,9 @@ pub fn summarize_turns(dicts: &[Value], head: usize, tail: usize) -> String {
         let synthetic = d.get("synthetic").and_then(Value::as_bool).unwrap_or(false);
         let quote = |d: &Value| -> String {
             let content = d.get("content").cloned().unwrap_or(Value::Null);
-            let content = content_from_value(content);
-            let text = content_text(content.as_ref());
+            let text = Content::from_value(content)
+                .map(|c| c.text())
+                .unwrap_or_default();
             if text.is_empty() {
                 "[图片输入]".to_string()
             } else {
@@ -253,7 +196,9 @@ pub fn summarize_turns(dicts: &[Value], head: usize, tail: usize) -> String {
         } else if role == "assistant" && q.is_some() && d.get("tool_calls").is_none() {
             let content = d.get("content").cloned().unwrap_or(Value::Null);
             if !content.is_null() {
-                final_text = content_text(content_from_value(content).as_ref());
+                final_text = Content::from_value(content)
+                    .map(|c| c.text())
+                    .unwrap_or_default();
             }
         }
     }
@@ -302,18 +247,15 @@ pub fn summarize_turns(dicts: &[Value], head: usize, tail: usize) -> String {
     lines.join("\n")
 }
 
-/// 把 JSON 形态的 content 还原成 `Content`（摘要/展示用）。
-fn content_from_value(v: Value) -> Option<Content> {
-    match v {
-        Value::String(s) => Some(Content::Text(s)),
-        Value::Array(parts) => Some(Content::Parts(parts)),
-        _ => None,
-    }
-}
-
-/// 历史窗口的摘要文本：`[历史窗口: <path>]` + 规则式轮次摘要。
+/// 历史窗口的摘要文本：`[历史窗口: <path>]` + 规则式轮次摘要（自己读盘）。
 pub fn build_window_summary(path: &Path, head: usize, tail: usize) -> String {
     let body = summarize_turns(&load_window_dicts(path), head, tail);
+    window_summary_text(path, &body)
+}
+
+/// 摘要正文就绪时拼「指针 + 正文」——`build_window_summary`（自己读盘算）与归档路径
+/// （digest 已经在手上，不必再读一遍盘、算一遍摘要）共用。
+fn window_summary_text(path: &Path, body: &str) -> String {
     let pointer = format!("{WINDOW_SUMMARY_MARKER} {}]", path.display());
     if body.is_empty() {
         format!("{pointer}\n\n（无可摘要内容）")
@@ -322,15 +264,58 @@ pub fn build_window_summary(path: &Path, head: usize, tail: usize) -> String {
     }
 }
 
-// ---------------------------------------------------------------- 消息构造辅助
-
-fn text_message(role: &str, text: String) -> Message {
-    Message {
-        role: role.to_string(),
-        content: Some(Content::Text(text)),
-        ..Default::default()
+/// **会话级压缩（第三级，level 3）**：把当前窗口的历史（`messages[1..]`，旧窗口摘要除外）
+/// 写进 `~/.pie/windows/` 成一块窗口块，并按「system + 各窗口摘要」重开窗口。
+/// 返回（新块路径, 流水事件）；没有可归档的内容 → `Ok(None)`；落盘失败 → `Err`（调用方**不动窗口**）。
+///
+/// ⚠ **只有用户手动触发**（`Session::clear_window` ← `/clear`）：换窗口会让当前轮的工作记忆
+/// （刚读的文件、跑的命令）只剩摘要，自动做会让模型莫名「失忆」—— 所以自动压缩只做
+/// 工具级（level 1）/ 轮次级（level 2），这一级留给用户。
+///
+/// 旧窗口摘要（`system` + level 3）不入档（否则「摘要的摘要」层层嵌套），而是留在窗口里
+/// —— 重开后的摘要链是连续的一段。
+pub fn compact_session(
+    messages: &mut Vec<Message>,
+    config: &crate::config::SessionCompaction,
+    storage: &Storage,
+) -> std::io::Result<Option<(PathBuf, CompactEvent)>> {
+    // 先算成 owned（下面要整体改写 messages，不能再借它）
+    let (dicts, old_summaries): (Vec<Value>, Vec<Message>) = {
+        let span = &messages[1..];
+        let archivable: Vec<Value> = span
+            .iter()
+            .filter(|m| !(m.role == "system" && m.compress_level == 3))
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let kept: Vec<Message> = span
+            .iter()
+            .filter(|m| m.role == "system" && m.compress_level == 3)
+            .cloned()
+            .collect();
+        (archivable, kept)
+    };
+    if dicts.is_empty() {
+        return Ok(None);
     }
+    // 块一律 pretty JSON 数组（与存量块同格式；`load_window_dicts` 两种都读）
+    let raw = pretty_indent1(&Value::Array(dicts.clone()));
+    let path = storage.store(StoreType::Window(&raw))?;
+    // 摘要直接拿手上的 dicts 算，不再读一遍盘
+    let digest = summarize_turns(&dicts, config.head, config.tail);
+    let mut summary = Message::system(window_summary_text(&path, &digest));
+    summary.mark_compressed(3, Some(&path));
+
+    // 重开窗口：system 不动，旧摘要留着（不入档），后面接新摘要
+    let mut rebuilt: Vec<Message> = Vec::with_capacity(2 + old_summaries.len());
+    rebuilt.push(messages[0].clone());
+    rebuilt.extend(old_summaries);
+    rebuilt.push(summary);
+    *messages = rebuilt;
+    let event = CompactEvent::session(&path, &digest);
+    Ok(Some((path, event)))
 }
+
+// ---------------------------------------------------------------- 消息构造辅助
 
 fn is_tool(m: &Message) -> bool {
     m.role == "tool"
@@ -338,30 +323,6 @@ fn is_tool(m: &Message) -> bool {
 
 fn is_user(m: &Message) -> bool {
     m.role == "user" && !m.synthetic
-}
-
-/// 压缩落盘后给消息打上「原文指针」元数据。
-fn set_raw(m: &mut Message, path: &Path, blob: &str) {
-    m.raw_path = Some(path.display().to_string());
-    m.raw_len = Some(blob.chars().count() as i64);
-    m.raw_tokens = Some(chars_div4(blob));
-}
-
-/// **工具自带落盘**（shell 超 `_max_lines`/`_max_bytes` 时写下的「全文已保存」指针）：
-/// 把这条 tool 消息标成「已工具级压缩」（`compress_level=1` + `raw_*`），并返回给 manifest 的压缩事件。
-/// 结果里没有真指针（或文件已不在）→ `None`（不动消息）。
-///
-/// ⚠ **只对 `shell` 调用**：read/edit/write 的结果文本里可能恰好含同样格式的字符串
-/// （比如刚读进来的源码字面量），全局搜会误判成落盘事件。
-/// 不标这一下会出真问题：那份 `shell-*.txt` 不会被 manifest 与 `raw_path` 引用，
-/// `context gc` 会把它当垃圾删掉，历史里的指针就成了死链。
-pub fn mark_tool_spill(msg: &mut Message, tool_name: &str, text: &str) -> Option<Value> {
-    let path = extract_spill_path(text)?;
-    msg.compress_level = 1;
-    set_raw(msg, &path, text);
-    let mut entry = compact_event(1, "tool", &path, "");
-    entry["tool"] = Value::String(tool_name.to_string());
-    Some(entry)
 }
 
 // ---------------------------------------------------------------- 三级压缩
@@ -403,11 +364,10 @@ fn protected_step_tool_indices(flat: &[Message], keep: usize) -> HashSet<usize> 
 fn compact_tools(
     messages: &mut [Message],
     config: &crate::config::ToolCompaction,
-    keep: usize,
     storage: &Storage,
-    cb: &mut dyn FnMut(Value),
+    cb: &mut dyn FnMut(CompactEvent),
 ) -> usize {
-    let protected = protected_step_tool_indices(messages, keep);
+    let protected = protected_step_tool_indices(messages, config.keep_last_steps);
     let mut count = 0usize;
     for (i, m) in messages.iter_mut().enumerate() {
         if !is_tool(m) || m.compress_level >= 1 || protected.contains(&i) {
@@ -422,13 +382,12 @@ fn compact_tools(
             continue;
         }
         let prefix = m.tool_name.clone().unwrap_or_else(|| "tool".to_string());
-        let Ok(stored) = storage.store(StoreType::Raw {
+        let Ok(path) = storage.store(StoreType::Raw {
             prefix: &prefix,
             body: &content,
         }) else {
             continue;
         };
-        let path = stored.path;
         let mut preview: Vec<&str> = lines[..config.head.min(lines.len())].to_vec();
         preview.push(TOOL_GAP);
         if config.tail > 0 {
@@ -439,24 +398,20 @@ fn compact_tools(
             path.display(),
             preview.join("\n")
         )));
-        m.compress_level = 1;
-        set_raw(m, &path, &content);
+        m.mark_compressed(1, Some(&path));
         let tool = m.tool_name.clone().unwrap_or_default();
-        let mut entry = compact_event(1, "tool", &path, "");
-        entry["tool"] = Value::String(tool);
-        cb(entry);
+        cb(CompactEvent::tool(&tool, &path));
         count += 1;
     }
     count
 }
 
 /// 轮次级压缩：从最老开始压**已完成**的轮次（最后一个 user 之后是进行中，不压），
-/// 直到降到 `target` 以下或没有可压的。返回压掉的轮数。
+/// 一路压到没有可压的。返回压掉的轮数。
 fn compact_turns(
     messages: &mut Vec<Message>,
-    target: Option<i64>,
     storage: &Storage,
-    cb: &mut dyn FnMut(Value),
+    cb: &mut dyn FnMut(CompactEvent),
 ) -> usize {
     let completed = messages
         .iter()
@@ -465,11 +420,6 @@ fn compact_turns(
         .saturating_sub(1);
     let mut count = 0usize;
     for _ in 0..=completed {
-        if let Some(t) = target {
-            if messages_tokens(messages) <= t {
-                break;
-            }
-        }
         // 每次重扫索引：切片替换会让后面的位置漂移，预算索引会误压进行中的轮次
         let user_idxs: Vec<usize> = messages
             .iter()
@@ -503,7 +453,11 @@ fn compact_turns(
 }
 
 /// 把一轮的叶子压成摘要 assistant（user 保留在外层）：原文落盘 + `[轮次原文已保存: …]` + 最终输出。
-fn compact_turn_span(span: &[Message], storage: &Storage, cb: &mut dyn FnMut(Value)) -> Message {
+fn compact_turn_span(
+    span: &[Message],
+    storage: &Storage,
+    cb: &mut dyn FnMut(CompactEvent),
+) -> Message {
     let raw = pretty_indent1(&Value::Array(
         span.iter()
             .filter_map(|m| serde_json::to_value(m).ok())
@@ -514,8 +468,7 @@ fn compact_turn_span(span: &[Message], storage: &Storage, cb: &mut dyn FnMut(Val
             prefix: "turn",
             body: &raw,
         })
-        .ok()
-        .map(|s| s.path);
+        .ok();
     let final_text = span
         .iter()
         .filter(|m| m.role == "assistant")
@@ -536,69 +489,16 @@ fn compact_turn_span(span: &[Message], storage: &Storage, cb: &mut dyn FnMut(Val
     });
     let body = lines.join("\n");
     if let Some(path) = &path {
-        cb(compact_event(2, "turn", path, &body));
+        cb(CompactEvent::turn(path, &body));
     }
     // 落盘失败（极端情况）：只放摘要，不写假指针
     let content = match &path {
         Some(p) => format!("[轮次原文已保存: {}]\n\n{body}", p.display()),
         None => body,
     };
-    let mut msg = text_message("assistant", content);
-    msg.compress_level = 2;
-    if let Some(p) = &path {
-        set_raw(&mut msg, p, &raw);
-    }
+    let mut msg = Message::assistant(content);
+    msg.mark_compressed(2, path.as_deref());
     msg
-}
-
-/// 会话级压缩：当前轮之前的整段历史落盘成新窗口块，插一条「摘要 + 指针」system 消息；
-/// 旧窗口摘要（level 3）继续保留在上下文里，不重复归档。
-fn compact_session(
-    messages: &mut Vec<Message>,
-    config: &crate::config::SessionCompaction,
-    storage: &Storage,
-    cb: &mut dyn FnMut(Value),
-) -> bool {
-    let Some(current_start) = messages.iter().rposition(is_user) else {
-        return false;
-    };
-    if current_start <= 1 {
-        return false; // 只有当前轮（或只有 system + 当前轮）
-    }
-    let head = &messages[1..current_start];
-    let (summaries, old): (Vec<Message>, Vec<Message>) = head
-        .iter()
-        .cloned()
-        .partition(|m| m.role == "system" && m.compress_level == 3);
-    if old.is_empty() {
-        return false;
-    }
-    let raw = pretty_indent1(&Value::Array(
-        old.iter()
-            .filter_map(|m| serde_json::to_value(m).ok())
-            .collect(),
-    ));
-    let Ok(stored) = storage.store(StoreType::Raw {
-        prefix: "session",
-        body: &raw,
-    }) else {
-        return false;
-    };
-    let path = stored.path;
-    let summary = build_window_summary(&path, config.head, config.tail);
-    let digest = summarize_turns(&load_window_dicts(&path), config.head, config.tail);
-    cb(compact_event(3, "session", &path, &digest));
-    let mut ptr = text_message("system", summary);
-    ptr.compress_level = 3;
-    set_raw(&mut ptr, &path, &raw);
-
-    let tail = messages[current_start..].to_vec();
-    let mut rebuilt = vec![messages[0].clone()];
-    rebuilt.extend(summaries);
-    rebuilt.push(ptr);
-    rebuilt.extend(tail);
-    *messages = rebuilt;
-    true
 }
 
 // ---------------------------------------------------------------- 驱动
@@ -606,77 +506,59 @@ fn compact_session(
 /// 压缩统计（`maybe_compact` / `compact` 共用同形状）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactStats {
-    pub saved_tokens: i64,
     pub turns: usize,
     pub tools: usize,
-    pub session: bool,
     /// 只有手动压缩在「未配置 compaction」时会带这个原因。
     pub skipped: Option<String>,
 }
 
-/// 按需压缩（自动）：**软阈值触发**，tools → turns → session，各级受对应子配置门控。
+/// 按需压缩（自动）：**只看 API 上报的水位** —— `reported`（上一次 `usage.prompt_tokens`）
+/// 达到软阈值就压：工具级 → 轮次级，各级压到不能再压；没有上报（首次请求前）就不动。
 ///
-/// 会话级压缩产出的**窗口块路径**通过 `on_compact` 事件（`level=3, kind=session, raw_path`）
-/// 回报——调用方（如会话层）据此登记；这里不再单开一个 `windows` 出参
-/// （`maybe_compact(..., windows=)` 那条链路实际没有调用方传值）。
+/// **第三级（会话级）不在这里**：那一级只由用户手动 `/clear` 触发（见 [`compact_session`]）——
+/// 自动压缩只做工具级 / 轮次级（换表示：原文落盘 + 指针/摘要，窗口不动）。
+///
+/// 产出的事件**随返回值交给调用方**：会话层拿去登记 `windows` / 落进 `__meta__.compaction_events`。
+/// 不走 `on_event` —— 事件是内部记账（gc 靠它保护原文），不是展示流。
 pub fn maybe_compact(
     messages: &mut Vec<Message>,
     config: &Config,
-    current_tokens: Option<i64>,
-    on_compact: Option<&mut dyn FnMut(Value)>,
-) -> CompactStats {
+    reported: Option<i64>,
+) -> (CompactStats, Vec<CompactEvent>) {
     let mut stats = CompactStats::default();
+    let mut events: Vec<CompactEvent> = Vec::new();
     let Some(compaction) = &config.compaction else {
-        return stats;
+        return (stats, events);
     };
     if config.context_window == 0 {
-        return stats;
+        return (stats, events);
     }
-    let tokens = current_tokens.unwrap_or_else(|| messages_tokens(messages));
-    if tokens < config.soft_limit() as i64 {
-        return stats;
-    }
-    let target = config.target_limit() as i64;
-    let before = messages_tokens(messages);
-    // 回调可选：None 时给个空实现，内部各级只管调（不再层层判 Option，也就没有重复可变借用）
-    let mut noop = |_: Value| {};
-    let cb: &mut dyn FnMut(Value) = match on_compact {
-        Some(c) => c,
-        None => &mut noop,
+    let Some(tokens) = reported else {
+        return (stats, events); // 还没有任何 API 上报（本次会话第一次请求前）→ 不压
     };
+    if tokens < config.soft_limit() as i64 {
+        return (stats, events);
+    }
+    let mut push = |e| events.push(e);
     if let Some(tool_config) = &compaction.tool {
-        stats.tools = compact_tools(
-            messages,
-            tool_config,
-            config.keep_last_steps,
-            &config.storage,
-            &mut *cb,
-        );
+        stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
     }
-    if compaction.turn && messages_tokens(messages) > target {
-        stats.turns = compact_turns(messages, Some(target), &config.storage, &mut *cb);
+    if compaction.turn {
+        stats.turns = compact_turns(messages, &config.storage, &mut push);
     }
-    if let Some(session_config) = &compaction.session {
-        if messages_tokens(messages) > target {
-            stats.session = compact_session(messages, session_config, &config.storage, &mut *cb);
-        }
-    }
-    stats.saved_tokens = (before - messages_tokens(messages)).max(0);
-    if stats.tools > 0 || stats.turns > 0 || stats.session {
+    if stats.tools > 0 || stats.turns > 0 {
         crate::log::warn(format!(
-            "[context] 压缩节省约 {} tokens（turns={}, tools={}, session={}）",
-            stats.saved_tokens, stats.turns, stats.tools, stats.session
+            "[context] 水位 {} 超软阈值 {} → 压缩（tools={}, turns={}）",
+            tokens,
+            config.soft_limit(),
+            stats.tools,
+            stats.turns
         ));
     }
-    stats
+    (stats, events)
 }
 
-/// 手动压缩模式（`/compact`）。
-/// 手动压缩模式（`/compact`）。
-///
-/// ⚠ `Tools` / `Turns` 暂时没人构造：`/compact` 是交互式命令，等 TUI / REPL 落地时接线
-/// （`compact()` 本身也是如此）；保留是为了与 `context.compact` 的 mode 口径一致。
-#[allow(dead_code)]
+/// 手动压缩模式（`/compact`）：`Auto` = 工具级 + 轮次级；`Tools` / `Turns` 只做对应那一级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactMode {
     /// 工具级 + 轮次级
@@ -687,113 +569,27 @@ pub enum CompactMode {
 
 /// **手动**压缩（`/compact`）：不看水位，按 `mode` 压；轮次级一路压到不能再压。
 /// 会话级（整窗口归档）不在手动范围内——那是 `/clear` 的事。
-#[allow(dead_code)]
 pub fn compact(
     messages: &mut Vec<Message>,
     config: &Config,
     mode: CompactMode,
-    on_compact: Option<&mut dyn FnMut(Value)>,
-) -> CompactStats {
+) -> (CompactStats, Vec<CompactEvent>) {
     let mut stats = CompactStats::default();
+    let mut events: Vec<CompactEvent> = Vec::new();
     let Some(compaction) = &config.compaction else {
         stats.skipped = Some("compaction disabled (未配置 [compaction])".to_string());
-        return stats;
+        return (stats, events);
     };
-    let before = messages_tokens(messages);
-    let mut noop = |_: Value| {};
-    let cb: &mut dyn FnMut(Value) = match on_compact {
-        Some(c) => c,
-        None => &mut noop,
-    };
+    let mut push = |e| events.push(e);
     if matches!(mode, CompactMode::Auto | CompactMode::Tools) {
         if let Some(tool_config) = &compaction.tool {
-            stats.tools = compact_tools(
-                messages,
-                tool_config,
-                config.keep_last_steps,
-                &config.storage,
-                &mut *cb,
-            );
+            stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
         }
     }
     if matches!(mode, CompactMode::Auto | CompactMode::Turns) && compaction.turn {
-        stats.turns = compact_turns(messages, None, &config.storage, &mut *cb);
+        stats.turns = compact_turns(messages, &config.storage, &mut push);
     }
-    stats.saved_tokens = (before - messages_tokens(messages)).max(0);
-    stats
-}
-
-// ---------------------------------------------------------------- GC
-
-/// 被引用的原文文件：所有 manifest 条目 + 所有会话消息里的 `raw_path`。
-pub fn referenced_raw_paths(storage: &Storage) -> HashSet<PathBuf> {
-    let mut refs: HashSet<PathBuf> = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(storage.context()) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if !p.to_string_lossy().ends_with(".manifest.jsonl") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    if let Ok(v) = serde_json::from_str::<Value>(line) {
-                        if let Some(raw) = v.get("raw_path").and_then(Value::as_str) {
-                            if let Some(abs) = absolutize(raw) {
-                                refs.insert(abs);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for session in std::fs::read_dir(storage.sessions())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-    {
-        if let Ok(text) = std::fs::read_to_string(&session) {
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    if v.get("__meta__").is_some() {
-                        continue;
-                    }
-                    if let Some(raw) = v.get("raw_path").and_then(Value::as_str) {
-                        if let Some(abs) = absolutize(raw) {
-                            refs.insert(abs);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    refs
-}
-
-/// 相对路径按「当前目录」补全（不要求文件存在）。
-fn absolutize(path: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        return Some(p);
-    }
-    std::env::current_dir().ok().map(|cwd| cwd.join(p))
-}
-
-/// `context/` 下没有被任何会话引用的 `.txt`（可安全删除）。窗口块在 `windows/`，不受影响。
-pub fn collect_context_garbage(storage: &Storage) -> Vec<PathBuf> {
-    let referenced = referenced_raw_paths(storage);
-    let mut garbage: Vec<PathBuf> = std::fs::read_dir(storage.context())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
-        .filter(|p| !referenced.contains(p))
-        .collect();
-    garbage.sort();
-    garbage
+    (stats, events)
 }
 
 #[cfg(test)]
@@ -808,12 +604,31 @@ mod tests {
         Storage::default()
     }
 
+    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息（各带 `raw_path`）。
+    ///
+    /// `referenced_raw_paths` 现在只扫 `sessions/`：流水在首行、指针在消息里，两者同一份文件。
+    fn write_session_with_events(
+        storage: &Storage,
+        events: &[serde_json::Value],
+        messages: &[Message],
+    ) {
+        let dir = storage.sessions();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = format!(
+            "{}\n",
+            json!({"__meta__": true, "compaction_events": events})
+        );
+        for m in messages {
+            out.push_str(&format!("{}\n", serde_json::to_string(m).unwrap()));
+        }
+        std::fs::write(dir.join("s.jsonl"), out).unwrap();
+    }
+
     /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，只为测试读起来短）。
     fn raw(body: &str, prefix: &str) -> PathBuf {
         storage()
             .store(StoreType::Raw { prefix, body })
             .unwrap()
-            .path
     }
 
     /// 测试会改进程级 `PIE_DIR` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
@@ -851,32 +666,14 @@ mod tests {
         }
     }
 
-    fn assistant_text(t: &str) -> Message {
-        Message {
-            role: "assistant".into(),
-            content: Some(Content::Text(t.into())),
-            ..Default::default()
-        }
-    }
-
-    fn text_of(m: &Message) -> String {
-        content_text(m.content.as_ref())
-    }
-
     #[test]
-    fn content_hash_and_pointer_round_trip() {
+    fn content_hash_dedupes_identical_blobs() {
         let _g = env_lock();
         let dir = pie_dir_tmp("hash");
         let a = raw("same", "bash");
         let b = raw("same", "bash");
         assert_eq!(a, b, "同内容只落一份");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "same");
-        // 真指针：文件在 → 认；把文件删了（或凭空写的字符串）→ 假指针，不算
-        let text = format!("看这个 [工具输出全文已保存: {}]", a.display());
-        assert_eq!(extract_spill_path(&text), Some(a.clone()));
-        std::fs::remove_file(&a).unwrap();
-        assert_eq!(extract_spill_path(&text), None);
-        assert_eq!(extract_spill_path("没有指针"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -893,11 +690,14 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", body.clone()),
         ];
-        let mut events: Vec<Value> = Vec::new();
+        let mut events: Vec<CompactEvent> = Vec::new();
         let n = compact_tools(
             &mut msgs,
-            &ToolCompaction { head: 2, tail: 2 },
-            1,
+            &ToolCompaction {
+                head: 2,
+                tail: 2,
+                keep_last_steps: 1,
+            },
             &storage(),
             &mut |e| events.push(e),
         );
@@ -905,7 +705,7 @@ mod tests {
         assert_eq!(msgs[4].compress_level, 0, "最近一批受保护");
         let compressed = &msgs[2];
         assert_eq!(compressed.compress_level, 1);
-        let text = text_of(compressed);
+        let text = compressed.content_text();
         assert!(text.starts_with("[工具输出全文已保存: "), "{text}");
         assert!(
             text.contains("line 1") && text.contains("line 200"),
@@ -920,9 +720,11 @@ mod tests {
             "原文完整可回取"
         );
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["level"], 1);
-        assert_eq!(events[0]["kind"], "tool");
-        assert_eq!(events[0]["tool"], "bash");
+        assert_eq!(events[0].level(), 1);
+        match &events[0] {
+            CompactEvent::Tool { tool, .. } => assert_eq!(tool, "bash"),
+            other => panic!("期望工具级事件：{other:?}"),
+        }
         // 短输出不值得压
         let mut short = vec![
             assistant_calls("c3", "bash"),
@@ -931,8 +733,7 @@ mod tests {
         assert_eq!(
             compact_tools(
                 &mut short,
-                &ToolCompaction { head: 2, tail: 2 },
-                0,
+                &ToolCompaction::default(),
                 &storage(),
                 &mut |_| {}
             ),
@@ -951,70 +752,76 @@ mod tests {
             Message::user("第一轮问题"),
             assistant_calls("c1", "bash"),
             Message::tool_result("c1", "bash", "out1"),
-            assistant_text("第一轮答复"),
+            Message::assistant("第一轮答复"),
             Message::user("第二轮问题"),
-            assistant_text("第二轮答复"),
+            Message::assistant("第二轮答复"),
         ];
-        let mut events: Vec<Value> = Vec::new();
-        let n = compact_turns(&mut msgs, None, &storage(), &mut |e| events.push(e));
+        let mut events: Vec<CompactEvent> = Vec::new();
+        let n = compact_turns(&mut msgs, &storage(), &mut |e| events.push(e));
         assert_eq!(n, 1);
         assert_eq!(msgs.len(), 5, "3 条叶子 → 1 条摘要");
         assert_eq!(msgs[1].role, "user", "user 保留");
         assert_eq!(msgs[2].compress_level, 2);
-        let text = text_of(&msgs[2]);
+        let text = msgs[2].content_text();
         assert!(text.starts_with("[轮次原文已保存: "), "{text}");
         assert!(text.contains("...[中间过程省略]..."), "{text}");
         assert!(text.contains("第一轮答复"), "{text}");
         assert!(PathBuf::from(msgs[2].raw_path.clone().unwrap()).exists());
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["level"], 2);
-        assert!(events[0]["summary"]
-            .as_str()
-            .unwrap()
-            .contains("第一轮答复"));
+        assert_eq!(events[0].level(), 2);
+        match &events[0] {
+            CompactEvent::Turn { summary, .. } => {
+                assert!(summary.contains("第一轮答复"), "{summary}")
+            }
+            other => panic!("期望轮次级事件：{other:?}"),
+        }
         // 已经压过 → 没有可再压的
-        assert_eq!(compact_turns(&mut msgs, None, &storage(), &mut |_| {}), 0);
+        assert_eq!(compact_turns(&mut msgs, &storage(), &mut |_| {}), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 会话级：当前轮之前的历史落盘成窗口块，插一条 `[历史窗口: …]` 摘要 system 消息。
     #[test]
-    fn session_level_archives_history_into_window() {
+    /// 第三级（会话级，[`compact_session`]）：整窗口落盘，当前轮**也**进归档，窗口重开成 system + 摘要。
+    fn compact_session_spills_the_whole_window() {
         let _g = env_lock();
-        let dir = pie_dir_tmp("session-level");
+        let dir = pie_dir_tmp("archive-window");
         let mut msgs = vec![
             Message::system("当前提示词"),
             Message::user("旧问题"),
-            assistant_text("旧答复"),
+            Message::assistant("旧答复"),
             Message::user("当前问题"),
         ];
-        let mut events: Vec<Value> = Vec::new();
         let config = SessionCompaction { head: 1, tail: 1 };
-        assert!(compact_session(
-            &mut msgs,
-            &config,
-            &storage(),
-            &mut |e| events.push(e)
-        ));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["level"], 3);
-        // 窗口块路径从事件里回报（不再单开出参）——调用方据此登记
-        let window = PathBuf::from(events[0]["raw_path"].as_str().unwrap());
-        assert!(window.exists());
-        assert_eq!(msgs.len(), 3, "system + 窗口摘要 + 当前轮");
+        let (path, event) = compact_session(&mut msgs, &config, &storage())
+            .expect("落盘成功")
+            .expect("有内容可归档");
+        assert!(path.exists(), "{path:?}");
+        assert_eq!(event.level(), 3);
+        assert_eq!(event.raw_path(), path);
+        // 窗口重开：system + 一条摘要（当前轮也被归档 → 摘要里）
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].role, "system");
-        assert_eq!(text_of(&msgs[0]), "当前提示词", "system 不动");
+        assert_eq!(msgs[0].content_text(), "当前提示词", "system 不动");
         assert_eq!(msgs[1].compress_level, 3);
-        let text = text_of(&msgs[1]);
+        let text = msgs[1].content_text();
         assert!(text.starts_with(WINDOW_SUMMARY_MARKER), "{text}");
-        assert!(text.contains("旧问题") && text.contains("旧答复"), "{text}");
-        assert_eq!(msgs[2].role, "user");
-        // 只剩窗口摘要 + 当前轮 → 没有再可归档的
-        assert!(!compact_session(&mut msgs, &config, &storage(), &mut |_| {}));
+        assert!(
+            text.contains("旧问题") && text.contains("当前问题"),
+            "{text}"
+        );
+        // 原文都在落盘件里（能从指针回取）
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for needle in ["旧问题", "旧答复", "当前问题"] {
+            assert!(raw.contains(needle), "块里丢了 {needle}");
+        }
+        // 只剩 system + 旧摘要 → 没有再可归档的
+        let again = compact_session(&mut msgs, &config, &storage()).unwrap();
+        assert!(again.is_none(), "只剩 system + 旧摘要 → 没内容可归档");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 自动压缩只在超过软阈值时触发（并水到目标水位以下）。
+    /// 自动压缩只在 API 上报的水位超过软阈值时触发，并且没有上报（首次请求前）时不动。
     #[test]
     fn maybe_compact_triggers_above_soft_limit_only() {
         let _g = env_lock();
@@ -1022,20 +829,26 @@ mod tests {
         let config = Config {
             context_window: 400,
             reserved_tokens: None,
-            keep_last_steps: 1,
             compaction: Some(CompactionConfig {
-                tool: Some(ToolCompaction { head: 1, tail: 1 }),
+                tool: Some(ToolCompaction {
+                    head: 1,
+                    tail: 1,
+                    keep_last_steps: 1,
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        // 短历史 → 不动
+        // 没有上报（本次会话还没发过请求）→ 不动
         let mut short = vec![Message::system("s"), Message::user("hi")];
-        assert_eq!(
-            maybe_compact(&mut short, &config, None, None),
-            CompactStats::default()
-        );
+        let (stats, events) = maybe_compact(&mut short, &config, None);
+        assert_eq!(stats, CompactStats::default());
+        assert!(events.is_empty());
+
+        // 有上报但没到软阈值（400×0.8 = 320）→ 也不动
+        let (stats, _) = maybe_compact(&mut short, &config, Some(10));
+        assert_eq!(stats, CompactStats::default());
 
         // 一条巨长 tool 输出（≈ 5000 字符 → 远超 400×0.8）→ 触发工具级压缩
         let mut long = vec![
@@ -1045,10 +858,34 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"),
         ];
-        let stats = maybe_compact(&mut long, &config, Some(9999), None);
+        let (stats, events) = maybe_compact(&mut long, &config, Some(9999));
         assert_eq!(stats.tools, 1);
-        assert!(stats.saved_tokens > 0, "{stats:?}");
+        assert_eq!(events.len(), 1, "工具级事件也从这里回报");
         assert_eq!(long[2].compress_level, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A+：自动压缩只做工具级 / 轮次级；第三级（整窗口归档）不在这里
+    /// （只由用户 `/clear` 触发）—— 即使配了 `[compaction.session]` 也不归档。
+    #[test]
+    fn auto_compaction_never_archives_the_window() {
+        let _g = env_lock();
+        let dir = pie_dir_tmp("auto-no-session");
+        let config = Config {
+            context_window: 400,
+            reserved_tokens: None,
+            compaction: Some(CompactionConfig::default()),
+            ..Default::default()
+        };
+        let mut msgs = vec![
+            Message::system("s"),
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+        ];
+        let (_, events) = maybe_compact(&mut msgs, &config, Some(9999));
+        assert!(events.iter().all(|e| e.level() < 3), "{events:?}");
+        assert!(msgs.iter().all(|m| m.compress_level < 3), "{msgs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1062,58 +899,65 @@ mod tests {
             ..Default::default()
         };
         let mut msgs = vec![Message::system("s"), Message::user("hi")];
-        let stats = compact(&mut msgs, &config, CompactMode::Auto, None);
+        let (stats, events) = compact(&mut msgs, &config, CompactMode::Auto);
         assert!(stats.skipped.is_some());
         assert_eq!(stats.turns, 0);
+        assert!(events.is_empty());
 
-        config.compaction = Some(CompactionConfig::default());
-        config.keep_last_steps = 1; // 保护窗口只罩住最近 1 个 step 批次，好让更早的那批能被压
+        config.compaction = Some(CompactionConfig {
+            // 保护窗口只罩住最近 1 个 step 批次，好让更早的那批能被压
+            tool: Some(ToolCompaction {
+                keep_last_steps: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let mut msgs = vec![
             Message::system("s"),
             Message::user("q1"),
             assistant_calls("c1", "bash"),
             Message::tool_result("c1", "bash", long_body(200)),
-            assistant_text("a1"),
+            Message::assistant("a1"),
             Message::user("q2"),
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"), // 最近一批：受 keep 保护
         ];
-        let stats = compact(&mut msgs, &config, CompactMode::Auto, None);
+        let (stats, events) = compact(&mut msgs, &config, CompactMode::Auto);
         assert_eq!(stats.tools, 1, "压掉保护窗口之外那条长输出");
         assert_eq!(stats.turns, 1, "第一轮（已完成）压成摘要");
-        assert!(stats.saved_tokens > 0);
+        assert_eq!(events.len(), 2, "工具级 + 轮次级各一条");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// shell 自带落盘（结果里带 spill 指针）→ 消息标成 `compress_level=1` + 落盘元数据 + 事件；
-    /// 而且这份文件被 `raw_path`/manifest 引用 → `context gc` 不能把它当垃圾删。
+    /// 工具自带落盘（`ToolOutput.spill`）→ 消息**构造时**就标成 `compress_level=1` + `raw_path`，
+    /// 并由会话层记一条压缩流水；两者都引用那份文件 → `context gc` 不能把它当垃圾删。
     #[test]
-    fn marks_shell_spill_so_gc_keeps_it() {
+    fn shell_spill_is_set_on_the_message_and_gc_keeps_it() {
         let _g = env_lock();
         let dir = pie_dir_tmp("spill");
         let full = raw(&long_body(200), "bash");
-        let text = format!(
-            "[exit=0]\n\n[工具输出全文已保存: {}]\n\nline 1\n...[中间省略]...\nline 200\n",
-            full.display()
-        );
-        let mut msg = Message::tool_result("c1", "bash", text.clone());
-        let entry = mark_tool_spill(&mut msg, "bash", &text).expect("有真指针 → 有事件");
-        assert_eq!(msg.compress_level, 1);
-        assert_eq!(entry["level"], 1);
-        assert_eq!(entry["kind"], "tool");
-        assert_eq!(entry["tool"], "bash");
-        let raw = PathBuf::from(msg.raw_path.clone().unwrap());
-        assert!(raw.exists());
-        // 关键：manifest + raw_path 都引用了它 → GC 不能删
-        write_manifest(&storage().context().join("s.manifest.jsonl"), &entry).unwrap();
-        assert!(referenced_raw_paths(&storage()).contains(&raw));
-        assert!(!collect_context_garbage(&storage()).contains(&raw));
+        // 这正是 `aturn` 回填工具结果时做的事：`mark_compressed` 标元数据（级别 1），顺手产一条事件
+        let mut msg = Message::tool_result("c1", "bash", "line 1\n...\nline 200\n");
+        msg.mark_compressed(1, Some(&full));
+        assert_eq!(msg.compress_level, 1, "落盘即工具级");
+        assert_eq!(msg.raw_path, Some(full.display().to_string()));
+        // 没落盘 → 不调 `mark_compressed`（默认就是 0 / None）
+        let plain = Message::tool_result("c2", "read", "x");
+        assert_eq!(plain.compress_level, 0);
+        assert!(plain.raw_path.is_none());
 
-        // 指针指向的文件不存在（如 read 回来的源码里恰好含这种字符串）→ 假指针，不动消息
-        let fake = "[工具输出全文已保存: /tmp/pie-definitely-missing.txt]";
-        let mut m = Message::tool_result("c2", "bash", fake);
-        assert!(mark_tool_spill(&mut m, "bash", fake).is_none());
-        assert_eq!(m.compress_level, 0);
+        let entry = CompactEvent::tool("bash", &full);
+        assert_eq!(entry.level(), 1);
+        match &entry {
+            CompactEvent::Tool { tool, .. } => assert_eq!(tool, "bash"),
+            other => panic!("期望工具级事件：{other:?}"),
+        }
+        // 关键：压缩流水 + raw_path 都引用了它 → GC 不能删
+        // （流水住在**会话文件首行**：`__meta__.compaction_events`，跟消息同一趟车落盘）
+        let entry_json = serde_json::to_value(&entry).unwrap();
+        write_session_with_events(&storage(), std::slice::from_ref(&entry_json), &[]);
+        assert!(crate::cli::referenced_raw_paths(&storage()).contains(&full));
+        assert!(!crate::cli::collect_context_garbage(&storage()).contains(&full));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1136,33 +980,5 @@ mod tests {
         // 轮数不够时全留
         assert!(summarize_turns(&dicts, 10, 10).contains("问3"));
         assert_eq!(summarize_turns(&[], 1, 1), "");
-    }
-
-    #[test]
-    fn gc_keeps_referenced_files_only() {
-        // ⚠ 注入临时 root（不用 `PIE_DIR` + `env_lock`）→ 不与并行用例抢、也不碰真实 `~/.pie`
-        let dir = std::env::temp_dir().join(format!("pie-ctx-gc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let storage = Storage::at(&dir);
-        // 这里必须用注入的 `storage`（`raw()` 走的是默认 root，会写到别处去）
-        let put = |prefix: &str, body: &str| {
-            storage
-                .store(StoreType::Raw { prefix, body })
-                .unwrap()
-                .path
-        };
-        let referenced = put("bash", "referenced");
-        let orphan = put("turn", "orphan");
-        let manifest = storage.context().join("s.manifest.jsonl");
-        write_manifest(
-            &manifest,
-            &json!({"level": 1, "raw_path": referenced.display().to_string()}),
-        )
-        .unwrap();
-        let garbage = collect_context_garbage(&storage);
-        assert!(garbage.contains(&orphan), "{garbage:?}");
-        assert!(!garbage.contains(&referenced), "{garbage:?}");
-        assert!(referenced_raw_paths(&storage).contains(&referenced));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

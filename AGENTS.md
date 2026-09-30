@@ -22,7 +22,9 @@ pie/
 │   ├── llm.rs        # OpenAI 兼容客户端（reqwest + 手写 SSE，**无 SDK**）+ 重试 + Files API + 余额
 │   ├── tools.rs      # 工具层：Tool trait + ToolRegistry + read/edit/writ/bash
 │   ├── session.rs    # 会话 JSONL + resume + 回合循环（Session::aturn）+ 图片记录/本地副本
-│   ├── context.rs    # 三级压缩 + 落盘指针 + manifest + gc + 窗口归档目录
+│   ├── cli.rs        # 磁盘维护：会话 / 图片 / 压缩原文的列表与 GC（`pie sessions` / `files list|gc` /
+│   │                 #   `context info|verify|gc` 的数据源；只读磁盘，不改会话状态。TUI 与绑定同样用它）
+│   ├── context.rs    # 三级压缩 + 落盘指针 + gc + 窗口归档目录
 │   ├── cancel.rs     # 取消信号（Esc / Cancel）
 │   ├── log.rs        # 告警出口（TUI 期间不能直接写 stderr）
 │   └── tui/          # ratatui 界面（模块划分见 src/tui/mod.rs 顶部注释）
@@ -64,7 +66,7 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 
 ### 分层与 feature
 
-- 核心层（`config` / `llm` / `tools` / `session` / `context` / `cancel` / `log`）放 lib；
+- 核心层（`config` / `llm` / `tools` / `session` / `context` / `cli` / `cancel` / `log`）放 lib；
   `src/tui/` 在 `tui` feature 后面，clap 在 `cli` feature 后面。绑定侧用 `default-features = false`
   依赖本库 → TUI 那堆依赖**真的**不进依赖图。
 - `main.rs` 只 `use pie::…`，**不要**再写 `mod xxx;`（那会变成第二份编译单元）。模块声明只住 `src/lib.rs`。
@@ -90,6 +92,11 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **落盘判据：不可再生才落盘**。bash 的 stdout 进程一结束就没了 → 全文落盘 + `[工具输出全文已保存: path]`
   指针（超限只留开头）；read 的内容可再生（原文件还在、自带 offset 分页）→ 只补
   `[已截断：可用 offset=N 继续读]`，**不落盘**。
+- **落盘路径是结构化的**：`Tool::call` 返回 `ToolOutput { text, spill }`（`spill` 只有 bash 超限时给），
+  消息层用 `Message::mark_compressed(1, spill)` 进历史前设好 `raw_path` + `compress_level`
+  —— 别再拿正文里那行指针去嗅探（`extract_spill_path` / `mark_tool_spill` 已删，连带那个
+  「read 回来的源码字面量会被误判」的坑一起没了）。`ToolOutput` 实现 `Deref<Target = str>` + `Display`，
+  所以旧的 `out.starts_with(…)` / `format!("{out}")` 照常能用。
 - bash 起进程必须独立进程组（`process_group(0)`）+ 取消/超时 `killpg(SIGKILL)`：只杀 `bash` 会让
   孙进程变孤儿并持有管道写端，等待被卡到子孙自然退出。shell 名/选项只住 `impl Bash` 的
   `const SHELL` / `SHELL_FLAG`（Unix `bash -c` / 否则 `cmd /C`），别在别处再写字面量。
@@ -101,12 +108,27 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **JSONL 落盘要转义「行分隔类」字符**（`session::json_line` / `escape_control_chars`）：serde_json 只转义 C0，
   C1（U+0080–U+009F）与 U+2028/U+2029 会裸着落盘——JSON 里合法，但 `splitlines()` 那一类读者会把
   **U+0085 当换行**，一条消息被劈成两半、整份会话读不出来。session 文件与 `/clear` 的窗口块都走 `json_line`。
-- 本地专有字段（`compress_level` / `raw_path` / `raw_hash` / `raw_len` / `raw_tokens` / `synthetic` / `thought_ms`）
+- 本地专有字段（`compress_level` / `raw_path` / `synthetic` / `thought_ms`）
   **绝不能进 API 请求体**：发给模型前统一过 `Message::to_api()`。`thought_ms` = 这条回复「思考」了多久
   （`session::ThoughtClock` 量：首个 reasoning 增量起算、首个正文增量停下）；**回放靠它还原**
   `• Thought for 3.4s` 那行——不落盘的话退出再 `-r` 就没了（非流式没有增量事件 → None）。
 - 目录分工别混：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘），`/clear` 归档的窗口块在
   `~/.pie/windows/`（用户主动归档的原文，gc 不碰），本地图片副本在 `~/.pie/files/`（有 24h mtime 保护窗）。
+- **压缩水位只认服务端上报，不做 token 估算**：`maybe_compact(messages, config, reported)` 只看上一次
+  `usage.prompt_tokens`（`reported` ≥ `soft_limit()` 就压，工具级 → 轮次级，各级压到不能再压）；
+  `reported` 为 `None`（本次会话还没发过请求）就**不压**。**整窗口归档（`/clear`）不在自动路径里**：
+  换窗口会让当前轮的工作记忆只剩摘要（模型「失忆」），**只由用户手动触发** —— `Session::clear_window`
+  调 `context::compact_session(messages, config, storage)`（`config` 就是 `&SessionCompaction`，head/tail 在它里；
+  整窗口 → `windows/`，重开成 system + 摘要链；返回 `std::io::Result`——错误上下文由 `Storage::write_atomic` 统一带上路径）。
+  `message_tokens` / `messages_tokens` / `Message.raw_len` / `raw_tokens` 已全删；单条消息的有界由工具层负责
+  （`read` / `bash` 的 `_max_lines` / `_max_bytes` + 超限落盘），判据失手由「400 上下文超限 → 再强压一次工具级/轮次级
+  再发，压不动就报错（提示 `/clear`）」兜底（`LlmError::is_context_overflow`）。
+- **压缩事件是类型化的 `context::CompactEvent`**：落盘 `{kind, ts, path, hash, summary?}`
+  （`#[serde(tag = "kind", rename_all = "lowercase")]`，variant `Tool` / `Turn` / `Session` ↔ `kind` 值）；
+  `level` 与 `raw_` 前缀都已去掉（旧会话靠 serde alias 读回；`referenced_raw_paths` 裸读 `Value` → `path` 优先 / `raw_path` 回退）。
+  `maybe_compact` / `compact` 返回 `(CompactStats, Vec<CompactEvent>)`（**没有回调参数**），
+  `Session.compaction_events: Vec<CompactEvent>` 随 `__meta__.compaction_events` 落盘 ——
+  它是**内部记账**（gc 保护原文 / `/stat` 计数 / resume 登记窗口），**别往 `TurnEvent` 里塞**（那是可丢的展示流）。
 - **磁盘布局与落盘都住 `config::Storage`**（一个 root + `sessions()` / `context()` / `files()` / `windows()` + `store(StoreType)`；
   `StoreType::{Blob,Raw,Window}` 分别对应图片副本 / 压缩原文 / 窗口块，目录、命名、0o600、原子写都在那儿）。
   `Config.storage` 是默认值（`PIE_DIR` → `./.pie` → `~/.pie`），`ToolCtx.storage` 把它带进工具层（bash 全文落盘要用）。

@@ -814,11 +814,9 @@ impl App {
                 self.with_session_mut("压缩", move |s| {
                     let stats = s.compact(mode);
                     format!(
-                        "节省约 {} tokens（工具级 {} 条 / 轮次级 {} 轮 / 会话级 {}）{}",
-                        stats.saved_tokens,
+                        "已压缩（工具级 {} 条 / 轮次级 {} 轮）{}",
                         stats.tools,
                         stats.turns,
-                        stats.session,
                         stats.skipped.map(|s| format!("（{s}）")).unwrap_or_default()
                     )
                 });

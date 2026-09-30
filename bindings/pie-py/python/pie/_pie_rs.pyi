@@ -71,8 +71,6 @@ class CompactStats(TypedDict):
 
     tools: int
     turns: int
-    session: int
-    saved_tokens: int
     skipped: str | None
 
 class Message(TypedDict, total=False):
@@ -141,7 +139,6 @@ class Config:
     reserved_tokens: int | None
     """`None` = 不发 `max_tokens`（配置文件里写 `"auto"`）。"""
     max_retries: int
-    keep_last_steps: int
     auto_compact_threshold: int | None
     timeout_seconds: float
     compaction: bool
@@ -158,9 +155,6 @@ class Config:
 
     def soft_limit(self) -> int:
         """触发自动压缩的水位。"""
-
-    def target_limit(self) -> int:
-        """压缩后的目标水位。"""
 
     def tool_defaults(self) -> dict[str, Any]:
         """按工具名给的私有默认参数（dispatch 时注入）。"""
@@ -276,7 +270,9 @@ class Session:
     def usage_report(self) -> str:
         """`/stat` 那份报告文本。"""
 
-    def compression_history(self) -> list[dict[str, Any]]: ...
+    def compression_history(self) -> list[dict[str, Any]]:
+        """本会话的压缩事件流水（`__meta__.compaction_events`）。"""
+        ...
     def save(self) -> None: ...
     def reset(self) -> None:
         """清历史（保留 system prompt 与记忆）。"""

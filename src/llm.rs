@@ -11,6 +11,7 @@
 //!   - 一个 `reqwest::Client` 就是一个连接池，不需要额外缓存 client。
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,6 +30,39 @@ use crate::config::Config;
 pub enum Content {
     Text(String),
     Parts(Vec<Value>),
+}
+
+impl Content {
+    /// 从 API / 会话 JSON 里的 content 形状还原：`"text"` → [`Content::Text`]、
+    /// `[...]` → [`Content::Parts`]，其余（数字 / 对象 / null）→ `None`。
+    ///
+    /// 与 serde 的 `untagged` 解析等价，但手写更直白也更快（不建 Deserialize 状态机），
+    /// 调用点也不用引 `serde_json`。
+    pub fn from_value(v: Value) -> Option<Self> {
+        match v {
+            Value::String(s) => Some(Content::Text(s)),
+            Value::Array(parts) => Some(Content::Parts(parts)),
+            _ => None,
+        }
+    }
+
+    /// 归一为可读文本：纯文本原样；多模态 parts 拼 text 片段、图片用 `[图片]` 占位
+    /// （data URI 不进人读文本）。摘要 / 标题 / TUI 展示都走这里。
+    pub fn text(&self) -> String {
+        match self {
+            Content::Text(t) => t.clone(),
+            Content::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                    Some("text") => p.get("text").and_then(Value::as_str).map(str::to_string),
+                    Some("image_url") | Some("file") => Some("[图片]".to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -74,11 +108,6 @@ pub struct Message {
     /// 压缩落盘的原文件（自描述指针）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_path: Option<String>,
-    /// 压缩前的原始文本长度 / token 估算（消息已被改写，靠它按比例复原估算）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_len: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_tokens: Option<i64>,
     /// 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
@@ -107,6 +136,25 @@ impl Message {
         }
     }
 
+    /// 纯文本 assistant（无 `tool_calls` / `reasoning_content`）。
+    ///
+    /// 带工具调用或思考内容的那条得自己设字段（它们在 `aturn` 里由模型返回值填）。
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: Some(Content::Text(text.into())),
+            ..Default::default()
+        }
+    }
+
+    /// `content` 的可读文本（没有 content → 空串）。
+    ///
+    /// 名字不叫 `content()`：`content` 是公开字段（`Option<Content>`），同名方法会让
+    /// `m.content` / `m.content()` 一读就错。
+    pub fn content_text(&self) -> String {
+        self.content.as_ref().map(Content::text).unwrap_or_default()
+    }
+
     pub fn tool_result(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -118,6 +166,18 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             tool_name: Some(tool_name.into()),
             ..Default::default()
+        }
+    }
+
+    /// 就地把这条消息标成「已压缩到 `level`，原文在 `path`」——四条落盘路径共用：
+    /// 工具级（level 1，工具**自带**落盘，见 `ToolOutput.spill`）/ 轮次级（2）/ 会话级（3）
+    /// 与 resume 重建窗口摘要（3）；`None`（落盘失败）只标级别、不写指针。
+    ///
+    /// 纯数据操作（不嗅探正文、不碰磁盘）：落盘这件事由工具 / 压缩器自己说了算，这里只记下来。
+    pub fn mark_compressed(&mut self, level: u8, path: Option<&Path>) {
+        self.compress_level = level;
+        if let Some(path) = path {
+            self.raw_path = Some(path.display().to_string());
         }
     }
 
@@ -271,6 +331,16 @@ impl std::error::Error for LlmError {}
 /// `file_id` 失效/不属于本账号的报错——触发「降级成内联 + 重传」自愈。
 const STALE_FILE_HINTS: [&str; 2] = ["do not exist or are not created", "file_ids do not exist"];
 
+/// 上下文超限（服务端按「输入 + max_tokens ≤ 窗口」预检）——触发「强制压一次 + 重发」。
+///
+/// ⚠ 关键词按 OpenAI 兼容端常见文案（比对时先 to_lowercase）；真机撞到别的文案就补这里。
+const CONTEXT_OVERFLOW_HINTS: [&str; 4] = [
+    "maximum context length",
+    "context_length_exceeded",
+    "too many tokens",
+    "reduce the length",
+];
+
 impl LlmError {
     pub fn status(&self) -> Option<u16> {
         match self {
@@ -295,6 +365,22 @@ impl LlmError {
             LlmError::Api {
                 status: 400, body, ..
             } => STALE_FILE_HINTS.iter().any(|h| body.contains(h)),
+            _ => false,
+        }
+    }
+
+    /// 上下文超限（400）：调用方可以**无视水位**压一次再重发。
+    ///
+    /// 水位现在只来自 API 上报：本次会话还没发过请求（没有上报）、或者单条输入本身就把窗口撑满
+    /// 时，判据会失手——这一档就是那时的兜底。
+    pub fn is_context_overflow(&self) -> bool {
+        match self {
+            LlmError::Api {
+                status: 400, body, ..
+            } => {
+                let body = body.to_lowercase();
+                CONTEXT_OVERFLOW_HINTS.iter().any(|h| body.contains(h))
+            }
             _ => false,
         }
     }
@@ -1052,6 +1138,33 @@ mod tests {
         assert_eq!(retry_delay(3.0, Some(600.0)), 60.0); // 上限 60s
         let d = retry_delay(0.0, None);
         assert_eq!(d, 1.0); // 无 Retry-After 时 1s 下限
+    }
+
+    /// 400 的分类：`file_id` 失效 / 上下文超限 / 其它——各自走不同的自愈路径。
+    #[test]
+    fn api_400_error_kinds_are_classified() {
+        let api = |body: &str| LlmError::Api {
+            status: 400,
+            body: body.into(),
+            retry_after: None,
+        };
+        let stale = api("Failed to find file: file_ids do not exist");
+        assert!(stale.is_stale_file_error());
+        assert!(!stale.is_context_overflow());
+
+        let overflow = api("This model's maximum context length is 65536 tokens");
+        assert!(overflow.is_context_overflow(), "文案里大小写不影响判定");
+        assert!(!overflow.is_stale_file_error());
+        assert!(api("context_length_exceeded").is_context_overflow());
+        assert!(!api("invalid temperature").is_context_overflow());
+        assert!(!api("invalid temperature").is_stale_file_error());
+        // 非 400 不算（500 里恰好包含关键词也不行）
+        assert!(!LlmError::Api {
+            status: 500,
+            body: "maximum context length".into(),
+            retry_after: None,
+        }
+        .is_context_overflow());
     }
 
     #[test]

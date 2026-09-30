@@ -225,7 +225,9 @@ fn run(
 fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {
     use pyo3::types::PyList;
     let list = PyList::empty(py);
-    for r in pie::session::list_sessions(limit) {
+    // 与 CLI 同口径：走默认数据根（`PIE_DIR` → `./.pie` → `~/.pie`）
+    let storage = pie::config::Storage::default();
+    for r in pie::cli::list_sessions(&storage, limit) {
         let d = PyDict::new(py);
         d.set_item("id", r.id)?;
         d.set_item("file", r.path.display().to_string())?;

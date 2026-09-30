@@ -2,6 +2,221 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-30（`compact_session` / `clear_window` 改用 `std::io::Result`：错误上下文在底层只写一次）
+
+用户：「`compact_session` 返回 `Result` 这 ok，但是它可以返回 `std::io::Result` 吗？我不想手写 error message。」
+—— 可以，而且早该如此：`Storage::store` 本来就是 `std::io::Result<PathBuf>`，那句
+`map_err(|e| format!("写窗口块失败: {e}"))` 是纯手写包装。
+
+- `context::compact_session` → `std::io::Result<Option<(PathBuf, CompactEvent)>>`；
+  `Session::clear_window` → `std::io::Result<usize>`（沿途零手写 message）。TUI 的
+  `format!("切换窗口失败：{e}")` 与绑定的 `Ok(self.lock()?.clear_window()?)`（pyo3 自带
+  `From<io::Error> for PyErr`）都不用改。
+- **错误上下文下沉到唯一落盘出口**：`Storage::write_atomic` 给每个 io 错误补上路径
+  （`Error::new(e.kind(), "<path>: <e>")`）—— std 的 `io::Error` 不带路径，写在底层一处，
+  于是 `store()` 的所有调用者（bash 落盘、图片副本、压缩原文、窗口块）都受益，上层不必各自拼 message。
+- 验证：`cargo test` 209（lib）+ 4（bin）全绿；clippy 14；绑定 27。
+
+## 2026-09-30（`compact_session(messages, config, storage)`：与 `compact_tools` 同形）
+
+用户点名了签名。原来 `head` / `tail` 是**单传的两个 usize**（调用方从 `config.compaction.session` 里
+取出来），而它们本来就是 `SessionCompaction` 的字段 —— 直接把 `&SessionCompaction` 传进来，
+参数就回到与 `compact_tools(messages, &ToolCompaction, storage, cb)` 同形（`messages → config → storage`）。
+
+- 调用方 `Session::clear_window` 反而更短：私有的 `window_sizes()` **删掉**（它只为“取 head/tail”存在，
+  单一消费者 → 内联），换成三行取配置（`[compaction.session]` 没配就用 `Default`）。
+- 验证：`cargo test` 209（lib）+ 4（bin）全绿；clippy 14；绑定 27。
+
+## 2026-09-30（`keep_last_steps` 挪进 `[compaction.tool]`）
+
+用户：「`Config.keep_last_steps` 是不是应该放入 `ToolCompaction`？」—— 是，它**只被工具级压缩用**
+（`compact_tools` 的跨批次保护窗口），住在顶层却只服务一级坐标不明。
+
+- `ToolCompaction` 加 `keep_last_steps: usize`（默认 7，值不变）；`Config.keep_last_steps` 删除
+  （含 `to_toml`、默认模板、绑定 getter/setter、`.pyi`）。
+- `compact_tools(messages, tool_config, storage, cb)` 少一个参数（keep 从 `tool_config` 里读）。
+- ⚠ **配置迁移**：顶层 `keep_last_steps = N` 现在会被忽略（未知键静默跳过）→ 要保留自定义值
+  就写进 `[compaction.tool]` 段。
+- 验证：`cargo test` 209（lib）+ 4（bin）全绿；clippy 14；绑定 27。
+
+## 2026-09-30（名字改回：`archive_window` → `compact_session`）
+
+用户：「第三级（`compact_session`）存在，只是只能由用户手动触发！」
+
+—— 对。level 3 从未消失：`compress_level = 3`、`CompactEvent::Session`、`[历史窗口: …]` 摘要、
+`[compaction.session]` 的 head/tail 都还在，变的只是**触发者**（水位 → 用户）。所以名字该描述
+“它是哪一级压缩”（`compact_session`），而不是“它物理上做了什么”（`archive_window`）。
+
+- `context::archive_window` 改名回 `pub fn compact_session(messages, storage, head, tail)`
+  （它现在**只服务于第三级**：唯一调用者是 `Session::clear_window`）。
+- 名字的“三级”含义在文档里写明：自动压缩只做工具级（level 1）/ 轮次级（level 2），
+  **第三级（会话级，level 3）只由用户手动 `/clear` 触发**。
+- 验证：`cargo test` 209（含 `compact_session_spills_the_whole_window`）+ 4 全绿；clippy 14；绑定 27。
+
+## 2026-09-30（归档只留给用户：`/clear` 是唯一入口，`archive_now` 删除）
+
+用户：「`compact_session` 只能由用户手动触发 —— 假设可以自动触发，那岂不是模型输出着突然就 clear window 了？」
+
+- 观察对，但真正的毛病比他说的更具体：**归档会打断「当前轮的工作记忆」**（刚读的文件、跑的命令只剩摘要），
+  而 400 兜底恰好发生在回合中途。另有一个决定性论据：兜底其实**救不了场** ——
+  已完成的历史太大时，轮次级本来就能压下去，用不着归档；真需要归档的是「当前轮自己就撑爆」，
+  而那正是「只归档当前轮之前」无能为力的情形（上一轮把归档改成整窗口才有效，代价就是打断工作记忆）。
+- **动手**：`context::archive_now` 删除；`WindowStore` enum 删除；`archive_window` 只剩 `/clear` 一个调用者，
+  签名简化为 `archive_window(messages, storage, head, tail)`（直接落 `windows/`）。
+- `aturn` 的 400 分支：只再强压一次工具级/轮次级；**压不动就报错收场**，并用 `log::warn` 给出出路
+  （「可以 `/clear` 开新窗口，或调小单条工具输出上限」）。
+- 验证：`cargo test` 209（lib，删了 `archive_now_spills_the_whole_window`）+ 4（bin）全绿；clippy 14；绑定 27。
+
+## 2026-09-30（统一语义：`/clear` 与超限兜底都是「整窗口落盘」）
+
+用户：「应该统一 `clear_window` 和 `compact_session` 的语义，都是把当前 window 内容全部落盘。」
+—— 把「归档哪一段」这个差异消掉：
+
+- `context::archive_window(messages, storage, store, head, tail)` 现在**就地**做完整件事：
+  把 `messages[1..]`（旧窗口摘要除外）落盘成一块 + 按「system + 摘要链」重开窗口，返回 `(路径, 事件)`；
+  没内容可归档 → `Ok(None)`。`WindowStore::{Compaction, Archive}` 定去处（`context/` vs `windows/`）。
+- `compact_session` **删掉**（它原来只归档「当前轮之前」，正是要消掉的那个差异）；`archive_now` 变薄，
+  成为 `archive_window` 在 `context/` 上的包装。
+- `Session::clear_window` 调同一个函数（`Archive` → `windows/`），之后把 `messages[0]` 换成重建的
+  system prompt —— 这是它与兜底唯一的差别（`/clear` 要反映 cwd / 记忆的变化）。顺带：`/clear` 不再
+  从盘重算所有旧摘要（`messages` 里的摘要文本原地留着），`window_summary_messages()` 只留给 `load` 的 resume 重建。
+- 验证：`cargo test` 210（含改名后的 `archive_window_spills_the_whole_window` /
+  `archive_now_spills_the_whole_window`）+ 4 全绿；clippy 14；绑定 27 全绿。
+
+## 2026-09-30（A+：自动压缩只做工具级/轮次级；`/clear` 与超限兜底共用 `archive_window`）
+
+用户发现：「`compact_session` 了那就是把当前窗口归档了，那岂不是 `compact_turns` / `compact_tools` 都没必要了？」
+—— 确实，而且是**删 `target` 判据那一步的直接后果**：原来有 target 时是逐级递进（压完工具级还超目标水位
+才压轮次级、还超才归档），删掉后变成「一触发就三级全上」，前两级必然白做且直接吃到损失最大的一级。
+
+- **自动压缩（`maybe_compact`）只做工具级 + 轮次级**；**会话级（整窗口归档）退出自动路径**。
+- **`archive_window`（新，`context.rs`）**：把一段消息归档成窗口块 —— 落盘 + 摘要消息 + 流水事件；
+  去处由 `WindowStore`（`Compaction(prefix)` → `context/`；`Archive` → `windows/`）定。
+  **`Session::clear_window` 与 `compact_session` 共用这一条**（用户点名要求），差异只剩「归档哪一段」
+  （调用方给切片）与去处。
+- **`compact_session` 降级为超限兜底**：`archive_now(messages, config)` 是它的 pub 包装，只在 `aturn`
+  的「400 上下文超限」分支里调（先 `compact(Auto)`，压不动才归档）；`[compaction.session]` 关掉 → 兜底也不归档。
+- 顺带：块格式统一成 pretty JSON 数组（`/clear` 原来是 JSONL；`load_window_dicts` 两种都读，存量块不受影响）；
+  `CompactStats.session` 字段、「会话级」的 TUI/绑定展示与 `.pyi` 一并删。
+- 验证：`cargo test` 210（lib，含新增 `auto_compaction_never_archives_the_window` /
+  `archive_now_archives_before_the_current_turn`）+ 4（bin）全绿；clippy 14；绑定 27 全绿。
+
+## 2026-09-30（`clear_window` vs `compact_session`：不合并，但少读一遍盘）
+
+用户问「`Session::clear_window` 实际上是不是做 `compact_session` 的事？能利用 `compact_session` 完成吗？」
+→ 结论：**机制同源、策略不同** —— 两个都是「归档一段历史 → 窗口块 + `[历史窗口: …]` 摘要 system 消息」，
+但四项策略不一样：归档范围（全部 vs 当前轮之前）/ 落盘去处（`windows/` 用户主动归档、gc 不碰
+vs `context/` 压缩产物、gc 的地盘）/ system prompt（重建 vs 保留）/ 重建布局（`windows` 字段动态重建
+vs 旧摘要留在上下文）；失败语义也不同（`/clear` 宁可不整理也不丢历史 → `Result`）。
+这些**不是重复代码而是两种语义**；上参数化只会换回四个开关。两者**已经**共享了所有该共享的小件
+（`summarize_turns` / `build_window_summary` / `CompactEvent::session` / `Storage::store` / `window_sizes`）。
+
+- 顺手清掉唯一一处真重复：`compact_session` 原本对同一个窗口块**读两遍盘、算两遍摘要**
+  （`build_window_summary` 内部一趟 + 紧接着 `summarize_turns(&load_window_dicts(&path))` 又一趟）
+  → 抽 `window_summary_text(path, body)`（拼「指针 + 正文」）：
+  `build_window_summary` = 读盘 + summarize + `window_summary_text`；归档路径算一次 `digest`，
+  同时喂消息与事件。
+- 验证：`cargo test` 208（lib）+ 4（bin）全绿；clippy 14（与基线一致）。
+
+## 2026-09-30（`content_text` 变成 `Message` / `Content` 的方法）
+
+用户：「content_text 功能是不是应该变为 Message 的方法？」——对，而且更好：它的参数本来就是
+`Option<&Content>`，而**每个调用点都在传 `m.content.as_ref()`**（session 6 处 / TUI 3 处 / context 内部）
+—— 说明它要的其实是「一条消息的可读文本」，不是「一个 `Option<&Content>`」。
+
+- 底层拆两半，都住 `llm.rs`（纯数据操作，不依赖 context）：
+  `Content::text()`（纯文本原样 / 多模态 parts 拼 text 片段 + 图片占位）+
+  `Message::content_text()`（`content.as_ref().map(Content::text).unwrap_or_default()`）。
+  名字**不叫** `content()`：`content` 是公开字段（`Option<Content>`），同名方法会让 `m.content` /
+  `m.content()` 一读就错。
+- `context::content_text` **删掉**；`summarize_turns`（处理的是会话 JSON 的 dict，不是 Message）
+  改走 `content_from_value(...).map(|c| c.text())`；测试里那个零逻辑的 `text_of` 包装也删了。
+- 验证：`cargo test` 208（lib）+ 4（bin）全绿；clippy 14（与基线一致）。
+- 顺带：`context::content_from_value` 也变成 **`Content::from_value`**（手写解析：`"text"` → `Text`、
+  `[...]` → `Parts`，其余 `None`；与 serde 的 `untagged` 等价，但更直白也更快）—— 于是
+  「content 的形状 / 可读文本」都住在 `llm.rs` 的 `impl Content` 里，`context.rs` 不再有 content 层的东西。
+
+## 2026-09-30（`context.rs` 的 GC 搬进 `cli.rs`）
+
+用户：「context.rs 里面和 cli 有关的移入 cli.rs 吧」。`referenced_raw_paths` / `collect_context_garbage`
+（+ 私有 `absolutize`）正是 `pie context verify|gc` 的数据源，与 `cli.rs` 里已有的图片副本那份
+（`iter_session_files` / `collect_file_garbage`）同类 → 搬过去；测试 `gc_keeps_referenced_files_only`
+跟着搬并改名 `context_gc_keeps_referenced_files_only`（与图片那份命名对齐），`write_session_with_events`
+helper 在 `cli.rs` 的 tests 里也备了一份。
+
+- `context.rs` 只剩压缩本身（三级压缩 + 落盘指针），模块 doc 指向 [`crate::cli`]；
+  `pretty_indent1` **留在 context**（它服务 `compact_*` 的落盘，`--mode transcript` 只是搭车用）。
+- `main.rs` 的 `context verify|gc` 改调 `cli::…`；`context.rs` 里那个跨模块断言（工具落盘 → gc 不删）
+  改走 `crate::cli::…`。
+- 验证：`cargo test` 208（lib）+ 4（bin）全绿；clippy 14（与基线一致）；绑定 27 全绿。
+
+## 2026-09-30（`Message::assistant` 补齐，删掉 `context::text_message`）
+
+- 构造器一族（`system` / `user` / `tool_result`）缺了 `assistant` → 补上 `Message::assistant(text)`
+  （纯文本；带 `tool_calls` / `reasoning_content` 的那条仍在 `aturn` 里手设字段）。顺手把三处手搓
+  （`Session::push_assistant` / `push_error_turn` / 取消收尾）与 `context` 测试里的 `assistant_text` helper 换掉。
+- `context::text_message(role, text)` 随之**删掉**：两个调用点一个变 `Message::assistant`、
+  一个变 `Message::system`（本来就存在）—— 又一个「单一用途的泛化参数」消失。
+- `context::set_raw` 退役：它那一行（写 `raw_path`）升成 `Message::mark_compressed(level, Option<&Path>)`
+  —— `compress_level` 与 `raw_path` **成对设置**只此一处（工具级 / 轮次级 / 会话级三条压缩路径 +
+  resume 重建窗口摘要共用；`None` 表示落盘失败，只标级别）。随后 `Message::with_spill` 也**删了**
+  （它与 `mark_compressed` 完全重复，且只有一个调用点）—— 四条落盘路径现在都走 `mark_compressed`。
+- 验证：`cargo test` 208（lib）+ 4（bin）全绿；clippy 14（与基线一致）。
+
+## 2026-09-30（落盘路径结构化：`ToolOutput { text, spill }` + `Message::with_spill`）
+
+用户问「`mark_tool_spill` 是不是应该内联进 `Message::tool_result`」→ 澄清后他给出了真正的意图：
+**消息构造出来就该是最终形态**（工具输出过长已落盘时，`raw_path` / `compress_level` 当场就设好），
+而不是「先造好、再拿正文里的指针去嗅探补一刀」。
+
+- **`Tool::call` 的返回从 `Result<String, ToolError>` 改成 `Result<ToolOutput, ToolError>`**
+  （`ToolOutput { text, spill: Option<PathBuf> }`）：只有 `bash` 超 `_max_lines` / `_max_bytes` 时给 `spill`
+  （落盘失败 → `None`，正文里的 `(落盘失败: …)` 照旧）。`ToolOutput` 实现 `Deref<Target = str>` + `Display`
+  → 测试与调用点的 `out.starts_with(…)` / `format!("{out}")` 几乎不用改。
+- **`Message::mark_compressed(1, spill)`**（`llm.rs`）：纯数据的一步——`Some(path)` →
+  `compress_level = 1` + `raw_path`；`None` 直通。所以 `llm.rs` **不需要依赖 context**（没有反向依赖、也没有 IO）。
+  （当天稍后 `Message::with_spill` 被删：它与 `mark_compressed` 完全重复。）
+- **删掉文本嗅探那一整套**：`context::mark_tool_spill` / `extract_spill_path` / `pointer_path`
+  全部删除（连带「read 回来的源码字面量会被误判 → 按工具名 gate → `path.exists()` 双保险」那串补丁）。
+  `aturn` 回填工具结果时改成一眼睛能看完的三行：`spill` 有值 → 记一条 `CompactEvent::tool` + `mark_compressed`。
+  正文里那行 `[工具输出全文已保存: <path>]` **保留**（那是给模型看、让它能读回的指针）。
+- **绑定**：Python 工具的调用体从 `Ok(text)` 改成 `Ok(ToolOutput::text(text))`（Python 工具没有落盘通道）。
+- 验证：`cargo test` 208（lib）+ 4（bin）全绿；clippy 14（与基线一致）；绑定 `maturin develop` + `pytest` 27 全绿。
+
+## 2026-09-30（压缩水位只认 API 上报：删掉 token 估算那一整条链）
+
+用户从「`raw_tokens` 能不能直接拿 `usage` 填」一路问到「我们真的需要 `message_tokens` 吗」，
+读了一圈 DeepSeek 的 Chat Completions 文档（`usage` 的粒度是**整个请求**，没有逐消息分项）后拍板：
+**不做估算**，水位只看服务端上报 —— 并点名「单条 tool 消息几十万 token 不正常，我给 `read` 加
+`_max_lines`/`_max_bytes`、给 bash 输出做 clip 就是为了这个」。
+
+- **`maybe_compact(messages, config, reported)`**：只看上一次 `usage.prompt_tokens`（≥ `soft_limit()` 就压）；
+  `reported = None`（本次会话还没发过请求）→ **不压**。`aturn` 的请求前 / 请求后两次都传
+  `self.usage.prompt_tokens`（请求后那次拿到的是刚回来的最准值）。
+- **各级压到不能再压**：`compact_turns` 的 `target` 参数与「压到目标水位」判据删除（反事实无法用实测判定），
+  `target_ratio` 配置项、`Config::target_limit()` / `target_ratio()`、绑定同名方法与 README 的「迟滞」说明一起删。
+- **删掉整条估算链**：`message_tokens` / `messages_tokens` / `content_tokens` / `chars_div4` / `IMAGE_TOKENS_MAX`
+  + `Message.raw_len` / `raw_tokens`（`set_raw` 只记 `raw_path`）；`CompactStats.saved_tokens`（收益本身就是估算值）
+  与 TUI / 绑定的对应展示一起去掉；`/stat` 的「各角色占用（估算）」改成**条数**、没有上报时明说「尚无 API 上报」、
+  落盘原文量改用**字节**（不再 `/4` 折 token）。
+- **新增安全网**（不是估算的替代品，是判据失手的兜底）：`LlmError::is_context_overflow`（400 + 关键词，
+  与 `is_stale_file_error` 同款）→ `aturn` 命中就**无视水位**强制 `compact(Auto)` 一次再发（没压动就照常失败）。
+  理由：水位只来自上报，首次请求前没有任何值；单条输入本身把窗口撑满时判据必然失手。
+- 验证：`cargo test` 208（lib，含新增 `api_400_error_kinds_are_classified`）+ 4（bin）全绿；
+  clippy 仍 14（与基线一致）；绑定 `maturin develop` + `pytest` 27 全绿。
+
+## 2026-09-30（压缩事件类型化：`CompactEvent` 取代裸 `Value`，判别看 `kind`）
+
+用户从「`compact_event` 能不能加进 `TurnEvent`」一路追问（「`on_event` 加 `Session` 参数呢」「新增一个 `CompactEvent` enum 呢」）。讨论结论：
+
+- **压缩事件不进 `TurnEvent`**。它是**内部记账**——`context gc` 靠它保护原文、`/stat` 靠它计数、resume 靠它登记窗口块——而 `TurnEvent` 是**展示流**（可丢、可限流、`Session::compact` 那条路压根没有 `on_event`）。给 `on_event` 加 `&mut Session` 也走不通：调用点全在「已借了 self」的上下文里（`self.llm.stream(&self.messages, …, |c| on_event(…))`）、`model_call` 是 `&self`、工具那批 future 并发跑（`&mut Session` 独占），实测 E0500 / E0524 两处编不过。
+- **但「用 `Value` 传」确实太松**：键名在四个地方裸摸（`entry.get("level")==Some(3)` 探窗口、`/stat` 分桶、`/clear` 归档**手搓同形状 JSON**、测试断言），形状一改就静默失效。于是定义 `context::CompactEvent`（`#[serde(tag = "kind", rename_all = "lowercase")]`，variant `Tool` / `Turn` / `Session` ↔ 现有 `kind` 值）+ 三个构造器（`tool` / `turn` / `session`，summary 的 200 字截断收在这里）+ `level()` / `raw_path()` 访问器。
+- **去掉冗余 `level`**：类型由 variant 决定，落盘只留 `kind` 标签（`{kind, ts, path, hash, summary?}`）；旧会话里多出来的 `level` 被 serde 忽略（逐条 `from_value`，单条坏只丢自己）→ 新增回归用例 `legacy_and_current_event_keys_both_load` + 落盘形状断言（`clear_window` 用例里钉住 `meta` 行不含 `"level"`）。
+- **事件里的键名去掉 `raw_` 前缀**（用户问「`raw_path`/`raw_hash` 是不是可以变更为 `path`/`hash`」，并追问当初为什么叫 `raw_*` → 翻 init commit 的 `src/pie/context.py`：`raw_` 的本义是「**压缩前**的原文」，注释原文就是「原始文本长度（压缩前），tokens() 比例估算用」）：`CompactEvent` 的字段直接用短名 `path` / `hash`，`#[serde(alias = "raw_path")]` / `alias = "raw_hash"` 保旧会话可读。⚠ `referenced_raw_paths` 是**裸读 `Value`**（不走 serde）—— 那里改成 `path` 优先、`raw_path` 回退，否则旧会话的引用查不到，`gc --delete` 会删掉还在被引用的原文。`Message` 那族的 `raw_*` **不动**（`raw_len` / `raw_tokens` 是「原文尺寸」，token 比例估算必需）。（`spill` 与 `raw` 是两套词：`extract_spill_path` 描述「溢出落盘」这个动作，`raw_*` 描述「那份件是原文」。）
+- **顺带消掉回调参数**：`maybe_compact` / `compact` 改成返回 `(CompactStats, Vec<CompactEvent>)`，「`on_compact: Option<&mut dyn FnMut(Value)>` + `noop` 空实现 + `drop(on_compact)` 借用收尾」三处别扭一起消失；`aturn` 里改成攒本地 `Vec<CompactEvent>`、回合末登记 `windows` + 并入字段。
+- **删过时标记**：`compact` / `CompactMode` 上的 `#[allow(dead_code)]` 与「⚠ `Tools`/`Turns` 暂时没人构造……等 TUI 落地时接线」注释（TUI `/compact` 与 Python 绑定都在用）、`Session::compact` 上同款 attr、重复的 doc 行。
+- 验证：`cargo test` 207（lib）+ 4（bin）全绿；绑定 `maturin develop` + `pytest tests` 27 全绿（`compression_history()` 输出形状不变——仍是 dict 列表，只是少了 `level` 键、`raw_path`/`raw_hash` 改名 `path`/`hash`）。
+
 ## 2026-09-29（`--cwd` / `/cd`：数据目录跟着工作目录走，并在会话里留一条 cwd 说明）
 
 - **`--cwd` 之后重解析数据目录**（用户点名要）：`Storage` 是在 `Config::load` 时定型的，而 `--cwd` 的 `set_current_dir` 在更晚的 `run()` 里 —— 原来切了工作目录、数据目录却不变。现在 `set_current_dir` 后紧跟 `config.storage = Storage::from_env()`：`PIE_DIR` 仍优先，其次新 cwd 下的 `.pie`（存在才算），最后 `~/.pie`。
@@ -36,6 +251,95 @@
   - `Cargo.toml` 的 `description`：顺手修了两个**事实错误**——它写的是「**pie** 的 Rust 重构」（自指，应为 pi），工具名写的是
     `write`/`shell`（本仓实际是 `writ`/`bash`）。
   - `AGENTS.md` 首段 + `MEMORY.md` 的「项目定位与仓库」各加一句来历（未来的 agent 看到命名不用猜）。
+
+## 2026-09-29（`file_stem` → `config::name_of`：落盘命名的三个函数归位）
+
+- **`session::file_stem` 改名为 `config::name_of` 并搬进 `config.rs`**（用户：「那把 file_stem 改名为 name_of 移入 config.rs 吧」）：
+  它本来就是「从落盘路径取回**文件名主干 = id**」，跟 `config::hash_of`（路径 → hash 段）是一对——搬过去后
+  `config` 里凑齐**三个一队**（`Hash` 段那一节的文档写明了分工）：
+  * `hash_id(data)`：内容 → hash（`Storage::store` 起名用）；
+  * `name_of(path)`：路径 → 文件名主干（= id，`img-<hash>` / `chat-<秒>-<微秒>`）——**别拿它当 `hash_of` 用**（主干带前缀）；
+  * `hash_of(path)`：路径 → hash 段（metadata 只要 hash 时用）。
+- 消费点：`session.rs` 取图片副本 id（与 `__meta__.files` 的键同形）、`cli.rs` 取会话 id（`list_sessions` / `file_id_index`）。
+  顺带把这条"别用 `hash_of` 顶替"的坑写进两侧的注释（上一轮用户问的正是这个）。
+- 验证：`cargo test` 206 + 4 全绿（改名没有行为变化）、clippy 14 不变；`pie sessions -l 3` 实跑（走的是 `name_of`）✓。
+
+## 2026-09-29（新建 `cli.rs`：把 CLI 用到的会话/文件查询搬出 `session.rs`）
+
+- **新模块 `src/cli.rs`**（用户：「新建 cli.rs，把 session.rs 里面会被 cli 用到的函数都放进去」）：装了 6 项
+  `SessionInfo` / `list_sessions` / `GC_PROTECT_HOURS` / `iter_session_files` / `file_id_index` / `collect_file_garbage`
+  （共 185 行）+ 它们的那条用例（`garbage_needs_no_reference_and_past_protect_window` 顺手改成 `Storage::at(临时目录)` 注入，
+  不再动进程级 `PIE_DIR`）。留 `session.rs` 的是会话本身（加载 / 落盘 / 回合循环 / 图片上传）与 `Session` 的方法
+  （`Session::new/load/resume/aturn` 这些**搬不动**——它们是类型的 API）；`file_stem` 变成 `pub(crate)` 给两处共用。
+- **命名说明**（写进模块头与 AGENTS）：`cli` 是**按用途**取的（CLI 子命令的数据源），不是"只在 CLI 编译进来"——
+  它一直在 lib 里，TUI（同一二进制）与 Python 绑定（`pie.list_sessions`）也用它。
+- 调用点：`main.rs` 5 处 `session::…` → `cli::…`；绑定 1 处 `pie::session::list_sessions` → `pie::cli::list_sessions`。
+- **顺手修了绑定侧两处早就编不过的调用**（HEAD 里就坏：`pie::session::list_sessions(limit)` 少个 `storage` 参数、
+  `guard.compression_history()` 这个方法上午已被删）→ 现在传 `Storage::default()`（与 CLI 同口径）并用 `compaction_events`；
+  `bindings/pie-py/.venv` 不在，重建了（`uv venv --python 3.12` + `maturin develop`）→ **27 个 pytest 全过** ✓。
+- 验证：`cargo test` 206 + 4 全绿、clippy 14（搬完先多出 1 条 `empty line after doc comment`——内联 `dispatch_tool` 时留下的孤儿 doc，已清）；
+  真二进制跑 `pie sessions -l 3` / `files list` / `files gc`（三条都打到了搬走的函数）✓；绑定 pytest 27 ✓。
+
+## 2026-09-29（压缩流水并入 `__meta__`：manifest 文件消失）
+
+- **压缩事件不再单独写 `~/.pie/context/<会话名>.manifest.jsonl`，改住会话文件首行 `__meta__.compaction_events`**
+  （用户：「既然每次 compact 都会修改 session 文件，为啥不直接把 manifest 放入 `__meta__`？」）：
+  - 先纠了前提：**compaction 本来不改会话文件**（它只 append manifest + 写 `context/` 原文；会话文件只在 `save()` 时整份重写）。
+    但用户的方案在"磁盘自洽"上是对的：把流水放进 `__meta__` 后，**流水与消息里的 `raw_path` 指针同一趟车落盘**，
+    不存在"账记了、指针没记"的半吊子状态；崩溃场景也只是"两边都没落盘 → 原文成孤儿 → 被回收是正确行为"。
+  - 落地：`Session.manifest: Option<PathBuf>` → `Session.compaction_events: Vec<Value>`（`ephemeral` 不再需要"关记账"的开关——
+    不 `save` 自然不落盘）；`save()` 写 `meta["compaction_events"]`（空则不写），`load()` 读回来；
+    `aturn` / `compact()` 用**本地 Vec 收集**（`self` 那时被借出去跑回合）再 `append` 进字段，`clear_window` 直接 push；
+    `compression_history()`（读文件）删掉，`/stat` 直接用字段。
+  - 删掉：`context::write_manifest`、`session::record_compact`、`session::manifest_path_of`、`Session.manifest` 字段。
+  - `referenced_raw_paths()` 改成**只扫 `sessions/`**（首行流水 + 消息指针都在同一个文件里）→ `context info` 也改成遍历会话首行；
+    `collect_context_garbage` 不动（它用的是同一个引用集）。
+  - ⚠ **不做兼容**（用户明确）：老会话的 `context/*.manifest.jsonl` 不再被读 → 那些老原文失去保护（下次 `gc --delete` 会回收）。
+  - ⚠ **一个我引入的回退，已发现并把范围做成可见**：老设计里 manifest **固定落在 `context/`**，所以哪怕会话文件在 `sessions/` 之外
+    （`pie -s /tmp/x.jsonl`）也顺带保护了它引用的原文；新设计里"记录跟着会话文件走"，**外部路径的会话不在 gc/verify 的统计里** ✗。
+    现在 `context info` / `gc` 的输出与 `--help` 都写明"只统计 `<sessions>` 里的会话"（`gc` 的那种情况会真的被回收 → 指针落空，
+    优雅降级但原文没了）。要彻底修的话得在 `save()` 时给外部会话另落一份引用索引（待定，用户未拍）。
+  - 验证：`cargo test` **206 + 4 全绿**、clippy 14；**端到端两轮真实回合**（临时 `PIE_DIR` + 临时 config 把 `[tools.bash] _max_bytes`
+    压到 20000 逼出落盘）：① 会话在 `sessions/` 里 → `__meta__` 里有 `compaction_events`、`context info` 打出它、
+    `gc` 报 0 个未引用、`verify` OK ✓；② 会话在 `/tmp/xxx/s.jsonl`（默认目录之外）→ 复现了上面那条回退 ✓。
+
+## 2026-09-29（`pie_dir` 内联 `pick_root`；「不为测试拆代码」写进规矩）
+
+- **`config::pick_root` 内联进 `pie_dir`**（用户：「pick_root 内联进入 pie_dir。不要为了方便测试把功能拆那么碎。代码也要给我读的。」）：
+  搜索顺序（`PIE_DIR` 非空 → `<cwd>/.pie` 存在才算 → `~/.pie`）本来就是 12 行三步，之前拆成「纯函数 + 问环境」两半，
+  唯一理由是能注入 `env`/`cwd`/`home` 直接测顺序。现在合成一个 `pie_dir()`，文档里写明**别再为了好测拆开**。
+  * 用例从 4 档缩到能测的 2 档（`PIE_DIR` 非空 / 空串回落到 `$HOME/.pie`，`HOME` 用环境变量注入），
+    `<cwd>/.pie` 那档要改进程 cwd（会污染并行跑的用例）→ **放弃覆盖**，用例里明写了原因 + 一个 `cwd 有 .pie 就跳过` 的守卫。
+  * 顺带把记忆改了：**判据只有「有没有第二个消费者」，不含「值不值得独立测试」**——之前那条把测试算进判据被用户否掉了
+    （全局 `~/.pie/memory.md` 与项目 `MEMORY.md` 都改成「要测就注入环境变量那类能测的，测不到的几行让读者看代码」）。
+- 验证：`cargo test` 206 + 4 全绿、clippy 14。
+
+## 2026-09-29（落盘命名与 store 接口收口）
+
+一次提了四件事，逐条落地并核过代码：
+
+- **`Storage::store` 只返回 `PathBuf`**（原来返回 `Stored { id, path }`）：三个变体里只有 `Blob` 的调用方用得到 id，
+  而「id」本来就等于文件名主干（`session.rs` 扫 `files/` 时也是用 `file_stem` 反推的）→ `Stored` 一并删掉。
+  要 hash 段的元数据改走新的 **`config::hash_of(path)`**（命名形状的逆运算；`context.rs` 的私有同名函数搬进 `config` 共用，
+  消费方：manifest 事件、窗口块元数据）；后来用户又把 `hash_id` 也移出 `store`，两个现在贴在一起当一对（`hash_id`：内容 → id，`hash_of`：路径 → id）。。
+- **`content_hash` + `image_hash_id` 合并成 `store` 里的嵌套 `fn hash_id(data: &[u8]) -> String`**（sha256 前 16 位）：
+  本来就是同一件事（一个收 `&str`、一个收 `&[u8]`，后者只多拼个 `img-` 前缀）。顺带修掉一处重复计算：
+  `session.rs` 写窗口块的 manifest 时又算了一遍 `content_hash(&raw)`，现在从落盘路径反推。
+- **`Window` 前缀对齐**：`window-<unix 秒>-<hash>.jsonl` → **`window-<hash>`**（与 `Raw` 的 `<前缀>-<hash>`、`Blob` 的
+  `img-<hash>` 同一套形状）。⚠ 这不只是改名：`Window` 从「每次新建」变成**内容寻址**（同内容 ⇒ 同名 ⇒ 已存在则不动），
+  「什么时候清的」由 manifest 的 `ts` 记着；`StoreType` 上面那段「两种策略别合并」的注释也一并改了。
+- **扩展名**：`Raw` / `Window` 的 `.txt` / `.jsonl` 去掉（纯装饰，`.txt` 对"美化过的 JSON 原文"还是误导）——
+  文件名主干因此严格等于 id。**`Blob` 的 `.png`/`.jpg` 保留**（我的建议，理由：那是用户数据，可能被双击 / 拖出去打开，
+  扩展名是「格式」的唯一载体，`image_ext(mime)` 就是为它存在的）；要一并去掉是一行的事。
+- **连带改到的地方**（好几处是测试当场抓出来的）：
+  * `collect_context_garbage` 原来按 `extension == "txt"` 筛 → 去掉扩展名后它会**一个都收不到**（`gc_keeps_referenced_files_only`
+    当场红了）；现在按**命名形状**筛（嵌套 `fn is_stored`：`<前缀>-<16 位十六进制>`）。
+  * 8 个调用点（`context.rs` × 3 + 测试助手、`session.rs` × 2、`tools.rs`、`clipboard.rs`）改收 `PathBuf`；
+    `blob()` / `raw()` 两个测试助手跟着改签名；窗口用例加强成「manifest 的 `raw_hash` == 文件名里那段」。
+- 验证：`cargo test` **206 + 4 全绿**、clippy 14；另外用真二进制 + 临时 `PIE_DIR` 手造 `context/bash-<hash>` + `turn-<hash>` +
+  `s.manifest.jsonl` 跑了 `context info` / `gc` / `gc --delete`：只列出**未被引用**的那个、manifest 自己不误删 ✓。
+  （小坑：`PIE_DIR` 连**配置**一起重定向 → 临时目录里没配置，真跑回合得加 `-c ~/.pie/config.toml`，否则 401。）
+- 留个观察：`files/` 的 gc 判据仍是「不以 `.` 开头 + 未被引用」，没有像 `context/` 那样查命名形状——要不要对齐待定。
 
 ## 2026-09-29（TUI 更新不及时：一轮吃整队事件）
 
