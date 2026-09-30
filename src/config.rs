@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------- 常量
 //
@@ -43,12 +44,177 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 数据根目录：`PIE_DIR` 环境变量可重定向（测试/多环境），默认 `~/.pie`。
-pub fn pie_dir() -> PathBuf {
-    match std::env::var_os("PIE_DIR") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => home_dir().join(".pie"),
+/// 数据存储：一个 root + 四个子目录 + 内容寻址落盘（[`Storage::store`]）。
+///
+/// **唯一职责是「用户数据放哪儿、怎么落盘」**（`config` 是底层，谁都能拿来用）。默认 root 来自
+/// [`Storage::from_env`]（`PIE_DIR` → 当前目录下的 `.pie` → `~/.pie`）；测试用 [`Storage::at`]
+/// 注入临时 root —— 不必再动进程级 `PIE_DIR`。
+#[derive(Clone, Debug)]
+pub struct Storage {
+    pub root: PathBuf,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self::from_env()
     }
+}
+
+/// 落盘请求：写哪个子目录、名字怎么起、用什么策略，都在这层定。
+///
+/// 两种策略**别合并**：`Blob` / `Raw` 是内容寻址（同内容一份、已存在则不动），
+/// `Window` 是**每次新建**（名字带 unix 秒）——它要留住每一次 `/clear` 归档，且不进 gc。
+pub enum StoreType<'a> {
+    /// 图片副本 → `files/`：`img-<sha256[:16]><ext>`（0o600、原子写）。
+    Blob { data: &'a [u8], mime: &'a str },
+    /// 压缩落盘文本 → `context/`：`<prefix>-<hash>.txt`（`prefix` = 工具名 / `turn` / `session`）。
+    Raw { prefix: &'a str, body: &'a str },
+    /// `/clear` 归档的窗口块 → `windows/`：`window-<unix 秒>-<hash>.jsonl`。
+    Window(&'a str),
+}
+
+/// 落盘产物：`id` 是文件名主干（不含扩展名），`path` 是完整路径。
+pub struct Stored {
+    /// `img-<hash>` / `<prefix>-<hash>` / `window-<unix 秒>-<hash>`。
+    pub id: String,
+    pub path: PathBuf,
+}
+
+impl Storage {
+    /// 从环境解析默认 root：`PIE_DIR` → 当前目录下的 `.pie`（存在即用）→ `~/.pie`。
+    pub fn from_env() -> Self {
+        Self { root: pie_dir() }
+    }
+
+    /// 指定 root（测试注入临时目录用）。
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// 会话目录：`<root>/sessions/`（会话 JSONL 的落脚处，`sessions` 子命令与 `-r` 都扫它）。
+    pub fn sessions(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    /// 压缩落盘正文目录：`<root>/context/`（`context info|verify|gc` 的地盘）。
+    pub fn context(&self) -> PathBuf {
+        self.root.join("context")
+    }
+
+    /// 本地图片副本目录：`<root>/files/`（`files list|gc` 的地盘；与 `context/` 分开：那边是文本）。
+    pub fn files(&self) -> PathBuf {
+        self.root.join("files")
+    }
+
+    /// `/clear` 归档的窗口块目录：`<root>/windows/`。
+    ///
+    /// **刻意放在 `context/` 之外**：那是压缩落盘 + `context gc` 的地盘，而窗口块是用户
+    /// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它。
+    pub fn windows(&self) -> PathBuf {
+        self.root.join("windows")
+    }
+
+    /// 内容寻址落盘：`Blob` 图片副本 / `Raw` 压缩原文 / `Window` 窗口块，见 [`StoreType`]。
+    pub fn store(&self, what: StoreType<'_>) -> std::io::Result<Stored> {
+        match what {
+            StoreType::Blob { data, mime } => {
+                let id = image_hash_id(data);
+                let dir = self.files();
+                let path = dir.join(format!("{id}{}", image_ext(mime)));
+                write_atomic(&dir, &path, data, Some(0o600))?;
+                Ok(Stored { id, path })
+            }
+            StoreType::Raw { prefix, body } => {
+                let dir = self.context();
+                let id = format!("{prefix}-{}", content_hash(body));
+                let path = dir.join(format!("{id}.txt"));
+                write_atomic(&dir, &path, body.as_bytes(), None)?;
+                Ok(Stored { id, path })
+            }
+            StoreType::Window(body) => {
+                let dir = self.windows();
+                let id = format!("window-{}-{}", now().as_secs(), content_hash(body));
+                let path = dir.join(format!("{id}.jsonl"));
+                write_atomic(&dir, &path, body.as_bytes(), None)?;
+                Ok(Stored { id, path })
+            }
+        }
+    }
+}
+
+/// 内容寻址：sha256 前 16 位（同内容只落一份）。
+pub fn content_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())[..16].to_string()
+}
+
+/// 图片内容 id：`img-<sha256[:16]>`。
+pub fn image_hash_id(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("img-{}", &hex::encode(hasher.finalize())[..16])
+}
+
+/// mime → 扩展名（`files/` 里的副本要能双击打开；白名单之外给空串）。
+fn image_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/bmp" => ".bmp",
+        _ => "",
+    }
+}
+
+/// 写文件：先写同目录临时文件再 rename（读者不会看到写了一半的文件），已存在则不动
+/// （路径都是内容寻址的：同名 ⇒ 同内容）。`mode` 只在 unix 生效（图片副本是用户数据 → 0o600）。
+fn write_atomic(dir: &Path, path: &Path, body: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    std::fs::rename(&tmp, path)
+}
+
+/// 数据根目录：`PIE_DIR` → 当前目录下的 `.pie`（**存在**才算）→ `~/.pie`。
+pub fn pie_dir() -> PathBuf {
+    pick_root(
+        std::env::var_os("PIE_DIR"),
+        std::env::current_dir().ok(),
+        &home_dir(),
+    )
+}
+
+/// 搜索顺序的**纯函数**（`pie_dir` 只负责去问环境）：`PIE_DIR`（非空）→ `<cwd>/.pie`
+/// （真的存在才算，不凭空造）→ `<home>/.pie`。抽出来是为了能直接测顺序、不必改进程 cwd。
+fn pick_root(env: Option<std::ffi::OsString>, cwd: Option<PathBuf>, home: &Path) -> PathBuf {
+    if let Some(v) = env {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Some(cwd) = cwd {
+        let local = cwd.join(".pie");
+        if local.is_dir() {
+            return local;
+        }
+    }
+    home.join(".pie")
 }
 
 pub fn default_config_file() -> PathBuf {
@@ -352,6 +518,9 @@ pub struct Config {
     /// 运行时属性（不落盘）：CLI `--append-system-prompt`（可重复）。
     #[serde(skip)]
     pub append_system_prompt: Vec<String>,
+    /// 运行时属性（不落盘）：数据存储（默认 `PIE_DIR` / `./.pie` / `~/.pie`；测试可注入临时 root）。
+    #[serde(skip)]
+    pub storage: Storage,
 }
 
 impl Default for Config {
@@ -379,6 +548,7 @@ impl Default for Config {
             auto_compact_threshold: None,
             system_prompt: None,
             append_system_prompt: Vec::new(),
+            storage: Storage::default(),
         }
     }
 }
@@ -756,6 +926,34 @@ pub fn build_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 数据根目录的搜索顺序：`PIE_DIR` → `<cwd>/.pie`（存在才算）→ `<home>/.pie`。
+    #[test]
+    fn pie_dir_prefers_env_then_local_then_home() {
+        let home = PathBuf::from("/tmp/pie-home-stub");
+        let cwd = std::env::temp_dir().join(format!("pie-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        let local = cwd.join(".pie");
+        std::fs::create_dir_all(&local).unwrap();
+
+        let env = |s: &str| Some(std::ffi::OsString::from(s));
+
+        // 1) PIE_DIR 非空 → 直接用它（本地就算有 .pie 也不看）
+        assert_eq!(
+            pick_root(env("/tmp/pie-from-env"), Some(cwd.clone()), &home),
+            PathBuf::from("/tmp/pie-from-env")
+        );
+        // 2) PIE_DIR 没设 / 空串 → 当前目录下的 .pie
+        assert_eq!(pick_root(None, Some(cwd.clone()), &home), local);
+        assert_eq!(pick_root(env(""), Some(cwd.clone()), &home), local);
+        // 3) 当前目录没有 .pie（或问不到 cwd）→ ~/.pie
+        let bare = cwd.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(pick_root(None, Some(bare), &home), home.join(".pie"));
+        assert_eq!(pick_root(None, None, &home), home.join(".pie"));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 
     /// `civil` 是纯函数（unix 秒 → 文本，不碰时区）；`fmt_local` 只断言形状
     /// （不硬编码跑测试的机器时区）。

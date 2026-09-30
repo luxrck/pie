@@ -219,6 +219,9 @@ async fn run(cli: Cli) -> i32 {
             eprintln!("切到工作目录失败 {}: {e}", cwd.display());
             return 1;
         }
+        // 数据目录跟着工作目录走：`PIE_DIR` 优先 → 新 cwd 下的 `.pie`（存在才算）→ `~/.pie`。
+        // ⚠ 必须在 `set_current_dir` **之后**重解析——`Storage` 是在 `Config::load` 时定型的。
+        config.storage = config::Storage::from_env();
     }
 
     // 维护类子命令（不需要模型）；files 要 config（建 Files API 客户端）
@@ -227,10 +230,10 @@ async fn run(cli: Cli) -> i32 {
             // 正常走不到（`run()` 开头已提前返回）——但这条臂留着：万一提前返回被挪掉，
             // `setup` 依旧是对的（它对已有文件一律不动，与启动时那发种子同级）。
             Cmd::Setup => setup_main(&cli),
-            Cmd::Context { action } => context_main(action),
+            Cmd::Context { action } => context_main(&config.storage, action),
             Cmd::Files { action } => files_main(&config, action).await,
             Cmd::Sessions { limit, all, json } => {
-                sessions_main(if *all { None } else { Some(*limit) }, *json)
+                sessions_main(&config.storage, if *all { None } else { Some(*limit) }, *json)
             }
         };
     }
@@ -455,8 +458,8 @@ fn setup_main(cli: &Cli) -> i32 {
 }
 
 /// `pie sessions`：列出历史会话。
-fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
-    let rows = session::list_sessions(limit);
+fn sessions_main(storage: &config::Storage, limit: Option<usize>, json: bool) -> i32 {
+    let rows = session::list_sessions(storage, limit);
     if json {
         let values: Vec<Value> = rows
             .iter()
@@ -479,7 +482,7 @@ fn sessions_main(limit: Option<usize>, json: bool) -> i32 {
         return 0;
     }
     if rows.is_empty() {
-        println!("暂无会话（{}）", session::sessions_dir().display());
+        println!("暂无会话（{}）", storage.sessions().display());
         return 0;
     }
     for r in rows {
@@ -608,8 +611,8 @@ fn read_text_or_path(value: &str) -> String {
 }
 
 /// `pie context info|verify|gc`：上下文压缩维护。
-fn context_main(action: &ContextAction) -> i32 {
-    let dir = context::context_dir();
+fn context_main(storage: &config::Storage, action: &ContextAction) -> i32 {
+    let dir = storage.context();
     if !dir.exists() {
         println!("暂无压缩记录（{} 不存在）", dir.display());
         return 0;
@@ -639,7 +642,7 @@ fn context_main(action: &ContextAction) -> i32 {
             0
         }
         ContextAction::Verify => {
-            let mut missing: Vec<std::path::PathBuf> = context::referenced_raw_paths()
+            let mut missing: Vec<std::path::PathBuf> = context::referenced_raw_paths(storage)
                 .into_iter()
                 .filter(|p| !p.exists())
                 .collect();
@@ -656,7 +659,7 @@ fn context_main(action: &ContextAction) -> i32 {
             }
         }
         ContextAction::Gc { delete } => {
-            let garbage = context::collect_context_garbage();
+            let garbage = context::collect_context_garbage(storage);
             println!("未引用文件 {} 个:", garbage.len());
             for p in &garbage {
                 println!("  {}", p.display());
@@ -679,11 +682,11 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             if *all {
                 return files_remote_list(config).await;
             }
-            let rows = session::iter_session_files(&session::sessions_dir());
+            let rows = session::iter_session_files(&config.storage.sessions());
             if rows.is_empty() {
                 println!(
                     "暂无图片记录（会话 __meta__.files 为空；副本目录 {}）",
-                    session::files_dir().display()
+                    config.storage.files().display()
                 );
                 return 0;
             }
@@ -711,7 +714,7 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             0
         }
         FilesAction::Gc { delete, all } => {
-            let garbage = session::collect_file_garbage(session::GC_PROTECT_HOURS);
+            let garbage = session::collect_file_garbage(&config.storage, session::GC_PROTECT_HOURS);
             println!(
                 "可回收的本地副本 {} 个（未被任何会话引用、且已放置超过 {} 小时）:",
                 garbage.len(),
@@ -754,7 +757,7 @@ async fn files_remote_list(config: &config::Config) -> i32 {
         println!("服务端没有上传件（云端为空）");
         return 0;
     }
-    let index = session::file_id_index();
+    let index = session::file_id_index(&config.storage);
     println!(
         "服务端上传件 {} 个（云端那份；本地记录见不带 --all 的 `pie files list`）:",
         files.len()

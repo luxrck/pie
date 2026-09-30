@@ -29,7 +29,6 @@ use crate::llm::{
     self, Content, LlmClient, LlmError, LlmResult, Message, StreamChunk, ToolCall, UsageTracker,
 };
 use crate::tools::{self, ToolRegistry};
-use sha2::{Digest, Sha256};
 
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
@@ -131,7 +130,7 @@ impl Session {
     /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
     pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
-        Self::at(resolve_path(id), config, llm, tools)
+        Self::at(resolve_path(&config.storage.sessions(), id), config, llm, tools)
     }
 
     /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`）、不写 manifest，其余完全一样。
@@ -140,7 +139,7 @@ impl Session {
     /// 就用“不记账的 Session”表达同一件事。
     pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
         let mut session = Self::at(
-            sessions_dir().join(format!("ephemeral-{}.jsonl", timestamp())),
+            config.storage.sessions().join(format!("ephemeral-{}.jsonl", timestamp())),
             config,
             llm,
             tools,
@@ -296,11 +295,6 @@ impl Session {
             ));
             msg.compress_level = 3;
             msg.raw_path = Some(block.display().to_string());
-            msg.raw_hash = block
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.rsplit('-').next())
-                .map(str::to_string);
             msg.raw_len = Some(raw.chars().count() as i64);
             msg.raw_tokens = Some(raw.chars().count() as i64 / 4);
             out.push(msg);
@@ -313,7 +307,7 @@ impl Session {
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string());
-        Self::resume_in(&sessions_dir(), cwd.as_deref(), config, llm, tools)
+        Self::resume_in(&config.storage.sessions(), cwd.as_deref(), config, llm, tools)
     }
 
     /// `resume` 的本体（目录可注入，便于测试）。
@@ -714,7 +708,8 @@ impl Session {
                             call.function.arguments.chars().take(500).collect::<String>()
                         )),
                         Ok(args) => {
-                            let text = dispatch_tool(registry, call, &args, cancel).await;
+                            let text =
+                                dispatch_tool(registry, call, &args, cancel, &self.config.storage).await;
                             (text != CANCEL_TEXT).then_some(text) // shell 被杀 → 哨兵 → 算取消
                         }
                     }
@@ -797,8 +792,12 @@ impl Session {
         if !enabled {
             return None;
         }
-        let (image_hash, local) = match store_blob(data, mime) {
-            Ok(v) => v,
+        let (image_hash, local) = match self
+            .config
+            .storage
+            .store(config::StoreType::Blob { data, mime })
+        {
+            Ok(s) => (s.id, s.path),
             Err(e) => {
                 crate::log::warn(format!("[warn] 图片本地副本写入失败: {e}"));
                 return None;
@@ -1008,8 +1007,12 @@ impl Session {
                 raw.push_str(&json_line(d)?);
                 raw.push('\n');
             }
-            let path = context::write_window_block(&raw)
-                .map_err(|e| format!("写窗口块失败: {e}"))?;
+            let path = self
+                .config
+                .storage
+                .store(config::StoreType::Window(&raw))
+                .map_err(|e| format!("写窗口块失败: {e}"))?
+                .path;
             let (head, tail) = self.window_sizes();
             // 与上下文压缩同一条 manifest（`pie context info` / `/stat` 看的就是它）
             record_compact(
@@ -1019,7 +1022,7 @@ impl Session {
                     "level": 3,
                     "kind": "session",
                     "raw_path": path.display().to_string(),
-                    "raw_hash": context::content_hash(&raw),
+                    "raw_hash": config::content_hash(&raw),
                     "summary": context::summarize_turns(&old, head, tail)
                         .chars()
                         .take(200)
@@ -1141,7 +1144,7 @@ impl Session {
     }
 
     fn at(path: PathBuf, config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
-        let manifest = Some(manifest_path_of(&path));
+        let manifest = Some(manifest_path_of(&config.storage, &path));
         Self {
             path,
             config: config.clone(),
@@ -1196,12 +1199,12 @@ fn escape_control_chars(json: String) -> String {
 }
 
 /// 压缩 manifest 路径：`~/.pie/context/<会话名>.manifest.jsonl`（只记不读）。
-fn manifest_path_of(session_path: &Path) -> PathBuf {
+fn manifest_path_of(storage: &config::Storage, session_path: &Path) -> PathBuf {
     let stem = session_path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    context::context_dir().join(format!("{stem}.manifest.jsonl"))
+    storage.context().join(format!("{stem}.manifest.jsonl"))
 }
 
 /// 单个工具失败不拖累其他工具：任何异常都文本化后回传模型，让它自己修。
@@ -1210,9 +1213,10 @@ async fn dispatch_tool(
     call: &ToolCall,
     args: &Value,
     cancel: &Cancel,
+    storage: &config::Storage,
 ) -> String {
-    // 取消信号随 ctx 传进工具层（shell 会在等待时 race 它、杀掉整个进程组）
-    let ctx = tools::ToolCtx::with_cancel(cancel.clone());
+    // 取消信号与数据目录随 ctx 传进工具层（shell 会在等待时 race 它、也可能要把 stdout 落盘）
+    let ctx = tools::ToolCtx::with_cancel(cancel.clone(), storage.clone());
     match registry.dispatch(&call.function.name, args, ctx).await {
         Ok(text) => text,
         Err(e) => format!("[工具错误] {e}"),
@@ -1249,8 +1253,8 @@ pub struct SessionInfo {
 }
 
 /// 列出历史会话（按 mtime 降序；`limit = None` = 全部）。
-pub fn list_sessions(limit: Option<usize>) -> Vec<SessionInfo> {
-    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
+pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<SessionInfo> {
+    let Ok(entries) = std::fs::read_dir(storage.sessions()) else {
         return Vec::new();
     };
     let mut files: Vec<(i64, PathBuf, u64)> = entries
@@ -1326,20 +1330,11 @@ fn record_compact(manifest: Option<&Path>, entry: &Value) {
     }
 }
 
-/// 会话目录：`~/.pie/sessions/`（`PIE_DIR` 可重定向）。
-pub fn sessions_dir() -> PathBuf {
-    config::pie_dir().join("sessions")
-}
-
 // ---------------------------------------------------------------- 图片文件管理
 //
 // 本地那一侧的事都在这里（`llm.rs` 只放 Files API 协议）：内容寻址副本、`__meta__.files`
-// 记录表、本地副本的 GC 清单。
-
-/// 本地副本目录：`~/.pie/files/`（与 `context/` 分开：那边是压缩落盘的文本）。
-pub fn files_dir() -> PathBuf {
-    config::pie_dir().join("files")
-}
+// 记录表、本地副本的 GC 清单。目录本身住 `config::Storage`（`sessions()` /
+// `files()`）——磁盘布局一处可见。
 
 /// 本地副本的 GC 保护窗口（小时）：比这新的未引用副本一概先留着。
 ///
@@ -1347,46 +1342,7 @@ pub fn files_dir() -> PathBuf {
 /// `__meta__.files` 之前没有任何引用，但路径可能正躺在输入框 / 某条命令里。
 pub const GC_PROTECT_HOURS: u64 = 24;
 
-/// 图片内容 id：`img-<sha256[:16]>`（与 `context` 的 `turn-<hash>` 同形状）。
-pub fn image_hash_id(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("img-{}", &hex::encode(hasher.finalize())[..16])
-}
 
-/// 把图片复制进 `~/.pie/files/`（内容寻址、幂等），返回 `(hash_id, 副本路径)`。
-///
-/// 先写临时文件再 rename（避免读到别人写了一半的副本）；权限 0o600（图是用户数据）。
-pub fn store_blob(data: &[u8], mime: &str) -> std::io::Result<(String, PathBuf)> {
-    let image_hash = image_hash_id(data);
-    let ext = match mime {
-        "image/jpeg" => ".jpg",
-        "image/png" => ".png",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/bmp" => ".bmp",
-        _ => "",
-    };
-    let dir = files_dir();
-    let path = dir.join(format!("{image_hash}{ext}"));
-    if path.exists() {
-        return Ok((image_hash, path));
-    }
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok((image_hash, path))
-}
 
 /// 记录还能不能直接用：同一 key / base_url + 未过期（`expires_at` 缺失 = 服务端永久保留）。
 pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
@@ -1448,9 +1404,9 @@ pub fn iter_session_files(sessions_dir: &Path) -> Vec<(PathBuf, String, Value)> 
 }
 
 /// `file_id` → 记着它的会话名（`files list --all` 标“谁传的”用）。
-pub fn file_id_index() -> HashMap<String, Vec<String>> {
+pub fn file_id_index(storage: &config::Storage) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
-    for (file, _, entry) in iter_session_files(&sessions_dir()) {
+    for (file, _, entry) in iter_session_files(&storage.sessions()) {
         if let Some(id) = entry.get("file_id").and_then(Value::as_str) {
             index
                 .entry(id.to_string())
@@ -1465,11 +1421,11 @@ pub fn file_id_index() -> HashMap<String, Vec<String>> {
 ///
 /// 副本是**跳会话共享**的（同一内容一个文件），所以“删会话”不会自动删副本 —— 回收靠这次
 /// 无状态扫描；服务端那份由上传时的 `expires_after`（默认 30 天）自行过期。
-pub fn collect_file_garbage(protect_hours: u64) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(files_dir()) else {
+pub fn collect_file_garbage(storage: &config::Storage, protect_hours: u64) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(storage.files()) else {
         return Vec::new();
     };
-    let referenced: std::collections::HashSet<PathBuf> = iter_session_files(&sessions_dir())
+    let referenced: std::collections::HashSet<PathBuf> = iter_session_files(&storage.sessions())
         .into_iter()
         .filter_map(|(_, _, e)| e.get("local").and_then(Value::as_str).map(PathBuf::from))
         .collect();
@@ -1504,8 +1460,7 @@ fn file_stem(path: &Path) -> String {
 }
 
 /// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
-fn resolve_path(id: Option<&str>) -> PathBuf {
-    let dir = sessions_dir();
+fn resolve_path(dir: &Path, id: Option<&str>) -> PathBuf {
     match id {
         None => dir.join(format!("chat-{}.jsonl", timestamp())),
         Some(id) => {
@@ -1572,6 +1527,27 @@ fn first_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::llm::{FunctionCall, Usage};
+
+    /// 测试用数据目录：跟随进程级 `PIE_DIR`（`pie_dir_tmp` + `env_lock` 那套）。
+    fn storage() -> config::Storage {
+        config::Storage::default()
+    }
+
+    /// 落一张图片副本 → `(id, 路径)`（`StoreType::Blob` 的薄包装，只为测试读起来短）。
+    fn blob(data: &[u8], mime: &str) -> (String, PathBuf) {
+        let s = storage()
+            .store(config::StoreType::Blob { data, mime })
+            .unwrap();
+        (s.id, s.path)
+    }
+
+    /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，仅供测试）。
+    fn raw(body: &str, prefix: &str) -> PathBuf {
+        storage()
+            .store(config::StoreType::Raw { prefix, body })
+            .unwrap()
+            .path
+    }
 
     /// 改进程级 `PIE_DIR` 的用例共用 `config::ENV_LOCK`（跟 `context` 的测试串行化）。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1766,7 +1742,7 @@ mod tests {
         assert_eq!(s.messages[0].compress_level, 0);
         assert_eq!(s.messages[1].compress_level, 3);
         let block = PathBuf::from(s.messages[1].raw_path.clone().expect("带指针"));
-        assert!(block.starts_with(context::windows_dir()), "{block:?}");
+        assert!(block.starts_with(storage().windows()), "{block:?}");
         assert!(block.exists(), "{block:?}");
         // 块里是**原文**（三条都在），且文件名最后一段就是内容 hash
         let raw = std::fs::read_to_string(&block).unwrap();
@@ -1774,7 +1750,7 @@ mod tests {
             assert!(raw.contains(needle), "块里丢了 {needle}：{raw}");
         }
         assert!(
-            block.file_stem().unwrap().to_string_lossy().ends_with(&context::content_hash(&raw)),
+            block.file_stem().unwrap().to_string_lossy().ends_with(&config::content_hash(&raw)),
             "hash 要放文件名最后一段：{block:?}"
         );
         // 摘要有窗口指针标记 + 首尾轮次
@@ -1783,7 +1759,7 @@ mod tests {
         assert!(text.contains("第一问"), "{text}");
 
         // manifest 里记了一条 level=3 的会话级事件
-        let manifest = manifest_path_of(&s.path);
+        let manifest = manifest_path_of(&s.config.storage, &s.path);
         let entries: Vec<Value> = std::fs::read_to_string(&manifest)
             .unwrap()
             .lines()
@@ -1909,14 +1885,14 @@ mod tests {
     fn blob_is_content_addressed_and_0600() {
         let _g = env_lock();
         let dir = pie_dir_tmp("blob");
-        let (h1, p1) = store_blob(b"same-bytes", "image/png").unwrap();
-        let (h2, p2) = store_blob(b"same-bytes", "image/png").unwrap();
+        let (h1, p1) = blob(b"same-bytes", "image/png");
+        let (h2, p2) = blob(b"same-bytes", "image/png");
         assert_eq!(h1, h2, "同内容同 id");
         assert_eq!(p1, p2, "幂等：同一份副本");
         assert!(h1.starts_with("img-") && h1.len() == 20, "{h1}");
         assert!(p1.to_string_lossy().ends_with(".png"), "{p1:?}");
         assert_eq!(std::fs::read(&p1).unwrap(), b"same-bytes");
-        assert_ne!(image_hash_id(b"other"), h1);
+        assert_ne!(config::image_hash_id(b"other"), h1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1957,10 +1933,10 @@ mod tests {
     fn garbage_needs_no_reference_and_past_protect_window() {
         let _g = env_lock();
         let dir = pie_dir_tmp("gc");
-        std::fs::create_dir_all(sessions_dir()).unwrap();
-        let (_, referenced) = store_blob(b"referenced", "image/png").unwrap();
-        let (_, orphan_old) = store_blob(b"orphan-old", "image/png").unwrap();
-        let (_, orphan_fresh) = store_blob(b"orphan-fresh", "image/png").unwrap();
+        std::fs::create_dir_all(storage().sessions()).unwrap();
+        let (_, referenced) = blob(b"referenced", "image/png");
+        let (_, orphan_old) = blob(b"orphan-old", "image/png");
+        let (_, orphan_fresh) = blob(b"orphan-fresh", "image/png");
         // 把孤儿副本的 mtime 拨到 2 天前（超出 24h 保护窗口）
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
         std::fs::File::options()
@@ -1974,15 +1950,15 @@ mod tests {
             "__meta__": true,
             "files": {"img-x": {"file_id": "f1", "local": referenced.display().to_string()}}
         });
-        std::fs::write(sessions_dir().join("s.jsonl"), format!("{meta}\n")).unwrap();
+        std::fs::write(storage().sessions().join("s.jsonl"), format!("{meta}\n")).unwrap();
 
         // 会话记录（`files list` 的数据源）读得出来，file_id 索引也建得出
-        let rows = iter_session_files(&sessions_dir());
+        let rows = iter_session_files(&storage().sessions());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "img-x");
-        assert!(file_id_index().contains_key("f1"));
+        assert!(file_id_index(&storage()).contains_key("f1"));
 
-        let garbage = collect_file_garbage(GC_PROTECT_HOURS);
+        let garbage = collect_file_garbage(&storage(), GC_PROTECT_HOURS);
         assert!(garbage.contains(&orphan_old), "{garbage:?}");
         assert!(!garbage.contains(&referenced), "被会话引用 → 不能收");
         assert!(!garbage.contains(&orphan_fresh), "保护窗口内 → 不能收");
@@ -2011,7 +1987,7 @@ mod tests {
             .block_on(s.ensure_image_file(b"bytes", "image/png", "x.png", "/tmp/x.png"))
             .is_none());
         assert!(s.files.is_empty());
-        assert!(!files_dir().exists(), "不开这个功能就没必要多存一份副本");
+        assert!(!storage().files().exists(), "不开这个功能就没必要多存一份副本");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2022,8 +1998,8 @@ mod tests {
     fn load_rebuilds_window_summaries() {
         let _g = env_lock();
         let dir = pie_dir_tmp("win");
-        std::fs::create_dir_all(context::context_dir()).unwrap();
-        let block = context::context_dir().join("session-abc.txt");
+        std::fs::create_dir_all(storage().context()).unwrap();
+        let block = storage().context().join("session-abc.txt");
         let raw = json!([
             {"role": "user", "content": "旧问题"},
             {"role": "assistant", "content": "旧答复"}
@@ -2062,13 +2038,13 @@ mod tests {
     fn full_history_expands_compaction_pointers() {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history");
-        std::fs::create_dir_all(context::context_dir()).unwrap();
+        std::fs::create_dir_all(storage().context()).unwrap();
         let config = Config::default();
         let mut s = Session::ephemeral(&config, llm(), tools());
 
         // 工具级：落盘的是被截断的那份输出全文（纯文本，不是消息）
         let full_text = "line1\nline2\nline3\n";
-        let spill = context::write_raw(full_text, "tool").unwrap();
+        let spill = raw(full_text, "tool");
         let mut tool = Message::tool_result(
             "call_1",
             "bash",
@@ -2098,7 +2074,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let turn = context::write_raw(&blob, "turn").unwrap();
+        let turn = raw(&blob, "turn");
         let mut summary = Message {
             role: "assistant".into(),
             content: Some(Content::Text(format!(
@@ -2136,11 +2112,11 @@ mod tests {
     fn full_history_falls_back_when_raw_is_gone() {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history-gone");
-        std::fs::create_dir_all(context::context_dir()).unwrap();
+        std::fs::create_dir_all(storage().context()).unwrap();
         let config = Config::default();
         let mut s = Session::ephemeral(&config, llm(), tools());
 
-        let turn = context::write_raw("[]", "turn").unwrap();
+        let turn = raw("[]", "turn");
         let mut summary = Message {
             role: "assistant".into(),
             content: Some(Content::Text(format!(
