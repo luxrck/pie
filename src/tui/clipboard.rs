@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use arboard::Clipboard;
 
-use crate::session;
 
 /// 剪贴板里的文件只认这些后缀（含多收的 TIFF）。
 /// —— 复制个 `.txt` 过来不算图片（会落回「剪贴板里没有图片」，不往输入框塞路径）。
@@ -31,16 +30,16 @@ const IMAGE_SUFFIXES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "t
 /// —— 文本不在这里兜底（那两个入口只负责图片）。
 ///
 /// 返回的路径插进输入框，回车即普通 `read`：位图是新落盘的副本，文件列表是磁盘上原文件。
-pub fn paste_image() -> Option<String> {
+pub fn paste_image(storage: &crate::config::Storage) -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     if let Ok(image) = clipboard.get_image() {
-        if let Some(path) = store_image(&image) {
+        if let Some(path) = store_image(storage, &image) {
             return Some(path);
         }
     }
     // 没有位图：macOS 的 furl / Windows 的 CF_HDROP / Linux 的 URI 列表都从这里出来。
-    if let Ok(paths) = clipboard.get().file_list() {
-        if let Some(path) = image_from_paths(&paths) {
+    if let Ok(storage) = clipboard.get().file_list() {
+        if let Some(path) = image_from_paths(&storage) {
             return Some(path.display().to_string());
         }
     }
@@ -86,8 +85,8 @@ pub fn no_image_hint() -> &'static str {
 }
 
 /// 文件列表 → 第一个「存在的图片文件」；**不复制**，直接用用户磁盘上那个文件。
-fn image_from_paths(paths: &[PathBuf]) -> Option<PathBuf> {
-    paths.iter().find(|p| is_image_file(p)).cloned()
+fn image_from_paths(storage: &[PathBuf]) -> Option<PathBuf> {
+    storage.iter().find(|p| is_image_file(p)).cloned()
 }
 
 fn is_image_file(path: &Path) -> bool {
@@ -98,7 +97,7 @@ fn is_image_file(path: &Path) -> bool {
 }
 
 /// arboard 的 RGBA 位图 → PNG 字节 → 内容寻址落盘。
-fn store_image(image: &arboard::ImageData<'_>) -> Option<String> {
+fn store_image(storage: &crate::config::Storage, image: &arboard::ImageData<'_>) -> Option<String> {
     let rgba = image::RgbaImage::from_raw(
         u32::try_from(image.width).ok()?,
         u32::try_from(image.height).ok()?,
@@ -106,8 +105,13 @@ fn store_image(image: &arboard::ImageData<'_>) -> Option<String> {
     )?;
     let mut png = std::io::Cursor::new(Vec::new());
     rgba.write_to(&mut png, image::ImageFormat::Png).ok()?;
-    let (_hash_id, path) = session::store_blob(&png.into_inner(), "image/png").ok()?;
-    Some(path.display().to_string())
+    let stored = storage
+        .store(crate::config::StoreType::Blob {
+            data: &png.into_inner(),
+            mime: "image/png",
+        })
+        .ok()?;
+    Some(stored.path.display().to_string())
 }
 
 #[cfg(test)]
@@ -131,11 +135,11 @@ mod tests {
             height: 2,
             bytes: std::borrow::Cow::Owned(bytes),
         };
-        let path = store_image(&data).expect("编码 + 落盘");
+        let path = store_image(&crate::config::Storage::default(), &data).expect("编码 + 落盘");
         assert!(path.contains("img-"), "{path}");
         assert!(std::path::Path::new(&path).exists());
         // 同内容再来一次 → 同一份副本（内容寻址）
-        let again = store_image(&data).expect("再来一次");
+        let again = store_image(&crate::config::Storage::default(), &data).expect("再来一次");
         assert_eq!(path, again);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -153,15 +157,15 @@ mod tests {
         let png = dir.join("shot.png");
         std::fs::write(&png, b"x").unwrap();
 
-        let paths = vec![
+        let storage = vec![
             txt,                     // 存在但不是图片
             dir.join("missing.png"), // 图片后缀但不存在
             upper.clone(),           // 大写扩展名也算
             png.clone(),             // 已经有更靠前的了，取不到
         ];
-        assert_eq!(image_from_paths(&paths), Some(upper));
+        assert_eq!(image_from_paths(&storage), Some(upper));
         // 一条都没有图片 → None（不再退回文本：复制个 .txt 不该往输入框里塞路径）
-        assert_eq!(image_from_paths(&paths[..2]), None);
+        assert_eq!(image_from_paths(&storage[..2]), None);
         assert_eq!(image_from_paths(&[]), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

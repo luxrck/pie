@@ -18,7 +18,7 @@ pie/
 ├── src/
 │   ├── lib.rs        # 核心库入口（模块边界在这里声明）
 │   ├── main.rs       # CLI：一次性（子 agent）/ TUI 入口 + sessions/context/files 子命令
-│   ├── config.rs     # ~/.pie/config.toml + 分层 system prompt + 全局记忆种子 + 项目根/时间工具
+│   ├── config.rs     # ~/.pie/config.toml + 数据存储（Storage：目录 + 落盘）+ 分层 system prompt + 全局记忆种子 + 项目根/时间工具
 │   ├── llm.rs        # OpenAI 兼容客户端（reqwest + 手写 SSE，**无 SDK**）+ 重试 + Files API + 余额
 │   ├── tools.rs      # 工具层：Tool trait + ToolRegistry + read/edit/writ/bash
 │   ├── session.rs    # 会话 JSONL + resume + 回合循环（Session::aturn）+ 图片记录/本地副本
@@ -107,6 +107,10 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   `• Thought for 3.4s` 那行——不落盘的话退出再 `-r` 就没了（非流式没有增量事件 → None）。
 - 目录分工别混：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘），`/clear` 归档的窗口块在
   `~/.pie/windows/`（用户主动归档的原文，gc 不碰），本地图片副本在 `~/.pie/files/`（有 24h mtime 保护窗）。
+- **磁盘布局与落盘都住 `config::Storage`**（一个 root + `sessions()` / `context()` / `files()` / `windows()` + `store(StoreType)`；
+  `StoreType::{Blob,Raw,Window}` 分别对应图片副本 / 压缩原文 / 窗口块，目录、命名、0o600、原子写都在那儿）。
+  `Config.storage` 是默认值（`PIE_DIR` → `./.pie` → `~/.pie`），`ToolCtx.storage` 把它带进工具层（bash 全文落盘要用）。
+  **别再读环境变量、别再拼目录字面量**；测试用 `Storage::at(临时目录)` 注入，不必改进程级 `PIE_DIR`。
 - **执行旋钮按次传**：`Session::aturn(input, on_event, cancel, max_steps, stream, parallel_tools)`；
   `--max-steps` / `--no-stream` **不进 Config**（CLI 直接传，TUI 经 `tui::run` 带下来）。
 - 重试收敛成唯一驱动器 `LlmClient::with_retry(what, op, decide)` + `Retry::{Backoff, Now, Give}`；
@@ -155,6 +159,9 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   每个终端事件 / 每个流式 delta / 每 66ms tick 都跑一帧，**没有 dirty 标记**（ratatui 的 diff 只省终端写入）；长会话是已知瓶颈
   （实测与三条治法、以及「改用终端 scrollback」的取舍见 `docs/CHANGELOG.md` 2026-09-28）→ 别往 `render` 里再加 O(历史) 的活。
 - lean 模式（`[tui] lean`，默认 true）只压工具活动那一行；`/help` 文案由 `palette::COMMANDS` 生成。
+- **`/cd <路径>`**（切换工作目录）：`set_current_dir` + 重解析 `config.storage`（与 CLI `--cwd` 同口径：
+  `PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）+ 往**会话历史与消息流**各插一条 system 说明
+  （`已切换工作目录：<路径>`——历史里那条是给模型的 cwd 上下文）+ 作废 `@` 补全索引；`~` 会展开。
 
 ### 配置、提示词、记忆
 

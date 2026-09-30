@@ -74,8 +74,6 @@ pub struct Message {
     /// 压缩落盘的原文件（自描述指针）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_hash: Option<String>,
     /// 压缩前的原始文本长度 / token 估算（消息已被改写，靠它按比例复原估算）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_len: Option<i64>,

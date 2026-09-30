@@ -46,18 +46,21 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 //
 // ---------------------------------------------------------------- 工具上下文
 
-/// 工具执行上下文：目前只装**取消信号**（将来放实时进度回调也走这条链）。
+/// 工具执行上下文：装**取消信号**与**数据目录**（将来放实时进度回调也走这条链）。
 ///
 /// 按值传（内部是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
 #[derive(Clone, Default)]
 pub struct ToolCtx {
     pub cancel: Option<crate::cancel::Cancel>,
+    /// 数据目录（bash 全文落盘要用；默认从 `PIE_DIR` 解析）。
+    pub storage: crate::config::Storage,
 }
 
 impl ToolCtx {
-    pub fn with_cancel(cancel: crate::cancel::Cancel) -> Self {
+    pub fn with_cancel(cancel: crate::cancel::Cancel, storage: crate::config::Storage) -> Self {
         Self {
             cancel: Some(cancel),
+            storage,
         }
     }
 }
@@ -845,9 +848,14 @@ impl Tool for Bash {
             None => Ok(format_output(&headers, &out)),
             Some(head) => {
                 // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针，指针是取回
-                // 被截掉那部分的唯一途径。落盘走 context::write_raw（内容 hash 寻址，按内容去重）。
-                let spill = crate::context::write_raw(&out, "bash")
-                    .map(|p| p.display().to_string())
+                // 被截掉那部分的唯一途径。落盘走 `Storage::store`（内容 hash 寻址，按内容去重）。
+                let spill = ctx
+                    .storage
+                    .store(crate::config::StoreType::Raw {
+                        prefix: "bash",
+                        body: &out,
+                    })
+                    .map(|s| s.path.display().to_string())
                     .unwrap_or_else(|e| format!("(落盘失败: {e})"));
                 headers.push(format!("[工具输出全文已保存: {spill}]"));
                 Ok(format_output(

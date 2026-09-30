@@ -2,6 +2,26 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-09-29（`--cwd` / `/cd`：数据目录跟着工作目录走，并在会话里留一条 cwd 说明）
+
+- **`--cwd` 之后重解析数据目录**（用户点名要）：`Storage` 是在 `Config::load` 时定型的，而 `--cwd` 的 `set_current_dir` 在更晚的 `run()` 里 —— 原来切了工作目录、数据目录却不变。现在 `set_current_dir` 后紧跟 `config.storage = Storage::from_env()`：`PIE_DIR` 仍优先，其次新 cwd 下的 `.pie`（存在才算），最后 `~/.pie`。
+- **TUI 新增 `/cd <路径>`**（手动切工作目录，与 `--cwd` 同一口径）：`set_current_dir` + 重解析 + 刷新 `App.storage` 与 `session.config.storage` + 重抓状态栏快照 + 作废 `@` 补全索引；`~` 会展开；数据目录真的换了就顺带写进说明里。
+  切换后**往会话历史与消息流各插一条 system 说明**（`已切换工作目录：<绝对路径>`）——历史那条是给模型的 cwd 上下文（模型得知道目录变了），流里那条是给人看的（`· ` 开头的 Notice）。
+- 验证：`cargo test` 206（lib，含 `tui::app::tests::cd_switches_working_dir_and_announces_it`）+ 4（bin）全绿；`cargo clippy --all-targets` 仍 14（与基线一致）。CLI 实测：`--cwd <含 .pie 的目录> sessions` 读的是那个 `.pie/sessions`，`--cwd <无 .pie 的目录> sessions` 回到 `~/.pie`。
+
+## 2026-09-29（落盘收敛成 `config::Storage::store`；文件名不换 uuid）
+
+用户问了两件事：`session::store_blob` / `context::write_raw` 的文件名是 hash、`session::save` 是 timestamp，**能不能统一成 uuid**？四个目录函数（`sessions_dir` / `context_dir` / `files_dir` / `windows_dir`）**能不能都放进 `config.rs`**？后来又问：**能不能合成一个 `store(StoreType)` 入口**？
+
+- **文件名不换 uuid**。三处看似「三种 id 生成法」，实际是**两种语义**：会话文件是「事件 id」（`chat-<unix 秒>-<微秒>`，唯一 + 天然可排序），而 `files/` 图片副本与 `context/` 原文是**内容寻址**（`img-<sha256[:16]>` / `<prefix>-<hash>.txt`）。后者不是「拿个哈希当文件名」，而是功能：同内容只存一份（图片重复粘贴幂等，`blob_is_content_addressed_and_0600` 钉住）、跨会话共享同一份副本、`context gc` 的引用计数才有意义。换 uuid 会把这些换成「同内容存 N 份」 + 引 `uuid` 依赖，而时间戳已到微秒、单机根本撞不上。**收尾：不动**（要统一就统一「命名形状」，不是 id 生成算法）。
+- **目录 + 落盘合进 `config::Storage`**（就是先叫 `Paths` 的那个类型，按用户要求扩充）：一个 root + `sessions()` / `context()` / `files()` / `windows()` + **`store(StoreType) -> Stored`**。三种形态在 enum 里、策略**不合并**：`Blob`（图片副本，0o600 + 原子写）/ `Raw`（压缩原文）内容寻址 + 幂等（已存在则不动），`Window`（`/clear` 窗口块）名字带 unix 秒、要留住每一次归档；内核统一成 `write_atomic`（先写同目录临时件再 rename）。它挂在 `Config.storage`（`#[serde(skip)]`）与 `ToolCtx.storage`（bash 全文落盘那条链）上。
+- **参数是 `&Storage`，不是 `&Config`、也不是函数内部取默认值**：`ToolCtx` 只装 storage（没有 Config）；落盘也只需要「写哪儿」。内部取 `Storage::default()` 会让测试隔离退回进程级 `PIE_DIR` + `env_lock`（不能并行）——上一轮专门消除了这个。
+- **三个薄壳已删**：`context::write_raw` / `context::write_window_block` / `session::store_blob` 不再存在，调用点直接 `storage.store(StoreType::{Raw,Window,Blob})`；`content_hash` / `image_hash_id` 搬进 `config`（`context.rs` 不再需要 sha2）。四个 `config::*_dir()` 自由函数更早就删了（它们每次都去读环境变量，而 `context.rs` 里还手拼过一个 `pie_dir().join("sessions")`——布局散落的证据）。
+- **`pie_dir()` 搜索顺序**：`PIE_DIR` → 当前目录下的 `.pie`（**存在**才算，不凭空造）→ `~/.pie`；抽成纯函数 `pick_root(env, cwd, home)` 直接测顺序，不必改进程 cwd。
+- **顺带删 `Message.raw_hash`**：全仓库没有任何读者（只在 `llm.rs` 声明 + 三处赋值），是纯元数据噪音。旧会话 JSONL 里的 `raw_hash` 被 `#[serde(default)]` 静默忽略，反序列化不受影响。⚠ manifest 里的 `raw_hash` **保留**：`pie context info` 会原样打印整行给用户看，那是审计信息。
+- 验证：`cargo test` 205（lib，含新增的 `pie_dir_prefers_env_then_local_then_home`）+ 4（bin）全绿；`cargo clippy --all-targets` 的 warning 数与 `HEAD` 基线一致（14 → 14）。
+- 还没做：存量测试从 `PIE_DIR` + `env_lock` 迁到 `Storage::at(临时目录)`（只迁了 `context::tests::gc_keeps_referenced_files_only` 作示范），迁完才能解锁测试并行。
+
 ## 2026-09-29（把「pie 是 pi 的 Rust 实现」写进描述）
 
 - **三处描述统一交代 pie ↔ pi 的关系**（用户：「我想强调 pie 和 pi 的关系，pie 是一个类似 pi 的极简 agent，用 Rust 实现」，

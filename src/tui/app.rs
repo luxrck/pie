@@ -121,6 +121,9 @@ fn inside(area: Rect, column: u16, row: u16) -> bool {
 pub struct App {
     /// 会话（回合任务与 UI 共用；回合期间锁被任务握着）。
     session: Arc<Mutex<Session>>,
+    /// 数据目录（`Ctrl+G` 粘图要落盘；从 `session.config.storage` 拄一份，
+    /// 免得为一个同步路径去异步锁会话）。
+    storage: crate::config::Storage,
     tx: UnboundedSender<UiEvent>,
     cells: Vec<Cell>,
     input: Input,
@@ -201,6 +204,7 @@ impl App {
     pub fn new(session: Session, max_steps: Option<usize>, stream: Option<bool>) -> (Self, UnboundedReceiver<UiEvent>) {
         let (tx, rx) = unbounded_channel();
         let lean = session.config.tui.lean;
+        let storage = session.config.storage.clone();
         let snapshot = Snapshot::capture(&session);
         // resume 的历史：把已有对话回放进消息流（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
@@ -210,6 +214,7 @@ impl App {
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
         let app = Self {
             session: Arc::new(Mutex::new(session)),
+            storage,
             tx,
             cells,
             input: Input::new(),
@@ -818,6 +823,7 @@ impl App {
                     )
                 });
             }
+            "cd" => self.change_dir(arg),
             "clear" => self.with_session_mut("切换窗口", |s| match s.clear_window() {
                 Ok(n) => {
                     let _ = s.save();
@@ -842,6 +848,52 @@ impl App {
             "balance" => self.spawn_fetch_balance(true),
             other => self.push_notice(&format!("未知命令：/{other}（/help 看列表）")),
         }
+    }
+
+    /// `/cd <路径>`：切工作目录（进程级 `set_current_dir`）。
+    ///
+    /// 数据目录跟着重解析（`PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）——切到带 `.pie` 的
+    /// 项目目录后，压缩落盘 / 图片副本 / 会话列表都落在那儿（与 CLI 的 `--cwd` 同一个口径）。
+    /// 切换会往**会话历史**与**消息流**各插一条 system 说明：历史里那条是给模型的上下文
+    /// （它得知道 cwd 变了），流里那条是给人看的。
+    fn change_dir(&mut self, arg: &str) {
+        if arg.trim().is_empty() {
+            self.push_notice(&format!("当前工作目录：{}（用法：/cd <路径>）", cwd_text()));
+            return;
+        }
+        let target = expand_tilde(arg.trim());
+        if let Err(e) = std::env::set_current_dir(&target) {
+            self.cells.push(Cell::Error(format!(
+                "切换工作目录失败 {}: {e}",
+                target.display()
+            )));
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap_or(target);
+        let storage = crate::config::Storage::from_env();
+        let mut text = format!("已切换工作目录：{}", cwd.display());
+        if storage.root != self.storage.root {
+            // 数据目录也跟着走了 → 说清楚落盘换到哪儿了（模型与人都需要知道）
+            text.push_str(&format!("（数据目录：{}）", storage.root.display()));
+        }
+        self.storage = storage.clone();
+        // 锁内只做「改会话 + 取快照」，出来再动 `self`（`guard` 借的是 `self.session`）
+        let announced = self.session.try_lock().ok().map(|mut guard| {
+            guard.config.storage = storage;
+            guard
+                .messages
+                .push(crate::llm::Message::system(text.clone()));
+            Snapshot::capture(&guard)
+        });
+        match announced {
+            Some(snapshot) => self.snapshot = snapshot,
+            // 回合中锁被任务占着：cwd 已经切了，历史里那条晚一点再补
+            None => self.push_notice("会话正忙：工作目录已切，历史里的说明稍后再生效"),
+        }
+        self.cells.push(Cell::Notice(text));
+        // `@` 补全的索引与补全会话都是按旧 cwd 建的 → 作废，下次用会在新目录重建
+        self.file_index = None;
+        self.path_session = None;
     }
 
     /// 回合进行中要读会话：锁被任务占着就提示，别卡住界面。
@@ -1146,7 +1198,7 @@ impl App {
     /// 纯文本不走这里 —— 终端自己的粘贴键（`⌘V` / `Ctrl+Shift+V`）经 bracketed paste
     /// 直接进输入框，见 `on_terminal_event` 的 `Event::Paste`。
     fn paste_clipboard(&mut self) {
-        match clipboard::paste_image() {
+        match clipboard::paste_image(&self.storage) {
             Some(path) => {
                 self.input.insert(&path);
                 self.push_notice("已插入图片路径（回车即 read 它）");
@@ -1491,6 +1543,17 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     (mark, format!("{}", out.trim_end_matches('\n')))
 }
 
+/// `/cd` 的 `~` 展开：`~` / `~/x` → 主目录下；其余原样（相对路径按当前 cwd 解析）。
+fn expand_tilde(arg: &str) -> PathBuf {
+    if arg == "~" {
+        return crate::config::home_dir();
+    }
+    match arg.strip_prefix("~/") {
+        Some(rest) => crate::config::home_dir().join(rest),
+        None => PathBuf::from(arg),
+    }
+}
+
 fn cwd_text() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -1524,6 +1587,50 @@ fn normalize_newlines(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// `/cd`：切 cwd + 数据目录跟着重解析 + 历史/消息流各插一条 system 说明。
+    #[test]
+    fn cd_switches_working_dir_and_announces_it() {
+        // cwd 与 `PIE_DIR` 都是进程级的 → 与其它环境类用例共用锁，收尾原样恢复
+        let _g = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_cwd = std::env::current_dir().unwrap();
+        let saved_pie = std::env::var_os("PIE_DIR");
+        std::env::remove_var("PIE_DIR");
+
+        let target = std::env::temp_dir().join(format!("pie-cd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(target.join(".pie")).unwrap();
+        // macOS：`/var` 是 `/private/var` 的软链 → 先 canonicalize，才能跟 `current_dir()` 对上
+        let target = target.canonicalize().unwrap();
+        let shown = target.join(".pie");
+
+        let mut app = test_app();
+        app.input.set_text(&format!("/cd {}", target.display()));
+        app.submit();
+
+        assert_eq!(std::env::current_dir().unwrap(), target, "cwd 切过去了");
+        assert_eq!(app.storage.root, shown, "数据目录跟着走（新 cwd 下有 .pie）");
+        {
+            let session = app.session.try_lock().unwrap();
+            assert_eq!(session.config.storage.root, shown, "会话那份也刷新了");
+            let last = session.messages.last().expect("历史里应有一条 system 说明");
+            assert_eq!(last.role, "system");
+        }
+        let text = target.display().to_string();
+        assert!(
+            matches!(app.cells.last(), Some(Cell::Notice(t)) if t.contains(&text)),
+            "消息流里应有一条带新路径的 Notice"
+        );
+
+        std::env::set_current_dir(&saved_cwd).unwrap();
+        match saved_pie {
+            Some(v) => std::env::set_var("PIE_DIR", v),
+            None => std::env::remove_var("PIE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&target);
+    }
 
     fn test_app() -> App {
         app_with_rx().0

@@ -8,7 +8,7 @@
 //!     （user 保留），原文落盘成 `[轮次原文已保存: <path>]`，摘要只留模型最终输出；
 //!   - **会话级**（level 3）：当前轮之前的整段历史落盘成**窗口块**
 //!     （`~/.pie/context/session-*.txt`；被 manifest / 会话 meta 引用，GC 不碰。`/clear` 归档的窗口块
-//!     另在 `~/.pie/windows/`，见 [`windows_dir`]），
+//!     另在 `~/.pie/windows/`，见 [`crate::config::Storage::windows`]），
 //!     插一条 `[历史窗口: <path>]` 摘要 system 消息，旧窗口摘要继续留在上下文里；
 //!   - 压缩级别**只升不降**；落盘按内容 hash 寻址（同内容只存一份）。
 //!
@@ -20,17 +20,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-use crate::config::{pie_dir, Config};
+use crate::config::{Config, Storage, StoreType};
 use crate::llm::{Content, Message};
 
 // ---------------------------------------------------------------- 目录与常量
-
-/// 落盘正文目录（`PIE_DIR` 可重定向）。
-pub fn context_dir() -> PathBuf {
-    pie_dir().join("context")
-}
+//
+// 磁盘布局（`context_dir` / `windows_dir`）住 `config`——一处定义，别处只管用。
 
 /// 窗口摘要消息的开头标记（便于识别）。
 pub const WINDOW_SUMMARY_MARKER: &str = "[历史窗口:";
@@ -119,49 +115,9 @@ pub fn messages_tokens(messages: &[Message]) -> i64 {
 }
 
 // ---------------------------------------------------------------- 落盘
-
-/// 内容寻址：sha256 前 16 位（同内容只落一份）。
-pub fn content_hash(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hex::encode(hasher.finalize())[..16].to_string()
-}
-
-/// 历史窗口块目录：`<PIE_DIR>/windows/`。
-///
-/// **刻意放在 `context/` 之外**：那是压缩落盘 + `context gc` 的地盘，而窗口块是用户
-/// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它。
-pub fn windows_dir() -> PathBuf {
-    crate::config::pie_dir().join("windows")
-}
-
-/// 把一段窗口原文落成窗口块（`/clear` 用），返回路径。
-///
-/// 文件名 `window-<unix 秒>-<内容 hash>.jsonl`：时间戳防重名（同一秒内两次 `/clear`
-/// 内容必然不同、hash 不同），**hash 放最后一段** —— 读回时 `window_summary_messages`
-/// 就是按「文件名最后一段」取 `raw_hash` 的（与 shell 落盘同一规矩）。
-pub fn write_window_block(raw: &str) -> std::io::Result<PathBuf> {
-    let dir = windows_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!(
-        "window-{}-{}.jsonl",
-        crate::config::now().as_secs(),
-        content_hash(raw)
-    ));
-    std::fs::write(&path, raw)?;
-    Ok(path)
-}
-
-/// 原文落盘：`<PIE_DIR>/context/<prefix>-<hash>.txt`（已存在则不动）。
-pub fn write_raw(blob: &str, prefix: &str) -> std::io::Result<PathBuf> {
-    let dir = context_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{prefix}-{}.txt", content_hash(blob)));
-    if !path.exists() {
-        std::fs::write(&path, blob)?;
-    }
-    Ok(path)
-}
+//
+// 落盘本身住 `config::Storage`（`store()`：内容寻址 + 原子写都在那儿）——这里只管
+// 「什么时候写、写哪个前缀」，即 `context/`（压缩原文）与 `windows/`（窗口块）两个目录的用法。
 
 /// 追加一条压缩事件到 manifest（jsonl）。
 pub fn write_manifest(manifest: &Path, entry: &Value) -> std::io::Result<()> {
@@ -387,7 +343,6 @@ fn is_user(m: &Message) -> bool {
 /// 压缩落盘后给消息打上「原文指针」元数据。
 fn set_raw(m: &mut Message, path: &Path, blob: &str) {
     m.raw_path = Some(path.display().to_string());
-    m.raw_hash = Some(raw_hash_of(path));
     m.raw_len = Some(blob.chars().count() as i64);
     m.raw_tokens = Some(chars_div4(blob));
 }
@@ -449,6 +404,7 @@ fn compact_tools(
     messages: &mut [Message],
     config: &crate::config::ToolCompaction,
     keep: usize,
+    storage: &Storage,
     cb: &mut dyn FnMut(Value),
 ) -> usize {
     let protected = protected_step_tool_indices(messages, keep);
@@ -466,9 +422,13 @@ fn compact_tools(
             continue;
         }
         let prefix = m.tool_name.clone().unwrap_or_else(|| "tool".to_string());
-        let Ok(path) = write_raw(&content, &prefix) else {
+        let Ok(stored) = storage.store(StoreType::Raw {
+            prefix: &prefix,
+            body: &content,
+        }) else {
             continue;
         };
+        let path = stored.path;
         let mut preview: Vec<&str> = lines[..config.head.min(lines.len())].to_vec();
         preview.push(TOOL_GAP);
         if config.tail > 0 {
@@ -495,6 +455,7 @@ fn compact_tools(
 fn compact_turns(
     messages: &mut Vec<Message>,
     target: Option<i64>,
+    storage: &Storage,
     cb: &mut dyn FnMut(Value),
 ) -> usize {
     let completed = messages
@@ -534,7 +495,7 @@ fn compact_turns(
         }
         let Some((u, end)) = victim else { break };
         let span: Vec<Message> = messages[u + 1..end].to_vec();
-        let new_msg = compact_turn_span(&span, cb);
+        let new_msg = compact_turn_span(&span, storage, cb);
         messages.splice(u + 1..end, std::iter::once(new_msg));
         count += 1;
     }
@@ -542,13 +503,19 @@ fn compact_turns(
 }
 
 /// 把一轮的叶子压成摘要 assistant（user 保留在外层）：原文落盘 + `[轮次原文已保存: …]` + 最终输出。
-fn compact_turn_span(span: &[Message], cb: &mut dyn FnMut(Value)) -> Message {
+fn compact_turn_span(span: &[Message], storage: &Storage, cb: &mut dyn FnMut(Value)) -> Message {
     let raw = pretty_indent1(&Value::Array(
         span.iter()
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect(),
     ));
-    let path = write_raw(&raw, "turn").ok();
+    let path = storage
+        .store(StoreType::Raw {
+            prefix: "turn",
+            body: &raw,
+        })
+        .ok()
+        .map(|s| s.path);
     let final_text = span
         .iter()
         .filter(|m| m.role == "assistant")
@@ -589,6 +556,7 @@ fn compact_turn_span(span: &[Message], cb: &mut dyn FnMut(Value)) -> Message {
 fn compact_session(
     messages: &mut Vec<Message>,
     config: &crate::config::SessionCompaction,
+    storage: &Storage,
     cb: &mut dyn FnMut(Value),
 ) -> bool {
     let Some(current_start) = messages.iter().rposition(is_user) else {
@@ -610,9 +578,13 @@ fn compact_session(
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect(),
     ));
-    let Ok(path) = write_raw(&raw, "session") else {
+    let Ok(stored) = storage.store(StoreType::Raw {
+        prefix: "session",
+        body: &raw,
+    }) else {
         return false;
     };
+    let path = stored.path;
     let summary = build_window_summary(&path, config.head, config.tail);
     let digest = summarize_turns(&load_window_dicts(&path), config.head, config.tail);
     cb(compact_event(3, "session", &path, &digest));
@@ -673,14 +645,20 @@ pub fn maybe_compact(
         None => &mut noop,
     };
     if let Some(tool_config) = &compaction.tool {
-        stats.tools = compact_tools(messages, tool_config, config.keep_last_steps, &mut *cb);
+        stats.tools = compact_tools(
+            messages,
+            tool_config,
+            config.keep_last_steps,
+            &config.storage,
+            &mut *cb,
+        );
     }
     if compaction.turn && messages_tokens(messages) > target {
-        stats.turns = compact_turns(messages, Some(target), &mut *cb);
+        stats.turns = compact_turns(messages, Some(target), &config.storage, &mut *cb);
     }
     if let Some(session_config) = &compaction.session {
         if messages_tokens(messages) > target {
-            stats.session = compact_session(messages, session_config, &mut *cb);
+            stats.session = compact_session(messages, session_config, &config.storage, &mut *cb);
         }
     }
     stats.saved_tokens = (before - messages_tokens(messages)).max(0);
@@ -729,11 +707,17 @@ pub fn compact(
     };
     if matches!(mode, CompactMode::Auto | CompactMode::Tools) {
         if let Some(tool_config) = &compaction.tool {
-            stats.tools = compact_tools(messages, tool_config, config.keep_last_steps, &mut *cb);
+            stats.tools = compact_tools(
+                messages,
+                tool_config,
+                config.keep_last_steps,
+                &config.storage,
+                &mut *cb,
+            );
         }
     }
     if matches!(mode, CompactMode::Auto | CompactMode::Turns) && compaction.turn {
-        stats.turns = compact_turns(messages, None, &mut *cb);
+        stats.turns = compact_turns(messages, None, &config.storage, &mut *cb);
     }
     stats.saved_tokens = (before - messages_tokens(messages)).max(0);
     stats
@@ -742,9 +726,9 @@ pub fn compact(
 // ---------------------------------------------------------------- GC
 
 /// 被引用的原文文件：所有 manifest 条目 + 所有会话消息里的 `raw_path`。
-pub fn referenced_raw_paths() -> HashSet<PathBuf> {
+pub fn referenced_raw_paths(storage: &Storage) -> HashSet<PathBuf> {
     let mut refs: HashSet<PathBuf> = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(context_dir()) {
+    if let Ok(entries) = std::fs::read_dir(storage.context()) {
         for e in entries.flatten() {
             let p = e.path();
             if !p.to_string_lossy().ends_with(".manifest.jsonl") {
@@ -763,7 +747,7 @@ pub fn referenced_raw_paths() -> HashSet<PathBuf> {
             }
         }
     }
-    for session in std::fs::read_dir(pie_dir().join("sessions"))
+    for session in std::fs::read_dir(storage.sessions())
         .into_iter()
         .flatten()
         .flatten()
@@ -798,9 +782,9 @@ fn absolutize(path: &str) -> Option<PathBuf> {
 }
 
 /// `context/` 下没有被任何会话引用的 `.txt`（可安全删除）。窗口块在 `windows/`，不受影响。
-pub fn collect_context_garbage() -> Vec<PathBuf> {
-    let referenced = referenced_raw_paths();
-    let mut garbage: Vec<PathBuf> = std::fs::read_dir(context_dir())
+pub fn collect_context_garbage(storage: &Storage) -> Vec<PathBuf> {
+    let referenced = referenced_raw_paths(storage);
+    let mut garbage: Vec<PathBuf> = std::fs::read_dir(storage.context())
         .into_iter()
         .flatten()
         .flatten()
@@ -818,6 +802,19 @@ mod tests {
     use crate::config::{CompactionConfig, SessionCompaction, ToolCompaction};
     use crate::llm::{FunctionCall, ToolCall};
     use serde_json::json;
+
+    /// 测试用数据目录：跟随进程级 `PIE_DIR`（`pie_dir_tmp` + `env_lock` 那套）。
+    fn storage() -> Storage {
+        Storage::default()
+    }
+
+    /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，只为测试读起来短）。
+    fn raw(body: &str, prefix: &str) -> PathBuf {
+        storage()
+            .store(StoreType::Raw { prefix, body })
+            .unwrap()
+            .path
+    }
 
     /// 测试会改进程级 `PIE_DIR` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
     /// 某个测试 panic 后锁会中毒（这不是错误，只是个测试挂了）→ 继续拿锁，别连锁失败。
@@ -870,8 +867,8 @@ mod tests {
     fn content_hash_and_pointer_round_trip() {
         let _g = env_lock();
         let dir = pie_dir_tmp("hash");
-        let a = write_raw("same", "bash").unwrap();
-        let b = write_raw("same", "bash").unwrap();
+        let a = raw("same", "bash");
+        let b = raw("same", "bash");
         assert_eq!(a, b, "同内容只落一份");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "same");
         // 真指针：文件在 → 认；把文件删了（或凭空写的字符串）→ 假指针，不算
@@ -901,6 +898,7 @@ mod tests {
             &mut msgs,
             &ToolCompaction { head: 2, tail: 2 },
             1,
+            &storage(),
             &mut |e| events.push(e),
         );
         assert_eq!(n, 1, "只压保护窗口（最近 1 个 step 批次）之外的那条");
@@ -935,6 +933,7 @@ mod tests {
                 &mut short,
                 &ToolCompaction { head: 2, tail: 2 },
                 0,
+                &storage(),
                 &mut |_| {}
             ),
             0
@@ -957,7 +956,7 @@ mod tests {
             assistant_text("第二轮答复"),
         ];
         let mut events: Vec<Value> = Vec::new();
-        let n = compact_turns(&mut msgs, None, &mut |e| events.push(e));
+        let n = compact_turns(&mut msgs, None, &storage(), &mut |e| events.push(e));
         assert_eq!(n, 1);
         assert_eq!(msgs.len(), 5, "3 条叶子 → 1 条摘要");
         assert_eq!(msgs[1].role, "user", "user 保留");
@@ -974,7 +973,7 @@ mod tests {
             .unwrap()
             .contains("第一轮答复"));
         // 已经压过 → 没有可再压的
-        assert_eq!(compact_turns(&mut msgs, None, &mut |_| {}), 0);
+        assert_eq!(compact_turns(&mut msgs, None, &storage(), &mut |_| {}), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -991,7 +990,12 @@ mod tests {
         ];
         let mut events: Vec<Value> = Vec::new();
         let config = SessionCompaction { head: 1, tail: 1 };
-        assert!(compact_session(&mut msgs, &config, &mut |e| events.push(e)));
+        assert!(compact_session(
+            &mut msgs,
+            &config,
+            &storage(),
+            &mut |e| events.push(e)
+        ));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["level"], 3);
         // 窗口块路径从事件里回报（不再单开出参）——调用方据此登记
@@ -1006,7 +1010,7 @@ mod tests {
         assert!(text.contains("旧问题") && text.contains("旧答复"), "{text}");
         assert_eq!(msgs[2].role, "user");
         // 只剩窗口摘要 + 当前轮 → 没有再可归档的
-        assert!(!compact_session(&mut msgs, &config, &mut |_| {}));
+        assert!(!compact_session(&mut msgs, &config, &storage(), &mut |_| {}));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1087,7 +1091,7 @@ mod tests {
     fn marks_shell_spill_so_gc_keeps_it() {
         let _g = env_lock();
         let dir = pie_dir_tmp("spill");
-        let full = write_raw(&long_body(200), "bash").unwrap();
+        let full = raw(&long_body(200), "bash");
         let text = format!(
             "[exit=0]\n\n[工具输出全文已保存: {}]\n\nline 1\n...[中间省略]...\nline 200\n",
             full.display()
@@ -1101,9 +1105,9 @@ mod tests {
         let raw = PathBuf::from(msg.raw_path.clone().unwrap());
         assert!(raw.exists());
         // 关键：manifest + raw_path 都引用了它 → GC 不能删
-        write_manifest(&context_dir().join("s.manifest.jsonl"), &entry).unwrap();
-        assert!(referenced_raw_paths().contains(&raw));
-        assert!(!collect_context_garbage().contains(&raw));
+        write_manifest(&storage().context().join("s.manifest.jsonl"), &entry).unwrap();
+        assert!(referenced_raw_paths(&storage()).contains(&raw));
+        assert!(!collect_context_garbage(&storage()).contains(&raw));
 
         // 指针指向的文件不存在（如 read 回来的源码里恰好含这种字符串）→ 假指针，不动消息
         let fake = "[工具输出全文已保存: /tmp/pie-definitely-missing.txt]";
@@ -1136,20 +1140,29 @@ mod tests {
 
     #[test]
     fn gc_keeps_referenced_files_only() {
-        let _g = env_lock();
-        let dir = pie_dir_tmp("gc");
-        let referenced = write_raw("referenced", "bash").unwrap();
-        let orphan = write_raw("orphan", "turn").unwrap();
-        let manifest = context_dir().join("s.manifest.jsonl");
+        // ⚠ 注入临时 root（不用 `PIE_DIR` + `env_lock`）→ 不与并行用例抢、也不碰真实 `~/.pie`
+        let dir = std::env::temp_dir().join(format!("pie-ctx-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::at(&dir);
+        // 这里必须用注入的 `storage`（`raw()` 走的是默认 root，会写到别处去）
+        let put = |prefix: &str, body: &str| {
+            storage
+                .store(StoreType::Raw { prefix, body })
+                .unwrap()
+                .path
+        };
+        let referenced = put("bash", "referenced");
+        let orphan = put("turn", "orphan");
+        let manifest = storage.context().join("s.manifest.jsonl");
         write_manifest(
             &manifest,
             &json!({"level": 1, "raw_path": referenced.display().to_string()}),
         )
         .unwrap();
-        let garbage = collect_context_garbage();
+        let garbage = collect_context_garbage(&storage);
         assert!(garbage.contains(&orphan), "{garbage:?}");
         assert!(!garbage.contains(&referenced), "{garbage:?}");
-        assert!(referenced_raw_paths().contains(&referenced));
+        assert!(referenced_raw_paths(&storage).contains(&referenced));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
