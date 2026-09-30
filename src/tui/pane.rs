@@ -197,14 +197,14 @@ pub fn fmt_duration(d: Duration) -> String {
     }
 }
 
-/// 工具调用的一行摘要：从参数 JSON 里抠出最有信息量的那个字段（`read`/`write`/`edit` 取
-/// `path`、`shell` 取 `command`）。
+/// 工具调用的一行摘要：从参数 JSON 里抠出最有信息量的那个字段（`read`/`writ`/`edit` 取
+/// `path`、`bash` 取 `command`、`repl` 取 `code`）。
 ///
-/// 只有这两个键可达 —— 内置工具的字符串参数就 `path` / `command` / `content` / `edits`
-/// （`content` 是正文、`edits` 是数组，都不适合当摘要），没有哪些工具用 `file_path` /
+/// 只有这三个键可达 —— 内置工具的字符串参数就 `path` / `command` / `code` / `content` /
+/// `edits`（`content` 是正文、`edits` 是数组，都不适合当摘要），没有哪些工具用 `file_path` /
 /// `pattern` / `query` 这类键。以后加新工具再往这里补它的键。
 pub fn tool_summary(arguments: &str) -> String {
-    const KEYS: [&str; 2] = ["path", "command"];
+    const KEYS: [&str; 3] = ["path", "command", "code"];
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) {
         for key in KEYS {
             if let Some(v) = value.get(key).and_then(|v| v.as_str()) {
@@ -1262,6 +1262,7 @@ mod tests {
             "seq 1 3"
         );
         assert_eq!(tool_summary(r#"{"path":"/tmp/a b.png"}"#), "/tmp/a b.png");
+        assert_eq!(tool_summary(r#"{"code":"print(1)","timeout":null}"#), "print(1)");
         assert_eq!(tool_summary("不是 JSON"), "不是 JSON");
         // 判成败只看第一行：`[exit=` 开头且不是 `[exit=0]` = 失败；没有头 = 成功
         assert_eq!(tool_status("[exit=0]\n\nhi"), Status::Ok);

@@ -1,7 +1,7 @@
 # pie
 
 `pie` 是 [`pi`](https://github.com/earendil-works/pi)（TypeScript 写的 agent harness）的 **Rust 重实现**：一个极简的
-agent harness —— 内置 read / edit / **writ** / **bash** 四个工具。对外提供 cli 可执行文件、Rust API 库和相应的 Python 绑定。
+agent harness —— 内置 read / edit / **writ** / **bash** / **repl** 五个工具。对外提供 cli 可执行文件、Rust API 库和相应的 Python 绑定。
 
 ## 命令行
 
@@ -39,7 +39,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | `--auto-compact-threshold <N>` | 服务端上报的上下文超过该值即自动压缩 |
 | `--timeout-seconds` / `--max-retries` / `--max-retry-delay-seconds` | HTTP 超时 / 重试次数 / 重试等待上限 |
 | `--cwd <目录>` | 工具的工作目录（默认当前目录） |
-| `--tools <名单>` | 限制可用工具，如 `read,ls,grep`（自带名 `read/edit/writ/bash` 启用对应工具，其余当 shell 子命令白名单） |
+| `--tools <名单>` | 限制可用工具，如 `read,ls,grep`（自带名 `read/edit/writ/bash/repl` 启用对应工具，其余当 shell 子命令白名单） |
 | `--system-prompt <文本或路径>` / `--append-system-prompt <…>` | 替换基础提示 / 追加到 system prompt（可重复） |
 | `--mode <text\|json\|transcript>` | 一次性模式的输出格式（默认 `text`） |
 | `--stat` | 跑完把 `/stat` 报告（上下文占用 / 压缩事件 / API 用量）打到 stderr |

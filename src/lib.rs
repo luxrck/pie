@@ -8,6 +8,7 @@
 //!   - [`config`]  —— 配置加载/保存 + 分层 system prompt + 全局记忆种子
 //!   - [`llm`]     —— OpenAI 兼容客户端（reqwest + 手写 SSE，无 SDK）+ 重试 + Files API
 //!   - [`tools`]   —— read / edit / writ / bash（结构体即参数：一个工具 = 一个结构体）
+//!   - [`repl`]    —— `repl`：会话内持久的 IPython（长活子进程，状态挂 `tools::SessionState`）
 //!   - [`cli`] —— 会话/图片文件的列表与维护（`pie sessions` / `files list|gc` 的数据源）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + gc
@@ -25,6 +26,7 @@ pub mod log;
 pub mod cli;
 pub mod session;
 pub mod tools;
+pub mod repl;
 
 /// TUI（ratatui + crossterm）。**不进绑定**：`default-features = false` 时整个模块不参与编译，
 /// 相关的可选依赖（ratatui / crossterm / ratatui-textarea / tui-markdown / arboard / unicode-width）

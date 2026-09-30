@@ -315,16 +315,6 @@ pub fn compact_session(
     Ok(Some((path, event)))
 }
 
-// ---------------------------------------------------------------- 消息构造辅助
-
-fn is_tool(m: &Message) -> bool {
-    m.role == "tool"
-}
-
-fn is_user(m: &Message) -> bool {
-    m.role == "user" && !m.synthetic
-}
-
 // ---------------------------------------------------------------- 三级压缩
 
 /// step 批次（半开区间）：一次 `assistant(tool_calls)` + 其后的连续 tool 结果。
@@ -335,7 +325,7 @@ fn step_batches(flat: &[Message]) -> Vec<(usize, usize)> {
         let m = &flat[i];
         if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
             let mut j = i + 1;
-            while j < flat.len() && is_tool(&flat[j]) {
+            while j < flat.len() && flat[j].role == "tool" {
                 j += 1;
             }
             batches.push((i, j));
@@ -354,7 +344,7 @@ fn protected_step_tool_indices(flat: &[Message], keep: usize) -> HashSet<usize> 
     let start = batches.len().saturating_sub(keep);
     let mut protected = HashSet::new();
     for (s, e) in &batches[start..] {
-        protected.extend((*s..*e).filter(|&i| is_tool(&flat[i])));
+        protected.extend((*s..*e).filter(|&i| flat[i].role == "tool"));
     }
     protected
 }
@@ -370,7 +360,7 @@ fn compact_tools(
     let protected = protected_step_tool_indices(messages, config.keep_last_steps);
     let mut count = 0usize;
     for (i, m) in messages.iter_mut().enumerate() {
-        if !is_tool(m) || m.compress_level >= 1 || protected.contains(&i) {
+        if m.role != "tool" || m.compress_level >= 1 || protected.contains(&i) {
             continue;
         }
         let Some(Content::Text(content)) = &m.content else {
@@ -415,7 +405,7 @@ fn compact_turns(
 ) -> usize {
     let completed = messages
         .iter()
-        .filter(|m| is_user(m))
+        .filter(|m| m.role == "user" && !m.synthetic)
         .count()
         .saturating_sub(1);
     let mut count = 0usize;
@@ -424,7 +414,7 @@ fn compact_turns(
         let user_idxs: Vec<usize> = messages
             .iter()
             .enumerate()
-            .filter(|&(_, m)| is_user(m))
+            .filter(|&(_, m)| m.role == "user" && !m.synthetic)
             .map(|(i, _)| i)
             .collect();
         let mut victim: Option<(usize, usize)> = None;
