@@ -351,12 +351,28 @@ fn format_reply(
     max_lines: Option<i64>,
     max_bytes: Option<i64>,
 ) -> ToolOutput {
-    // 图像附件：只留**确实存在**的文件（driver 偶尔会把已被删掉的临时图报上来）。
+    // 图像附件：driver 出的是**临时** PNG（一小时后它自己会清），这里转存进内容寻址的本地副本
+    // 目录（`files/img-<hash>.png`）——会话 `__meta__.files` 记的 `local` 才立得住，`files gc`
+    // 也才认得出它还被引用（见 `session::record_repl_images`）。读不到字节的（已被删掉的
+    // 临时图）直接跳过。
     let images: Vec<std::path::PathBuf> = reply
         .images
         .iter()
-        .map(|s| std::path::PathBuf::from(s.as_str()))
-        .filter(|p| p.is_file())
+        .filter_map(|s| std::fs::read(s).ok())
+        .filter_map(|data| {
+            match ctx
+                .storage
+                .store(crate::config::StoreType::Blob {
+                    data: &data,
+                    mime: "image/png",
+                }) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    crate::log::warn(format!("[warn] repl 图副本写入失败: {e}"));
+                    None
+                }
+            }
+        })
         .collect();
     let mut body = String::new();
     for part in [
@@ -433,6 +449,24 @@ while True:
 import sys
 sys.stderr.write("ModuleNotFoundError: No module named 'IPython'\n")
 sys.exit(3)
+"#;
+
+    /// 把「输入 code」当成一个文件路径回帧的假驱动：用它验证**图从临时目录转存进 `files/`**
+    /// （不依赖 IPython / matplotlib）。
+    const FAKE_IMAGES: &str = r#"
+import json, os, struct, sys
+inp = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
+out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+while True:
+    head = inp.read(4)
+    if len(head) < 4:
+        break
+    (size,) = struct.unpack(">I", head)
+    path = inp.read(size).decode("utf-8").strip()
+    images = [path] if os.path.isfile(path) else []
+    payload = {"stdout": "", "stderr": "", "error": None, "images": images}
+    body = json.dumps(payload).encode("utf-8")
+    out.write(struct.pack(">I", len(body)) + body); out.flush()
 "#;
 
     /// 有 python3 才跑（本工具本来就要解释器；没有就跳过）。
@@ -570,6 +604,28 @@ sys.exit(3)
         let args = json!({"code": "stall", "_python": py, "_driver": FAKE, "timeout": 1});
         let out = reg.dispatch("repl", &args, ctx).await.unwrap();
         assert!(out.text.contains("超过 1s"), "{out:?}");
+    }
+
+    /// driver 出的图是**临时** PNG → 工具层转存成 `files/img-<hash>.png`（会话才留得住它）。
+    #[tokio::test]
+    async fn driver_images_land_in_the_local_store() {
+        let Some(py) = python3() else { return };
+        let tmp = tempdir("images");
+        let reg = registry();
+        let ctx = ctx_at(&tmp);
+        // 模拟 driver 落的临时图（内容不要求是真 PNG——工具层只读字节转存）
+        let src = tmp.join("fig-tmp.png");
+        std::fs::write(&src, b"fake-png-bytes").unwrap();
+
+        let args = json!({
+            "code": src.display().to_string(), "_python": py, "_driver": FAKE_IMAGES
+        });
+        let out = reg.dispatch("repl", &args, ctx).await.unwrap();
+        assert_eq!(out.images.len(), 1, "{out:?}");
+        let stored = &out.images[0];
+        assert_eq!(stored.parent().unwrap(), tmp.join("files"), "转存进 files/：{stored:?}");
+        assert!(stored.to_string_lossy().ends_with(".png"), "{stored:?}");
+        assert_eq!(std::fs::read(stored).unwrap(), b"fake-png-bytes");
     }
 
     /// 对模型暴露的 schema：只有 `code`（必填）+ `timeout`，私有参数不进。

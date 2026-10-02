@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use ratatui::Frame;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Style;
@@ -143,9 +145,27 @@ impl Repl {
 
     /// 按会话历史重建画布（消息流那边是 `Cell::from_messages`，这是它的 repl 版）。
     ///
-    /// ⚠ 图**不会**回来：图像是运行时附件，没进会话文件（临时文件过一个小时也被清了）。
-    pub fn from_messages(messages: &[Message]) -> Self {
+    /// `files` = 会话的 `__meta__.files`：`repl` 出的图靠条目里的 `calls` 认回自己那条记录
+    /// （`local` 就是要渲染的本地副本 `files/img-<hash>.png`；文件被 gc / 手工删了就当没图）。
+    pub fn from_messages(messages: &[Message], files: &HashMap<String, Value>) -> Self {
         let mut view = Self::default();
+        // 调用 id → 它产出的图（`__meta__.files[*].calls` 的反向表）
+        let mut by_call: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for entry in files.values() {
+            let Some(local) = entry.get("local").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = PathBuf::from(local);
+            if !path.is_file() {
+                continue; // 本地副本没了 → 别记一条渲染不出来的路径
+            }
+            let Some(calls) = entry.get("calls").and_then(Value::as_array) else {
+                continue; // `read` 那条路的记录没有 `calls`（它不产图给画布）
+            };
+            for id in calls.iter().filter_map(Value::as_str) {
+                by_call.entry(id).or_default().push(path.clone());
+            }
+        }
         // tool_call_id → 画布里的下标（结果消息只带 id，名字/参数在调用那条里）
         let mut pending: HashMap<String, usize> = HashMap::new();
         for m in messages {
@@ -158,7 +178,7 @@ impl Repl {
                     code: code_of(&call.function.arguments),
                     output: None,
                     status: Status::Running,
-                    images: Vec::new(), // 图是运行时附件，不进会话文件 → 回放不出图
+                    images: Vec::new(),
                 });
             }
             if m.role == "tool" {
@@ -169,8 +189,17 @@ impl Repl {
                 let content = m.content_text();
                 view.entries[index].status = pane::tool_status(&content);
                 view.entries[index].output = Some(content);
+                if let Some(images) = by_call.remove(id) {
+                    view.entries[index].images = images;
+                }
             }
         }
+        // 贴底时显示最近一张（与实时收到结果时一致；之后每帧 `pick_image` 会按滚动位置重选）
+        view.image = view
+            .entries
+            .iter()
+            .rev()
+            .find_map(|e| e.images.last().cloned());
         view
     }
 
@@ -773,13 +802,54 @@ mod tests {
             assistant,
             Message::tool_result("c1", "repl", "1\n"),
         ];
-        let view = Repl::from_messages(&messages);
+        let view = Repl::from_messages(&messages, &HashMap::new());
         let text = plain(&view, 40);
         assert!(text.contains("❯ print(1)"), "{text}");
         assert!(text.contains("  1"), "结果要配对到那条调用上：{text}");
         assert!(!text.contains("ls"), "只有 repl 的工具进画布：{text}");
-        // 图是运行时附件（不进会话）→ 回放后没有图
+        // `__meta__.files` 里没有 `calls` 记录 → 回放后没有图
         assert!(view.image.is_none());
+    }
+
+    /// `-r` 时图也回来：靠 `__meta__.files` 的 `calls`（`local` 是要渲染的本地副本）。
+    #[test]
+    fn resume_restores_the_image_recorded_in_meta_files() {
+        use crate::llm::{FunctionCall, ToolCall};
+        let png = temp_png("resume.png", 40, 20);
+        let assistant = Message {
+            role: "assistant".into(),
+            tool_calls: Some(vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "repl".into(),
+                    arguments: r#"{"code":"plt.show()"}"#.into(),
+                },
+            }]),
+            ..Default::default()
+        };
+        let messages = vec![
+            Message::user("画个图"),
+            assistant,
+            Message::tool_result("c1", "repl", ""),
+        ];
+        // 会话首行 `__meta__.files` 里的那条（`local` + `calls`）
+        let mut files = HashMap::new();
+        files.insert(
+            "img-deadbeef".to_string(),
+            serde_json::json!({
+                "hash_id": "img-deadbeef",
+                "local": png.display().to_string(),
+                "calls": ["c1"],
+            }),
+        );
+        let view = Repl::from_messages(&messages, &files);
+        assert_eq!(view.entries[0].images, vec![png.clone()], "图要配回那次调用");
+        assert_eq!(view.image.as_ref(), Some(&png), "贴底时显示最近一张");
+        assert!(
+            view.split(Rect::new(0, 0, 40, 20)).1.is_some(),
+            "有图就该切出图区"
+        );
     }
 
     #[test]

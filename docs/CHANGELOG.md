@@ -2,6 +2,46 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-01（滚动条 thumb 贴不到底）
+
+用户：「看看右边的 scrollbar，我已经划到最底部了」——截图里 thumb 停在轨道中段（后面还空着一大截）。
+
+**根因**：ratatui 的 `ScrollbarState::position` 满量程是 `content_length - 1`
+（`thumb_start = position*track/(content-1+viewport)`），而 `App::render_scrollbar` 直接拿「总行数」当 `content_length`
+→ 分母多算 `height - 1`：滚到底 `thumb_start` 只到轨道 `total/(total+height-1)` 处（贴顶倒是准的；
+`total/height` 越大偏差的**比例**越小，内容只比视口大一点时一眼可见）。
+
+- 改传「**可滚位置数**」`total - height + 1`：满量程正好 = 最大偏移 `total - height`，于是
+  `thumb_len = round(V*T/total)`、贴底 = `thumb_start + thumb_len == 轨道底`。消息流与画布共用这一个函数，一处改两处好。
+- 顺带：点/拖到轨道最底行的可视结果也终于自洽（修前 `scrollbar_jump` 把偏移拖到 `0` 时，thumb 同样贴不到底）。
+- 测试：`tui::app::tests::the_thumb_reaches_the_track_bottom_when_scrolled_to_the_end`
+  （贴底占住轨道最后一行、贴顶占住第一行；用例特意挑 `total` 只比视口大一点的场景，分母算错才看得出来）。
+
+## 2026-10-01（repl 的图活过重启：转存 `files/` + `__meta__.files.calls`）
+
+用户：「为啥关闭重新打开 pie，repl 的 image 就消失了？」→ 拍板「driver 出图后存进 `~/.pie/files/`」并「复用 `__meta__.files`」。
+
+**根因**：图原先是纯运行时附件（driver 落的临时 PNG → `ToolOutput.images` → 画布），会话文件里根本没有它
+→ `-r` 时 `Repl::from_messages` 只能填 `Vec::new()`；而临时 PNG 一小时后还会被 driver 自己清掉。
+
+- `repl.rs::format_reply`：把 driver 的临时 PNG 读成字节后走 `storage.store(StoreType::Blob)` 转存成
+  内容寻址副本 `files/img-<hash>.png`（同内容只落一份、0o600、原子写）→ 进 `ToolOutput.images`。
+- `session.rs::record_repl_images`（`aturn` 里工具结果入历史后调）：把副本登记进 `__meta__.files` ——
+  `local` 让 `files gc` 认得出「还被引用」，`calls` 记下是哪几次调用产出了它（`hash → entry` 没有调用维度，
+  这是 `-r` 配回画布的唯一线索）。与 `read` 那条路共表 → 只补自己那几项，**按字段合并**。
+- `ensure_image_file` 的写入从整条 `insert` 改成按字段合并（同 hash 的两条来源不再互抹 `file_id` / `calls`）。
+- `Repl::from_messages(messages, files)`：按 `files[*].calls` 建反向表把图填回对应 entry（`local` 不在就当没图），
+  贴底时预选最近一张；`App::new` 传入 `&session.files`。
+- `pie files list`：没 `file_id` 的（本地图）显示 `file_id=-  过期=-`（不再拿 `?` / `永久` 误导）。
+
+判据复习（用户问过）：`collect_file_garbage` = 「`files/` 下常规文件 ∩ 未被任何会话 `__meta__.files[*].local`
+引用 ∩ mtime ≥ 24h」—— **与 `expires_at` / `file_id` 无关**，所以保命只需一条带 `local` 的登记。
+
+测试：`repl::tests::driver_images_land_in_the_local_store`（假驱动喂临时 PNG → 落在 `files/`）、
+`session::tests::repl_images_are_registered_for_gc_and_resume`（登记 + 落盘后 `gc` 保住 + `calls` 去重追加）、
+`tui::repl::tests::resume_restores_the_image_recorded_in_meta_files`。另用手头 venv 的真 matplotlib
+临时跑了一次端到端（图 → `files/img-a87ed86998952d74.png`，PNG magic 正确），验完删。
+
 ## 2026-10-01（REPL 画布也有滚动条）
 
 用户：「tui Repl 也加个 scrollbar 吧」。

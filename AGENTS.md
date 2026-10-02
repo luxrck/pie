@@ -169,7 +169,10 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   一张，见 `Repl::pick_image`）——固定 Rect 才不会因滚动重传，而 `Protocol` 编码一次、区域变了才重编）。⚠ 协议档位**只按环境变量定**
   （`tui::pick_terminal_protocol`）：**别用 `Picker::from_query_stdio`** —— 它把「读终端回应」丢到独立
   线程，超时后那个线程杀不掉、会跟 crossterm 抢 stdin（实测 `←`/`→` 直接失效）。WezTerm 系（含 Kaku）
-  只有 iTerm2 无 bug。
+  只有 iTerm2 无 bug。**图能活过重启**：driver 的临时 PNG 由 `repl.rs::format_reply` 转存成内容寻址副本
+  `files/img-<hash>.png`，`Session::record_repl_images` 把 `{local, calls, src:"repl"}` 登记进
+  `__meta__.files`（`local` 保 `files gc` 不回收、`calls` 供 `-r` 复原），`Repl::from_messages(messages, files)`
+  按 `calls` 把图填回对应记录；与 `read` 那条路共表 → `ensure_image_file` **按字段合并**（别整条覆盖）。
 - **贴图的 `FontSize` 必须等于终端真实字符格**（`pick_terminal_protocol` 用 `crossterm::terminal::window_size()`
   的 `xpixel/ypixel ÷ 列/行` 现问，问不到才退回 10×20）：iTerm2 协议是按**像素**发图的
   （`1337;File=…;width=Npx`），终端就照这个像素数 1:1 画 —— 猜错多少，图就按那个比例缩错多少
@@ -198,7 +201,10 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   鼠标捕获为滚轮常开 → 框选/拖选都得自己做，写完剪贴板用长活 `Copier`（每帧新建再 drop 会砸屏 + 复制不生效）。
 - **滚动条（消息流与 REPL 画布各一份）**：当前视图右缘**固定**留 1 列（`bar_w = body.width > 2`）——因为折行宽度与 markdown 缓存键都吃 `width`，
   「有溢出才留」会让跨阈值那一下换宽度 → 整段重排 + 缓存全失效；因此没溢出时**只是不画**（`ScrollbarState` 的 thumb 会铺满，很难看）。
-  画法只有一份 `App::render_scrollbar`；换算只有一份 `App::scrollbar_jump`（线性映射，不按 thumb 尺寸抓取），它按 tab 分派：
+  画法只有一份 `App::render_scrollbar`——⚠ 它的 `ScrollbarState::new(...)` 传的是「**可滚位置数**」`total - height + 1`，
+  **不是总行数**：ratatui 的 `position` 满量程是 `content_length - 1`（`thumb_start = position*track/(content-1+viewport)`），
+  传总行数会让分母多算 `height - 1` → 滚到底 thumb 也只到轨道 `total/(total+height-1)` 处、永远贴不到底。
+  换算只有一份 `App::scrollbar_jump`（线性映射，不按 thumb 尺寸抓取），它按 tab 分派：
   消息流改 `scroll_from_bottom`，画布交给 `Repl::jump_to_row`（行数/顶部行是 `Repl` 上一帧渲染时记的 `total` / `top`：
   画布视图下 `App.body` 是空的，滚动条只能问它自己）。
   `surface_at` 有三种面：输入框 > 滚动条 > 消息流（`body` 已经是**不含**滚动条列的那块；画布视图下 `body` 为空 → 画布本身不成框选面）
