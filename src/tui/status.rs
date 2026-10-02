@@ -259,7 +259,7 @@ pub fn hint_text(busy: bool, tab: Tab) -> &'static str {
         (Tab::Repl, true) => "Esc 停止 · ← / → 切视图",
         (Tab::Chat, true) => "Esc 停止 · PgUp/PgDn 滚动 · Ctrl+C 退出",
         (Tab::Chat, false) => {
-            "⏎ 发送 · ⇧⏎ 换行 · PgUp/PgDn 滚动 · Ctrl+G 粘贴图片 · Ctrl+C 退出"
+            "← / → 切视图 · ⏎ 发送 · ⇧⏎ 换行 · PgUp/PgDn 滚动 · Ctrl+G 粘贴图片 · Ctrl+C 退出"
         }
     }
 }

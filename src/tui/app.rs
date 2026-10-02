@@ -221,10 +221,10 @@ impl App {
         let snapshot = Snapshot::capture(&session);
         // resume 的历史：把已有对话回放进消息流**与 REPL 画布**（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
-        // （画布只回放 code/output——图是运行时附件，没进会话文件。）
+        // （画布的图靠 `__meta__.files` 里的 `calls` 认回来，见 `Repl::from_messages`。）
         let history = session.full_history();
         let cells = Cell::from_messages(&history);
-        let repl = Repl::from_messages(&history).with_picker(picker);
+        let repl = Repl::from_messages(&history, &session.files).with_picker(picker);
         // 主题：`Config.theme`（族名 / 具体 flavor 都认，见 `Palette::from_name`）。认不出来就用
         // 默认并留一句告警——`run()` 里装好出口后再说（此刻 raw mode + 交替屏，写 stderr 会砸花）。
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
@@ -565,7 +565,11 @@ impl App {
         if bar.width == 0 || total <= height as usize {
             return;
         }
-        let mut state = ScrollbarState::new(total)
+        // `top` 是「顶部显示行」（满量程 `total - height`），而 ratatui 把 `position` 的满量程当成
+        // `content_length - 1`（`thumb_start = position*track/(content-1+viewport)`）——直接传「总行数」
+        // 会让分母多算 `height - 1`：滚到底 thumb 只到轨道 `total/(total+height-1)` 处，永远差一截。
+        // 改传「可滚位置数」（满量程正好 = 最大偏移 `total - height`）两边才对上。
+        let mut state = ScrollbarState::new(total - height as usize + 1)
             .position(top)
             .viewport_content_length(height as usize);
         frame.render_stateful_widget(
@@ -3268,6 +3272,53 @@ mod tests {
             .count();
         assert!(drawn > 0, "溢出时该画出 thumb");
         assert!(drawn < app.body.height as usize, "thumb 不该铺满整条：{drawn}");
+    }
+
+    /// **滚到底时 thumb 必须贴住轨道底**（贴顶时贴住轨道顶）。
+    ///
+    /// ratatui 的 `position` 满量程是 `content_length - 1`（`thumb_start = position*track/(content-1+viewport)`）
+    /// —— 直接拿「总行数」当 `content_length` 会把分母多算 `height - 1`：内容只比视口大一点时，
+    /// 滚到底 thumb 只到轨道中段（用户实测到的那一条）。
+    #[test]
+    fn the_thumb_reaches_the_track_bottom_when_scrolled_to_the_end() {
+        const W: u16 = 40;
+        let mut app = test_app();
+        for i in 0..6 {
+            app.cells.push(Cell::User(format!("第 {i} 行")));
+        }
+        let buf = render_buffer(&mut app, W, 12);
+        let bar_x = app.body.right();
+        let total = app.pane.total();
+        let height = app.body.height as usize;
+        assert!(total > height, "该溢出：total={total} height={height}");
+        assert!(
+            total < 2 * height + 2,
+            "要挑「内容只比视口多一点」的场景（V/C 大，分母算错才看得出来）：total={total}"
+        );
+        assert_eq!(app.scroll_from_bottom, 0, "默认贴底");
+        assert_eq!(
+            buf[(bar_x, app.body.bottom() - 1)].symbol(),
+            "▐",
+            "贴底时 thumb 该占住轨道最后一行"
+        );
+        assert_ne!(
+            buf[(bar_x, app.body.y)].symbol(),
+            "▐",
+            "贴底时轨道第一行不该是 thumb"
+        );
+
+        app.scroll_from_bottom = app.max_scroll();
+        let buf = render_buffer(&mut app, W, 12);
+        assert_eq!(
+            buf[(bar_x, app.body.y)].symbol(),
+            "▐",
+            "贴顶时 thumb 该占住轨道第一行"
+        );
+        assert_ne!(
+            buf[(bar_x, app.body.bottom() - 1)].symbol(),
+            "▐",
+            "贴顶时轨道最后一行不该是 thumb"
+        );
     }
 
     /// 点/拖滚动条**只改消息流的滚动偏移**：输入框（含它自己的视口与草稿）一点不动，

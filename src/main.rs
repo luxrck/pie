@@ -722,14 +722,17 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 println!("{image_hash}  {size:>10} B  {mime}  {local_name}");
+                let file_id = entry.get("file_id").and_then(Value::as_str);
                 let expires = entry.get("expires_at").and_then(Value::as_f64);
                 let expires_txt = match expires {
                     Some(t) if t > 0.0 => config::fmt_local(t as i64),
-                    _ => "永久".to_string(),
+                    // 没记有效期 = 服务端永久件；`repl` 出的是纯本地图（从不上传）→ 谈不上过期
+                    None if file_id.is_some() => "永久".to_string(),
+                    _ => "-".to_string(),
                 };
                 println!(
                     "    file_id={}  过期={expires_txt}  源={}",
-                    entry.get("file_id").and_then(Value::as_str).unwrap_or("?"),
+                    file_id.unwrap_or("-"),
                     entry.get("src").and_then(Value::as_str).unwrap_or("")
                 );
                 println!("    会话={}", session_stem(&session_file));

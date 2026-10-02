@@ -552,6 +552,8 @@ impl Session {
                 let mut msg = Message::tool_result(&call.id, name, out.text.clone());
                 msg.mark_compressed(1, out.spill.as_deref());
                 self.messages.push(msg);
+                // `repl` 出的图登记进 `__meta__.files`（本地副本保命 + `calls` 供 resume 配对）
+                self.record_repl_images(call, &out);
                 batch_results.push(out.text);
             }
             if interrupted {
@@ -806,6 +808,53 @@ impl Session {
         changed
     }
 
+    /// 登记 `repl` 产出的图：写进 `__meta__.files`（`local` 保命 + `calls` 供 resume 配对）。
+    ///
+    /// 为什么必须登记：图落地后是 `files/img-<hash>.png`，而 `files gc` 的判据是「未被任何会话
+    /// 的 `__meta__.files[*].local` 引用 + 放置超过 `GC_PROTECT_HOURS`」——不登记就活不过一天。
+    /// `calls` 则是 `Repl::from_messages` 把图配回那次调用的唯一线索（`hash → entry` 本身没有
+    /// 调用维度）。
+    ///
+    /// 与 `read` 那条路（[`Self::ensure_image_file`]）共用同一张表（同内容 = 同 hash），所以
+    /// **按字段合并**：已有的 `file_id` / `base_url` 等照旧留着，只补自己这几项。
+    fn record_repl_images(&mut self, call: &ToolCall, out: &ToolOutput) {
+        if call.function.name != "repl" || out.images.is_empty() {
+            return;
+        }
+        for path in &out.images {
+            if !path.is_file() {
+                continue;
+            }
+            let hash_id = config::name_of(path);
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let entry = self.files.entry(hash_id.clone()).or_insert_with(|| json!({}));
+            entry["hash_id"] = json!(hash_id);
+            entry["size"] = json!(size);
+            entry["mime"] = json!("image/png");
+            entry["local"] = json!(path.display().to_string());
+            if entry.get("filename").is_none() {
+                entry["filename"] = json!(filename);
+            }
+            if entry.get("src").is_none() {
+                entry["src"] = json!("repl");
+            }
+            // `calls`：产出过这张图的调用（去重追加）——resume 就靠它把图配回画布那条记录
+            let mut calls = entry
+                .get("calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !calls.iter().any(|v| v.as_str() == Some(call.id.as_str())) {
+                calls.push(json!(call.id));
+            }
+            entry["calls"] = json!(calls);
+        }
+    }
+
     /// 保证这张图有一个可用的 `file_id`：先落本地副本 → 命中可用记录就复用，否则上传。
     ///
     /// 未开启（`files_api = false` / 模型不支持）或上传失败 → `None`，调用方就不注入图片
@@ -861,22 +910,23 @@ impl Session {
                 return None;
             }
         };
-        self.files.insert(
-            image_hash.clone(),
-            json!({
-                "hash_id": image_hash,
-                "size": data.len(),
-                "mime": mime,
-                "filename": filename,
-                "src": src,
-                "local": local.display().to_string(),
-                "file_id": uploaded.id,
-                "base_url": base_url,
-                "key_fp": key_fp,
-                "uploaded_at": config::now().as_secs() as i64,
-                "expires_at": uploaded.expires_at,
-            }),
-        );
+        // **按字段合并**：同 hash 可能已被 `repl` 那条路登记过（`calls` / `src`）——整条覆盖
+        // 会把那些抹掉（下次 `repl` 出的同张图就配不回画布了）。这里只动上传相关的字段。
+        let entry = self
+            .files
+            .entry(image_hash.clone())
+            .or_insert_with(|| json!({}));
+        entry["hash_id"] = json!(image_hash);
+        entry["size"] = json!(data.len());
+        entry["mime"] = json!(mime);
+        entry["filename"] = json!(filename);
+        entry["src"] = json!(src);
+        entry["local"] = json!(local.display().to_string());
+        entry["file_id"] = json!(uploaded.id);
+        entry["base_url"] = json!(base_url);
+        entry["key_fp"] = json!(key_fp);
+        entry["uploaded_at"] = json!(config::now().as_secs() as i64);
+        entry["expires_at"] = json!(uploaded.expires_at);
         Some(uploaded.id)
     }
 
@@ -1697,6 +1747,57 @@ mod tests {
         ));
     }
 
+
+    /// `repl` 出的图登记两条命脉：`local`（`files gc` 才认得“还被引用”）+ `calls`（`-r` 才配回画布）。
+    #[test]
+    fn repl_images_are_registered_for_gc_and_resume() {
+        let dir = std::env::temp_dir().join(format!("pie-repl-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            storage: config::Storage::at(&dir),
+            ..Default::default()
+        };
+        let mut s = Session::new(&config, Some("s.jsonl"), llm(), tools());
+        // `repl.rs` 转存后的持久副本（`files/img-<hash>.png`）
+        let image = config
+            .storage
+            .store(config::StoreType::Blob {
+                data: b"png-bytes",
+                mime: "image/png",
+            })
+            .unwrap();
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "repl".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let out = || ToolOutput::text("").with_images(vec![image.clone()]);
+        s.record_repl_images(&call("c1"), &out());
+
+        let hash = config::name_of(&image);
+        assert_eq!(s.files[&hash]["local"], json!(image.display().to_string()));
+        assert_eq!(s.files[&hash]["calls"], json!(["c1"]), "记下那图是哪次调用产的");
+        assert_eq!(s.files[&hash]["src"], json!("repl"));
+        assert!(s.files[&hash].get("file_id").is_none(), "本地图不上传，没有 file_id");
+
+        // 同一次调用重复产出 → 不重复记；另一次调用再产出 → 追加
+        s.record_repl_images(&call("c1"), &out());
+        s.record_repl_images(&call("c2"), &out());
+        assert_eq!(s.files[&hash]["calls"], json!(["c1", "c2"]));
+
+        // 落盘后 `files gc`：副本刚落的、又没人引用——没有这条登记就会被当成垃圾回收。
+        // 保护窗设 0（即“过了”，只看引用）→ 能留下就说明 `local` 生效了。
+        s.save().unwrap();
+        let garbage = crate::cli::collect_file_garbage(&config.storage, 0);
+        assert!(
+            !garbage.contains(&image),
+            "登记过 `local` 就该留住：{garbage:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 没开 `files_api`（或模型不支持）时不注入、也不落副本（更不碰网络）。
     ///
