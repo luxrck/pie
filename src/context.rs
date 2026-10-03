@@ -1,7 +1,7 @@
 //! 上下文管理层：三级压缩（工具级 / 轮次级 / 会话级）+ 原文落盘指针。
 //! （`context/` 的维护——引用扫描与垃圾判定——在 [`crate::cli`]，与图片副本那份同类。）
 //!
-//! 消息是扁平 `Vec<Message>`（没有类层级），靠 `role` + `compress_level` + `synthetic` 判定，
+//! 消息是扁平 `Vec<Message>`（没有类层级），靠 `role` + `compaction` + `synthetic` 判定，
 //! 三种压缩都以「就地改写消息列表」实现：
 //!   - **工具级**（level 1）：`keep_last_steps` 个 step 批次**之外**的 tool 输出，行数超过
 //!     `head+tail` 就全文落盘 + 头部/尾部留预览，内容换成 `[工具输出全文已保存: <path>]` 指针；
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Config, Storage, StoreType};
-use crate::llm::{Content, Message};
+use crate::llm::{Compaction, Content, Message};
 
 // ---------------------------------------------------------------- 目录与常量
 //
@@ -119,7 +119,7 @@ impl CompactEvent {
         }
     }
 
-    /// 压缩级别（1 工具级 / 2 轮次级 / 3 会话级，与 `Message.compress_level` 同口径）。
+    /// 压缩级别（1 工具级 / 2 轮次级 / 3 会话级，与 `Message.compaction` 的变体同口径）。
     pub fn level(&self) -> u8 {
         match self {
             Self::Tool { .. } => 1,
@@ -284,12 +284,12 @@ pub fn compact_session(
         let span = &messages[1..];
         let archivable: Vec<Value> = span
             .iter()
-            .filter(|m| !(m.role == "system" && m.compress_level == 3))
+            .filter(|m| !(m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. }))))
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect();
         let kept: Vec<Message> = span
             .iter()
-            .filter(|m| m.role == "system" && m.compress_level == 3)
+            .filter(|m| m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. })))
             .cloned()
             .collect();
         (archivable, kept)
@@ -303,7 +303,7 @@ pub fn compact_session(
     // 摘要直接拿手上的 dicts 算，不再读一遍盘
     let digest = summarize_turns(&dicts, config.head, config.tail);
     let mut summary = Message::system(window_summary_text(&path, &digest));
-    summary.mark_compressed(3, Some(&path));
+    summary.compaction = Some(Compaction::session(&path));
 
     // 重开窗口：system 不动，旧摘要留着（不入档），后面接新摘要
     let mut rebuilt: Vec<Message> = Vec::with_capacity(2 + old_summaries.len());
@@ -360,7 +360,7 @@ fn compact_tools(
     let protected = protected_step_tool_indices(messages, config.keep_last_steps);
     let mut count = 0usize;
     for (i, m) in messages.iter_mut().enumerate() {
-        if m.role != "tool" || m.compress_level >= 1 || protected.contains(&i) {
+        if m.role != "tool" || m.compaction.is_some() || protected.contains(&i) {
             continue;
         }
         let Some(Content::Text(content)) = &m.content else {
@@ -388,7 +388,7 @@ fn compact_tools(
             path.display(),
             preview.join("\n")
         )));
-        m.mark_compressed(1, Some(&path));
+        m.compaction = Some(Compaction::tool(&path));
         let tool = m.tool_name.clone().unwrap_or_default();
         cb(CompactEvent::tool(&tool, &path));
         count += 1;
@@ -426,7 +426,7 @@ fn compact_turns(
             }
             if span
                 .iter()
-                .all(|m| m.role == "assistant" && m.compress_level >= 2)
+                .all(|m| m.role == "assistant" && matches!(m.compaction, Some(Compaction::Turn { .. })))
             {
                 continue; // 已经轮次级压过
             }
@@ -487,7 +487,7 @@ fn compact_turn_span(
         None => body,
     };
     let mut msg = Message::assistant(content);
-    msg.mark_compressed(2, path.as_deref());
+    msg.compaction = Some(Compaction::turn(path.as_deref()));
     msg
 }
 
@@ -594,7 +594,7 @@ mod tests {
         Storage::default()
     }
 
-    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息（各带 `raw_path`）。
+    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息。
     ///
     /// `referenced_raw_paths` 现在只扫 `sessions/`：流水在首行、指针在消息里，两者同一份文件。
     fn write_session_with_events(
@@ -692,9 +692,9 @@ mod tests {
             &mut |e| events.push(e),
         );
         assert_eq!(n, 1, "只压保护窗口（最近 1 个 step 批次）之外的那条");
-        assert_eq!(msgs[4].compress_level, 0, "最近一批受保护");
+        assert_eq!(msgs[4].compaction, None, "最近一批受保护");
         let compressed = &msgs[2];
-        assert_eq!(compressed.compress_level, 1);
+        assert!(matches!(compressed.compaction, Some(Compaction::Tool { .. })));
         let text = compressed.content_text();
         assert!(text.starts_with("[工具输出全文已保存: "), "{text}");
         assert!(
@@ -702,7 +702,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(TOOL_GAP), "{text}");
-        let raw = PathBuf::from(compressed.raw_path.clone().unwrap());
+        let raw = PathBuf::from(compressed.compaction.as_ref().unwrap().path().unwrap());
         assert!(raw.exists());
         assert_eq!(
             std::fs::read_to_string(&raw).unwrap(),
@@ -751,12 +751,12 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(msgs.len(), 5, "3 条叶子 → 1 条摘要");
         assert_eq!(msgs[1].role, "user", "user 保留");
-        assert_eq!(msgs[2].compress_level, 2);
+        assert!(matches!(msgs[2].compaction, Some(Compaction::Turn { .. })));
         let text = msgs[2].content_text();
         assert!(text.starts_with("[轮次原文已保存: "), "{text}");
         assert!(text.contains("...[中间过程省略]..."), "{text}");
         assert!(text.contains("第一轮答复"), "{text}");
-        assert!(PathBuf::from(msgs[2].raw_path.clone().unwrap()).exists());
+        assert!(PathBuf::from(msgs[2].compaction.as_ref().unwrap().path().unwrap()).exists());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level(), 2);
         match &events[0] {
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[0].content_text(), "当前提示词", "system 不动");
-        assert_eq!(msgs[1].compress_level, 3);
+        assert!(matches!(msgs[1].compaction, Some(Compaction::Session { .. })));
         let text = msgs[1].content_text();
         assert!(text.starts_with(WINDOW_SUMMARY_MARKER), "{text}");
         assert!(
@@ -851,7 +851,7 @@ mod tests {
         let (stats, events) = maybe_compact(&mut long, &config, Some(9999));
         assert_eq!(stats.tools, 1);
         assert_eq!(events.len(), 1, "工具级事件也从这里回报");
-        assert_eq!(long[2].compress_level, 1);
+        assert!(matches!(long[2].compaction, Some(Compaction::Tool { .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -875,7 +875,7 @@ mod tests {
         ];
         let (_, events) = maybe_compact(&mut msgs, &config, Some(9999));
         assert!(events.iter().all(|e| e.level() < 3), "{events:?}");
-        assert!(msgs.iter().all(|m| m.compress_level < 3), "{msgs:?}");
+        assert!(msgs.iter().all(|m| !matches!(m.compaction, Some(Compaction::Session { .. }))), "{msgs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -919,22 +919,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 工具自带落盘（`ToolOutput.spill`）→ 消息**构造时**就标成 `compress_level=1` + `raw_path`，
+    /// 工具自带落盘（`ToolOutput.spill`）→ 消息**构造时**就带上 `compaction` 元数据，
     /// 并由会话层记一条压缩流水；两者都引用那份文件 → `context gc` 不能把它当垃圾删。
     #[test]
     fn shell_spill_is_set_on_the_message_and_gc_keeps_it() {
         let _g = env_lock();
         let dir = pie_dir_tmp("spill");
         let full = raw(&long_body(200), "bash");
-        // 这正是 `aturn` 回填工具结果时做的事：`mark_compressed` 标元数据（级别 1），顺手产一条事件
+        // 这正是 `aturn` 回填工具结果时做的事：标工具级元数据，顺手产一条事件
         let mut msg = Message::tool_result("c1", "bash", "line 1\n...\nline 200\n");
-        msg.mark_compressed(1, Some(&full));
-        assert_eq!(msg.compress_level, 1, "落盘即工具级");
-        assert_eq!(msg.raw_path, Some(full.display().to_string()));
-        // 没落盘 → 不调 `mark_compressed`（默认就是 0 / None）
+        msg.compaction = Some(Compaction::tool(&full));
+        assert_eq!(msg.compaction, Some(Compaction::tool(&full)), "落盘即工具级");
+        assert_eq!(msg.compaction.as_ref().and_then(Compaction::path), Some(full.to_str().unwrap()));
+        // 没落盘 → 不标
         let plain = Message::tool_result("c2", "read", "x");
-        assert_eq!(plain.compress_level, 0);
-        assert!(plain.raw_path.is_none());
+        assert!(plain.compaction.is_none());
 
         let entry = CompactEvent::tool("bash", &full);
         assert_eq!(entry.level(), 1);

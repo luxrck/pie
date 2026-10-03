@@ -82,10 +82,54 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// 这条消息是怎么被压缩的：变体即级别（tool=1 / turn=2 / session=3），原文路径就在里面。
+///
+/// 与 [`crate::context::CompactEvent`] 同构（那边也是变体 + `level()` 导出数字）；
+/// 所以没有「级别 + 路径」两个要手工保持同步的字段——**非法状态构造不出来**：
+/// 工具级（「输出已落盘」的定义）一定有 `path`，只有轮次级会出现「已压过但没落盘」。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Compaction {
+    /// 工具级：这条 tool 消息的输出已落盘。
+    Tool { path: String },
+    /// 轮次级：整轮原文已落盘（`None` = 落盘失败，只剩摘要、没有可回查的指针）。
+    Turn { path: Option<String> },
+    /// 会话级：整窗口已归档。
+    Session { path: String },
+}
+
+impl Compaction {
+    pub fn tool(path: &Path) -> Self {
+        Self::Tool {
+            path: path.display().to_string(),
+        }
+    }
+
+    pub fn turn(path: Option<&Path>) -> Self {
+        Self::Turn {
+            path: path.map(|p| p.display().to_string()),
+        }
+    }
+
+    pub fn session(path: &Path) -> Self {
+        Self::Session {
+            path: path.display().to_string(),
+        }
+    }
+
+    /// 落盘原文（只有轮次级落盘失败时是 `None`）。
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Tool { path } | Self::Session { path } => Some(path),
+            Self::Turn { path } => path.as_deref(),
+        }
+    }
+}
+
 /// 一条会话消息。字段全部可缺省，构造走下面的便捷方法。
 ///
-/// 带压缩元数据（`compress_level` / `raw_*`）：这些字段**只进会话文件，不进 API 请求体**
-/// （发给模型前统一过 `to_api()`）。字段名与落盘的 `to_dict()` 形状对齐，所以会话文件可以互读
+/// 带压缩元数据（`compaction`）：这个字段**只进会话文件，不进 API 请求体**
+/// （发给模型前统一过 `to_api()`）。字段名与落盘的形状对齐，所以会话文件可以互读
 /// （不写冗余的 `cls` 字段——消息没有类层级，靠 `role` 判定即可）。
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
@@ -103,11 +147,9 @@ pub struct Message {
     /// 工具名（tool 消息）：工具级压缩落盘时当文件名前缀。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
-    /// 压缩级别：0=原始 1=工具级 2=轮次级 3=会话级（**只升不降**）。
-    pub compress_level: u8,
-    /// 压缩落盘的原文件（自描述指针）。
+    /// 压缩元数据：`None` = 原始消息（写入唯一的入口就是 [`Compaction`] 的三个构造器）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_path: Option<String>,
+    pub compaction: Option<Compaction>,
     /// 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
@@ -166,18 +208,6 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             tool_name: Some(tool_name.into()),
             ..Default::default()
-        }
-    }
-
-    /// 就地把这条消息标成「已压缩到 `level`，原文在 `path`」——四条落盘路径共用：
-    /// 工具级（level 1，工具**自带**落盘，见 `ToolOutput.spill`）/ 轮次级（2）/ 会话级（3）
-    /// 与 resume 重建窗口摘要（3）；`None`（落盘失败）只标级别、不写指针。
-    ///
-    /// 纯数据操作（不嗅探正文、不碰磁盘）：落盘这件事由工具 / 压缩器自己说了算，这里只记下来。
-    pub fn mark_compressed(&mut self, level: u8, path: Option<&Path>) {
-        self.compress_level = level;
-        if let Some(path) = path {
-            self.raw_path = Some(path.display().to_string());
         }
     }
 
@@ -502,7 +532,7 @@ impl LlmClient {
     ) -> Value {
         let mut body = json!({
             "model": self.model,
-            // 只发协议字段：压缩元数据（compress_level / raw_*）不能进请求体
+            // 只发协议字段：压缩元数据（`compaction`）不能进请求体
             "messages": messages.iter().map(Message::to_api).collect::<Vec<_>>(),
         });
         let map = body.as_object_mut().expect("object");
@@ -1111,6 +1141,59 @@ mod tests {
     use super::*;
     // 单线程的测试里用 `Cell` 计数就行（`Send` 约束只对 spawn 出去的 future 有意义）
     use std::cell::Cell;
+
+    /// 压缩元数据与「落盘」绑死：**工具级一定带原文**（只有轮次级会「已压过但没落盘」）。
+    ///
+    /// 这是 2026-10-02 那个 bug 的护栏：会话层曾无条件调旧的 `mark_compressed(1, spill)`
+    /// （`spill` 为 `None` 也照标）→ 每条 tool 消息一出生就是「级别 1 无指针」→
+    /// `compact_tools` 以为都已压过而永远跳过它，工具级压缩静默失效。
+    #[test]
+    fn compaction_markers_keep_kind_and_path_together() {
+        let raw = Path::new("/tmp/raw-ab12");
+        let path_of =
+            |m: &Message| m.compaction.as_ref().and_then(Compaction::path).map(str::to_string);
+
+        let mut tool = Message::tool_result("c1", "bash", "x");
+        tool.compaction = Some(Compaction::tool(raw));
+        assert_eq!(path_of(&tool).as_deref(), Some("/tmp/raw-ab12"));
+
+        let mut turn = Message::assistant("摘要");
+        turn.compaction = Some(Compaction::turn(Some(raw)));
+        assert_eq!(path_of(&turn).as_deref(), Some("/tmp/raw-ab12"));
+        // 落盘失败：还是轮次级（已压过），只是没有可回查的指针 —— 光看路径区分不出这两件事
+        let mut failed = Message::assistant("摘要");
+        failed.compaction = Some(Compaction::turn(None));
+        assert!(matches!(
+            &failed.compaction,
+            Some(Compaction::Turn { path: None })
+        ));
+
+        let mut window = Message::system("窗口摘要");
+        window.compaction = Some(Compaction::session(raw));
+        assert_eq!(path_of(&window).as_deref(), Some("/tmp/raw-ab12"));
+
+        // 没落盘的原始消息：没有元数据（工具级压缩据此才认得出它还没压过）
+        let fresh = Message::tool_result("c2", "read", "x");
+        assert!(fresh.compaction.is_none());
+
+        // 落盘形状：变体即级别（`{"kind":"turn",…}`），JSONL 能原样读回
+        let json = serde_json::to_string(&turn).unwrap();
+        assert!(json.contains(r#""kind":"turn""#), "{json}");
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compaction, turn.compaction);
+        // 落盘失败（`path: None`）也读得回来；连 `path` 键都缺的极简形式也认
+        let json = serde_json::to_string(&failed).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compaction, failed.compaction);
+        let bare: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"摘要","compaction":{"kind":"turn"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            bare.compaction,
+            Some(Compaction::Turn { path: None })
+        ));
+    }
 
     /// `thought_ms` 是纯本地元数据：**绝不进 API 请求体**（回放才用它）。
     #[test]
