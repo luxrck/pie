@@ -13,11 +13,12 @@
 //!
 //! 文件名用 `chat-<unix 秒>-<微秒>.jsonl`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use futures_util::stream::{self, StreamExt};
@@ -65,6 +66,21 @@ pub enum TurnEvent {
     /// 推过了，再推一次消费者会重复显示。
     Answer(String),
 }
+
+/// 解释器跑过的单个代码块（写进 `__meta__.repl_blocks`）。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReplBlock {
+    /// 工具调用的 id（判「它还在不在当前对话里」就靠它）。
+    pub id: String,
+    /// 那次 `repl` 的 `code` 参数（逐字；过长的按字符截断并标一句）。
+    pub code: String,
+}
+
+/// `repl_blocks` 最多留这么多个（超出丢最老的）——它同时限住 `__meta__` 与那节 system prompt。
+const REPL_BLOCKS_MAX: usize = 24;
+/// 单个 cell 存进日志/显示的字符上限（超了截断 + 提示看原文）。
+const REPL_BLOCK_MAX_CHARS: usize = 2000;
+
 #[derive(Debug)]
 pub struct Session {
     /// 会话 JSONL 自身的路径（也是 `save` 的默认目标）。
@@ -84,6 +100,14 @@ pub struct Session {
     /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
     /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
     pub compaction_events: Vec<context::CompactEvent>,
+    /// 解释器跑过的代码块（写进 `__meta__.repl_blocks`）。
+    ///
+    /// 为什么得单独存一份：压缩会把 `tool_calls` 从消息里删掉（轮次级把整段 span 换成摘要、
+    /// 会话级把整窗口归档）—— 等要把代码摆进 system prompt 那节时，消息里已经查不到了。
+    /// 所以它**独立于压缩**维护（每轮开头扫一遍消息里新增的 `repl` 调用、按 call id 去重）。
+    /// 而 system prompt 那节的内容是由它派生的：**只列 id 已不在 `messages` 里的那些** ——
+    /// 两次压缩之间逐字不变（缓存照旧命中），只有真被压走东西的那一刻才变。
+    pub repl_blocks: Vec<ReplBlock>,
     /// 完整历史（`messages[0]` 是当前 system prompt）。
     pub messages: Vec<Message>,
     /// 用量：token 是最近一次上报值，`calls` 累计（见 `UsageTracker`）。
@@ -250,6 +274,16 @@ impl Session {
                     .and_then(Value::as_object)
                     .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default();
+                // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）
+                session.repl_blocks = value
+                    .get("repl_blocks")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|b| serde_json::from_value(b.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 continue;
             }
             // 旧 system（提示词 / 窗口摘要）丢掉：按当前提示词重建
@@ -394,7 +428,9 @@ impl Session {
         stream: Option<bool>,
         parallel_tools: Option<bool>,
     ) -> Result<String, LlmError> {
-        // 每轮开头校准「运行时状态」（cwd 可能被 `/cd` 改过）——必须先于任何请求
+        // 每轮开头：先收解释器代码块（压缩会把 `tool_calls` 删掉，这是最后的收集机会），
+        // 再校准 system prompt 末尾那节（cwd 可能被 `/cd` 改过）——都必须先于任何请求
+        self.collect_repl_blocks();
         self.refresh_runtime_state();
         self.push_user(input);
         // 转录快照（解释器的 `history()` 读它）——每轮重写，于是会话进行中也能查到历史
@@ -440,9 +476,10 @@ impl Session {
             steps += 1;
 
             // 请求前：拿上一次 API 上报的水位判一次（本次会话还没发过请求 → 不压）
-            let (_, mut events) =
+            let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
             compacted.append(&mut events);
+            self.refresh_after_compaction(&stats);
 
             let specs = self.tools.specs();
             let called = match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
@@ -505,9 +542,10 @@ impl Session {
             let tool_calls = result.tool_calls.clone();
             self.usage.record(&result.usage);
             // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再判一次
-            let (_, mut events) =
+            let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
             compacted.append(&mut events);
+            self.refresh_after_compaction(&stats);
             self.messages.push(Message {
                 role: "assistant".into(),
                 content: result
@@ -977,6 +1015,10 @@ impl Session {
         if !self.compaction_events.is_empty() {
             meta["compaction_events"] = json!(self.compaction_events);
         }
+        if !self.repl_blocks.is_empty() {
+            // 空表不写：没跑过 repl 的会话不该多一个键
+            meta["repl_blocks"] = json!(self.repl_blocks);
+        }
         let mut out = String::new();
         out.push_str(&json_line(&meta)?);
         out.push('\n');
@@ -1069,7 +1111,8 @@ impl Session {
     ///
     /// 为什么住 `messages[0]` 而不是历史里的一条 system：见 [`config::runtime_state`]。
     fn refresh_runtime_state(&mut self) {
-        let state = config::runtime_state();
+        // 那节现在有两块：cwd（每轮现取）+ 解释器跑过的代码（**只列已被压缩带走的**）
+        let state = config::runtime_state(&self.repl_section());
         let Some(prompt) = self.messages.first_mut() else {
             return;
         };
@@ -1079,6 +1122,101 @@ impl Session {
             None => text.as_str(),   // 旧会话 / 手改过（没节）→ 直接接在末尾
         };
         *prompt = Message::system(format!("{base}{state}"));
+    }
+
+    /// 压缩之后把刚消失的代码块补进那节（每次 `maybe_compact` 后调）。
+    ///
+    /// 全 0 说明什么都没压 → **一个字节都别动**（否则会白打掉前缀缓存）。
+    fn refresh_after_compaction(&mut self, stats: &context::CompactStats) {
+        if stats.tools > 0 || stats.turns > 0 {
+            self.refresh_runtime_state();
+        }
+    }
+
+    /// 每轮开头把消息里**还没记过**的 `repl` 代码块收进 `repl_blocks`。
+    ///
+    /// 幂等（按 call id 去重，重复扫不会重复记）。当前这轮不在压缩的受害范围里
+    /// （轮次级只压「已完成」的轮，会话级只由用户手动 `/clear`）→ 下一轮再收也来得及。
+    fn collect_repl_blocks(&mut self) {
+        let seen: HashSet<&str> = self.repl_blocks.iter().map(|b| b.id.as_str()).collect();
+        let mut fresh: Vec<ReplBlock> = Vec::new();
+        for m in &self.messages {
+            for call in m.tool_calls.iter().flatten() {
+                if call.function.name != "repl" || seen.contains(call.id.as_str()) {
+                    continue;
+                }
+                let Some(code) = serde_json::from_str::<Value>(&call.function.arguments)
+                    .ok()
+                    .and_then(|v| v.get("code").and_then(Value::as_str).map(str::to_string))
+                else {
+                    continue;
+                };
+                let mut code = code;
+                if code.chars().count() > REPL_BLOCK_MAX_CHARS {
+                    code = code.chars().take(REPL_BLOCK_MAX_CHARS).collect::<String>();
+                    code.push_str("\n# …（本 cell 过长，完整见原文）");
+                }
+                fresh.push(ReplBlock {
+                    id: call.id.clone(),
+                    code,
+                });
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        self.repl_blocks.extend(fresh);
+        if self.repl_blocks.len() > REPL_BLOCKS_MAX {
+            let cut = self.repl_blocks.len() - REPL_BLOCKS_MAX;
+            self.repl_blocks.drain(..cut); // 丢最老的
+        }
+    }
+
+    /// 那节里列什么：**日志里 id 已经不在 `messages` 里的那些** cell（= 被压缩带走的）。
+    ///
+    /// 于是它有两条白拿的性质：两次压缩之间消息没变 → 返回值**逐字相同**（缓存不受影响）；
+    /// 刚被压走东西的那一刻才变 —— 而那正是缓存已经全废的时刻。
+    fn repl_section(&self) -> String {
+        let live: HashSet<&str> = self
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().flatten())
+            .map(|c| c.id.as_str())
+            .collect();
+        let gone: Vec<&str> = self
+            .repl_blocks
+            .iter()
+            .filter(|b| !live.contains(b.id.as_str()))
+            .map(|b| b.code.as_str())
+            .collect();
+        if gone.is_empty() {
+            return String::new();
+        }
+        // 字符预算跟窗口成比例：小窗口的模型不该被这节挤爆（大窗口够放完 24 个 cell）。
+        let mut budget = (self.config.context_budget() / 32).max(2_000);
+        let mut start = gone.len();
+        for i in (0..gone.len()).rev() {
+            let n = gone[i].chars().count();
+            if budget < n && start != gone.len() {
+                break; // 至少放最近一个；再多放不下了就停
+            }
+            budget = budget.saturating_sub(n);
+            start = i;
+        }
+        let mut out = format!(
+            "解释器里跑过的代码（列了 {} 个 cell，**只列已被压缩带走的** —— 最近跑的那几个 cell 还在上面的对话里）：\n```python\n",
+            gone.len() - start
+        );
+        for (i, code) in gone[start..].iter().enumerate() {
+            out.push_str(&format!("# cell {}\n{code}\n\n", start + i + 1));
+        }
+        out.push_str("```");
+        if start > 0 {
+            out.push_str(&format!(
+                "\n（更早的 {start} 个不列出来了；逐条转录/输出用 `history()`，或看 `[轮次原文已保存: …]` 的原文）"
+            ));
+        }
+        out
     }
 
     /// 转录快照的路径：**临时目录** + 会话路径的 hash。
@@ -1251,6 +1389,7 @@ impl Session {
             ))],
             usage: UsageTracker::default(),
             windows: Vec::new(),
+            repl_blocks: Vec::new(),
             files: HashMap::new(),
             title: None,
             turn_count: 0,
@@ -2059,6 +2198,97 @@ mod tests {
         let _ = std::fs::remove_file(&snap); // 落在临时目录，测完就收
     }
 
+    /// 解释器代码块：**收进日志独立于压缩**（压缩会把 `tool_calls` 删掉），而那节**只列
+    /// 已经从对话里消失的** —— 于是两次压缩之间那节逐字不变（缓存），压走之后才补上。
+    #[test]
+    fn repl_blocks_are_collected_and_listed_only_after_compaction() {
+        let dir = std::env::temp_dir().join(format!("pie-rs-blocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            storage: crate::config::Storage::at(&dir),
+            ..Config::default()
+        };
+        let repl_call = |id: &str, code: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::llm::FunctionCall {
+                name: "repl".into(),
+                arguments: json!({"code": code}).to_string(),
+            },
+        };
+        let mut s = Session::new(&config, Some("blocks.jsonl"), llm(), tools());
+        s.messages.push(Message {
+            role: "assistant".into(),
+            tool_calls: Some(vec![repl_call("c1", "df = 1"), repl_call("c2", "df.head()")]),
+            ..Default::default()
+        });
+
+        // 1) 采集：独立于压缩，只按 call id 去重（重复扫不重复记）
+        s.collect_repl_blocks();
+        s.collect_repl_blocks();
+        assert_eq!(s.repl_blocks.len(), 2, "{:?}", s.repl_blocks);
+        assert_eq!(s.repl_blocks[0].code, "df = 1");
+
+        // 2) 还在对话里 → 那节不该列它（避重复）
+        s.refresh_runtime_state();
+        let live = s.messages[0].content_text();
+        assert!(!live.contains("df.head()"), "还在对话里就不该列进那节：{live}");
+        assert!(live.ends_with(&config::runtime_state("")));
+
+        // 3) 什么都没压 → 重拼逐字相同（前缀缓存不受影响）
+        s.refresh_runtime_state();
+        assert_eq!(s.messages[0].content_text(), live, "没压东西就不该动那节");
+        let base = live[..live.rfind(config::RUNTIME_STATE_HEADING).unwrap()].to_string();
+
+        // 4) 模拟轮次级压缩：那两条 tool_calls 被换成一条摘要
+        s.messages[1] = Message::assistant("[轮次原文已保存: …]\n\n...[中间过程省略]...\n好了");
+        s.refresh_runtime_state();
+        let after = s.messages[0].content_text();
+        assert!(after.contains("# cell 1\ndf = 1"), "{after}");
+        assert!(after.contains("# cell 2\ndf.head()"), "{after}");
+        assert!(after.contains("只列已被压缩带走的"), "{after}");
+        assert!(
+            after.starts_with(&base),
+            "标题前面那段不该变（缓存前缀照旧）：{after}"
+        );
+
+        // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建
+        s.save().unwrap();
+        let mut loaded = Session::load(&s.path, &config, llm(), tools()).unwrap();
+        assert_eq!(loaded.repl_blocks.len(), 2, "{:?}", loaded.repl_blocks);
+        loaded.refresh_runtime_state();
+        assert!(
+            loaded.messages[0].content_text().contains("df.head()"),
+            "载入后那节要能重建：{}",
+            loaded.messages[0].content_text()
+        );
+    }
+
+    /// 日志有上限：超出丢最老的（不能让它变成第二份无限长的历史）。
+    #[test]
+    fn repl_blocks_are_capped_and_drop_the_oldest() {
+        let mut s = Session::new(&Config::default(), Some("cap.jsonl"), llm(), tools());
+        for i in 0..(REPL_BLOCKS_MAX + 3) {
+            s.messages.push(Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![ToolCall {
+                    id: format!("c{i}"),
+                    kind: "function".into(),
+                    function: crate::llm::FunctionCall {
+                        name: "repl".into(),
+                        arguments: json!({"code": format!("x = {i}")}).to_string(),
+                    },
+                }]),
+                ..Default::default()
+            });
+        }
+        s.collect_repl_blocks();
+        assert_eq!(s.repl_blocks.len(), REPL_BLOCKS_MAX);
+        assert_eq!(s.repl_blocks[0].code, "x = 3", "丢最老的三个");
+        assert_eq!(s.repl_blocks[REPL_BLOCKS_MAX - 1].code, "x = 26");
+    }
+
     /// 「运行时状态」节活在 `messages[0]` 末尾：每轮重拼、**幂等**（cwd 没变就逐字相同 →
     /// 提示词前缀缓存不失效），cwd 变了只换尾部那节。
     ///
@@ -2082,7 +2312,7 @@ mod tests {
         // ⚠ 别数绝对次数：提示词正文里就可能提到这个标题（`prompts/system.md` 就写了）——
         // 判据是「那一节在**末尾**」，而且重拼不会凭空多出几节。
         assert!(
-            before.ends_with(&config::runtime_state()),
+            before.ends_with(&config::runtime_state("")), // 还没跑过 repl → 那节只有 cwd
             "建会话时那节就该在末尾：{before}"
         );
         let sections = before.matches(heading).count();
