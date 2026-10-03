@@ -2,6 +2,41 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（`repl` 跑过的代码住进 system prompt：压缩带走的那些，永远看得见）
+
+用户：「把 repl 的 code blocks 统一集中到 system 区域……和 `/cd` 的处理类似。因为这样不用特殊处理
+turn/session 压缩」——**对，而且这是唯一一处能让两级压缩共用一套机制的地方。**
+
+**先认两个错（用户两次纠正都成立）**：
+- 「压缩那一刻缓存本来就全废了」——**成立**。我核了 `compact_turns`：它一次把**所有已完成的轮**
+  全压掉（唯一跳过条件是「已压过」），`maybe_compact` 也不给它留 `keep_last_steps`（那是工具级才有的）
+  → 失效点紧跟最后一条幸存摘要，**按 token 算几乎整段前缀都废**。所以我先前「改 `messages[0]` 会打掉
+  整段前缀」的反对，是把「每轮都改」当成了默认；只在压缩那一次改，成本可忽略。
+- 「摘要里只放首行代码，对模型不清不楚」——**成立**。`import matplotlib` / `plt.close("all")` 这种首行
+  什么也没说。要**逐字**，不是首行。
+
+**落地**：
+- `Session.repl_blocks: Vec<ReplBlock{id, code}>`（`__meta__.repl_blocks`）：`collect_repl_blocks()`
+  在**每轮开头**扫 `messages` 里新增的 `repl` 调用（按 call id 去重、幂等），**不看压缩** —— 这就是
+  「不用特殊处理压缩」的前提：日志独立于压缩存在，而压缩之后消息里已经没有 `tool_calls` 了。
+- 那节的内容 = **日志里 id 已不在 `messages` 里的那些**（= 被压缩带走的）。于是：
+  - 两次压缩之间**逐字不变** → 前缀缓存照旧命中（与 cwd 那节同一个道理）；
+  - 只有真被压走东西的那一刻才变 —— 而那正是缓存已全废的时刻；
+  - `/clear` 之后自动生效（会话级「system 不动」，而窗口里的 cell 已不在 `messages` 里）；
+  - `-r` 之后从 `__meta__` 读回日志 → 那节自动重建；
+  - 不需要 `mark`、不需要监听「压了什么」，**`context.rs` 一行都没改**。
+- `config::runtime_state(repl_blocks)`：那节现在两块（cwd + 解释器代码），仍在 `messages[0]` 末尾，
+  ⚠ 必须在 `RUNTIME_STATE_HEADING` **之后**（`refresh_runtime_state` 按标题截断重拼）。
+- 重拼点两处：`aturn` 开头（每次）+ `maybe_compact` 之后（**只在 `stats` 非 0 时**，全 0 就一个字节
+  都不动，别白打缓存）。⚠ 自动压缩发生在 `aturn` 中段，所以光靠开头那次重拼会晚一轮。
+- cap：日志 `REPL_BLOCKS_MAX`=24 个 / 单个 `REPL_BLOCK_MAX_CHARS`=2000 字符（超了截断 + 注明看原文）；
+  那节还有一条**跟窗口成比例**的字符预算（`context_budget()/32`，下限 2000）—— 小窗口的模型不该被它挤爆。
+- `prompts/system.md` 里那节说明也改了（原来写「现在只有当前工作目录」）。
+
+测试：`session::tests::repl_blocks_are_collected_and_listed_only_after_compaction`（采集幂等 /
+还在对话里不列 / 没压就逐字不变 / 压走后列出来且标题前那段不变 / save+load 后能重建）、
+`session::tests::repl_blocks_are_capped_and_drop_the_oldest`。
+
 ## 2026-10-03（`history()`：把历史变成数据 —— repl 里能查到「被压缩卷走」的那部分）
 
 用户：「tui 里面你可以通过 `full_history` 来重建 repl blocks。但是，假设我们的上下文经过压缩了，

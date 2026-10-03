@@ -922,7 +922,7 @@ pub fn build_system_prompt(
     parts.extend(append_system_prompt.iter().filter(|s| !s.is_empty()).cloned());
     // 永远**最后**一节：`Session::aturn` 每轮按 [`RUNTIME_STATE_HEADING`] 重拼它
     //（所以别把它插到中间，也别把 `append_system_prompt` 挪到它后面）。
-    parts.push(runtime_state());
+    parts.push(runtime_state("")); // 初建：解释器那块是空的（`Session` 每轮再往里添）
     parts.join("\n\n")
 }
 
@@ -939,13 +939,22 @@ pub const RUNTIME_STATE_HEADING: &str = "## 运行时状态";
 /// `messages[0]` 则是**压缩免疫**的：轮次级只在两个 user 之间动手（`messages[0]` 在第一个 user
 /// 之前），会话级明确「system 不动」。代价是它住在提示词前缀里 → **内容没变就别动**，
 /// 否则每次请求都打掉服务端的前缀缓存。
-pub fn runtime_state() -> String {
+///
+/// `repl_blocks` = 解释器跑过的代码块（**只列已被压缩带走的那些**，由 `Session` 派生，可为空）——
+/// 压缩会把 `tool_calls` 从消息里删掉，而代码是「会话级状态」里最不可从摘要里恢复的那部分，
+/// 所以让它住进这节（跟着 cwd 一起现取，而不是插进历史）。
+pub fn runtime_state(repl_blocks: &str) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".to_string());
-    format!(
+    let mut out = format!(
         "{RUNTIME_STATE_HEADING}\n\n当前工作目录：{cwd}\n（`read` / `edit` / `bash` 的相对路径都相对它；它可能中途变化，别假设整段对话里不变。）"
-    )
+    );
+    if !repl_blocks.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(repl_blocks);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -102,6 +102,15 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   工具输出只给 `full_output_path`、**不**把全文塞回来（那正是它当初落盘的原因）。
   为什么值得做：我们的压缩本来就**无损**（原文都在盘上），缺的是**可达性** ——
   `[轮次原文已保存: path]` 是散文里的一个路径，要模型记得去 `read`；`history()` 把引用变成**可编程遍历的数据**。
+- **`repl` 跑过的代码住进 system prompt 末尾那节**（`__meta__.repl_blocks`）：压缩会把 `tool_calls` 删掉，
+  所以 `Session` **每轮开头**把消息里新增的 repl cell 收进 `repl_blocks`（**独立于压缩**、按 call id 去重、
+  上限 `REPL_BLOCKS_MAX`=24 个 / 每个 `REPL_BLOCK_MAX_CHARS`=2000 字符）；而**那节只列
+  id 已不在 `messages` 里的那些**（= 被压缩带走的），还在对话里的不重复列。
+  两条性质因此白拿：两次压缩之间那节**逐字不变**（前缀缓存不受影响）；只有真被压走东西的那一刻才变
+  —— 而那一刻缓存本来就全废了（`compact_turns` 一次压掉所有已完成轮，失效点紧跟最后一条幸存摘要）。
+  ⚠ 重拼点在两处：`aturn` 开头 + 每次 `maybe_compact` 之后（`stats` 全 0 就不动，别白打缓存）；
+  它住在 `config::runtime_state(repl_blocks)` 里 → 必须在 `RUNTIME_STATE_HEADING` **之后**（
+  `refresh_runtime_state` 是按标题截断重拼的，放前面会被砍掉）。cap 之外还有窗口成比例的字符预算。
 - 两条编译器定的规矩：trait 里必须写 `-> impl Future<Output=…> + Send`（`async fn` 表达不出 `Send`；
   impl 里仍可写 `async fn`）；`#[schemars(...)]` 必须写在 `#[derive(JsonSchema)]` **之后**。
   schemars 另有两个坑：doc 的单换行会被合并成空格（多行描述用 `#[schemars(description=…)]`）、
