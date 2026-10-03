@@ -87,6 +87,11 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   有状态的工具（`repl` 的长活 IPython）用 `ctx.state.get_or_init::<T>(…)` 存长活对象——同一 `Session`
   共享、不同 `Session` 各一份。**别把它放 `ToolRegistry`**：registry 会被多个 session 复用（绑定的常见用法）
   → 状态会串台。
+- **`repl` 的输出头区有一行 `[解释器] …`**（`repl.rs::headers`，数据来自 driver 的 `Namespace`）：
+  当前命名空间 + 本次新增。为什么每帧都报：模型看不到解释器内部，而**压缩会把那些代码块一起卷走**
+  —— 状态得由每次执行自己带回来（让模型另发一次询问 = 白搭一次往返）。
+  为什么放**头区**：`head_prefix` 保留的是开头，超限截断/落盘时它得跟着走。
+  ⚠ driver 没上报（`state: None`）就不加那行 —— 与「上报了、是空的」（`[解释器] 空`）是两回事。
 - 两条编译器定的规矩：trait 里必须写 `-> impl Future<Output=…> + Send`（`async fn` 表达不出 `Send`；
   impl 里仍可写 `async fn`）；`#[schemars(...)]` 必须写在 `#[derive(JsonSchema)]` **之后**。
   schemars 另有两个坑：doc 的单换行会被合并成空格（多行描述用 `#[schemars(description=…)]`）、

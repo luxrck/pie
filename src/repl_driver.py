@@ -105,6 +105,16 @@ except Exception:
     pass  # 老版本 IPython 没有 events 就放弃（图就看不到，但工具照常工作）
 
 
+def _namespace():
+    """用户自己的名字：丢掉 IPython 注入的 `_i1` / `In` / `Out` / `exit` / `open` 那些噪音
+    （后者在 `user_ns_hidden` 里，前者以 `_` 开头）。"""
+    try:
+        hidden = getattr(shell, "user_ns_hidden", {})
+        return sorted(n for n in shell.user_ns if not n.startswith("_") and n not in hidden)
+    except Exception:
+        return []
+
+
 def _read_exact(n):
     buf = b""
     while len(buf) < n:
@@ -132,6 +142,7 @@ while True:
         break  # 父进程没了 → 退出
 
     _images.clear()
+    before = set(_namespace())
     try:
         with capture_output() as cap:
             result = shell.run_cell(code, store_history=True)
@@ -155,4 +166,12 @@ while True:
         }
     except BaseException as exc:  # KeyboardInterrupt / 驱动自身异常：也要回一帧，别让 Rust 卡住
         payload = {"stdout": "", "stderr": "", "error": _format_exc(exc), "images": []}
+    # 解释器状态随每一帧回去（异常帧也要）：模型看不到解释器内部，压缩之后它连代码块都没了
+    # —— 有这一行，它才不会按记忆里的变量名瞎写。Rust 侧拼成输出**头区**那行 `[解释器] …`。
+    names = _namespace()
+    payload["state"] = {
+        "names": names[:32],
+        "total": len(names),
+        "defined": [n for n in names if n not in before][:16],
+    }
     _send(payload)

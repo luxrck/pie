@@ -2,6 +2,31 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（repl 的状态由**每次执行自己带回来**：输出头区那行 `[解释器] …`）
+
+用户：「你这样每次都要 `_pie_state()` 发给模型，平白多了一次调用」——**对**。
+
+**背景（三个方案对比）**：模型看不到解释器内部，而轮次级压缩会把 repl 的代码块一并卷走。
+① 搭在 repl 结果上（零新通道）；② 推到请求末尾（模型永远知道，但要一套 `ToolOutput.hint` + `llm` 签名
+通道 + 每请求 ~140 token）；③ 拉（提示词教模型自己问 `_pie_state()`）。
+③ **拿一次完整往返（几秒 + 更多 token）换一句稳定提示**，不划算；② 留着（真需要“永远知道”时再叠）。
+
+**落地的 ①**：
+- `repl_driver.py::_namespace()`：`user_ns` 里非 `_` 开头、且**不在 `user_ns_hidden`** 的名字
+  （实测那个 hidden 表正好装着 `In` / `Out` / `exit` / `quit` / `open` / `get_ipython` / `_i*` 这些噪音）；
+  每帧回 `state = {names[:32], total, defined[:16]}`（`defined` = 与执行前那份的差集）。
+- `Reply.state: Option<Namespace>` → `repl.rs::headers()` 拼成 `[解释器] 共 3 个：df, f, math（本次新增：df）`。
+- ⚠ **必须放头区**：`head_prefix` 保留的是**开头**（`tools.rs` 注释），正文尾部一截就没了
+  —— 而“输出很长”恰恰是最需要它的场合。头区第一行不参与成败判定（`pane::tool_status` 只认
+  `[exit=…` / `[工具错误]`，repl 本来就不发 `[exit=`）。
+- `Option` 而不是空值：**没上报**（假驱动/老 driver）不加那行，**与「上报了、是空的」是两回事**
+  （后者要输出 `[解释器] 空` —— “解释器是新的”正是模型最该知道的事）。
+- 工具 doc 加一句告诉模型：“写代码前以这一行为准，别按记忆猜”。
+
+测试：`repl::tests::namespace_digest_lands_in_the_header`（头区那行 + 没上报的驱动不凭空多行）、
+`repl::tests::namespace_digest_survives_truncation`（超限落盘时它还在）。另拿 `~/.pie/repl/bin/python`
+的真 IPython 跑了驱动：`math`/`df`/`f` 逐个进 `names`、`defined` 只在真正新增时非空。
+
 ## 2026-10-03（进程级状态不进历史：system prompt 末尾的「运行时状态」节）
 
 用户：「轮次级压缩为啥会吃掉 system message? system message 不是一定会夹在两个 turn 中间吗」——**用户的前提对，而且正是机制本身**。
