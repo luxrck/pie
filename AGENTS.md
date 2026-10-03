@@ -92,6 +92,9 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   —— 状态得由每次执行自己带回来（让模型另发一次询问 = 白搭一次往返）。
   为什么放**头区**：`head_prefix` 保留的是开头，超限截断/落盘时它得跟着走。
   ⚠ driver 没上报（`state: None`）就不加那行 —— 与「上报了、是空的」（`[解释器] 空`）是两回事。
+  ⚠ `repl` 的 `function.description` 走 **`#[schemars(description = …)]` 显式给**（不再加 doc 注释）：
+  schemars 会把 doc 里的单换行**合并成空格**，而那份描述要多行（同 `Edit`）。改它 = 改模型选工具时的判据 ——
+  往「什么时候该用 repl」的方向写（多段 Python / 贵的准备 / 画图 → repl；一次性命令 → bash）。
 - **解释器里有 `history()`（历史即数据）**：读的是 `Session::write_transcript` **每轮开头**
   重写的转录快照（临时目录 + 会话路径 hash，经 `PIE_TRANSCRIPT` 交给 driver）。
   ⚠ 它同时同步进 `user_ns_hidden`（IPython 藏 `exit` / `quit` / `open` 的同一招）→ 不出现在

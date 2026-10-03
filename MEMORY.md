@@ -11,6 +11,8 @@
 - **功能尽量内联**：不要给单一消费者写私有辅助函数（嵌套 `fn` 可以，多一层就得多一个理由）——`config.rs::fmt_local` 原本拆出的 `civil` / `local_utc_offset` 就是被点名合并的例子。
 - **不要为了方便测试而拆功能**（用户明确要求）：判据只有「有没有第二个消费者」；`config.rs::pie_dir` 的搜索顺序当初拆出过 `pick_root` 只为好测 → 已内联，接受「`<cwd>/.pie` 那档没有单测」。
 - 工具名 `writ` / `bash`（**不是笔误，别再「修」回去**）。
+- **要 pie 更多用 `repl`**（别用 `bash` 反复 `python3 -c`）：工具描述与 `prompts/system.md` 都按这个方向
+  写了「什么时候用 repl」（多段 Python / 贵的准备 / 画图 / 反复试 → repl；一次性命令 → bash）。
 - TUI 形态参考 codex：状态栏（chrome）在**最下方**，消息流从屏幕第一行开始。
 - 内置提示词正文用**小写文件名**（`prompts/system.md`）——与运行时按名找的 `SYSTEM.md` 区分开。
 - 命名：拿 `Config` 当参数 / 变量就叫 `config`（**不要 `cfg`**）；绑定内部的核心配置叫 `core_config`。
