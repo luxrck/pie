@@ -2,6 +2,62 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（`compress_level: u8` + `raw_path` → `compaction: Option<Compaction>`）
+
+用户：「`compress_level` 有存在的必要吗？」——**数字没有，判别式有，但它不该是两个要手工保持同步的字段**。
+
+**证据（四个读者要的都是「是哪一类」，没一处按数字排序）**：`compact_tools` 问「这条 tool 消息已压过吗」、
+`compact_turns` 问「这一轮已经是摘要了吗」、`compact_session` 问「这是窗口摘要吗」、
+`full_history` 问「落盘件是消息数组还是纯文本」。`>= 1` / `>= 2` 只是写法，1<2<3 的序关系**不是承重的**。
+
+**改法**：
+```rust
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Compaction {
+    Tool { path: String },            // 一定有原文（「工具级」的定义就是输出已落盘）
+    Turn { path: Option<String> },    // 唯一允许「已压过但没落盘」（落盘失败）
+    Session { path: String },
+}
+```
+`Message.compaction: Option<Compaction>` —— 与 `context::CompactEvent` 同构（同样变体 + `level()` 导出数字），
+**两处压缩元数据不再是两种形状**。于是昨天那个 bug 的类型（`mark_compressed(1, None)` =「1 却没有指针」）
+从字段层就构造不出来了（昨天的具名方法只收紧了「写」那一侧，字段还是 `pub` 的裸 `u8`）。
+三个具名方法退化成 `Compaction::{tool,turn,session}` 三个构造器 + 直接赋值。
+
+**只用 `raw_path` 单字段不行**（试过）：`compact_turns` 必须认出**落盘失败**的轮次摘要（否则同一轮
+每轮重压、越包越深），`compact_session` 要分开「已有窗口摘要」与「待归档内容」，`full_history`
+要分「JSON 消息数组」与「纯文本输出」——`Option`（没压过 vs 压过没落盘）+ 变体（三类）两个维度都必要。
+
+**顺带改了**：`cli::referenced_raw_paths` 的消息侧扫描改成读 `compaction.path`（它现在有测试覆盖了）；
+`bindings/pie-py` 的 `_pie_rs.pyi` Message 字段同步（顺手删了早就没了的 `raw_hash`）。
+**不保兼容**（按用户指示）：旧会话文件里的 `compress_level` / `raw_path` 键会被当未知字段忽略
+（→ 消息级不再展开，`full_history` 退回压缩形式本身；`__meta__.compaction_events` 的 alias 仍在，
+gc 保护不受影响）。
+
+## 2026-10-03（修：工具级压缩静默失效 —— 没落盘的 tool 消息也被标成 `compress_level = 1`）
+
+用户：「检查一下 `chat-*.jsonl`，为啥 tool 的 `compress_level=1`？应该还没到触发压缩的时机吧？」
+
+**诊断**：水位确实没到（`usage.prompt_tokens` 112k vs 软阈值 736k，首行 `__meta__` 里连 `compaction_events` 都没生出来）。
+`compress_level = 1` 是另一回事：`Session::aturn` 回填工具结果时**无条件**调
+`msg.mark_compressed(1, out.spill.as_deref())`，而旧的 `mark_compressed` 对 `path` 才做 `Some` 判断、`level` 照收
+→ `spill` 为 `None` 时结果就是「级别 1 + 无指针」，**每条 tool 消息一出生就如此**。
+
+**后果**：`compact_tools` 的第一道门是 `m.compress_level >= 1 → continue`（意思是「已压过」）
+→ **工具级压缩永远压 0 条**，是死代码；自动压缩只剩轮次级，`/compact tools` 也压不动。
+`compress_level` 也从「已压缩」退化成「这是个 tool 消息」。
+
+**引进点**：`31436f6`（2026-09-30「落盘路径结构化」）把文本嗅探 `mark_tool_spill` 换成 `mark_compressed` 时写成了无条件调用。
+**测试为什么没抓到**：唯一相关的 `context::tests::shell_spill_is_set_on_the_message_and_gc_keeps_it` 是手搓 message、
+从不走 `aturn`；Rust 测试里也没有 HTTP stub，跑不了「成功工具调用」的端到端用例。
+
+**修法（顺手把不变量做进类型）**：`Message::mark_compressed(level, Option<&Path>)` 拆成三个具名方法，
+与 `context::CompactEvent` 的 Tool / Turn / Session 一一对应：`mark_tool_spilled(&Path)` /
+`mark_turn_compacted(Option<&Path>)` / `mark_session_archived(&Path)`。级别 1 的构造路径里**必须**有 `path`
+→ 「1 却没有指针」这个状态**构造不出来**；`spill` 为 `None` 时压根不调。既有约定全保留：
+「只升不降」与「轮次级落盘失败 → 2 + 无指针」。按用户「快速迭代、不欠旧账」的指示，**不做**旧会话文件的归一化迁移。
+测试：`llm::tests::compaction_markers_keep_level_and_path_together`。
+
 ## 2026-10-01（滚动条 thumb 贴不到底）
 
 用户：「看看右边的 scrollbar，我已经划到最底部了」——截图里 thumb 停在轨道中段（后面还空着一大截）。

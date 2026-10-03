@@ -76,7 +76,7 @@ class CompactStats(TypedDict):
     skipped: str | None
 
 class Message(TypedDict, total=False):
-    """一条消息（字段与 JSONL 文件一致，含压缩元数据）。"""
+    """一条消息（字段与 JSONL 文件一致，含压缩元数据 `compaction`）。"""
 
     role: str
     content: Any
@@ -84,9 +84,7 @@ class Message(TypedDict, total=False):
     tool_call_id: str
     tool_name: str
     reasoning_content: str
-    compress_level: int
-    raw_path: str
-    raw_hash: str
+    compaction: dict[str, Any]
     synthetic: bool
 
 class BalanceInfo(TypedDict):

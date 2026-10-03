@@ -26,7 +26,8 @@ use crate::cancel::{Cancel, CANCEL_TEXT};
 use crate::config::{self, Config};
 use crate::context;
 use crate::llm::{
-    self, Content, LlmClient, LlmError, LlmResult, Message, StreamChunk, ToolCall, UsageTracker,
+    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, StreamChunk, ToolCall,
+    UsageTracker,
 };
 use crate::tools::{self, ToolOutput, ToolRegistry};
 
@@ -80,7 +81,7 @@ pub struct Session {
     /// 旧会话里的键是 `raw_path` / `raw_hash`，靠 `CompactEvent` 的 serde alias 读回）。
     ///
     /// 以前单独 append 到 `~/.pie/context/<会话名>.manifest.jsonl`；现在**只住内存**，
-    /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `raw_path` 指针
+    /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
     /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
     pub compaction_events: Vec<context::CompactEvent>,
     /// 完整历史（`messages[0]` 是当前 system prompt）。
@@ -232,7 +233,7 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default();
-                // 压缩事件流水（与消息里的 `raw_path` 同车落盘）
+                // 压缩事件流水（与消息里的 `compaction` 指针同车落盘）
                 // 逐条解析：单条坏（手改过？）只丢那条，不让整份流水变空
                 session.compaction_events = value
                     .get("compaction_events")
@@ -310,7 +311,7 @@ impl Session {
                 session_config.head,
                 session_config.tail,
             ));
-            msg.mark_compressed(3, Some(block.as_path()));
+            msg.compaction = Some(Compaction::session(block.as_path()));
             out.push(msg);
         }
         out
@@ -544,13 +545,15 @@ impl Session {
                     }
                 };
                 let name = call.function.name.as_str();
-                // 工具自带落盘（bash）→ 消息**进历史前**就带上原文指针（工具级），
-                // 并同步一条压缩流水（gc 靠它保住那份落盘原文）
+                // 工具自带落盘（bash / repl 超限）→ 消息**进历史前**就带上原文指针（工具级），
+                // 并同步一条压缩流水（gc 靠它保住那份落盘原文）。
+                // ⚠ 只有真落了盘才设：`compact_tools` 靠 `compaction.is_some()` 跳过「已压过」的
+                // 消息，没落盘却设一段元数据会让工具级压缩永远压不动（曾经就是无条件标）。
+                let mut msg = Message::tool_result(&call.id, name, out.text.clone());
                 if let Some(path) = &out.spill {
                     compacted.push(context::CompactEvent::tool(name, path));
+                    msg.compaction = Some(Compaction::tool(path));
                 }
-                let mut msg = Message::tool_result(&call.id, name, out.text.clone());
-                msg.mark_compressed(1, out.spill.as_deref());
                 self.messages.push(msg);
                 // `repl` 出的图登记进 `__meta__.files`（本地副本保命 + `calls` 供 resume 配对）
                 self.record_repl_images(call, &out);
@@ -1005,18 +1008,21 @@ impl Session {
         let mut out: Vec<Message> = Vec::new();
         for m in &self.messages {
             let raw = m
-                .raw_path
-                .as_deref()
+                .compaction
+                .as_ref()
+                .and_then(Compaction::path)
                 .map(PathBuf::from)
                 .filter(|p| p.exists());
-            match (m.compress_level, raw) {
+            match (m.compaction.as_ref(), raw) {
                 // 轮次级 / 会话级：落盘的是整段原文（JSON 数组或 JSONL）
-                (2 | 3, Some(path)) => {
+                (Some(Compaction::Turn { .. } | Compaction::Session { .. }), Some(path)) => {
                     let mut raws: Vec<Message> = context::load_window_dicts(&path)
                         .into_iter()
                         .filter_map(|v| serde_json::from_value::<Message>(v).ok())
                         .collect();
-                    if m.compress_level == 2 && raws.first().is_some_and(|r| r.role == "user") {
+                    if matches!(m.compaction, Some(Compaction::Turn { .. }))
+                        && raws.first().is_some_and(|r| r.role == "user")
+                    {
                         raws.remove(0); // 轮次级：user 留在外层，落盘的是它后面的过程
                     }
                     out.extend(raws);
@@ -1025,7 +1031,7 @@ impl Session {
                 //
                 // 头区（`[exit=N]` / 指针行）不在落盘件里，从压缩后的消息里补回来——否则回放的
                 // bash 行看不到退出码，会被当成成功（回放里失败的命令显示 〼 且不带正文）。
-                (1, Some(path)) if m.role == "tool" => {
+                (Some(Compaction::Tool { .. }), Some(path)) if m.role == "tool" => {
                     let pointer = m.content_text();
                     let headers = pointer.split_once("\n\n").map_or(
                         pointer.as_str(), // 只有头区（没空行）时整段都是头
@@ -1526,12 +1532,15 @@ mod tests {
 
         assert_eq!(s.clear_window().expect("归档成功"), 1, "一个窗口块");
 
-        // 新窗口 = system（重建）+ 窗口摘要（level 3，带指针）
+        // 新窗口 = system（重建）+ 窗口摘要（会话级，带指针）
         assert_eq!(s.messages.len(), 2, "{:?}", s.messages.len());
         assert_eq!(s.messages[0].role, "system");
-        assert_eq!(s.messages[0].compress_level, 0);
-        assert_eq!(s.messages[1].compress_level, 3);
-        let block = PathBuf::from(s.messages[1].raw_path.clone().expect("带指针"));
+        assert!(s.messages[0].compaction.is_none());
+        assert!(matches!(
+            s.messages[1].compaction,
+            Some(Compaction::Session { .. })
+        ));
+        let block = PathBuf::from(s.messages[1].compaction.as_ref().unwrap().path().unwrap());
         assert!(block.starts_with(storage().windows()), "{block:?}");
         assert!(block.exists(), "{block:?}");
         // 块里是**原文**（三条都在），且文件名最后一段就是内容 hash
@@ -1857,8 +1866,11 @@ mod tests {
         let s = Session::load(&path, &Config::default(), llm(), tools()).expect("load");
         assert_eq!(s.messages.len(), 3, "system prompt + 窗口摘要 + 真实消息");
         assert_eq!(s.messages[0].role, "system");
-        assert_eq!(s.messages[0].compress_level, 0, "第一条是当前提示词");
-        assert_eq!(s.messages[1].compress_level, 3, "窗口摘要要重建回来");
+        assert!(s.messages[0].compaction.is_none(), "第一条是当前提示词");
+        assert!(
+            matches!(s.messages[1].compaction, Some(Compaction::Session { .. })),
+            "窗口摘要要重建回来"
+        );
         let text = s.messages[1].content_text();
         assert!(text.starts_with(context::WINDOW_SUMMARY_MARKER), "{text}");
         assert!(text.contains("旧问题") && text.contains("旧答复"), "{text}");
@@ -1887,7 +1899,7 @@ mod tests {
                 spill.display()
             ),
         );
-        tool.mark_compressed(1, Some(&spill));
+        tool.compaction = Some(Compaction::tool(&spill));
         s.messages.push(tool);
 
         // 轮次级：落盘的是整段原文（JSON 数组，首条是 user）
@@ -1912,7 +1924,7 @@ mod tests {
             "[轮次原文已保存: {}]\n\n旧答复",
             turn.display()
         ));
-        summary.mark_compressed(2, Some(&turn));
+        summary.compaction = Some(Compaction::turn(Some(&turn)));
         s.messages.push(summary);
 
         let full = s.full_history();
@@ -1929,7 +1941,7 @@ mod tests {
             "轮次级展开成原文序列：{full:?}"
         );
         assert!(
-            !full.iter().any(|m| m.compress_level >= 2),
+            !full.iter().any(|m| matches!(m.compaction, Some(Compaction::Turn { .. }))),
             "指针消息都展开完了"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1947,7 +1959,7 @@ mod tests {
         let turn = raw("[]", "turn");
         let mut summary =
             Message::assistant(format!("[轮次原文已保存: {}]\n\n旧答复", turn.display()));
-        summary.mark_compressed(2, Some(&turn));
+        summary.compaction = Some(Compaction::turn(Some(&turn)));
         s.messages.push(summary);
         std::fs::remove_file(&turn).unwrap();
 
@@ -2182,7 +2194,7 @@ mod tests {
         let path = tmp("py.jsonl");
         let jsonl = [
             r#"{"__meta__":true,"usage":{"prompt_tokens":123,"completion_tokens":null,"total_tokens":null,"prompt_cache_hit_tokens":null,"prompt_cache_miss_tokens":null,"reasoning_tokens":null,"calls":3},"windows":[],"cwd":"/tmp","title":"旧会话"}"#,
-            r#"{"role":"system","content":"SENTINEL-OLD-SYSTEM","compress_level":3,"raw_path":"/x"}"#,
+            r#"{"role":"system","content":"SENTINEL-OLD-SYSTEM","compaction":{"kind":"session","path":"/x"}}"#,
             r#"{"role":"user","content":"你好","synthetic":false}"#,
             r#"{"role":"assistant","content":"在的","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}"#,
             r#"{"role":"tool","content":"[exit=0]\n\n/tmp","tool_call_id":"call_1"}"#,

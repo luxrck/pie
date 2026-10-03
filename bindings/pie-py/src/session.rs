@@ -235,7 +235,7 @@ impl PySession {
     }
 
     /// **API 形状**的消息（去掉压缩元数据）——存档 / 喂给别的模型用；
-    /// `messages` 给的是原始 dict（含 `compress_level` / `raw_path` 那些）。
+    /// `messages` 给的是原始 dict（含 `compaction` 那类压缩元数据）。
     #[getter]
     fn api_messages(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self.lock()?;

@@ -98,10 +98,12 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **落盘判据：不可再生才落盘**。bash 的 stdout 进程一结束就没了 → 全文落盘 + `[工具输出全文已保存: path]`
   指针（超限只留开头）；read 的内容可再生（原文件还在、自带 offset 分页）→ 只补
   `[已截断：可用 offset=N 继续读]`，**不落盘**。
-- **落盘路径是结构化的**：`Tool::call` 返回 `ToolOutput { text, spill }`（`spill` 只有 bash 超限时给），
-  消息层用 `Message::mark_compressed(1, spill)` 进历史前设好 `raw_path` + `compress_level`
+- **落盘路径是结构化的**：`Tool::call` 返回 `ToolOutput { text, spill }`（`spill` 只有 bash / repl 超限时给），
+  消息层**进历史前**就把压缩元数据设好（`msg.compaction = Some(Compaction::tool(&path))`
+  —— 变体即级别，与 `CompactEvent` 的 Tool / Turn / Session 一一对应）
   —— 别再拿正文里那行指针去嗅探（`extract_spill_path` / `mark_tool_spill` 已删，连带那个
-  「read 回来的源码字面量会被误判」的坑一起没了）。`ToolOutput` 实现 `Deref<Target = str>` + `Display`，
+  「read 回来的源码字面量会被误判」的坑一起没了）。⚠ **没落盘就别设**：`Compaction::Tool` 的定义就是
+  「输出已落盘」，而 `compact_tools` 靠 `>= 1` 跳过已压过的消息 → 乱标会让工具级压缩永远压不动。`ToolOutput` 实现 `Deref<Target = str>` + `Display`，
   所以旧的 `out.starts_with(…)` / `format!("{out}")` 照常能用。
 - bash 起进程必须独立进程组（`process_group(0)`）+ 取消/超时 `killpg(SIGKILL)`：只杀 `bash` 会让
   孙进程变孤儿并持有管道写端，等待被卡到子孙自然退出。shell 名/选项只住 `impl Bash` 的
@@ -114,7 +116,7 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **JSONL 落盘要转义「行分隔类」字符**（`session::json_line` / `escape_control_chars`）：serde_json 只转义 C0，
   C1（U+0080–U+009F）与 U+2028/U+2029 会裸着落盘——JSON 里合法，但 `splitlines()` 那一类读者会把
   **U+0085 当换行**，一条消息被劈成两半、整份会话读不出来。session 文件与 `/clear` 的窗口块都走 `json_line`。
-- 本地专有字段（`compress_level` / `raw_path` / `synthetic` / `thought_ms`）
+- 本地专有字段（`compaction` / `synthetic` / `thought_ms`）
   **绝不能进 API 请求体**：发给模型前统一过 `Message::to_api()`。`thought_ms` = 这条回复「思考」了多久
   （`session::ThoughtClock` 量：首个 reasoning 增量起算、首个正文增量停下）；**回放靠它还原**
   `• Thought for 3.4s` 那行——不落盘的话退出再 `-r` 就没了（非流式没有增量事件 → None）。

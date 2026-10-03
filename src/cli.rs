@@ -198,7 +198,7 @@ pub fn collect_file_garbage(storage: &config::Storage, protect_hours: u64) -> Ve
     garbage
 }
 
-/// 被引用的**压缩原文**：所有会话的 `__meta__.compaction_events` + 所有消息里的 `raw_path`。
+/// 被引用的**压缩原文**：所有会话的 `__meta__.compaction_events` + 所有消息里的 `compaction.path`。
 ///
 /// 两者都在**会话文件**里（同一趟车落盘），所以这里只扫 `sessions/`。
 pub fn referenced_raw_paths(storage: &config::Storage) -> HashSet<PathBuf> {
@@ -236,7 +236,13 @@ pub fn referenced_raw_paths(storage: &config::Storage) -> HashSet<PathBuf> {
                 }
                 continue;
             }
-            if let Some(raw) = v.get("raw_path").and_then(Value::as_str) {
+            // 消息里的压缩元数据：`{"compaction":{"kind":"turn","path":…}}`
+            // （轮次级落盘失败时没有 `path`——那种消息本来就没引用什么）
+            let raw = v
+                .get("compaction")
+                .and_then(|c| c.get("path"))
+                .and_then(Value::as_str);
+            if let Some(raw) = raw {
                 if let Some(abs) = absolutize(raw) {
                     refs.insert(abs);
                 }
@@ -335,7 +341,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息（各带 `raw_path`）。
+    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息。
     fn write_session_with_events(
         storage: &Storage,
         events: &[Value],
@@ -368,16 +374,24 @@ mod tests {
                 .unwrap()
         };
         let referenced = put("bash", "referenced");
+        let in_message = put("turn", "in-message");
         let orphan = put("turn", "orphan");
         write_session_with_events(
             &storage,
             &[serde_json::json!({"level": 1, "raw_path": referenced.display().to_string()})],
-            &[],
+            &[{
+                // 消息侧的引用来自 `compaction.path`（这里抽查轮次级那条路子）
+                let mut m = crate::llm::Message::assistant("摘要");
+                m.compaction = Some(crate::llm::Compaction::turn(Some(&in_message)));
+                m
+            }],
         );
         let garbage = collect_context_garbage(&storage);
         assert!(garbage.contains(&orphan), "{garbage:?}");
         assert!(!garbage.contains(&referenced), "{garbage:?}");
+        assert!(!garbage.contains(&in_message), "消息里的指针也算引用：{garbage:?}");
         assert!(referenced_raw_paths(&storage).contains(&referenced));
+        assert!(referenced_raw_paths(&storage).contains(&in_message));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

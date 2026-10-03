@@ -273,7 +273,7 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
 | `CompactMode`（enum） | `str`（`"auto" \| "tools" \| "turns"`） | 解析失败抛 `ValueError` |
 | `LlmError` / `ConfigError` | 异常层级：`PieError` → `LlmError`（带 `.status`）/ `ConfigError` / `ToolError` | `status()` / `retryable()` 暴露成属性 |
 | `PathBuf` | `str`（`os.fspath` 兼容） | 读写都走 `os.PathLike` |
-| `Message` / `Usage` / `TurnEvent` | `dict` | 字段名保持 JSONL 原名（`compress_level` 而非 `compressLevel`） |
+| `Message` / `Usage` / `TurnEvent` | `dict` | 字段名保持 JSONL 原名（`tool_call_id` 而非 `toolCallId`） |
 | `Config.api_key` | ⚠️ `repr` 打码；默认值是**本部署真实 key** | 文档与 `Config.load()` 都要提示 |
 
 ### 5.7 路径与共享资产

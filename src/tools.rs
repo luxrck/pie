@@ -17,9 +17,10 @@ use serde_json::{json, Value};
 
 /// 工具执行的产出：正文 + **落盘全文的路径**（`spill`）。
 ///
-/// `spill` 只在工具把全文写到盘上时给（现在只有 `bash` 超 `_max_lines` / `_max_bytes` 时）
-/// —— 消息层据此**进历史前**就把 `raw_path` / `compress_level` 设好（`Message::mark_compressed`），
-/// 不用事后拿正文里那行 `[工具输出全文已保存: …]` 去嗅探。
+/// `spill` 只在工具把全文写到盘上时给（`bash` / `repl` 超 `_max_lines` / `_max_bytes` 时）
+/// —— 消息层据此**进历史前**就把 `compaction` 设好（`Compaction::tool(path)`），
+/// 不用事后拿正文里那行 `[工具输出全文已保存: …]` 去嗅探。**没落盘就什么都别设**：
+/// `compact_tools` 靠 `compaction.is_some()` 跳过已压过的消息。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolOutput {
     pub text: String,
@@ -941,7 +942,7 @@ impl Tool for Bash {
             None => Ok(ToolOutput::text(format_output(&headers, &out))),
             Some(head) => {
                 // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针（模型据此读回），
-                // 同时把路径**结构化**地放进 `ToolOutput.spill`（消息层构造时就带上 `raw_path`）。
+                // 同时把路径**结构化**地放进 `ToolOutput.spill`（消息层构造时就带上 `compaction`）。
                 // 落盘走 `Storage::store`（内容 hash 寻址，按内容去重）。
                 let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
                     prefix: "bash",
@@ -1799,7 +1800,7 @@ mod tests {
             .find_map(|l| l.strip_prefix("[工具输出全文已保存: ")?.strip_suffix(']'))
             .expect("有落盘指针");
         let full = std::fs::read_to_string(spill).expect("落盘文件可读");
-        // 结构化：路径也随结果交出来（消息层据此**构造时**就设 `raw_path`，不再靠文本嗅探）
+        // 结构化：路径也随结果交出来（消息层据此**构造时**就设 `compaction`，不再靠文本嗅探）
         let spilled = out.spill.clone().expect("落盘 → ToolOutput.spill 有值");
         assert_eq!(
             spilled,
