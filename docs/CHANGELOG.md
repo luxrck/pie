@@ -2,6 +2,27 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（修：跨 cell 增量改同一个 figure 丢图 —— driver 不再 `plt.close("all")`）
+
+用户：「为啥我看到的图片中没有那个六边形呢？是 pie 的代码有问题还是我的代码有问题？」——**是 pie 的 bug。**
+
+`repl_driver.py::_capture_figures` 每轮 `post_execute` 抓完图就 `plt.close("all")`，而抓图只认
+`plt.get_fignums()` —— close 把 figure 从 pyplot **注销**（对象还在用户命名空间里，所以 `ax.add_patch`
+照常生效、图确实变了）。于是「同一个 cell 建图 + 画完」没问题，但**跨 cell 复用同一个 `fig` 增量叠加**
+（`fig, ax = plt.subplots()` 之后几个 cell 慢慢加图层 —— matplotlib 的标准用法）就再也抓不到
+→ 图变了却不上报，画布 `Repl::pick_image` 往前找最近一张，一直显示旧图。
+
+**改法**：去重从「抓完就关」换成「**内容 sha256 判重**」（`_last_png_hash: {figure number: hash}`），不再 close。
+
+- 语义等价：close 原本只为了「下一轮别重复抓」，hash 判重接管这件事，而且判据精确到内容。
+- 代价：figure 不再自动关闭 → 长会话里画很多张会堆着（matplotlib 到 20 张会自己警告）。备选方案
+  （只抓 `fig.stale`）能省掉每轮的编码开销，但依赖 matplotlib 的 stale 标志，撞上「改了却不置 stale」
+  的操作会**漏抓** —— 取确定性。
+
+**验证**：临时脚本起真 driver 子进程按协议喂 cell —— HEAD 版「建图 / 叠加 / 再叠加」三格分别上报
+**1 / 0 / 0** 张（复现），新版是 **1 / 1 / 1** 且三张 hash 互不相同；「没碰 figure」的格与空格仍是 0 张
+（去重没退化）。`cargo test` 254 + 4 全绿。⚠ driver 是 `include_str!` 编进二进制的 → 要**重启 pie** 才生效。
+
 ## 2026-10-03（`repl` 跑过的代码住进 system prompt：压缩带走的那些，永远看得见）
 
 用户：「把 repl 的 code blocks 统一集中到 system 区域……和 `/cd` 的处理类似。因为这样不用特殊处理

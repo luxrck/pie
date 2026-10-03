@@ -189,7 +189,8 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   消息流那条渲染路径（`else` 分支里）。**别把画布塞回消息流**：独立 Rect 是固定的 → 贴图
   （ratatui-image）不会被滚动反复重传。
 - **REPL 画布能贴图**：`repl` 里 matplotlib 出的图走**结构化通道**（`repl_driver.py` 在 `post_execute`
-  扫还开着的 figure → `Reply.images` → `ToolOutput.images` → `TurnEvent::ToolResult.images` → **浮在画布右下角**的**固定 Rect**
+  扫还开着的 figure（⚠ 判重按**内容 sha256**，**别**再 `plt.close("all")`：关闭会把 figure 从 pyplot 注销
+  → `get_fignums()` 看不到它，跨 cell 增量改同一个 `fig` 就永远抓不到） → `Reply.images` → `ToolOutput.images` → `TurnEvent::ToolResult.images` → **浮在画布右下角**的**固定 Rect**
   （文本仍占**整块**画布；浮层为画布 4/5 宽、4/5 高且上限 60 行，`Image` 贴到该区右下角），
   `ratatui-image` 渲染；显示的是**跟随滚动位置**的那张（滚到哪条记录就显示那条的图，那条没图就往前找最近
   一张，见 `Repl::pick_image`）——固定 Rect 才不会因滚动重传，而 `Protocol` 编码一次、区域变了才重编）。⚠ 协议档位**只按环境变量定**
