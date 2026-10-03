@@ -9,6 +9,7 @@ parent 一死，stdin 就 EOF → 本进程自杀（孤儿进程防护）。
 """
 
 import glob
+import hashlib
 import io
 import json
 import os
@@ -67,14 +68,22 @@ except OSError:
 
 # 本次执行产出的图（每轮开始清空；帧里带给 Rust 侧）。
 _images = []
+# 每个 figure 上一次上报时的内容指纹：替「抓完就 close」做去重（见 `_capture_figures`）。
+_last_png_hash = {}
 
 
 def _capture_figures():
-    """把当前**还开着**的 matplotlib figure 存成 PNG。
+    """把**内容变了的** matplotlib figure 存成 PNG。
 
     为什么在 `post_execute` 扫、而不去 patch `plt.show`：无显示后端下 `show()` 是 no-op，
     而用户往往在**同一个 cell** 里 `import` + `plot` + `show` —— 执行前 patch 来不及。
     执行后扫「还没关掉的 figure」则一定抓得到（`show()` 在 Agg 下不会关它们）。
+
+    去重靠内容 hash，**不**用 `plt.close("all")`：close 会把 figure 从 pyplot 注销
+    （对象还在用户命名空间里，所以照常能改），于是**跨 cell 增量改同一个 `fig`**
+    （`fig, ax = plt.subplots()` 之后几个 cell 慢慢加图层）就再也不会被 `get_fignums()`
+    看到 —— 图变了却不上报，画布一直显示旧图。
+    代价：figure 不再自动关闭（长会话里画很多张会堆着，matplotlib 到 20 张时自己会警告）。
     """
     if _IMAGE_DIR is None:
         return
@@ -88,15 +97,19 @@ def _capture_figures():
     for n in nums:
         try:
             fig = plt.figure(n)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=110)
+            data = buf.getvalue()
+            digest = hashlib.sha256(data).hexdigest()
+            if _last_png_hash.get(n) == digest:
+                continue  # 这个 figure 自上次上报后没变 → 不重复上报
             path = os.path.join(_IMAGE_DIR, f"fig-{int(time.time() * 1000)}-{n}.png")
-            fig.savefig(path, dpi=110)
+            with open(path, "wb") as fh:
+                fh.write(data)
             _images.append(path)
+            _last_png_hash[n] = digest
         except Exception:
             pass
-    try:
-        plt.close("all")  # 关掉才不会下一轮重复抓
-    except Exception:
-        pass
 
 
 try:
