@@ -2,6 +2,44 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（`history()`：把历史变成数据 —— repl 里能查到「被压缩卷走」的那部分）
+
+用户：「tui 里面你可以通过 `full_history` 来重建 repl blocks。但是，假设我们的上下文经过压缩了，
+模型应该不是很容易能够准确记住全部 code blocks 吧？」——**对，而且比这更麻烦**：模型不只是记不住，
+它**不知道自己忘了**（摘要读起来是连贯的），于是按记忆里的变量名/签名继续写，拿到的是静默漂移的结果。
+
+**调研对照（`jaz-lang/jaz`，arXiv 2609.26891）**：那份工作把「REPL 转录」当作 `__history__` 变量绑进解释器
+命名空间，让 agent **写代码**去遍历/搜索；他们论文里的原话是 *compaction corresponds to passing in a
+`prev_progress_summary` only*（即我们那套压缩是他们的退化特例）。我们不需要它的架构（loop / 语言原语），
+但要它的**纪律**：上下文应当是**可寻址的数据**，不是一段要模型记住的散文。
+
+**先纠正一个我自己的错误说法**：我们**不丢数据** —— 工具级全文在 `context/<prefix>-<hash>`、
+轮次级整段 span 在 `context/turn-<hash>`、`/clear` 整窗口在 `windows/window-<hash>`，
+`full_history()` 能完整展开。真正的差距是**可达性**：`[轮次原文已保存: path]` 是散文里的路径字符串，
+要模型①注意到②知道能 `read`③愿意花一次调用；而 JAZ 那边是个 list，`[e for e in prev_history if …]` 就查了。
+
+**落地**：
+- `Session::write_transcript()`（`aturn` 开头调）：把当前**压缩态**的 `self.messages` 按 `json_line` 写成
+  一份快照 —— 临时目录 + 会话路径 hash（不占数据目录；父/子 agent 并行不串台），走「临时文件 + rename」
+  所以读到的永远是完整一份。
+  ⚠ **为什么不让解释器直接读会话文件**：那个文件只在退出 / `/save` 时落盘，**会话进行中根本不存在**
+  （一次性会话更是永远不落盘）→ 会话中途查历史会得到空。这条是设计的关键约束。
+- `ToolCtx.transcript: Option<PathBuf>`（新增字段 + `with_transcript`）→ `ReplProc::spawn` 设
+  `PIE_TRANSCRIPT` 环境变量 → driver 侧 `history()` 读它（与 `PIE_REPL_IMAGE_DIR` 同一套 env 通道）。
+- `repl_driver.py`：`_read_records()`（**两种形状都认**：JSONL 一行一条 / pretty JSON 数组）、
+  `history(expand=True, turn=None)` —— 每条消息另给 `turn` 索引；`turn` / `session` 归档**整段插回来**；
+  `tool` 落盘只给 `full_output_path`。挂进 `shell.user_ns`，**同时**同步进 `user_ns_hidden`
+  （IPython 藏 `exit` / `quit` / `open` 的同一招）→ 不出现在 `[解释器] …` 的名字清单里——
+  它是我们预置的库函数，不是用户的东西；发现渠道是工具描述。⚠ 只管**显示**：`history = 5` 照样盖掉它。
+- 工具 doc 加了一句：「记不清早先写过什么、跑过什么就查它，别靠回忆」——工具描述每次请求都在，是最可靠的发现渠道。
+
+测试：`repl::tests::history_reads_the_transcript_and_expands_compaction`（真驱动 + 真 IPython：
+展开 5 条 / `expand=False` 4 条 / `turn=0` 3 条 / 归档里的代码可查 / `full_output_path` 在）、
+`session::tests::transcript_snapshot_is_rewritten_for_each_turn`（重写而非追加）。
+
+**已知边界**：① 快照含当前用户输入、不含本轮尚未落盘的消息；② `expand` 只展开**结构**指针
+（归档整段），工具输出的全文仍留在盘上按需读 —— 这是有意的，落盘的意义就是不塞回上下文。
+
 ## 2026-10-03（repl 的状态由**每次执行自己带回来**：输出头区那行 `[解释器] …`）
 
 用户：「你这样每次都要 `_pie_state()` 发给模型，平白多了一次调用」——**对**。

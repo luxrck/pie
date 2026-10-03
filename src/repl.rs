@@ -13,6 +13,7 @@
 //!
 //! 协议见 `repl_driver.py`（「4 字节大端长度 + UTF-8」），本模块是它的对端。
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,6 +55,9 @@ const SIGKILL: i32 = 9;
 /// 在当前会话里持久运行的 IPython 中执行一段 Python 代码（变量、import、定义跨调用保留）。
 /// 输出的头区总有一行 `[解释器] …`：解释器现在有哪些名字、本次新增了什么——
 /// 上下文被压缩后你的历史里可能已经没有那些代码块了，写代码前以这一行为准，别按记忆猜。
+/// 解释器里备着 `history()`：本会话的完整转录（**压缩指针已展开**），逐条含 `role` /
+/// `content` / `tool_calls`（代码就在 `arguments` 里）/ `turn`，被落盘的工具输出另带
+/// `full_output_path` —— 记不清早先写过什么、跑过什么就查它，别靠回忆。
 #[derive(Deserialize, JsonSchema)]
 pub struct Repl {
     /// 要执行的 Python 代码（可多行；和往 IPython 里敲的一样，支持 `%` 魔法与 `!shell`）
@@ -169,7 +173,7 @@ impl Tool for Repl {
                 .unwrap_or(true);
             if dead {
                 *guard = None;
-                *guard = Some(ReplProc::spawn(&python, &driver).await?);
+                *guard = Some(ReplProc::spawn(&python, &driver, ctx.transcript.as_deref()).await?);
             }
             let proc = guard.as_mut().expect("刚确保过");
             match proc.run(code.clone(), &ctx, timeout).await {
@@ -202,9 +206,17 @@ impl Tool for Repl {
 
 impl ReplProc {
     /// 起一个解释器进程，把 `stdin` / `stdout` / `stderr` 交给 owner task。
-    async fn spawn(python: &str, driver: &str) -> Result<ReplProc, ToolError> {
+    async fn spawn(
+        python: &str,
+        driver: &str,
+        transcript: Option<&Path>,
+    ) -> Result<ReplProc, ToolError> {
         let mut cmd = tokio::process::Command::new(python);
         cmd.arg("-u").arg("-c").arg(driver);
+        // 解释器据此读转录（`history()`）——一份**每轮重写**的快照，不是会话文件本身
+        if let Some(path) = transcript {
+            cmd.env("PIE_TRANSCRIPT", path);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -549,6 +561,7 @@ while True:
         ToolCtx {
             cancel: None,
             storage: Storage::at(tmp.to_path_buf()),
+            transcript: None,
             state: Arc::new(crate::tools::SessionState::default()),
         }
     }
@@ -629,6 +642,103 @@ while True:
         );
         assert!(out.text.contains("line1\nline2\n"), "只留开头两行：{out:?}");
         assert!(out.spill.is_some());
+    }
+
+    /// 真驱动要 IPython（系统 `python3` 通常没有）→ 优先 `~/.pie/repl/bin/python`。
+    fn python_with_ipython() -> Option<String> {
+        let venv = std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h)
+                .join(".pie/repl/bin/python")
+                .to_string_lossy()
+                .to_string()
+        });
+        venv.into_iter().chain(["python3".to_string()]).find(|py| {
+            std::process::Command::new(py)
+                .args(["-c", "import IPython"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// 跑**真驱动**（不传 `_driver`）——`history()` 那条路只有真解释器才有。
+    async fn run_code_real(reg: &ToolRegistry, ctx: &ToolCtx, py: &str, code: &str) -> ToolOutput {
+        let args = json!({"code": code, "_python": py});
+        reg.dispatch("repl", &args, ctx.clone()).await.unwrap()
+    }
+
+    /// `history()`：解释器里能拿到**本会话的完整转录**，压缩指针默认展开。
+    #[tokio::test]
+    async fn history_reads_the_transcript_and_expands_compaction() {
+        let Some(py) = python_with_ipython() else { return };
+        let tmp = tempdir("history");
+        // 轮次归档：被压掉的那一轮原文（整轮的代码 + 输出）
+        let archive = tmp.join("turn-abc");
+        std::fs::write(
+            &archive,
+            serde_json::to_string_pretty(&json!([
+                {"role": "assistant", "content": null,
+                 "tool_calls": [{"id": "c1", "type": "function", "function":
+                                 {"name": "repl", "arguments": "{\"code\": \"df = 42\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "42"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        // 快照（真跑时由 `Session::write_transcript` 每轮重写；这里是手造的）
+        let snapshot = tmp.join("transcript.jsonl");
+        std::fs::write(
+            &snapshot,
+            [
+                json!({"role": "user", "content": "第一问"}).to_string(),
+                json!({"role": "assistant", "content": "[轮次原文已保存: …]\n\n...[中间过程省略]...",
+                       "compaction": {"kind": "turn", "path": archive}})
+                .to_string(),
+                json!({"role": "user", "content": "第二问"}).to_string(),
+                json!({"role": "tool", "tool_name": "bash", "content": "<head>",
+                       "compaction": {"kind": "tool", "path": "/tmp/全文.txt"}})
+                .to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let reg = registry();
+        let ctx = ToolCtx {
+            transcript: Some(snapshot),
+            ..ctx_at(&tmp)
+        };
+        let out = run_code_real(
+            &reg,
+            &ctx,
+            &py,
+            "print([(e['role'], e['turn']) for e in history()])\n\
+             print(len(history(expand=False)), len(history(turn=0)))\n\
+             print(history()[1]['tool_calls'][0]['function']['arguments'])\n\
+             print(history()[4]['full_output_path'])\n",
+        )
+        .await;
+
+        // 展开后：user(0) + 归档里的 assistant(0)/tool(0) + user(1) + tool(1)
+        assert!(
+            out.text.contains(
+                "[('user', 0), ('assistant', 0), ('tool', 0), ('user', 1), ('tool', 1)]"
+            ),
+            "{out:?}"
+        );
+        assert!(
+            out.text.contains("4 3"),
+            "expand=False 是压缩态（4 条）、turn=0 只那一轮（3 条）：{out:?}"
+        );
+        assert!(
+            out.text.contains(r#"{"code": "df = 42"}"#),
+            "归档里的代码要能被查到：{out:?}"
+        );
+        assert!(
+            out.text.contains("/tmp/全文.txt"),
+            "落盘全文的路径要带出来：{out:?}"
+        );
     }
 
     #[tokio::test]

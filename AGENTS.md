@@ -92,6 +92,16 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   —— 状态得由每次执行自己带回来（让模型另发一次询问 = 白搭一次往返）。
   为什么放**头区**：`head_prefix` 保留的是开头，超限截断/落盘时它得跟着走。
   ⚠ driver 没上报（`state: None`）就不加那行 —— 与「上报了、是空的」（`[解释器] 空`）是两回事。
+- **解释器里有 `history()`（历史即数据）**：读的是 `Session::write_transcript` **每轮开头**
+  重写的转录快照（临时目录 + 会话路径 hash，经 `PIE_TRANSCRIPT` 交给 driver）。
+  ⚠ 它同时同步进 `user_ns_hidden`（IPython 藏 `exit` / `quit` / `open` 的同一招）→ 不出现在
+  `[解释器] …` 的名字清单里（发现渠道是工具描述）；⚠ 只管**显示**，`history = 5` 照样盖掉它。
+  为什么不直接读会话文件：
+  它**只在退出 / `/save` 时**落盘，会话进行中根本不存在（一次性会话更是永远不落盘）。
+  压缩指针（`turn` / `session`）在 **Python 侧展开**（`_read_records` 认 JSONL 与 JSON 数组两种形状）；
+  工具输出只给 `full_output_path`、**不**把全文塞回来（那正是它当初落盘的原因）。
+  为什么值得做：我们的压缩本来就**无损**（原文都在盘上），缺的是**可达性** ——
+  `[轮次原文已保存: path]` 是散文里的一个路径，要模型记得去 `read`；`history()` 把引用变成**可编程遍历的数据**。
 - 两条编译器定的规矩：trait 里必须写 `-> impl Future<Output=…> + Send`（`async fn` 表达不出 `Send`；
   impl 里仍可写 `async fn`）；`#[schemars(...)]` 必须写在 `#[derive(JsonSchema)]` **之后**。
   schemars 另有两个坑：doc 的单换行会被合并成空格（多行描述用 `#[schemars(description=…)]`）、
