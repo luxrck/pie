@@ -918,8 +918,10 @@ impl App {
     ///
     /// 数据目录跟着重解析（`PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）——切到带 `.pie` 的
     /// 项目目录后，压缩落盘 / 图片副本 / 会话列表都落在那儿（与 CLI 的 `--cwd` 同一个口径）。
-    /// 切换会往**会话历史**与**消息流**各插一条 system 说明：历史里那条是给模型的上下文
-    /// （它得知道 cwd 变了），流里那条是给人看的。
+    ///
+    /// ⚠ **不往会话历史里插说明**：模型看到的是 system prompt 末尾那节「运行时状态」，
+    /// 由 `Session::aturn` 每轮现拼（往历史里插一条 system 会被轮次级压缩卷进摘要，模型就瞎了）。
+    /// 消息流里那条 `Notice` 才是给人看的。
     fn change_dir(&mut self, arg: &str) {
         if arg.trim().is_empty() {
             self.push_notice(&format!("当前工作目录：{}（用法：/cd <路径>）", cwd_text()));
@@ -937,22 +939,21 @@ impl App {
         let storage = crate::config::Storage::from_env();
         let mut text = format!("已切换工作目录：{}", cwd.display());
         if storage.root != self.storage.root {
-            // 数据目录也跟着走了 → 说清楚落盘换到哪儿了（模型与人都需要知道）
+            // 数据目录也跟着走了 → 说清楚落盘换到哪儿了
             text.push_str(&format!("（数据目录：{}）", storage.root.display()));
         }
         self.storage = storage.clone();
-        // 锁内只做「改会话 + 取快照」，出来再动 `self`（`guard` 借的是 `self.session`）
-        let announced = self.session.try_lock().ok().map(|mut guard| {
+        // 数据目录得写进会话（落盘用）；拿不到锁就等下一轮——cwd 那节反正每轮会自己校准，
+        // 所以这里不算“模型不知道 cwd 了”，只是这一轮新产生的落盘还会去旧目录。
+        // （锁内只取快照，出来再赋给 `self`：`guard` 借的是 `self.session`。）
+        let snapshot = self.session.try_lock().ok().map(|mut guard| {
             guard.config.storage = storage;
-            guard
-                .messages
-                .push(crate::llm::Message::system(text.clone()));
             Snapshot::capture(&guard)
         });
-        match announced {
+        match snapshot {
             Some(snapshot) => self.snapshot = snapshot,
-            // 回合中锁被任务占着：cwd 已经切了，历史里那条晚一点再补
-            None => self.push_notice("会话正忙：工作目录已切，历史里的说明稍后再生效"),
+            // 回合进行中：cwd 已经切了（下一轮开头会反映进 system prompt），数据目录下次再切
+            None => self.push_notice("会话正忙：目录已切；数据目录的切换请等这个回合结束后再 `/cd` 一次"),
         }
         self.cells.push(Cell::Notice(text));
         // `@` 补全的索引与补全会话都是按旧 cwd 建的 → 作废，下次用会在新目录重建
@@ -1671,7 +1672,11 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    /// `/cd`：切 cwd + 数据目录跟着重解析 + 历史/消息流各插一条 system 说明。
+    /// `/cd`：切 cwd + 数据目录跟着重解析 + 消息流一条 Notice。
+    ///
+    /// ⚠ **不往历史里插消息**（旧行为）：模型看到的是 system prompt 末尾那节「运行时状态」，
+    /// 由 `Session::aturn` 每轮现拼——往历史里插一条 system 会被轮次级压缩卷进摘要，模型就瞎了。
+    /// 这里只钉「历史没被污染」；那节本身的重拼在 `session::tests` 里钉。
     #[test]
     fn cd_switches_working_dir_and_announces_it() {
         // cwd 与 `PIE_DIR` 都是进程级的 → 与其它环境类用例共用锁，收尾原样恢复
@@ -1698,8 +1703,8 @@ mod tests {
         {
             let session = app.session.try_lock().unwrap();
             assert_eq!(session.config.storage.root, shown, "会话那份也刷新了");
-            let last = session.messages.last().expect("历史里应有一条 system 说明");
-            assert_eq!(last.role, "system");
+            assert_eq!(session.messages.len(), 1, "历史里不该多出消息（只剩 system prompt）");
+            assert_eq!(session.messages[0].role, "system");
         }
         let text = target.display().to_string();
         assert!(
