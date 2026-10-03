@@ -32,7 +32,8 @@
 - 输出统一 `Headers\n\nBody`：headers 一行一个 `[key=value]`，body 空则连空行都不给。**bash 失败才给头**（一行 `[exit=N, os=…, shell=…]`），成功只有正文（成功且无输出 = 空串）；判成败只看第一行（`[exit=` 开头且不是 `[exit=0…` = 失败）。
 - **落盘判据：不可再生才落盘**。bash 的 stdout → 全文落盘 + 指针（超限只留**开头**）；read 可再生 → 只补 `[已截断：可用 offset=N 继续读]`，不落盘。**落盘路径是结构化的**（2026-09-30）：`Tool::call` 返回 `ToolOutput { text, spill }`，消息层用 `Compaction` 设元数据 —— `msg.compaction = Some(Compaction::tool(&path))`，**只有真落盘才设**（`Compaction::Tool` 的定义就是「输出已落盘」，而 `compact_tools` 靠 `compaction.is_some()` 跳过已压过的消息；没落盘乱设会让工具级压缩永远压不动，2026-10-03 修）。**没数字级别了**（2026-10-03）：`compress_level: u8` + `raw_path` 两个字段合成 `compaction: Option<Compaction>`（`Tool{path}` / `Turn{path: Option<String>}` / `Session{path}`，serde `tag="kind"`）——变体即级别（要数字用 `level()` 同口径），与 `CompactEvent` 同形；**非法状态（「1 却没有指针」）构造不出来**；`extract_spill_path` / `mark_tool_spill` 已删（文本嗅探 + 工具名 gate + `exists()` 双保险一起没了）。
 - bash：`process_group(0)` + 取消/超时 `killpg(SIGKILL)`（只杀 `bash` 会被孙进程持有的管道卡住）；shell 名/选项只住 `impl Bash` 的 `const SHELL` / `SHELL_FLAG`。`--tools read,ls,grep` = read + 只允许 ls/grep 的受限 bash（复用 `_allow_cmds`，白名单在启动进程前校验）。
-- edit 诊断齐（级联引用 / 出现多次 / 重叠 / 只差空白 + 最接近位置 + 简版 diff，自写不引依赖）；图片识别用 `image` crate 只读头部，**必须过格式白名单**（TIFF/ICO 它也认得，不该当图片）。
+- edit 诊断齐（级联引用 / 出现多次 / 重叠 / 只差空白 + 最接近位置 + 简版 diff，自写不引依赖；2026-10-04 补：**重复时列出每一处的行号+上下文**、**会话级 read 快照** `ReadSnapshots` 把 `not_found` 分成四态 ——「没读过（`bash` 看的不算）/ 内容一致（附**读过的行区间**）/ 文件已变」；依据：失败里 34% 是「本会话没读过该文件」、有 read 的里 77% 只局部读过）；图片识别用 `image` crate 只读头部，**必须过格式白名单**（TIFF/ICO 它也认得，不该当图片）。
+- **edit 的前置纪律**（2026-10-04 写进 `Edit` 的 description 与 `prompts/system.md`）：**改前先 read 你要改的那一段**（oldText 从**最近一次** read 的输出整段复制，别凭记忆写；`bash`/`grep` 看到的内容不算）、oldText **至少 3 行上下文**、别用单行或高重复片段。
 
 ### 会话 / 上下文 / 图片
 
@@ -54,6 +55,7 @@
 ### 模型层（llm.rs）
 
 - reqwest + **手写 SSE**，不含任何 SDK；`GET /user/balance` 查余额（金额是字符串）、`GET /models` 列模型。
+- **请求体只有一处出口** `request_body`（`complete` / `stream` 共用）：`model` + `messages`，可选 `tools` / `reasoning_effort` 或关闭思考的 `thinking:{type:disabled}` / `max_tokens` / `stream`+`stream_options`。**按次覆盖**走 `llm::RequestOptions`（enum、按协议分：现在只有 `ChatCompletions { reasoning_effort: Option<&str>, response_format: ResponseFormat }`，将来 Responses API = 加一个变体；`Default` 手写）—— 从 `LlmClient::complete`/`stream` 一路透到 `Session::aturn` 与绑定的 `aturn`/`aturn_async`/`turn_future`/`run`（CLI/TUI 不暴露、传 `RequestOptions::default()`）；`reasoning_effort` 的 `None` = 客户端自身的，空串/`none` = 关闭思考，`response_format` 的 `Text` 默认 = **不发**该字段。归一逻辑住 `config::normalize_reasoning_effort`（`Config` 那个方法也调它）。对照文档**没补**的：`temperature`/`top_p`/`stop`/`tool_choice`/`logprobs`/`user_id`（两个 `*_penalty` 已 deprecated、不发是对的）。
 - 重试收敛成**唯一驱动器** `LlmClient::with_retry(what, op, decide)` + 枚举 `Retry::{Backoff, Now, Give}`：`complete`/`list_models` 用 `default_retry`（额度 = `1 + max_retries`，只认 408/409/429/5xx 与传输层异常），`stream` 的两条特例写在它自己的 `decide` 里（**已吐过增量 → Give**；400 拒 `stream_options` → 改写开关 + `Now`，不占额度）。`Retry-After` 优先并夹在 `[1.0, 60.0]`。重试进度走 `log::progress(key, …)` 分组，TUI 侧**就地更新同一块**。
 - 上下文两笔账：`context_window`（输入+输出一起算）与 `reserved_tokens`（= 发给 API 的 `max_tokens`，`None`/`auto` = 不发）。服务端按「输入 + max_tokens ≤ 窗口」**预检**，超了直接 400 → 水位必须相对 `context_budget` 算。窗口大小服务端只在超限报错里告诉你（`GET /models` 只给 id）；本部署 deepseek-flash 实测窗口 1,048,576、`max_tokens` 合法区间 `[1, 393216]`。
 

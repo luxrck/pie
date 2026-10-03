@@ -119,7 +119,7 @@ tools.register(fetch)                 # 或 tools.register(name="x", schema={...
 | `TurnEvent` | dict（`{"type": "tool_call", "name": …, "arguments": …}`） | 与旧 Python 版 `on_event` 的 dict 形状**一致**，两边代码可移植 |
 | `Usage` / `CompactStats` | dict | 同上 |
 | `Config` 的字段 | `to_dict()` / `update(dict)` + 少量 `#[getter]`/`#[setter]`（model / base_url / reasoning_effort / context_window / reserved_tokens / compaction / tools / tui） | 全字段属性太脆（Rust 结构体会变）；常用项给属性，其余走 dict |
-| 每回合的执行旋钮 | `aturn(input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None)`（**形参**，不在 Config 里） | 同旧纯 Python 版 `loop.aturn`；`max_steps=None` = 不限，`stream=None` = 默认流式，`parallel_tools=None` = 跟随 `Config.parallel_tools` |
+| 每回合的执行旋钮 | `aturn(input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None)`（**形参**，不在 Config 里） | 同旧纯 Python 版 `loop.aturn`；`max_steps=None` = 不限，`stream=None` = 默认流式，`parallel_tools=None` = 跟随 `Config.parallel_tools`，`reasoning_effort=None` = 用配置里的思考深度，`response_format=None` = `text` |
 
 配套 `py.typed` + `pie/_pie_rs.pyi` 类型存根，把 dict 写成 `TypedDict`。
 
@@ -422,6 +422,32 @@ pub struct Entry { pub name: String, pub description: String, pub parameters: Va
   一条不联网。`PIE_DIR` 指到 tmp 目录 → 不碰真实 `~/.pie`（`ephemeral` 不落盘另有断言）。
 - `.gitignore` 加了 `pie/bindings/*/target/`（这个 crate 有自己的 target/）。
 - 绑定侧 dev 环境：`bindings/pie-py/.venv`（maturin + pytest）。
+
+### 按次旋钮补齐：`reasoning_effort` / `response_format`（2026-10-04）
+
+用户：「`LlmClient.complete` / `.stream` 的请求参数也加上 `reasoning_effort`、`response_format`吧。」
+
+对照 DeepSeek 的 chat-completions 文档我们缺的可设项共 5 个（`temperature` / `top_p` / `response_format` /
+`stop` / `tool_choice` / `logprobs` / `user_id`；两个 `*_penalty` 已 deprecated、不该发）。这次只补**两个
+最常用的**，且都做成**按次覆盖**（不进 Config、不写回文件——与 `max_steps` / `stream` 同一条口径）：
+
+- 核心：`LlmClient::complete` / `stream` 多两个尾参；`Session::aturn`、绑定的 `aturn` /
+  `aturn_async` / `turn_future` / `run` 跟着透传。
+- `reasoning_effort: Option<&str>`：`None` = 用客户端自身的（= 配置值）；`Some` = 覆盖，且与配置值
+  **过同一套归一**（空串 / `none` = 关闭思考 → 改发 `thinking: {type: disabled}`）。
+  归一函数提到 `config::normalize_reasoning_effort`（原来 `Config` 那个方法体）——三个消费者一处定义。
+- `response_format: ResponseFormat`（`Text` / `JsonObject`，默认 `Text`）：`Text` **不发**该字段
+  （服务端默认就是 text，少发一个字段对非 DeepSeek 端点也更安全）；`JsonObject` 才发
+  `{"type": "json_object"}`。绑定侧收字符串（`None` / `"text"` / `"json_object"`），
+  `crate::parse_response_format` 解析，非法值当场抛 `PieError`。
+- 一个坑：绑定里 `response_format` 必须在**持 GIL 的那层**就解析好——回合块返回的是 `LlmError`，
+  `?` 一个 `PyErr` 进不去（`aturn` / `turn_future` 各一处）。
+- 回归：核心 `request_body_per_call_overrides`（覆盖 / 关闭思考 / 默认不发 / 字符串解析）、
+  绑定两条（同步 `complete` + `aturn`、异步 `aturn_async` 的 kwargs 透传）+ 非法值报错。
+- 内部结构（同日跟进）：两个覆盖值在核心拼成 `llm::RequestOptions` —— **按协议分的 enum**（现在
+  只有 `ChatCompletions { reasoning_effort, response_format }` 一个变体），为将来的 Responses API 留位；
+  **Python 侧签名不变**。（`reasoning_effort` 本身仍是 `Option<&str>`：它是开放集合 + 透传，
+  不该被封闭枚举收窄。）
 
 ### M5：asyncio 入口（2026-09-23）
 

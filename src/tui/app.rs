@@ -1013,8 +1013,17 @@ impl App {
                 let _ = event_tx.send(UiEvent::Turn(event));
             };
             let result = guard
-                // `parallel_tools: None` = 跟随 `config.parallel_tools`（TUI 没有覆盖它的入口）
-                .aturn(&input, &mut on_event, &cancel, max_steps, stream, None)
+                // `parallel_tools: None` = 跟随 `config.parallel_tools`（TUI 没有覆盖它的入口）；
+                // `options` 走 chat completions 的默认（思考深度跟客户端、`response_format` = text）
+                .aturn(
+                    &input,
+                    &mut on_event,
+                    &cancel,
+                    max_steps,
+                    stream,
+                    None,
+                    crate::llm::RequestOptions::default(),
+                )
                 .await;
                 let snapshot = Snapshot::capture(&guard);
             let _ = tx.send(UiEvent::TurnDone(result, snapshot));

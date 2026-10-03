@@ -193,9 +193,15 @@ class LlmClient:
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] | None = ...,
+        reasoning_effort: str | None = ...,
+        response_format: Literal["text", "json_object"] | None = ...,
     ) -> dict[str, Any]:
         """同步调**一次**模型（不吃工具循环）：返回 `content` / `reasoning_content` /
-        `tool_calls` / `usage`。跑回合请用 `Session.aturn`。"""
+        `tool_calls` / `usage`。跑回合请用 `Session.aturn`。
+
+        `reasoning_effort`（`None` = 用客户端的思考深度；`"none"` = 关闭思考）与
+        `response_format`（`None` / `"text"` = 不发该字段；`"json_object"` = 要求合法 JSON）
+        是**按次**覆盖（口径同 `Session.aturn`）。"""
 
 # ---------------------------------------------------------------- 工具
 
@@ -301,8 +307,14 @@ class Session:
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,
+        reasoning_effort: str | None = ...,
+        response_format: Literal["text", "json_object"] | None = ...,
     ) -> str:
-        """跑一个完整回合，返回最终答复（阻塞；期间释放 GIL）。"""
+        """跑一个完整回合，返回最终答复（阻塞；期间释放 GIL）。
+
+        后五个都是**按次**的执行旋钮（不写回配置）：`reasoning_effort` = 本回合的思考深度
+        （`None` = 用配置里的；`"none"` = 关闭思考），`response_format` = `None` / `"text"`（不发
+        该字段）或 `"json_object"`（要求合法 JSON 输出——⚠ 还得自己在 prompt 里交代）。"""
 
     def aturn_async(
         self,
@@ -311,8 +323,10 @@ class Session:
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,
+        reasoning_effort: str | None = ...,
+        response_format: Literal["text", "json_object"] | None = ...,
     ) -> Coroutine[Any, Any, str]:
-        """`await` 版回合（M5）：事件走 `async for ev in session.events()`。
+        """`await` 版回合（M5）：事件走 `async for ev in session.events()`；按次旋钮同 `aturn`。
 
         `task.cancel()` / `session.stop()` 都能真停住（前者靠 Python 侧 glue 桥到 `stop()`）。
         """
@@ -328,6 +342,8 @@ class Session:
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,
+        reasoning_effort: str | None = ...,
+        response_format: Literal["text", "json_object"] | None = ...,
     ) -> Coroutine[Any, Any, str]:
         """底层口：回合 + 事件经 `sink` 推送（`pie._async` 用它，一般不用手动调）。"""
 
@@ -341,8 +357,10 @@ def run(
     max_steps: int | None = ...,
     stream: bool | None = ...,
     parallel_tools: bool | None = ...,
+    reasoning_effort: str | None = ...,
+    response_format: Literal["text", "json_object"] | None = ...,
 ) -> str:
-    """一次性任务（无会话、不落盘），返回最终答复。"""
+    """一次性任务（无会话、不落盘），返回最终答复。按次旋钮同 `Session.aturn`。"""
 
 def list_sessions(limit: int | None = ...) -> list[SessionRow]:
     """历史会话（按 mtime 降序；`limit=None` = 全部）。"""

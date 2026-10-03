@@ -122,6 +122,67 @@ impl std::fmt::Debug for SessionState {
     }
 }
 
+/// 一次（或几次）read 留下的痕迹：整文件内容 hash + **读过的行区间**（1 起、闭区间）。
+#[derive(Clone)]
+struct ReadMark {
+    hash: String,
+    /// 读过的行区间（合并过的）。文件一变就清空 —— 旧范围对新内容没意义。
+    ranges: Vec<(usize, usize)>,
+}
+
+/// 会话级的 **read 快照**：绝对路径 → [`ReadMark`]（只存 hash 与行号，**不存内容**）。
+///
+/// 只服务一件事：`edit` 在 `oldText` 找不到时区分「你抄错了」与「**你手上那份是旧的**」——
+/// 后者工具自己看不出来（它无状态，只认磁盘上的当前内容），而那是 `not_found` 的主要成因。
+/// 行区间是后加的：实测失败里 34% 是「本会话压根没读过这个文件」、有 read 的那批里 77% 只
+/// **局部读**过 —— 光说「文件变了」不够，得把「你读过的是哪几行」摆出来。
+#[derive(Default)]
+struct ReadSnapshots(std::sync::Mutex<HashMap<PathBuf, ReadMark>>);
+
+impl ReadSnapshots {
+    /// 记一笔：`content` 是**整文件**内容，`lines` 是这次实际读到的行区间。
+    fn record(&self, path: &Path, content: &str, lines: (usize, usize)) {
+        let hash = crate::config::hash_id(content.as_bytes());
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mark = map
+            .entry(snapshot_key(path))
+            .or_insert_with(|| ReadMark {
+                hash: hash.clone(),
+                ranges: Vec::new(),
+            });
+        if mark.hash != hash {
+            // 文件变了：旧的行号对新内容没意义
+            mark.hash = hash;
+            mark.ranges.clear();
+        }
+        // 插入并按需合并（相邻 / 重叠都并 —— 多次局部 read 会拼成几段）
+        mark.ranges.push(lines);
+        mark.ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(mark.ranges.len());
+        for &(s, e) in mark.ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 + 1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        mark.ranges = merged;
+    }
+
+    /// 上次读到的是哪一份？`None` = 本次会话还没读过它。
+    fn last(&self, path: &Path) -> Option<ReadMark> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&snapshot_key(path))
+            .cloned()
+    }
+}
+
+/// 快照表的键：尽量用绝对路径 —— 同一个文件被「相对路径 read、绝对路径 edit」提到时也要对得上。
+fn snapshot_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// 工具执行上下文：装**取消信号**、**数据目录**与**会话级状态槽**（将来放实时进度回调也走这条链）。
 ///
 /// 按值传（内部都是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
@@ -299,7 +360,7 @@ pub struct Read {
 }
 
 impl Tool for Read {
-    async fn call(self, _ctx: ToolCtx) -> ToolResult {
+    async fn call(self, ctx: ToolCtx) -> ToolResult {
         // 嗅探只需文件开头这一小段（魔数 + 文件头里的尺寸，不解码全图）
         const READ_HEAD_BYTES: usize = 65_536;
 
@@ -425,6 +486,11 @@ impl Tool for Read {
             cap = cap.min(lines_by_bytes(start, m));
         }
         let picked = &lines[start..(start + cap).min(lines.len())];
+        // 记一笔快照（**整文件**内容 + 这次读到的行区间）：`edit` 靠它区分「抄错了 / 手里那份是旧的 /
+        // 压根没读过这一段」
+        ctx.state
+            .get_or_init(ReadSnapshots::default)
+            .record(p, &content, (start + 1, start + picked.len()));
         let omitted = want - picked.len();
 
         let body = picked.join("\n");
@@ -501,7 +567,7 @@ pub fn parse_image_marker(text: &str) -> Option<ImageRef> {
 // `#[schemars(description = ...)]` 显式给。
 #[derive(Deserialize, JsonSchema)]
 #[schemars(
-    description = "一次调用做多个精确替换：每个 oldText 必须**唯一**且互不重叠，且都按**同一份原文**匹配（不是逐条叠加）。\n编辑纪律（不做很容易白花一次往返）：\n- oldText 从刚 read 到的内容里**整段复制**（含缩进与空行）；\n- 同一次调用的多条 edits **互不依赖**：不能引用另一条 edit 的新文本（要级联就分两次调用）；\n- 任何一条报错，**整次调用什么都不写入**（原子）→ 重新 read 再改，不要接着用旧内容；\n- 改动较大或相邻，就用**一条** edit 覆盖整块，不要拆成多条挨着的 edits。"
+    description = "一次调用做多个精确替换：每个 oldText 必须**唯一**且互不重叠，且都按**同一份原文**匹配（不是逐条叠加）。\n编辑纪律（不做很容易白花一次往返）：\n- **改前先 read 你要改的那一段**：oldText 从**最近一次** read 的输出里整段复制（含缩进与空行），别凭记忆写；\n- oldText 多带几行上下文（**至少 3 行**），别用单行或高重复片段（`}`、`return …`、表格行）—— 命中多次时会把每一处的行号与上下文列出来；\n- 同一次调用的多条 edits **互不依赖**：不能引用另一条 edit 的新文本（要级联就分两次调用）；\n- 任何一条报错，**整次调用什么都不写入**（原子）→ 重新 read 再改，不要接着用旧内容；\n- 改动较大或相邻，就用**一条** edit 覆盖整块，不要拆成多条挨着的 edits。"
 )]
 pub struct Edit {
     /// Path to the file to edit (relative or absolute)
@@ -522,7 +588,7 @@ pub struct EditOp {
 }
 
 impl Tool for Edit {
-    async fn call(self, _ctx: ToolCtx) -> ToolResult {
+    async fn call(self, ctx: ToolCtx) -> ToolResult {
         let Self { path, edits } = self;
         let p = Path::new(&path);
         if !p.exists() {
@@ -632,9 +698,41 @@ impl Tool for Edit {
             )
         };
 
+        // 每处出现的**行号 + 上下文**：不必再 read 一遍就能判断该给哪处加长（`not_unique` 的典型是
+        // 「oldText 太短」，见 stats：9 次里含 `}` 这种一字符的）。
+        const MAX_SHOWN: usize = 6;
+        const CTX_LINES: usize = 2;
+        let occurrences = |content: &str, old: &str| -> String {
+            let lines: Vec<&str> = content.lines().collect();
+            let span = old.lines().count().max(1);
+            let starts: Vec<usize> = content.match_indices(old).map(|(i, _)| i).collect();
+            let mut out = vec![format!("    出现在 {} 处：", starts.len())];
+            for (k, &byte) in starts.iter().take(MAX_SHOWN).enumerate() {
+                let first = content[..byte].matches('\n').count() + 1; // 起始行（1 起）
+                let from = first.saturating_sub(1 + CTX_LINES);
+                let to = (first - 1 + span + CTX_LINES).min(lines.len());
+                out.push(format!("      #{} 第 {}-{} 行：", k + 1, first, first + span - 1));
+                for (idx, line) in lines[from..to].iter().enumerate() {
+                    let n = from + idx + 1;
+                    let mark = if (first..first + span).contains(&n) {
+                        '▸'
+                    } else {
+                        ' '
+                    };
+                    out.push(format!("      {mark}{n:>5}| {line}"));
+                }
+            }
+            if starts.len() > MAX_SHOWN {
+                out.push(format!("      …（超过 {} 处，只列前 {} 处）", starts.len(), MAX_SHOWN));
+            }
+            out.join("\n")
+        };
+
         let mut replacements: Vec<(usize, usize, String)> = Vec::new(); // (start, end, new)
         let mut labels: Vec<String> = Vec::new();
         let mut problems: Vec<String> = Vec::new();
+        // 当前文件内容的 hash（**惰性算**：只有真要为某条 oldText 出诊断时才需要）
+        let mut current_hash: Option<String> = None;
 
         for (i, e) in edits.iter().enumerate() {
             let old = e.oldText.as_str();
@@ -678,15 +776,53 @@ impl Tool for Edit {
                 if !hint.is_empty() {
                     msg.push(format!("    {hint}"));
                 }
+                // 诊断 4：会话级 read 快照 —— 「文件已变」与「你记错了」要的下一步不一样：
+                // 前者得重新 read（整个文件都可能旧了），后者只是「别凭记忆写」（不点破的话
+                // 模型会去猜缩进，白白多绕一两轮）。
+                let hash =
+                    current_hash.get_or_insert_with(|| crate::config::hash_id(content.as_bytes()));
+                // 读过的行区间：「文件没变、但**你压根没读过这一段**」是最难自查的情形，要直接点破。
+                let ranges = |mark: &ReadMark| -> String {
+                    if mark.ranges.is_empty() {
+                        return "（未记到范围）".to_string();
+                    }
+                    mark.ranges
+                        .iter()
+                        .map(|(s, e)| {
+                            if s == e {
+                                format!("第 {s} 行")
+                            } else {
+                                format!("第 {s}-{e} 行")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("、")
+                };
+                msg.push(match ctx.state.get_or_init(ReadSnapshots::default).last(p) {
+                    Some(mark) if mark.hash != *hash => "    提示：这个文件在你上次 read 之后**已被改动** —— \
+                         你手上那段是旧副本；请重新 read 后整段复制（整个文件都可能已变，不只这一处）。"
+                        .to_string(),
+                    Some(mark) => format!(
+                        "    提示：文件内容与你上次 read 到的完全一致（那次读到的是{}）—— \
+                         若这段不在那个范围里，就是你从没读过它：请 read 到那一段再整段复制，别凭记忆写。",
+                        ranges(&mark)
+                    ),
+                    None => "    提示：本次会话你还没（用 `read`）读过这个文件 —— 先 read 一次再改。".to_string(),
+                });
                 problems.push(msg.join("\n"));
                 continue;
             }
             if matched > 1 {
-                problems.push(format!(
-                    "edits[{i}].oldText 在 {path} 中出现 {matched} 次，必须唯一：{:?}\n    \
-                     提示：把 oldText 加长到能唯一确定位置（多带几行上下文），或与相邻改动合并成一个 edit。",
+                let mut msg = vec![format!(
+                    "edits[{i}].oldText 在 {path} 中出现 {matched} 次，必须唯一：{:?}",
                     clip(old)
-                ));
+                )];
+                msg.push(occurrences(&content, old));
+                msg.push(
+                    "    提示：把 oldText 加长到能唯一确定位置（多带几行上下文），或与相邻改动合并成一个 edit。"
+                        .to_string(),
+                );
+                problems.push(msg.join("\n"));
                 continue;
             }
             let start = content.find(old).expect("matched>0");
@@ -1495,8 +1631,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.0.contains("出现 2 次"), "{e}");
+        // 每一处都给行号 + 上下文（不必再 read 一遍就能判断该给哪一处加长）
+        assert!(e.0.contains("出现在 2 处"), "{e}");
+        assert!(e.0.contains("#1 第 1-1 行"), "{e}");
+        assert!(e.0.contains("#2 第 2-2 行"), "{e}");
+        assert!(e.0.contains("▸    1| x"), "{e}");
         let _ = std::fs::remove_file(&p);
     }
+
+    /// `oldText` 找不到时，会话级 read 快照要区分四种情形：没读过 / 读过且内容未变 / 读过但文件已被改 /
+    /// **只读过别的行段**。它们的下一步不一样（光看 diff 会去猜缩进，而那是最没用的动作）。
+    #[tokio::test]
+    async fn edit_tells_you_when_your_copy_is_stale() {
+        let p = tmp("stale.txt");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        let reg = builtin();
+        let ctx = ToolCtx::default(); // 同一个 ctx = 同一个会话状态（read 记、edit 查）
+        let path = p.to_str().unwrap();
+        let miss = json!({"path": path, "edits": [{"oldText": "nope", "newText": "x"}]});
+
+        // ① 本会话没（用 `read`）读过这个文件
+        let e = reg.dispatch("edit", &miss, ctx.clone()).await.unwrap_err();
+        assert!(e.0.contains("还没（用 `read`）读过"), "{e}");
+
+        // ② read 过、且文件没变 → 只能是自己凭记忆写的；提示里要带上「你读过的是哪几行」
+        reg.dispatch("read", &json!({"path": path}), ctx.clone())
+            .await
+            .unwrap();
+        let e = reg.dispatch("edit", &miss, ctx.clone()).await.unwrap_err();
+        assert!(e.0.contains("完全一致"), "{e}");
+        assert!(e.0.contains("那次读到的是第 1-2 行"), "{e}");
+        assert!(e.0.contains("凭记忆"), "{e}");
+
+        // ③ read 之后文件被改过 → 手上那段是旧副本
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let e = reg.dispatch("edit", &miss, ctx.clone()).await.unwrap_err();
+        assert!(e.0.contains("已被改动"), "{e}");
+        assert!(e.0.contains("旧副本"), "{e}");
+
+        // ④ 只读过一部分（`limit`）：点出「你读到的是第 1 行」—— 这比单说「凭记忆」有用得多
+        let ctx3 = ToolCtx::default();
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        reg.dispatch("read", &json!({"path": path, "limit": 1}), ctx3.clone())
+            .await
+            .unwrap();
+        let e = reg.dispatch("edit", &miss, ctx3.clone()).await.unwrap_err();
+        assert!(e.0.contains("那次读到的是第 1 行"), "{e}");
+        assert!(e.0.contains("从没读过它"), "{e}");
+
+        // 多次局部 read 会把行段拼起来（读 3-4 行后，前面读过的 1-2 行不能丢）
+        reg.dispatch("read", &json!({"path": path, "offset": 3}), ctx3.clone())
+            .await
+            .unwrap();
+        let e = reg.dispatch("edit", &miss, ctx3).await.unwrap_err();
+        assert!(e.0.contains("第 1 行、第 3 行"), "{e}");
+
+        // 另一种写法（相对/绝对混用）也要对得上同一个文件：这里用 canonicalize 后的路径读
+        let ctx2 = ToolCtx::default();
+        let canon = std::fs::canonicalize(&p).unwrap();
+        reg.dispatch("read", &json!({"path": canon.to_str().unwrap()}), ctx2.clone())
+            .await
+            .unwrap();
+        std::fs::write(&p, "changed\n").unwrap();
+        let e = reg.dispatch("edit", &miss, ctx2).await.unwrap_err();
+        assert!(e.0.contains("已被改动"), "{e}");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
 
     /// 找不到时给「最接近的位置 + 简版 diff」（缩进少两个空格的典型场景）。
     #[tokio::test]

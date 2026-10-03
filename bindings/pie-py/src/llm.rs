@@ -48,13 +48,18 @@ impl PyLlmClient {
     /// 返回 `{"content", "reasoning_content", "tool_calls", "usage"}`。适合「拿模型当纯函数用」的场景（如生成评测清单），不要拿它跑回合
     /// （工具循环请用 `Session.aturn`）。
     ///
+    /// `reasoning_effort` / `response_format` 是**按次**覆盖（口径同 `Session.aturn`）：
+    /// 前者 `None` = 用客户端的思考深度，后者 `None` = `text`。
+    ///
     /// ⚠ 阻塞（内部含重试），期间释放 GIL。
-    #[pyo3(signature = (messages, tools=None))]
+    #[pyo3(signature = (messages, tools=None, reasoning_effort=None, response_format=None))]
     fn complete(
         &self,
         py: Python<'_>,
         messages: &Bound<'_, PyAny>,
         tools: Option<&Bound<'_, PyAny>>,
+        reasoning_effort: Option<&str>,
+        response_format: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let msgs: Vec<pie::llm::Message> = serde_json::from_value(crate::py_to_json(messages)?)
             .map_err(|e| pie_error(format!("messages 解析失败（要 API 形状的 dict 列表）: {e}")))?;
@@ -66,8 +71,13 @@ impl PyLlmClient {
             None => Vec::new(),
         };
         let inner = &self.inner;
+        // 按次覆盖的两个值拼成 [`RequestOptions`]（解析放在 `detach` 之前：PyErr 要 GIL）
+        let options = pie::llm::RequestOptions::ChatCompletions {
+            reasoning_effort,
+            response_format: crate::parse_response_format(response_format)?,
+        };
         let got = py
-            .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs)))
+            .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs, options)))
             .map_err(|e| llm_error(py, e))?;
         // `LlmResult` 没有 Serialize → 手拼
         let dict = pyo3::types::PyDict::new(py);

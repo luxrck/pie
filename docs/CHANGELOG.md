@@ -2,6 +2,122 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-04（edit 诊断：陈旧副本检测 + 重复时列出每处位置）
+
+用户：「edit 的错误一直都好多」→ 先把历史会话统计一遍（127 个会话、1153 次 edit 调用），再按数据补诊断。
+
+**数据**：失败 51 次 = 4.4%。分型 `not_found` 38（74.5%）/ `not_unique` 9（17.6%）/ `overlap` 3 /
+文件不存在 1。失败率与「一次几条 edits」是**纯概率叠加**（单条 2.4%，`1-(1-2.4%)^n` 吻合），
+失败后 45/49 下一笔就成功（诊断够用，但每次白花一轮 + 中位 377 字符诊断进上下文）。关键的三个发现：
+
+- `not_found` 里 **16/38（42%）的 oldText 能在更早的工具输出里逐字找到** → 是**旧副本**（read 之后
+  文件又被改过，模型拿旧内容去匹配）；剩下 58% 整段历史里都没有 → 凭记忆写的。
+- `not_unique` 的样本 oldText 普遍极短（含一个 1 字符的 `}`）—— 而成功调用里 oldText 行数中位只有 2 行。
+- 失败集中地是 `MEMORY.md` / `AGENTS.md` / `CHANGELOG.md` 这类**结构重复的文档**。
+
+**① 陈旧副本检测**（`tools.rs::ReadSnapshots`）：`read` 成功时把「绝对路径（canonicalize）→ 整文件
+内容 hash」记进 `ctx.state`（**只存 hash**）；`edit` 在 oldText 匹配为 0 时对比当前文件 hash，分三态
+给结论 —— 没读过这个文件 / 读过且内容一致（→ 这段是凭记忆写的，不是复制来的）/ 读过但文件已变
+（→ 你手上是旧副本，整个文件都可能旧了）。三态要的下一步不一样；不点破的话模型会去猜缩进——
+那才是「多绕一两轮」的来源。
+
+**② `not_unique` 时列出每一处**：行号区间 + 前后 2 行上下文（最多 6 处，超了只说总数），模型不必再
+read 一遍就能判断该给哪一处加长。对着统计里「oldText 太短」那个根因。
+
+**没做的**：`occurrence: N` 参数与行号锚点模式 —— 前者有改错位置的真实风险，后者要处理行号漂移，
+收益对不上复杂度。另：这两条都**不降低失败率**（失败定义就是 oldText 对不上），只把修复从「猜」
+变成「知道」；真正降失败率得靠提示词纪律（改前 read / oldText 来自最近一次 read / 多行至少 3 行上下文）。
+
+**验证**：`cargo test` 257 + 4 全绿。新增 `edit_tells_you_when_your_copy_is_stale`（覆盖四态 +
+相对/绝对路径混用对得上同一个文件）；`edit_rejects_non_unique_old_text` 加了「列出每处行号上下文」的断言。
+
+**续（同日，用户：「继续诊断吧」——此时新 pie 已生效）**：把统计再挖一层（重放 127 个会话、按
+`__meta__.cwd` 归一化路径后把每条 edit 与「同文件上一次 read」配对）：
+
+- 失败 edit 距上次 read 的中位间隔 **16** 次工具调用（成功 12），p90 **111**（成功 84）—— 隔得越久越危。
+- **34%（18/53）的失败 edit，本会话压根没读过那个文件**。
+- 有 read 的那批里 **77%（27/35）那次 read 是局部读**（带 offset/limit）。
+
+→ 光说「文件变了」不够，得把**读过的行号**摆出来（「这段不在你读过的那几行里」是最难自查的情形）。
+于是 `ReadSnapshots` 的值从「hash」升级成「hash + 读过的行区间」（多次局部 read 会合并；文件一变就重置
+范围），提示变成四态：没读过（并且措辞点明是「没用 `read` 读过」——`bash` 看的内容不进快照）/ 内容一致
+（附「那次读到的是第 1-2 行」）/ 已改动 / 其余交给原有 diff。
+
+→ 同时把**唯一能降失败率**的那一步做了：`Edit` 的 description 与 `prompts/system.md` 各补两条硬纪律
+——①**改前先 read 你要改的那一段**（别凭记忆写）；②oldText **至少 3 行上下文**、别用单行或高重复片段
+（命中多次时错误里会列出每一处的行号与上下文）。
+
+**现场例子**：实现本条时我自己 edit `src/tools.rs` 失败了一次 —— oldText 是照着 `grep`/`sed` 的输出拼的
+（没走 `read`），属性前的缩进就拼错了；而报错里那句「本次会话你还没（用 `read`）读过这个文件」正好点破。
+新诊断第一个抓住的就是我自己。
+
+## 2026-10-04（`RequestOptions` enum + 思考档位表收口）
+
+用户：「`reasoning_effort` 也能抽象出一个类吗？`RequestOptions` 能做成 enum 吗？目前我们是基于
+chat_completion_api 的，后面也许要扩充支持 responses_api。那现在就可以叫做 `RequestOptions::ChatCompletions`？」
+
+**`reasoning_effort` 没做成枚举**（保持 `Option<&str>`）：它是**开放集合 + 透传** —— `-t` 收 8 个写法
+（含 `off` 别名与服务端兼容名）、配置文件不校验、测试里钉着「`xhigh` 原样透传」；封闭枚举会把这些收回去，
+带 `Other(String)` 又退化成字符串。它真正需要类型化的那点是**二分**的（关 / 开）—— 那就是现在这个
+`Option<&str>` + `normalize_reasoning_effort`。
+
+**① 按次旋钮打包成 `llm::RequestOptions`（enum）**：
+
+```rust
+pub enum RequestOptions<'a> {
+    ChatCompletions { reasoning_effort: Option<&'a str>, response_format: ResponseFormat },
+}
+```
+
+- `complete` / `stream` / `Session::aturn` 各收**一个** `options`（不再各自追加两个参数）；
+  将来支持 Responses API（`/v1/responses`，请求体与响应解析都不一样）就是**加一个变体**，调用点不动。
+- `Default` **手写**（`#[derive(Default)]` 的 `#[default]` 只能标在 unit 变体上，带字段的变体不行）：
+  默认 = `ChatCompletions { None, Text }`，调用点写 `RequestOptions::default()`。
+- `request_body` 里用**单变体的 irrefutable `let`** 解构（`let RequestOptions::ChatCompletions { .. } = options;`）；
+  将来多变体时编译器会在这里报错 → 正是该改的地方。
+- 绑定侧 Python 签名不变（`reasoning_effort` / `response_format` 仍是关键字参数，`response_format` 仍是
+  字符串）：只在 Rust 内部拼成 `RequestOptions`（`parse_response_format` 仍在持 GIL 那层调）。
+
+**② 思考档位表收口**（原先两份：`config::REASONING_LEVELS` 4 档 + `main.rs::THINKING_LEVELS` 8 档）：
+
+- 唯一事实来源 = `config::THINKING_LEVELS`（8 个写法，注释一并从 main.rs 搬来）；`-t` 的 clap
+  `value_parser` 直接指它。
+- `config::reasoning_levels()` 从它**派生** `/thinking` 候选（= 去掉 `THINKING_ALIASES`：`off` 是人写法，
+  `minimal`/`medium`/`xhigh` 是服务端兼容名）；`REASONING_LEVELS` 常量与其消费者（`palette.rs`）随之改。
+- 语义**没变**：别名照样被 `-t` 收下、照样原样透传给服务端，只是不列进补全候选。
+
+**验证**：core 256 + 4、绑定 29 全绿；新增 `config::tests::reasoning_levels_derive_from_thinking_levels`
+（四档、都在 `THINKING_LEVELS` 里、四个别名都不进候选）。
+
+## 2026-10-04（llm：按次 `reasoning_effort` / `response_format`）
+
+用户：「`LlmClient.complete` / `.stream` 的请求参数也加上 `reasoning_effort`、`response_format` 吧。」
+
+先对照 DeepSeek 的 chat-completions 文档盘了一遍（`request_body` 是请求体唯一出口）：我们缺
+`temperature` / `top_p` / `response_format` / `stop` / `tool_choice` / `logprobs`+`top_logprobs` /
+`user_id`（两个 `*_penalty` 文档已标 deprecated、「传了也不生效」→ 不发是对的）。这次只补用户点名的
+两个，且都按**按次**（与 `--max-steps` / `--no-stream` 同一条口径：不进 Config、不写回文件）：
+
+- `response_format`：核心用 `enum ResponseFormat { Text, JsonObject }`（`#[default] Text`）——
+  `Text` **不发**该字段（服务端默认就是 text，少发一个字段对非 DeepSeek 端点也更稳），`JsonObject`
+  才发 `{"type": "json_object"}`。本来考虑过绑定侧的 `output_json: bool`，最后没用：枚举在 Rust 侧
+  更明确，字符串解析（`ResponseFormat::from_name`）只留给绑定。
+- `reasoning_effort: Option<&str>`：`None` = 用客户端自身的（= 配置值）；`Some` 覆盖，且与配置值
+  **过同一套归一**（空串 / `none` = 关闭思考 → 改发 `thinking: {type: disabled}`）。归一逻辑原本是
+  `Config::normalized_reasoning_effort` 的方法体 → 提成 `config::normalize_reasoning_effort`
+  （消费者三个：`Config` 的方法、`LlmClient::new`/`set_reasoning_effort`、按次覆盖）—— 一处定义。
+
+传播链：`LlmClient::complete` / `stream` → `Session::aturn`（两个新尾参）→ 绑定 `PySession::aturn` /
+`turn_future` / `aturn_async` / 模块级 `run` → `_pie_rs.pyi` + `_async.py` 胶水。CLI / TUI 不暴露这
+两个旋钮（传默认：`None` / `ResponseFormat::Text`）。
+
+一个绑定侧的坑：`response_format` 的字符串解析（可抛 `PyErr`）必须在**持 GIL 的那层**做 —— 回合块在
+`spawn` / `future_into_py` 里返回的是 `LlmError`，`?` 一个 `PyErr` 编译不过（`aturn` / `turn_future` 各一处）。
+
+**验证**：核心 255 + 4 全绿（新增 `request_body_per_call_overrides`：覆盖生效 / `none`·空串关闭思考 /
+默认不发 `response_format` / `from_name` 认三种、拒未知）；绑定 29 例全绿（新增两条：同步路径的
+`complete` + `aturn` 断言请求体、`aturn_async` 的 kwargs 透传到请求体，外加非法值当场报 `PieError`）。
+
 ## 2026-10-03（修：跨 cell 增量改同一个 figure 丢图 —— driver 不再 `plt.close("all")`）
 
 用户：「为啥我看到的图片中没有那个六边形呢？是 pie 的代码有问题还是我的代码有问题？」——**是 pie 的 bug。**

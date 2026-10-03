@@ -16,13 +16,47 @@ use sha2::{Digest, Sha256};
 //
 // ⚠ 默认值**不在这里开 `DEFAULT_*` 常量**：类型自己有 `Default`（`impl Default for Config` /
 // `CompactionConfig` / …），值就写在那儿 —— 一处定义、改一处。这里只留**跨模块要用的**东西：
-// `REASONING_LEVELS`（TUI 的 `/thinking` 候选）、`REASONING_NONE`（CLI 的 `-t off` 归一）、
-// 以及提示词文件名（`find_project_root` / `resolve_prompt_file` / `build_system_prompt` 三处共用）。
+// `THINKING_LEVELS`（`-t` 的合法值，TUI 的 `/thinking` 候选从它派生）、`REASONING_NONE`
+//（CLI 的 `-t off` 归一）、以及提示词文件名（`find_project_root` / `resolve_prompt_file` /
+// `build_system_prompt` 三处共用）。
 
-/// 思考深度合法值（`/thinking` 候选与配置 `reasoning_effort`）。
-pub const REASONING_LEVELS: [&str; 4] = ["none", "low", "high", "max"];
+/// 思考深度的**全部合法写法**（`-t/--thinking` 收这些）—— **唯一事实来源**：
+/// TUI 的 `/thinking` 候选也从它派生（见 [`reasoning_levels`]）。
+///
+/// 对外写法是 `off`（内部才归一到配置口径 `none`）；`none` 也收 —— 配置文件与 `/thinking`
+/// 里写的就是 `none`，顺手敲 `-t none` 也应该能用。
+pub const THINKING_LEVELS: [&str; 8] = [
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
+/// `THINKING_LEVELS` 里**不是配置口径档位**的那些写法：`off` 是 `none` 的人写法，
+/// 其余三个是 DeepSeek 的兼容名（服务端自己把 `minimal` 映射到 `low`、`medium`/`xhigh` 映射到 `high`）。
+/// 它们照样**原样透传**给服务端（见 `main.rs::apply_overrides`）—— 这里只是不列进 `/thinking` 候选。
+const THINKING_ALIASES: [&str; 4] = ["off", "minimal", "medium", "xhigh"];
+
+/// 配置口径的档位（TUI `/thinking` 的候选）= [`THINKING_LEVELS`] 去掉别名。
+pub fn reasoning_levels() -> impl Iterator<Item = &'static str> {
+    THINKING_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| !THINKING_ALIASES.contains(level))
+}
+
 /// `none` = 关闭思考：不发 `reasoning_effort`，改发 `thinking: {type: disabled}`。
 pub const REASONING_NONE: &str = "none";
+
+/// 思考深度归一：空串 / `none` = 关闭思考（`None`）。
+///
+/// 三个消费者共用（`Config::normalized_reasoning_effort`、`LlmClient` 的构造与**按次覆盖**）——
+/// 别在别处再写一份。
+pub fn normalize_reasoning_effort(effort: &str) -> Option<&str> {
+    let e = effort.trim();
+    if e.is_empty() || e == REASONING_NONE {
+        None
+    } else {
+        Some(e)
+    }
+}
 
 /// 提示词文件名（位置不再可配）。
 pub const SYSTEM_FILE: &str = "SYSTEM.md";
@@ -645,12 +679,7 @@ impl Config {
 
     /// 归一化后的思考深度：`none` → `None`（不发送 `reasoning_effort`）。
     pub fn normalized_reasoning_effort(&self) -> Option<&str> {
-        let e = self.reasoning_effort.trim();
-        if e.is_empty() || e == REASONING_NONE {
-            None
-        } else {
-            Some(e)
-        }
+        normalize_reasoning_effort(&self.reasoning_effort)
     }
 
     /// 写回配置文件（`config_file`，默认 `~/.pie/config.toml`）——`/model`、`/thinking` 用。
@@ -1037,6 +1066,20 @@ mod tests {
         assert_eq!(parse_reserved_tokens("384K").unwrap(), Some(384_000));
         assert_eq!(parse_reserved_tokens("65536").unwrap(), Some(65_536));
         assert!(parse_reserved_tokens("abc").is_err());
+    }
+
+    #[test]
+    fn reasoning_levels_derive_from_thinking_levels() {
+        // `/thinking` 的候选从**唯一那张表**（`-t` 的合法值）派生：四档配置口径，别名不列
+        let levels: Vec<&str> = reasoning_levels().collect();
+        assert_eq!(levels, ["none", "low", "high", "max"]);
+        assert!(levels.iter().all(|lv| THINKING_LEVELS.contains(lv)));
+        // `off` 只是人写法，`minimal` / `medium` / `xhigh` 是服务端兼容名：都收、都原样透传，
+        // 但不进 `/thinking` 候选
+        for alias in ["off", "minimal", "medium", "xhigh"] {
+            assert!(THINKING_LEVELS.contains(&alias), "{alias} 要能被 -t 收下");
+            assert!(!levels.contains(&alias), "{alias} 不该进候选");
+        }
     }
 
     #[test]

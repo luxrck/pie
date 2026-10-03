@@ -27,8 +27,8 @@ use crate::cancel::{Cancel, CANCEL_TEXT};
 use crate::config::{self, Config};
 use crate::context;
 use crate::llm::{
-    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, StreamChunk, ToolCall,
-    UsageTracker,
+    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions, StreamChunk,
+    ToolCall, UsageTracker,
 };
 use crate::tools::{self, ToolOutput, ToolRegistry};
 
@@ -407,12 +407,16 @@ impl Session {
     /// 回合语义：工具失败文本化后照常回传、达到 `max_steps` 就把
     /// 最后一段 assistant 文本当答复（不额外追加消息）、`tool` 结果与 `tool_call_id` 严格配对。
     ///
-    /// 两个**按次**的执行旋钮（不在配置里）：
+    /// 按次（不在配置里）的执行旋钮：
     ///   - `max_steps`：单回合最多问几次模型；`None` = 不限。
     ///   - `stream`：`None` = 默认（客户端都实现了 `stream()` → 流式）；`Some(false)` 强制一次性
     ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
     ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `config.parallel_tools`
     ///     （默认 true）。工具共享可变状态时必须 `Some(false)`（改为按模型返回顺序串行）。
+    ///   - `options`：本回合模型请求的**按次覆盖**（见 [`RequestOptions`]）——思考深度
+    ///     （`None` = 用客户端自身的 / 配置值；空串 / `none` = 关闭思考）与 `response_format`
+    ///     （`Text` 默认 = 不发该字段；`JsonObject` = 要求合法 JSON，⚠ 还得自己在 prompt 里交代）。
+    ///     **只影响本回合的请求**：不改配置、不写回文件。
     ///
     /// `cancel` 触发时（TUI 的 `Esc`）：
     ///   - 模型请求中的取消 → 直接收尾（不追加 assistant 消息）；
@@ -427,6 +431,7 @@ impl Session {
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
+        options: RequestOptions<'_>,
     ) -> Result<String, LlmError> {
         // 每轮开头：先收解释器代码块（压缩会把 `tool_calls` 删掉，这是最后的收集机会），
         // 再校准 system prompt 末尾那节（cwd 可能被 `/cd` 改过）——都必须先于任何请求
@@ -482,7 +487,10 @@ impl Session {
             self.refresh_after_compaction(&stats);
 
             let specs = self.tools.specs();
-            let called = match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
+            let called = match self
+                .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                .await
+            {
                 Ok(option) => option,
                 Err(e) => {
                     // file_id 失效（服务端删了 / 中途换了 key）：把历史里的图片块降级成文本占位、
@@ -491,7 +499,10 @@ impl Session {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
-                        match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
+                        match self
+                            .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                            .await
+                        {
                             Ok(option) => option,
                             Err(e) => {
                                 self.push_error_turn(&e);
@@ -520,7 +531,10 @@ impl Session {
                             "[warn] 上下文超限，已强制压缩（工具级 {} 条 / 轮次级 {} 轮）并重试一次",
                             stats.tools, stats.turns
                         ));
-                        match self.model_call(&specs, on_event, &mut clock, cancel, use_stream).await {
+                        match self
+                            .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                            .await
+                        {
                             Ok(option) => option,
                             Err(e) => {
                                 self.push_error_turn(&e);
@@ -630,7 +644,8 @@ impl Session {
         Ok(answer.unwrap_or_default())
     }
 
-    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` 由 `aturn` 按次传进来。
+    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` / `options` 由 `aturn`
+    /// 按次传进来。
     /// 一次模型调用；`Ok(None)` = 请求期间被取消（不 push 任何消息，收尾由 `aturn` 统一做）。
     async fn model_call(
         &self,
@@ -639,6 +654,7 @@ impl Session {
         clock: &mut ThoughtClock,
         cancel: &Cancel,
         stream: bool,
+        options: RequestOptions<'_>,
     ) -> Result<Option<LlmResult>, LlmError> {
         if cancel.is_cancelled() {
             return Ok(None);
@@ -646,7 +662,7 @@ impl Session {
         let call = async {
             if stream {
                 self.llm
-                    .stream(&self.messages, specs, |chunk| match chunk {
+                    .stream(&self.messages, specs, options, |chunk| match chunk {
                         // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
                         StreamChunk::Content(d) => {
                             let ev = TurnEvent::AssistantText(d);
@@ -662,7 +678,7 @@ impl Session {
                     })
                     .await
             } else {
-                self.llm.complete(&self.messages, specs).await
+                self.llm.complete(&self.messages, specs, options).await
             }
         };
         tokio::select! {
@@ -2548,6 +2564,7 @@ mod tests {
                     None,
                     Some(false),
                     None,
+                    RequestOptions::default(),
                 )
                 .await
                 .expect_err("请求必定失败");

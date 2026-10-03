@@ -86,7 +86,9 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 - **会话级工具状态**：`ToolCtx.state: Arc<SessionState>`（`Session` 建一份、每次工具调用 clone 进去）。
   有状态的工具（`repl` 的长活 IPython）用 `ctx.state.get_or_init::<T>(…)` 存长活对象——同一 `Session`
   共享、不同 `Session` 各一份。**别把它放 `ToolRegistry`**：registry 会被多个 session 复用（绑定的常见用法）
-  → 状态会串台。
+  → 状态会串台。目前两个用户：`repl` 的长活 IPython；`read` 写、`edit` 读的 `ReadSnapshots`
+  （会话级 read 快照：路径 → 整文件 hash + **读过的行区间**（多次局部 read 合并、文件一变就重置），
+  用来把 `oldText` 找不到分成「你抄错了 / 你手上那份是旧的 / 你压根没读过这一段」—— **只记行号与 hash，不存内容**）。
 - **`repl` 的输出头区有一行 `[解释器] …`**（`repl.rs::headers`，数据来自 driver 的 `Namespace`）：
   当前命名空间 + 本次新增。为什么每帧都报：模型看不到解释器内部，而**压缩会把那些代码块一起卷走**
   —— 状态得由每次执行自己带回来（让模型另发一次询问 = 白搭一次往返）。
@@ -168,8 +170,16 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   `StoreType::{Blob,Raw,Window}` 分别对应图片副本 / 压缩原文 / 窗口块，目录、命名、0o600、原子写都在那儿）。
   `Config.storage` 是默认值（`PIE_DIR` → `./.pie` → `~/.pie`），`ToolCtx.storage` 把它带进工具层（bash 全文落盘要用）。
   **别再读环境变量、别再拼目录字面量**；测试用 `Storage::at(临时目录)` 注入，不必改进程级 `PIE_DIR`。
-- **执行旋钮按次传**：`Session::aturn(input, on_event, cancel, max_steps, stream, parallel_tools)`；
-  `--max-steps` / `--no-stream` **不进 Config**（CLI 直接传，TUI 经 `tui::run` 带下来）。
+- **执行旋钮按次传**：`Session::aturn(input, on_event, cancel, max_steps, stream, parallel_tools,
+  options)`；`--max-steps` / `--no-stream` **不进 Config**（CLI 直接传，TUI 经 `tui::run` 带下来）。
+  `options: llm::RequestOptions<'_>`（2026-10-04 加）是**按次的请求覆盖**，而且是**按协议分的 enum**：
+  现在只有 `ChatCompletions { reasoning_effort, response_format }`（将来支持 Responses API 就是加一个变体，
+  调用点那串参数不动）；`LlmClient::complete` / `stream` 也各收一个（同义）。
+  `reasoning_effort: Option<&str>`（`None` = 用客户端的，空串 / `none` = 关闭思考）、
+  `response_format: ResponseFormat`（`Text` 默认 = **不发**该字段）；`Default` 是**手写**的
+  （`#[default]` 只能标在 unit 变体上）→ 调用点写 `RequestOptions::default()`。绑定侧
+  `aturn` / `aturn_async` / `turn_future` / 模块级 `run` 都透传（字符串 `response_format` 走
+  `crate::parse_response_format`，在持 GIL 那层调）。
 - 重试收敛成唯一驱动器 `LlmClient::with_retry(what, op, decide)` + `Retry::{Backoff, Now, Give}`；
   流式只在**还没吐过增量**时重试；400 拒 `stream_options` → 摘参数立刻重来（不占重试额度）。
   `Retry-After` 优先，夹在 `[1.0, 60.0]`。
@@ -256,6 +266,10 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
 
 - 配置只从 `~/.pie/config.toml` 读（`-c` / `PIE_CONFIG_FILE` / `PIE_DIR` 可重定向）；加字段就写进
   `Default`（默认值一处定义，别另开 `DEFAULT_*` 常量）；`Config.tools` 按下划线私有参数注入工具默认值。
+- **思考档位只有一张表**：`config::THINKING_LEVELS`（8 个写法，`-t` 的 clap 合法值）是唯一事实来源，
+  `/thinking` 的候选由 `config::reasoning_levels()` 派生（去掉别名）= 配置口径的四档
+  （`none`/`low`/`high`/`max`）。别名（`off` 是人写法，`minimal`/`medium`/`xhigh` 是服务端兼容名）
+  **照样收、照样原样透传**给服务端，只是不列进候选；别再在别处另开一张档位表。
 - `Config::load` 之后再按环境变量覆盖两项：`OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`
   （空串 / 全空白 = 没设，不动配置文件里的值；只改内存、不写回文件）。`Config::default()` 不受影响。
 - 提示词分两类，**别搞混**：`prompts/system.md` / `prompts/memory.md` 是**编译期嵌入**的内置正文

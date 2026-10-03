@@ -45,6 +45,17 @@ pub(crate) fn pie_error(msg: impl std::fmt::Display) -> PyErr {
     PieError::new_err(msg.to_string())
 }
 
+/// 解析按次的 `response_format` 参数：`None` / `""` / `text` = 不发该字段，`json_object` = 要求合法 JSON。
+///
+/// ⚠ 别叫 `response_format`：同名局部变量会遮蔽函数（值命名空间同一个）。
+pub(crate) fn parse_response_format(value: Option<&str>) -> PyResult<pie::llm::ResponseFormat> {
+    match value {
+        None => Ok(pie::llm::ResponseFormat::Text),
+        Some(v) => pie::llm::ResponseFormat::from_name(v)
+            .ok_or_else(|| pie_error(format!("response_format 只认 text / json_object：{v:?}"))),
+    }
+}
+
 /// `ConfigError` → Python `ConfigError`。
 pub(crate) fn config_error(e: pie::config::ConfigError) -> PyErr {
     ConfigError::new_err(e.to_string())
@@ -184,10 +195,11 @@ pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 /// `config=None` 时读 `~/.pie/config.toml`
 /// （文件不在就用默认值）；`llm` / `tools` 不传就按 config 造（内置四件套）。
 ///
-/// 三个执行旋钮与 [`Session.aturn`] 同义（`max_steps=None` = 不限、`stream=None` = 默认流式、
-/// `parallel_tools=None` = 跟随 `Config.parallel_tools`）。
+/// 五个按次旋钮与 [`Session.aturn`] 同义（`max_steps=None` = 不限、`stream=None` = 默认流式、
+/// `parallel_tools=None` = 跟随 `Config.parallel_tools`、`reasoning_effort=None` = 用配置里的思考深度、
+/// `response_format=None` = `text`）。
 #[pyfunction]
-#[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None))]
+#[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
 fn run(
     py: Python<'_>,
     task: String,
@@ -197,6 +209,8 @@ fn run(
     max_steps: Option<usize>,
     stream: Option<bool>,
     parallel_tools: Option<bool>,
+    reasoning_effort: Option<&str>,
+    response_format: Option<&str>,
 ) -> PyResult<String> {
     // 默认：读配置文件（不在就用默认值）
     let core_config = match config {
@@ -214,7 +228,17 @@ fn run(
     let session = crate::session::PySession::wrap(pie::session::Session::ephemeral(
         &core_config, client, registry,
     ));
-    session.aturn(py, task, None, None, max_steps, stream, parallel_tools)
+    session.aturn(
+        py,
+        task,
+        None,
+        None,
+        max_steps,
+        stream,
+        parallel_tools,
+        reasoning_effort.map(str::to_string),
+        response_format.map(str::to_string),
+    )
 }
 
 /// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。

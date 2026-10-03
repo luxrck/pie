@@ -458,6 +458,60 @@ fn one_line(s: &str) -> String {
 
 // ---------------------------------------------------------------- 客户端
 
+/// `response_format`：`Text`（默认，**不发**这个字段——服务端默认就是 text）或 `JsonObject`
+/// （要求合法 JSON 输出；⚠ 还得自己在 prompt 里交代，否则模型可能一直吐空白）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    JsonObject,
+}
+
+impl ResponseFormat {
+    /// 解析字符串（`""` / `text` / `json_object`）——配置与 Python 绑定都用它。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim() {
+            "" | "text" => Some(Self::Text),
+            "json_object" => Some(Self::JsonObject),
+            _ => None,
+        }
+    }
+
+    /// 线上取值：`None` = 不发这个字段。
+    fn api_value(self) -> Option<&'static str> {
+        match self {
+            Self::Text => None,
+            Self::JsonObject => Some("json_object"),
+        }
+    }
+}
+
+/// 一次请求的**按次覆盖**（`complete` / `stream` / `Session::aturn` 各收一个）。
+///
+/// 做成 enum 而不是 struct：请求形状是**按协议**分的 —— 现在只有 chat completions 一种；
+/// 将来支持 Responses API（`/v1/responses`，请求体与响应解析都不一样）就是**加一个变体**，
+/// 调用点那串参数不用再动。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestOptions<'a> {
+    /// `POST /chat/completions`。
+    ChatCompletions {
+        /// 按次覆盖思考深度：`None` = 用客户端自身的（= 配置值）；空串 / `none` = 关闭思考。
+        reasoning_effort: Option<&'a str>,
+        /// `Text`（默认）= **不发**这个字段。
+        response_format: ResponseFormat,
+    },
+}
+
+impl Default for RequestOptions<'_> {
+    /// 默认 = chat completions + 两项都走默认（`None` / `Text`）—— 调用点写 `RequestOptions::default()`。
+    fn default() -> Self {
+        RequestOptions::ChatCompletions {
+            reasoning_effort: None,
+            response_format: ResponseFormat::Text,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LlmClient {
     http: reqwest::Client,
@@ -513,23 +567,32 @@ impl LlmClient {
     }
 
     /// 切换思考深度（`/thinking`）：同步客户端实例（配置写回由会话层负责）。
-    /// `None` = 关闭思考（不发 `reasoning_effort`，改发 `thinking: disabled`）。
+    /// `None` / `none` / 空串 = 关闭思考（不发 `reasoning_effort`，改发 `thinking: disabled`）。
     pub fn set_reasoning_effort(&mut self, level: Option<&str>) {
-        self.reasoning_effort = level.map(str::to_string);
+        self.reasoning_effort = level
+            .and_then(crate::config::normalize_reasoning_effort)
+            .map(str::to_string);
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path)
     }
 
-    /// 请求体。`reasoning_effort` 为 `None` 时改发 `thinking: {type: disabled}`（关闭思考）。
+    /// 请求体。`options` 是**按次**覆盖（见 [`RequestOptions`]）：
+    /// 思考深度归一后为 `None` 时改发 `thinking: {type: disabled}`（关闭思考）；
+    /// `response_format` 为 `Text` 时不发该字段。
     fn request_body(
         &self,
         messages: &[Message],
         tools: &[Value],
         stream: bool,
         with_usage: bool,
+        options: RequestOptions<'_>,
     ) -> Value {
+        let RequestOptions::ChatCompletions {
+            reasoning_effort,
+            response_format,
+        } = options;
         let mut body = json!({
             "model": self.model,
             // 只发协议字段：压缩元数据（`compaction`）不能进请求体
@@ -539,13 +602,21 @@ impl LlmClient {
         if !tools.is_empty() {
             map.insert("tools".into(), Value::Array(tools.to_vec()));
         }
-        match &self.reasoning_effort {
+        // 思考深度：按次覆盖 > 客户端自身（两者过同一套归一：空 / `none` = 关闭思考）
+        let effort = match reasoning_effort {
+            Some(level) => crate::config::normalize_reasoning_effort(level),
+            None => self.reasoning_effort.as_deref(),
+        };
+        match effort {
             Some(e) => {
                 map.insert("reasoning_effort".into(), json!(e));
             }
             None => {
                 map.insert("thinking".into(), json!({"type": "disabled"}));
             }
+        }
+        if let Some(kind) = response_format.api_value() {
+            map.insert("response_format".into(), json!({"type": kind}));
         }
         if let Some(mt) = self.max_tokens {
             map.insert("max_tokens".into(), json!(mt));
@@ -595,15 +666,17 @@ impl LlmClient {
     }
 
     /// 非流式完整请求（一次尝试的完整流程就写在 `with_retry` 的闭包里）。
+    /// `options` 是**按次**覆盖（见 [`RequestOptions`]）。
     pub async fn complete(
         &self,
         messages: &[Message],
         tools: &[Value],
+        options: RequestOptions<'_>,
     ) -> Result<LlmResult, LlmError> {
         self.with_retry(
             "请求",
             || async move {
-                let body = self.request_body(messages, tools, false, false);
+                let body = self.request_body(messages, tools, false, false, options);
                 let resp = self
                     .http
                     .post(self.url("chat/completions"))
@@ -636,10 +709,13 @@ impl LlmClient {
     /// 两条流式专属规则塞在 `decide` 里（其余走默认判定）：**只在还没吐出过任何增量时**才重试；
     /// 端点以 400 拒 `stream_options` 时摘掉该参数重来一次（不占重试额度）。
     /// SSE 解析（按行切、`[DONE]` 就地收工）就在闭包里的 `async` 块中，不再单开一层 `_once`。
+    ///
+    /// `options` 与 [`LlmClient::complete`] 同义（按次覆盖）。
     pub async fn stream<F>(
         &self,
         messages: &[Message],
         tools: &[Value],
+        options: RequestOptions<'_>,
         on_chunk: F,
     ) -> Result<LlmResult, LlmError>
     where
@@ -661,7 +737,7 @@ impl LlmClient {
                 let with_usage = with_usage.load(Ordering::Relaxed);
                 let (on_chunk, emitted) = (&on_chunk, &emitted);
                 async move {
-                    let body = self.request_body(messages, tools, true, with_usage);
+                    let body = self.request_body(messages, tools, true, with_usage, options);
                     let resp = self
                         .http
                         .post(self.url("chat/completions"))
@@ -1382,18 +1458,78 @@ mod tests {
         let mut config = Config::default();
         config.reasoning_effort = "high".into();
         let c = LlmClient::new(&config).unwrap();
-        let b = c.request_body(&[Message::user("hi")], &[], false, false);
+        let b = c.request_body(
+            &[Message::user("hi")],
+            &[],
+            false,
+            false,
+            RequestOptions::default(),
+        );
         assert_eq!(b["reasoning_effort"], "high");
         assert!(b.get("thinking").is_none());
         assert_eq!(b["max_tokens"], 128_000);
+        // 默认 `response_format` = text：不发这个字段
+        assert!(b.get("response_format").is_none());
 
         config.reasoning_effort = "none".into();
         let c = LlmClient::new(&config).unwrap();
-        let b = c.request_body(&[Message::user("hi")], &[], true, true);
+        let b = c.request_body(
+            &[Message::user("hi")],
+            &[],
+            true,
+            true,
+            RequestOptions::default(),
+        );
         assert!(b.get("reasoning_effort").is_none());
         assert_eq!(b["thinking"]["type"], "disabled");
         assert_eq!(b["stream"], true);
         assert_eq!(b["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn request_body_per_call_overrides() {
+        // 客户端自身是 `high`，按次覆盖压过它；`JsonObject` 才会发 `response_format`
+        let mut config = Config::default();
+        config.reasoning_effort = "high".into();
+        let c = LlmClient::new(&config).unwrap();
+        let b = c.request_body(
+            &[Message::user("hi")],
+            &[],
+            false,
+            false,
+            RequestOptions::ChatCompletions {
+                reasoning_effort: Some("low"),
+                response_format: ResponseFormat::JsonObject,
+            },
+        );
+        assert_eq!(b["reasoning_effort"], "low");
+        assert!(b.get("thinking").is_none());
+        assert_eq!(b["response_format"]["type"], "json_object");
+
+        // 按次覆盖成「关闭思考」：`none` / 空串（归一同源）都走 `thinking: disabled`
+        for level in ["none", "  "] {
+            let b = c.request_body(
+                &[Message::user("hi")],
+                &[],
+                false,
+                false,
+                RequestOptions::ChatCompletions {
+                    reasoning_effort: Some(level),
+                    response_format: ResponseFormat::Text,
+                },
+            );
+            assert!(b.get("reasoning_effort").is_none(), "{level}");
+            assert_eq!(b["thinking"]["type"], "disabled");
+        }
+
+        // 字符串解析（Python 绑定走它）：认空串 / text / json_object，其余报错
+        assert_eq!(ResponseFormat::from_name(""), Some(ResponseFormat::Text));
+        assert_eq!(ResponseFormat::from_name("text"), Some(ResponseFormat::Text));
+        assert_eq!(
+            ResponseFormat::from_name(" json_object "),
+            Some(ResponseFormat::JsonObject)
+        );
+        assert_eq!(ResponseFormat::from_name("xml"), None);
     }
 
     #[test]
