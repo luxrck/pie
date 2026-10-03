@@ -52,13 +52,13 @@ const SIGKILL: i32 = 9;
 
 // 会话内持久的 IPython：状态活在本会话的进程里；`pie -r` 恢复会话**不会**带回解释器内存
 // （重新起一个干净的）——活进程没法跨进程重启携带。
-/// 在当前会话里持久运行的 IPython 中执行一段 Python 代码（变量、import、定义跨调用保留）。
-/// 输出的头区总有一行 `[解释器] …`：解释器现在有哪些名字、本次新增了什么——
-/// 上下文被压缩后你的历史里可能已经没有那些代码块了，写代码前以这一行为准，别按记忆猜。
-/// 解释器里备着 `history()`：本会话的完整转录（**压缩指针已展开**），逐条含 `role` /
-/// `content` / `tool_calls`（代码就在 `arguments` 里）/ `turn`，被落盘的工具输出另带
-/// `full_output_path` —— 记不清早先写过什么、跑过什么就查它，别靠回忆。
+// 工具描述用 `#[schemars(description = …)]` 显式给（doc 注释不行：schemars 会把单换行
+// 合并成空格，而这里要多行）—— 跟 `Edit` 上面那条注释同一个理由。
+// `[解释器]` 头区那行与 `history()` 的来龙去脉见 AGENTS.md。
 #[derive(Deserialize, JsonSchema)]
+#[schemars(
+    description = "会话内**持久**的 Python 解释器（IPython）：变量 / import / 定义跨调用保留，本会话后面每次调用都在同一个进程里。\n**要跑 Python 就优先用它**，别用 `bash` 反复 `python3 -c`（那每次都是新进程，状态不会留）：\n- 分几段写、边看边改（探查数据、调参数、试算法）：import 与读数据做一次，后面反复掏；\n- 有贵的准备（加载大文件 / 大表、连服务、起子进程）→ 做一次留着，别每段重来；\n- 要画图：matplotlib 的 figure 会随结果回传、在界面上直接显示 —— 画图只能用 repl；\n- 一次性 shell 命令（grep / 看目录 / 构建 / 测试）用 `bash` 更直接。\n结果头区总有一行 `[解释器] …`（当前有哪些名字 + 本次新增）：写代码前以它为准，别按记忆猜；要逐条转录与输出，调 `history()`。"
+)]
 pub struct Repl {
     /// 要执行的 Python 代码（可多行；和往 IPython 里敲的一样，支持 `%` 魔法与 `!shell`）
     pub code: String,
