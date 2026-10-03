@@ -874,9 +874,10 @@ fn read_text(path: Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
-/// 按分层组装 system prompt：SYSTEM.md（角色）+ AGENTS.md（项目）+ 记忆（存在即加载）。
+/// 按分层组装 system prompt：SYSTEM.md（角色）+ AGENTS.md（项目）+ 记忆（存在即加载）
+/// + **运行时状态节**（永远在最后，见 [`RUNTIME_STATE_HEADING`]）。
 ///
-/// `system_prompt` 非空时替换 SYSTEM.md 基础提示；`append_system_prompt` 追加到最末。
+/// `system_prompt` 非空时替换 SYSTEM.md 基础提示；`append_system_prompt` 追加到记忆之后、运行时状态之前。
 pub fn build_system_prompt(
     config: &Config,
     system_prompt: Option<&str>,
@@ -919,7 +920,32 @@ pub fn build_system_prompt(
     }
 
     parts.extend(append_system_prompt.iter().filter(|s| !s.is_empty()).cloned());
+    // 永远**最后**一节：`Session::aturn` 每轮按 [`RUNTIME_STATE_HEADING`] 重拼它
+    //（所以别把它插到中间，也别把 `append_system_prompt` 挪到它后面）。
+    parts.push(runtime_state());
     parts.join("\n\n")
+}
+
+/// 运行时状态节的小标题：**每轮重拼时按它定位**（取最后一次出现，见 `Session::refresh_runtime_state`）。
+pub const RUNTIME_STATE_HEADING: &str = "## 运行时状态";
+
+/// 运行时状态：进程级、会变、且**必须每轮现取**的东西（现在只有 cwd）。
+///
+/// 为什么不学「状态一变就往历史里插一条 system 消息」（`/cd` 当年就是这么干的）：
+/// 那是 `messages` 里的一条，而轮次级压缩的 span 就是「相邻两个 user 之间的**一切**」
+/// （`context::compact_turns` 不按 role 过滤）→ 它迟早被卷进 `[轮次原文已保存]` 的摘要里，
+/// 模型再也看不见（原文只在盘上，模型没有回查途径 —— 它甚至不知道有这回事）。
+///
+/// `messages[0]` 则是**压缩免疫**的：轮次级只在两个 user 之间动手（`messages[0]` 在第一个 user
+/// 之前），会话级明确「system 不动」。代价是它住在提示词前缀里 → **内容没变就别动**，
+/// 否则每次请求都打掉服务端的前缀缓存。
+pub fn runtime_state() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    format!(
+        "{RUNTIME_STATE_HEADING}\n\n当前工作目录：{cwd}\n（`read` / `edit` / `bash` 的相对路径都相对它；它可能中途变化，别假设整段对话里不变。）"
+    )
 }
 
 #[cfg(test)]

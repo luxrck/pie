@@ -2,6 +2,41 @@
 
 本文件按时间倒序记录 pie 的关键设计决策与实现变更。决策的「当前状态」摘要保留在仓库根目录 `MEMORY.md`。
 
+## 2026-10-03（进程级状态不进历史：system prompt 末尾的「运行时状态」节）
+
+用户：「轮次级压缩为啥会吃掉 system message? system message 不是一定会夹在两个 turn 中间吗」——**用户的前提对，而且正是机制本身**。
+
+**核实**：`compact_turns` 的 span 是 `messages[u+1..end]`（相邻两个 user 的索引），即「两个 user 之间的**一切**」，
+**不按 role 过滤**。而 `/cd` 那条 `已切换工作目录：…` 是 `messages.push()` 到末尾的 → 空闲时正好落在
+「上一个 user 之后、下一个 user 之前」= **span 内部**。不是被删（整段 span 原样进 `context/turn-<hash>`，
+`full_history` 展开能回来），而是**从模型当前上下文里消失**（摘要只留 `...[中间过程省略]...` + 最后一条 assistant 文本），
+而且模型没有任何回查途径。
+
+**顺带查出一个真 bug**：`/cd` 在回合进行中执行时 `session.try_lock()` 拿不到 → 那条 note **压根没进历史**，
+只推了一句「历史里的说明稍后再生效」的 Notice——而代码里**没有任何“稍后补”的逻辑**（`pending` 零命中）。
+所以这种情况比压缩那条更糟：cwd 改了、模型从头到尾不知道。
+
+**修法（用户选 b：进程级状态根本不进历史）**：
+- `config::runtime_state()` 拼一节运行时状态（标题常量 `RUNTIME_STATE_HEADING`，现在只有 cwd），
+  由 `build_system_prompt` 拼在**最末**（`append_system_prompt` 因此不再是最后一节）。
+- `Session::refresh_runtime_state()`（`aturn` 开头调）：取标题**最后一次**出现、只重拼尾部那节——
+  幂等（cwd 没变则逐字相同 → 服务端提示词前缀缓存照旧命中），cwd 变了只动尾部。
+- 为什么住 `messages[0]`：它**压缩免疫**（轮次级只在两个 user 之间动手，`messages[0]` 在第一个 user 之前；
+  会话级明确「system 不动」）。代价是它在提示词前缀里 → 所以幂等重拼而不是每轮重建整个 prompt
+  （那会重读 `AGENTS.md` / `MEMORY.md` 并让“记忆改动立即生效”这种未要求的行为变化混进来）。
+- `/cd` 不再插历史消息（只切目录 + 一条给人看的 Notice + 作废 `@` 索引）；回合中拿不到锁时不留“稍后补”的空头话，
+  而是明说数据目录的切换要等回合结束再 `/cd` 一次。
+- `prompts/system.md` 加了一节「运行时状态」告诉模型这节每轮现取、以它为准。
+
+测试：`session::tests::runtime_state_is_refreshed_in_place_on_the_system_prompt`（幂等 / 换 cwd 只动尾部 /
+轮次级压缩后 cwd 还在）、`tui::app::tests::cd_switches_working_dir_and_announces_it`（改成钉「历史没被污染」）。
+
+⚠ 一个坑（写测试时当场踩到）：**标题串会出现在提示词正文里**——我一开始在 `prompts/system.md` 里也用了
+`## 运行时状态` 当小节标题，于是拼接结果里出现了两次，`matches(heading).count() == 1` 直接挂。
+定位靠 `rfind`（**最后一次**出现 = 我们那节，永远在末尾）所以功能没问题；但提示词正文改成了不带标题的
+行内说明，测试也改成「末尾是它」+「重拼不会多出几节」而不是数绝对次数。
+**尚未做**：repl 的状态摘要将来走同一节（跨重启、状态账本那套见前文与 `docs/repl-tool.md`）。
+
 ## 2026-10-03（`compress_level: u8` + `raw_path` → `compaction: Option<Compaction>`）
 
 用户：「`compress_level` 有存在的必要吗？」——**数字没有，判别式有，但它不该是两个要手工保持同步的字段**。

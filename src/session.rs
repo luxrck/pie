@@ -394,6 +394,8 @@ impl Session {
         stream: Option<bool>,
         parallel_tools: Option<bool>,
     ) -> Result<String, LlmError> {
+        // 每轮开头校准「运行时状态」（cwd 可能被 `/cd` 改过）——必须先于任何请求
+        self.refresh_runtime_state();
         self.push_user(input);
         // 压缩事件先攒在本地（`self.messages` 这会儿正被借出去跑回合）→ 回合末并进字段
         let mut compacted: Vec<context::CompactEvent> = Vec::new();
@@ -1055,6 +1057,27 @@ impl Session {
         out
     }
 
+    // `messages[0]` 的两件维护工作：这里的「运行时状态」与下面的 `/clear` 重建。
+
+    /// 每轮开头校准 `messages[0]` 末尾的「运行时状态」节（cwd 之类）。
+    ///
+    /// 把最后一次出现的标题之前那段原样留下、尾部重拼 —— 幂等：cwd 没变时结果逐字相同，
+    /// 服务端提示词前缀缓存照旧命中（所以不必先比较再赋值）。
+    ///
+    /// 为什么住 `messages[0]` 而不是历史里的一条 system：见 [`config::runtime_state`]。
+    fn refresh_runtime_state(&mut self) {
+        let state = config::runtime_state();
+        let Some(prompt) = self.messages.first_mut() else {
+            return;
+        };
+        let text = prompt.content_text();
+        let base = match text.rfind(config::RUNTIME_STATE_HEADING) {
+            Some(at) => &text[..at], // 含标题前面那两个空行（原来怎么拼就怎么留）
+            None => text.as_str(),   // 旧会话 / 手改过（没节）→ 直接接在末尾
+        };
+        *prompt = Message::system(format!("{base}{state}"));
+    }
+
     /// 只留 system prompt（`/clear` 的一半：换窗口）。
     #[allow(dead_code)] // 入口是交互层的 `/clear`
     pub fn reset(&mut self) {
@@ -1086,7 +1109,8 @@ impl Session {
             self.compaction_events.push(event);
             self.windows.push(path);
         }
-        // `/clear` 的特性（兜底没有）：system prompt 顺便重建一次（cwd / 记忆变化要反映进来）
+        // `/clear` 的特性（兜底没有）：system prompt 顺便重建一次（记忆变化要反映进来；
+        // cwd 那节每轮也会被 `refresh_runtime_state` 重拼）
         self.messages[0] = Message::system(config::build_system_prompt(
             &self.config,
             self.config.system_prompt.as_deref(),
@@ -1970,6 +1994,79 @@ mod tests {
             "退回压缩形式：{full:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「运行时状态」节活在 `messages[0]` 末尾：每轮重拼、**幂等**（cwd 没变就逐字相同 →
+    /// 提示词前缀缓存不失效），cwd 变了只换尾部那节。
+    ///
+    /// 它不进历史 → 轮次级压缩碰不到它：这正是「把状态变更插成一条 system 消息」那个做法
+    /// 的老病（span 就是「两个 user 之间的一切」）的解药。
+    #[test]
+    fn runtime_state_is_refreshed_in_place_on_the_system_prompt() {
+        let _g = env_lock(); // cwd 是进程级的 → 与其它环境类用例串行
+        let saved = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!("pie-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            storage: crate::config::Storage::at(&dir),
+            ..Config::default()
+        };
+        let mut s = Session::ephemeral(&config, llm(), tools());
+
+        let before = s.messages[0].content_text();
+        let heading = config::RUNTIME_STATE_HEADING;
+        // ⚠ 别数绝对次数：提示词正文里就可能提到这个标题（`prompts/system.md` 就写了）——
+        // 判据是「那一节在**末尾**」，而且重拼不会凭空多出几节。
+        assert!(
+            before.ends_with(&config::runtime_state()),
+            "建会话时那节就该在末尾：{before}"
+        );
+        let sections = before.matches(heading).count();
+        let base = before[..before.rfind(heading).unwrap()].to_string();
+
+        // 幂等：故意连搅两次，逐字相同（不堆出第二节）
+        s.refresh_runtime_state();
+        s.refresh_runtime_state();
+        assert_eq!(s.messages[0].content_text(), before, "cwd 没变就该逐字相同");
+
+        // 轮到新 cwd：下一轮反映进去，而且**只有尾部那节变**（前面那段原样 → 缓存前缀照旧）
+        let moved = std::env::temp_dir().join(format!("pie-rs-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&moved);
+        std::fs::create_dir_all(&moved).unwrap();
+        let moved = moved.canonicalize().unwrap();
+        std::env::set_current_dir(&moved).unwrap();
+        s.refresh_runtime_state();
+        let after = s.messages[0].content_text();
+        assert!(after.starts_with(&base), "标题前面的那段不该变：{after}");
+        assert_eq!(
+            after.matches(heading).count(),
+            sections,
+            "重拼不该多出几节：{after}"
+        );
+        assert!(
+            after.contains(&moved.display().to_string()),
+            "新 cwd 要写进去：{after}"
+        );
+
+        // 轮次级压缩压的是「两个 user 之间」→ system prompt 那节不受影响
+        s.messages.push(Message::user("q1"));
+        s.messages.push(Message::assistant("a1"));
+        s.messages.push(Message::user("q2"));
+        s.messages.push(Message::assistant("a2"));
+        let (stats, _) = context::maybe_compact(&mut s.messages, &config, Some(9_999_999));
+        assert!(stats.turns > 0, "这一轮该被压掉");
+        assert!(
+            s.messages[0]
+                .content_text()
+                .contains(&moved.display().to_string()),
+            "压缩后 cwd 还在：{}",
+            s.messages[0].content_text()
+        );
+
+        std::env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 
     /// `/model`、`/thinking`：改配置 + 同步客户端实例 + 写回文件。

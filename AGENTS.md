@@ -217,8 +217,12 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop && .venv/bin/python -m pytest t
   （实测与三条治法、以及「改用终端 scrollback」的取舍见 `docs/CHANGELOG.md` 2026-09-28）→ 别往 `render` 里再加 O(历史) 的活。
 - lean 模式（`[tui] lean`，默认 true）只压工具活动那一行；`/help` 文案由 `palette::COMMANDS` 生成。
 - **`/cd <路径>`**（切换工作目录）：`set_current_dir` + 重解析 `config.storage`（与 CLI `--cwd` 同口径：
-  `PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）+ 往**会话历史与消息流**各插一条 system 说明
-  （`已切换工作目录：<路径>`——历史里那条是给模型的 cwd 上下文）+ 作废 `@` 补全索引；`~` 会展开。
+  `PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）+ 消息流一条 Notice + 作废 `@` 补全索引；`~` 会展开。
+  ⚠ **不往会话历史里插消息**：模型看到的 cwd 来自 system prompt 末尾那节「运行时状态」
+  （`config::runtime_state`，由 `Session::aturn` 每轮按 `RUNTIME_STATE_HEADING` 重拼）——
+  往历史里插一条 system 会被轮次级压缩卷进 `[轮次原文已保存]` 摘要（span 就是「两个 user 之间的**一切**」），
+  模型就再也看不见了。`messages[0]` 是**压缩免疫**的（轮次级只在 user 之间动手、会话级「system 不动」）。
+  同一套将来也给 repl 的状态摘要用。
 
 ### 配置、提示词、记忆
 
