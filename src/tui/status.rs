@@ -441,7 +441,7 @@ mod tests {
         let text = balance_text(&balance).expect("有明细就有文本");
         assert_eq!(text, "¥110.00");
         let left =
-            " cr deepseek-flash high · ~/Projects/pie  │ 24,048/920,576 (2.6%) │ ¥110.00";
+            " cr deepseek-flash high · ~/Projects/pie │ 24,048/920,576 (2.6%) │ ¥110.00";
 
         // 空闲：左边一串常驻信息，右边什么都没有（剩下的都是填空）
         let idle = line_text(&status_line(
