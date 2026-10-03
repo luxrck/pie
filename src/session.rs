@@ -397,6 +397,8 @@ impl Session {
         // 每轮开头校准「运行时状态」（cwd 可能被 `/cd` 改过）——必须先于任何请求
         self.refresh_runtime_state();
         self.push_user(input);
+        // 转录快照（解释器的 `history()` 读它）——每轮重写，于是会话进行中也能查到历史
+        self.write_transcript();
         // 压缩事件先攒在本地（`self.messages` 这会儿正被借出去跑回合）→ 回合末并进字段
         let mut compacted: Vec<context::CompactEvent> = Vec::new();
 
@@ -747,7 +749,8 @@ impl Session {
                                 cancel.clone(),
                                 self.config.storage.clone(),
                                 self.tool_state.clone(),
-                            );
+                            )
+                            .with_transcript(self.transcript_path());
                             let out = match registry.dispatch(&call.function.name, &args, ctx).await {
                                 Ok(out) => out,
                                 Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
@@ -1076,6 +1079,41 @@ impl Session {
             None => text.as_str(),   // 旧会话 / 手改过（没节）→ 直接接在末尾
         };
         *prompt = Message::system(format!("{base}{state}"));
+    }
+
+    /// 转录快照的路径：**临时目录** + 会话路径的 hash。
+    ///
+    /// 放临时目录是为了不占数据目录（一次性子 agent 也会写它，不该在 `sessions/` 里留垃圾）；
+    /// 带 hash 是为了并行会话互不打架（父 agent 的界面与它派生的子 agent 各读各的）。
+    fn transcript_path(&self) -> PathBuf {
+        let id = config::hash_id(self.path.to_string_lossy().as_bytes());
+        std::env::temp_dir().join(format!("pie-transcript-{id}.jsonl"))
+    }
+
+    /// 把当前（**压缩态**）转录写一份快照给解释器 —— `repl` 的 `history()` 读它。
+    ///
+    /// 为什么不让解释器直接读会话文件：那个文件**只在退出 / `/save` 时**落盘，会话进行中
+    /// 它根本还不存在（一次性会话更是永远不落盘）。每轮开头重写一次的代价只是一次内存
+    /// 序列化，换来「解释器里随时拿得到完整转录」。写盘走「临时文件 + 改名」，
+    /// 读到的一定是完整的一份（不撞上半截 JSON）。
+    fn write_transcript(&self) {
+        let path = self.transcript_path();
+        let mut body = String::new();
+        for m in &self.messages {
+            match json_line(m) {
+                Ok(line) => {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+                Err(e) => crate::log::warn(format!("[转录快照] 序列化失败: {e}")),
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        let done =
+            std::fs::write(&tmp, body.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = done {
+            crate::log::warn(format!("[转录快照] 写入失败 {}: {e}", path.display()));
+        }
     }
 
     /// 只留 system prompt（`/clear` 的一半：换窗口）。
@@ -1994,6 +2032,31 @@ mod tests {
             "退回压缩形式：{full:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 转录快照：每轮**重写**（不是追加），解释器的 `history()` 读它。
+    ///
+    /// 为什么不能让它读会话文件：那个文件只在退出 / `/save` 时落盘，会话进行中根本不存在。
+    #[test]
+    fn transcript_snapshot_is_rewritten_for_each_turn() {
+        let mut s = Session::new(&Config::default(), Some("s.jsonl"), llm(), tools());
+        s.push_user("第一问");
+        s.write_transcript();
+        let snap = s.transcript_path();
+        let body = std::fs::read_to_string(&snap).unwrap();
+        assert!(body.contains("第一问"), "{body:?}");
+        assert_eq!(body.lines().count(), 2, "system + user 各一行：{body:?}");
+
+        s.messages.push(Message::assistant("第一答"));
+        s.push_user("第二问");
+        s.write_transcript();
+        let body2 = std::fs::read_to_string(&snap).unwrap();
+        assert_eq!(body2.lines().count(), 4, "重写而不是追加：{body2:?}");
+        assert!(
+            body2.contains("第二问") && body2.contains("第一答"),
+            "{body2:?}"
+        );
+        let _ = std::fs::remove_file(&snap); // 落在临时目录，测完就收
     }
 
     /// 「运行时状态」节活在 `messages[0]` 末尾：每轮重拼、**幂等**（cwd 没变就逐字相同 →

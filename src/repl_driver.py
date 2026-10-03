@@ -115,6 +115,86 @@ def _namespace():
         return []
 
 
+# ---------------------------------------------------------------- 历史即数据
+#
+# `history()`：把**本会话的转录**变成解释器里的一份数据。快照由 Rust 侧每轮开头重写
+# （路径走 `PIE_TRANSCRIPT`）—— 会话文件只在退出 / `/save` 时落盘，会话进行中它根本还不存在。
+# 压缩指针默认展开：那正是它存在的理由（压缩之后模型的历史里已经没有那些代码块了）。
+_TRANSCRIPT = os.environ.get("PIE_TRANSCRIPT") or ""
+
+
+def _read_records(path):
+    """读一份消息落盘件。两种形状都认：JSONL（一行一个对象）与 pretty JSON 数组。"""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if text.lstrip().startswith("["):
+        return json.loads(text)
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if isinstance(obj, dict) and obj.get("__meta__"):
+            continue  # 会话文件的首行元信息
+        out.append(obj)
+    return out
+
+
+def _annotate(msg, turn):
+    """每条消息额外带两个东西：`turn`（第几轮）与漏盘全文的路径。"""
+    entry = {**msg, "turn": turn}
+    comp = msg.get("compaction") or {}
+    if comp.get("kind") == "tool" and comp.get("path"):
+        entry["full_output_path"] = comp["path"]
+    return entry
+
+
+def history(expand=True, turn=None):
+    """本会话的转录（从快照读，不是解释器里的变量）→ 按原顺序的 list[dict]。
+
+    每条就是会话文件里那条消息（字段名一致，**只在适用的字段才出现**），另加：
+      - `turn`：属于第几个用户回合（0 起）
+      - `full_output_path`：工具输出被截断/落盘时**全文**的路径（`open(path).read()` 取）
+    默认把压缩指针**展开**（`turn` / `session` 归档整段插回来）→ 拿到的是没被压过的完整对话；
+    `expand=False` 看原始（压缩后）形态，`turn=2` 只看第 2 轮。
+    快照每轮开头重写：含当前这轮的用户输入，不含本轮尚未落盘的消息。没有快照 → 空列表。
+    """
+    if not _TRANSCRIPT or not os.path.isfile(_TRANSCRIPT):
+        return []
+    try:
+        records = _read_records(_TRANSCRIPT)
+    except Exception:
+        return []
+    out = []
+    current = -1
+    for msg in records:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            current += 1
+        comp = msg.get("compaction") or {}
+        kind, path = comp.get("kind"), comp.get("path")
+        if expand and kind in ("turn", "session") and path:
+            try:
+                archived = _read_records(path)
+            except Exception:
+                archived = []
+            if archived:
+                out.extend(_annotate(raw, current) for raw in archived if isinstance(raw, dict))
+                continue
+        out.append(_annotate(msg, current))
+    return out if turn is None else [e for e in out if e["turn"] == turn]
+
+
+shell.user_ns["history"] = history
+# 同时同步进 `user_ns_hidden`（IPython 自己的惯例：`exit` / `quit` / `open` 就是这么藏的，
+# 好让 `%who` 看不见）—— 它是我们预置的**库函数**，不该混进 `[解释器] …` 那行的名字清单里；
+# 它仍然可用，发现渠道是工具描述（每次请求都在）。
+# ⚠ 只管**显示**：用户写 `history = 5` 照样会盖掉它。
+shell.user_ns_hidden["history"] = history
+
+
 def _read_exact(n):
     buf = b""
     while len(buf) < n:

@@ -130,6 +130,9 @@ pub struct ToolCtx {
     pub cancel: Option<crate::cancel::Cancel>,
     /// 数据目录（bash 全文落盘要用；默认从 `PIE_DIR` 解析）。
     pub storage: crate::config::Storage,
+    /// 本会话**转录快照**的路径（`Session::write_transcript` 每轮重写；没有会话语境时 `None`）。
+    /// `repl` 把它交给解释器（`PIE_TRANSCRIPT`），于是 `history()` 能把历史当数据查。
+    pub transcript: Option<PathBuf>,
     /// 会话级工具状态槽（有状态的工具用它存长活对象；调用方每轮把它 clone 进 ctx）。
     pub state: Arc<SessionState>,
 }
@@ -143,8 +146,15 @@ impl ToolCtx {
         Self {
             cancel: Some(cancel),
             storage,
+            transcript: None,
             state,
         }
+    }
+
+    /// 带上转录快照路径（`repl` 的 `history()` 读它）。
+    pub fn with_transcript(mut self, path: PathBuf) -> Self {
+        self.transcript = Some(path);
+        self
     }
 }
 
