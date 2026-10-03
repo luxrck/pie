@@ -10,7 +10,7 @@ use std::io::{IsTerminal, Write};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-use pie::llm::LlmClient;
+use pie::llm::{LlmClient, RequestOptions};
 use pie::session::{Session, TurnEvent};
 use pie::tools::{tools_from_spec, ToolRegistry};
 use pie::{cancel, cli, config, context, tui};
@@ -26,14 +26,6 @@ enum Mode {
     Transcript,
 }
 
-/// `-t/--thinking` 的合法值。
-///
-/// 对外写法是 `off`（内部才归一到配置口径 `none`）；这里**两个都收** ——
-/// 配置文件与 `/thinking` 里写的就是 `none`，顺手敲 `-t none` 也应该能用。
-const THINKING_LEVELS: [&str; 8] = [
-    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
-];
-
 #[derive(Parser, Debug)]
 #[command(name = "pie", version, about = "pie 的 Rust 重构")]
 struct Cli {
@@ -46,7 +38,7 @@ struct Cli {
     model: Option<String>,
 
     /// 本次思考强度（off / none / low / medium / high / xhigh / max；`off` = `none`，覆盖配置，不持久化）
-    #[arg(short = 't', long, value_parser = THINKING_LEVELS)]
+    #[arg(short = 't', long, value_parser = config::THINKING_LEVELS)]
     thinking: Option<String>,
 
     /// 每次请求为输出预留的 token（即 API 的 max_tokens；例：131072 / 128k / auto；覆盖配置）
@@ -361,7 +353,8 @@ async fn run(cli: Cli) -> i32 {
             };
         }
         let answer = match session
-            // `parallel_tools: None` = 跟随配置（CLI 没有覆盖它的旗标）
+            // 后两个按次旋钮走默认：`parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）、
+            // `options` 走 chat completions 的默认（思考深度用客户端/配置的、`response_format` = text）
             .aturn(
                 &task,
                 &mut printer,
@@ -369,6 +362,7 @@ async fn run(cli: Cli) -> i32 {
                 max_steps,
                 stream,
                 None,
+                RequestOptions::default(),
             )
             .await
         {
@@ -402,6 +396,7 @@ async fn run(cli: Cli) -> i32 {
             max_steps,
             stream,
             None,
+            RequestOptions::default(),
         )
         .await
     {

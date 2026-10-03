@@ -7,7 +7,7 @@
 //!
 //! 匹配规则（三条，按序）：
 //!   1. `/model ` 前缀 → 端点可用模型列表（「← 当前」标注现用那个）；
-//!   2. `/thinking ` 前缀 → 思考级别（`REASONING_LEVELS`，同上标注）；
+//!   2. `/thinking ` 前缀 → 思考级别（`config::reasoning_levels()`，同上标注）；
 //!   3. 其它以 `/` 开头 → 候选表里**前缀命中**的项（完整命令也在内，所以刚打完就还留着面板）。
 
 use ratatui::style::{Modifier, Style};
@@ -97,11 +97,10 @@ pub fn matches(value: &str, models: &[String], model: &str, effort: &str) -> Vec
     }
     // `/thinking <prefix>`：列思考级别
     if let Some(prefix) = value.strip_prefix("/thinking ") {
-        return crate::config::REASONING_LEVELS
-            .iter()
+        return crate::config::reasoning_levels()
             .filter(|lv| lv.starts_with(prefix))
             .map(|lv| {
-                let desc = if *lv == effort {
+                let desc = if lv == effort {
                     "← 当前"
                 } else {
                     "切换思考深度"

@@ -49,6 +49,8 @@ async def aturn_async(
     max_steps: int | None = None,
     stream: bool | None = None,
     parallel_tools: bool | None = None,
+    reasoning_effort: str | None = None,
+    response_format: str | None = None,
 ) -> str:
     """`Session.aturn_async` 的实现体（Rust 侧只负责建队列 + 转交到这儿）。"""
     loop = asyncio.get_running_loop()
@@ -57,7 +59,16 @@ async def aturn_async(
         # 从 tokio 线程被调用：只做「丢进队列」这一件事（队列本身线程不安全）
         loop.call_soon_threadsafe(queue.put_nowait, _DONE if payload is None else payload)
 
-    fut = session.turn_future(input, sink, cancel, max_steps, stream, parallel_tools)
+    fut = session.turn_future(
+        input,
+        sink,
+        cancel,
+        max_steps,
+        stream,
+        parallel_tools,
+        reasoning_effort,
+        response_format,
+    )
     try:
         return await fut
     except asyncio.CancelledError:

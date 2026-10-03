@@ -375,6 +375,36 @@ def test_turn_accepts_per_turn_knobs(env):
     assert events[-1]["text"] == "搞定了"
 
 
+def test_request_carries_per_call_reasoning_effort_and_response_format(env):
+    """`reasoning_effort` / `response_format` 是 `aturn` / `complete` 的**按次**形参：
+    `none` → 关闭思考（改发 `thinking: disabled`），`json_object` → 发 `response_format`。
+    """
+    cfg, llm, tools, server = env
+
+    # 裸调用（不吃工具循环）：两项都按参数走
+    llm.complete(
+        [{"role": "user", "content": "打个招呼"}],
+        reasoning_effort="low",
+        response_format="json_object",
+    )
+    body = server.requests[-1]
+    assert body["reasoning_effort"] == "low"
+    assert "thinking" not in body
+    assert body["response_format"] == {"type": "json_object"}
+
+    # 回合：按次覆盖成「关闭思考」；没传的那项走默认（不发 `response_format`）
+    session = pie.Session.ephemeral(cfg, llm, tools)
+    session.aturn("打个招呼", stream=False, reasoning_effort="none")
+    body = server.requests[-1]
+    assert "reasoning_effort" not in body
+    assert body["thinking"] == {"type": "disabled"}
+    assert "response_format" not in body
+
+    # 非法值当场报错（不用等模型 400）
+    with pytest.raises(pie.PieError, match="response_format"):
+        session.aturn("再来一次", response_format="xml")
+
+
 def test_stop_from_another_thread_aborts_the_turn(env):
     cfg, llm, tools, server = env
     server.delay = 3.0  # 让模型请求挂住，好从中途取消
@@ -760,6 +790,27 @@ def test_aturn_async_streams_events_and_returns_answer(env):
     answer, kinds = asyncio.run(run())
     assert answer == "搞定了"
     assert kinds == ["tool_call", "tool_result", "content_delta", "content_delta"], kinds
+
+
+def test_aturn_async_forwards_per_call_knobs(env):
+    """`aturn_async` 走的是 `_async.py` 的胶水（kwargs → `turn_future`）——新形参也要透到请求体。"""
+    import asyncio
+
+    cfg, llm, tools, server = env
+    session = pie.Session.ephemeral(cfg, llm, tools)
+
+    async def run() -> str:
+        task = asyncio.create_task(
+            session.aturn_async("打个招呼", reasoning_effort="none", response_format="json_object")
+        )
+        async for _ev in session.events():
+            pass
+        return await task
+
+    assert asyncio.run(run()) == "搞定了"
+    body = server.requests[0]
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["response_format"] == {"type": "json_object"}
 
 
 def test_aturn_async_cancel_really_stops_the_turn(env):

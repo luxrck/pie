@@ -305,11 +305,13 @@ impl PySession {
     ///
     /// `max_steps=None` = 不限步数；`stream=None` = 默认流式（`False` 则一次性 complete，
     /// 只推一次 `answer`）；`parallel_tools=None` = 跟随 `Config.parallel_tools`（同一批
-    /// tool_calls 是否并发执行）。三个都是**按次**的执行旋钮（**不是**配置项）。
+    /// tool_calls 是否并发执行）；`reasoning_effort=None` = 用配置里的思考深度（`"none"` =
+    /// 本回合关闭思考）；`response_format=None` = `text`（`"json_object"` = 要求合法 JSON 输出）。
+    /// 五个都是**按次**的执行旋钮（**不是**配置项，也不写回文件）。
     ///
     /// 模型请求失败（外部原因）抛 `pie.LlmError`，但**历史里已经补了一条 `[请求失败] <错误>` 的
     /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
-    #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     pub(crate) fn aturn(
         &self,
         py: Python<'_>,
@@ -319,6 +321,8 @@ impl PySession {
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
+        reasoning_effort: Option<String>,
+        response_format: Option<String>,
     ) -> PyResult<String> {
         // ① 独占会话：拿不到锁立刻报错（别排队等）
         let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
@@ -329,23 +333,40 @@ impl PySession {
             *slot = Some(token.clone());
         }
 
-        // ③ 回合扔到 runtime 上跑，事件只进 channel（tokio 线程里不碰 Python）
+        // ③ `response_format` 先在这里解析：PyErr 只能在持 GIL 的这层抛
+        //（回合块里返回的是 `LlmError`，`?` 二者不通用）
+        let response_format = crate::parse_response_format(response_format.as_deref())?;
+
+        // ④ 回合扔到 runtime 上跑，事件只进 channel（tokio 线程里不碰 Python）
         let (tx, rx) = mpsc::channel::<TurnEvent>();
         let handle = crate::runtime().spawn(async move {
             let mut session = guard;
+            // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
+            let options = pie::llm::RequestOptions::ChatCompletions {
+                reasoning_effort: reasoning_effort.as_deref(),
+                response_format,
+            };
             let result = {
                 let mut emit = move |event: TurnEvent| {
                     // 接收端没了（调用方已放弃）就静默丢弃，别把回合搞崩
                     let _ = tx.send(event);
                 };
                 session
-                    .aturn(&input, &mut emit, &token, max_steps, stream, parallel_tools)
+                    .aturn(
+                        &input,
+                        &mut emit,
+                        &token,
+                        max_steps,
+                        stream,
+                        parallel_tools,
+                        options,
+                    )
                     .await
             };
             result
         });
 
-        // ④ 调用线程 pump：等事件时释放 GIL，拿到事件回 GIL 调回调
+        // ⑤ 调用线程 pump：等事件时释放 GIL，拿到事件回 GIL 调回调
         //
         // ⚠ `rx` 只能**按值**进闭包再带出来：`py.detach` 的闭包要 `Send`，而
         // `mpsc::Receiver` 是 `Send + !Sync` —— 按引用捕获就需要 `Sync`，编译不过。
@@ -401,7 +422,7 @@ impl PySession {
     /// ⚠ 它必须只做「把东西丢给 asyncio」（`pie/_async.py` 里就是 `call_soon_threadsafe` +
     /// `queue.put_nowait`）—— **别碰 Session**（回合正占着锁）。
     #[cfg(feature = "asyncio")]
-    #[pyo3(signature = (input, sink, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    #[pyo3(signature = (input, sink, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn turn_future(
         &self,
         py: Python<'_>,
@@ -411,6 +432,8 @@ impl PySession {
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
+        reasoning_effort: Option<String>,
+        response_format: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         // ① 独占会话 + 取消信号（与同步 `aturn` 同一套）
         let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
@@ -427,10 +450,17 @@ impl PySession {
             *slot = Some(token.clone());
         }
 
+        // `response_format` 先解析：PyErr 只能在持 GIL 的这层抛（回合块返回的是 `LlmError`）
+        let response_format = crate::parse_response_format(response_format.as_deref())?;
         let sink_for_events = sink.clone_ref(py);
         let sink_end = sink;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = guard;
+            // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
+            let options = pie::llm::RequestOptions::ChatCompletions {
+                reasoning_effort: reasoning_effort.as_deref(),
+                response_format,
+            };
             let mut emit = move |event: TurnEvent| {
                 // 事件：只会「往 asyncio 队列里丢」，失败就当没发生（别把回合弄崩）
                 let _ = Python::attach(|py| -> PyResult<()> {
@@ -440,7 +470,15 @@ impl PySession {
                 });
             };
             let result = session
-                .aturn(&input, &mut emit, &token, max_steps, stream, parallel_tools)
+                .aturn(
+                    &input,
+                    &mut emit,
+                    &token,
+                    max_steps,
+                    stream,
+                    parallel_tools,
+                    options,
+                )
                 .await;
             // 收尾：告诉 Python 侧「事件到头了」——`events()` 的迭代器据此 StopAsyncIteration
             let _ = Python::attach(|py| -> PyResult<()> {
@@ -482,7 +520,7 @@ impl PySession {
     /// 事件走 `async for ev in session.events()`；`task.cancel()` / `session.stop()` 都能真停住
     /// （前者靠 Python 侧的 glue 把 `CancelledError` 桥到 `stop()`）。
     #[cfg(feature = "asyncio")]
-    #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None))]
+    #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn aturn_async(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -491,6 +529,8 @@ impl PySession {
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
+        reasoning_effort: Option<String>,
+        response_format: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         // 队列**在这里就建好并登记**：这样 `s.aturn_async(...)` 返回后 `s.events()` 立刻能用
         //（不用先 await 一下让协程跑起来）。胶水（哨兵 / CancelledError → stop）在 Python 侧。
@@ -505,6 +545,8 @@ impl PySession {
         kwargs.set_item("max_steps", max_steps)?;
         kwargs.set_item("stream", stream)?;
         kwargs.set_item("parallel_tools", parallel_tools)?;
+        kwargs.set_item("reasoning_effort", reasoning_effort)?;
+        kwargs.set_item("response_format", response_format)?;
         Ok(helper.call((slf, input), Some(&kwargs))?.unbind())
     }
 
