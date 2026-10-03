@@ -52,6 +52,8 @@ const SIGKILL: i32 = 9;
 // 会话内持久的 IPython：状态活在本会话的进程里；`pie -r` 恢复会话**不会**带回解释器内存
 // （重新起一个干净的）——活进程没法跨进程重启携带。
 /// 在当前会话里持久运行的 IPython 中执行一段 Python 代码（变量、import、定义跨调用保留）。
+/// 输出的头区总有一行 `[解释器] …`：解释器现在有哪些名字、本次新增了什么——
+/// 上下文被压缩后你的历史里可能已经没有那些代码块了，写代码前以这一行为准，别按记忆猜。
 #[derive(Deserialize, JsonSchema)]
 pub struct Repl {
     /// 要执行的 Python 代码（可多行；和往 IPython 里敲的一样，支持 `%` 魔法与 `!shell`）
@@ -103,6 +105,23 @@ struct Reply {
     /// 只给界面用（模型看不到）——走结构化通道，不从正文里嗅探。
     #[serde(default)]
     images: Vec<String>,
+    /// 解释器状态：driver 报的 `state`（见 `Namespace`）。`None` = **没上报**（假驱动/老驱动）
+    /// —— 与「上报了、是空的」是两回事：前者不加头区那行，后者要加（“空”正是模型最该知道的事）。
+    #[serde(default)]
+    state: Option<Namespace>,
+}
+
+/// 解释器里现在有什么（driver 的 `_namespace` 口径）。
+#[derive(Deserialize, Default)]
+struct Namespace {
+    /// 当前命名空间（非下划线、非 IPython 注入的），driver 已截断到 32。
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    total: usize,
+    /// 本次执行新增的名字。
+    #[serde(default)]
+    defined: Vec<String>,
 }
 
 /// 一次执行的结果分类。
@@ -390,7 +409,7 @@ fn format_reply(
     }
 
     match tools::head_prefix(&body, max_lines, max_bytes) {
-        None => ToolOutput::text(body).with_images(images),
+        None => ToolOutput::text(tools::format_output(&headers(&reply), &body)).with_images(images),
         Some(head) => {
             // 单元格输出一旦被消费就没了（不可再生）→ 超限落盘 + 指针，与 `bash` 同款。
             let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
@@ -400,13 +419,44 @@ fn format_reply(
                 Ok(path) => (Some(path.clone()), path.display().to_string()),
                 Err(e) => (None, format!("(落盘失败: {e})")),
             };
+            let mut headers = headers(&reply);
+            headers.push(format!("[工具输出全文已保存: {spill_txt}]"));
             ToolOutput {
-                text: tools::format_output(&[format!("[工具输出全文已保存: {spill_txt}]")], &head),
+                text: tools::format_output(&headers, &head),
                 spill,
                 images,
             }
         }
     }
+}
+
+/// 输出头区：解释器状态那一行（`[解释器] 共 3 个：df, f, math（本次新增：df）`）。
+///
+/// 为什么每次调用都报（包括“空”）：模型看不到解释器内部，压缩之后它连自己写过的代码块都没了
+/// —— “里面有什么”得由每次执行自己带回来，而不能靠模型另发一次询问（白搭一次往返）。
+/// 为什么放**头区**：`head_prefix` 保留的是开头，超限截断/落盘时它得跟着走；
+/// 而“输出很长”恰恰是最需要它的场合。
+fn headers(reply: &Reply) -> Vec<String> {
+    let Some(state) = &reply.state else {
+        return Vec::new(); // driver 没上报（假驱动）—— 别凭空说“空”
+    };
+    let mut line = if state.total == 0 {
+        "[解释器] 空".to_string()
+    } else {
+        let mut line = format!(
+            "[解释器] 共 {} 个：{}",
+            state.total,
+            state.names.join(", ")
+        );
+        if state.total > state.names.len() {
+            line.push('…');
+        }
+        line
+    };
+    if !state.defined.is_empty() {
+        line.push_str(&format!("（本次新增：{}）", state.defined.join(", ")));
+    }
+    vec![line]
 }
 
 #[cfg(test)]
@@ -438,6 +488,11 @@ while True:
         payload = {"stdout": "", "stderr": "oops\n", "error": None}
     elif code == "error":
         payload = {"stdout": "", "stderr": "", "error": "ValueError: boom"}
+    elif code.startswith("ns:"):
+        # 上报解释器状态 + 一段足够长的输出（测截断时状态行还在不在头区）
+        payload = {"stdout": "".join("line%d\n" % i for i in range(1, 20)),
+                   "stderr": "", "error": None,
+                   "state": {"names": ["df", "f", "math"], "total": 3, "defined": ["df"]}}
     else:
         payload = {"stdout": "call#%d: %s\n" % (count, code), "stderr": "", "error": None}
     body = json.dumps(payload).encode("utf-8")
@@ -535,6 +590,45 @@ while True:
         let t = run_code(&reg, &ctx, py, "error").await;
         assert_eq!(t.text, "ValueError: boom");
         // 异常是 REPL 的正常输出，不是工具失败（dispatch 返回 Ok）
+    }
+
+    /// 解释器状态行：模型压缩后看不到代码块，就靠这一行知道解释器里有什么。
+    #[tokio::test]
+    async fn namespace_digest_lands_in_the_header() {
+        let Some(py) = python3() else { return };
+        let reg = registry();
+        let ctx = ctx_at(&tempdir("ns"));
+
+        let out = run_code(&reg, &ctx, py, "ns:any").await;
+        assert!(
+            out.text
+                .starts_with("[解释器] 共 3 个：df, f, math（本次新增：df）\n\nline1\n"),
+            "{out:?}"
+        );
+        // 没上报状态的驱动（上面的 FAKE）不该凭空多出这一行
+        let plain = run_code(&reg, &ctx, py, "hello").await;
+        assert!(plain.text.starts_with("call#"), "{plain:?}");
+    }
+
+    /// 输出超限落盘时状态行**得留在头区**（`head_prefix` 保留开头）——不然最需要它的场合恰好丢掉。
+    #[tokio::test]
+    async fn namespace_digest_survives_truncation() {
+        let Some(py) = python3() else { return };
+        let tmp = tempdir("ns-spill");
+        let reg = registry();
+        let ctx = ctx_at(&tmp);
+
+        let args = json!({
+            "code": "ns:long", "_python": py, "_driver": FAKE, "_max_lines": 2
+        });
+        let out = reg.dispatch("repl", &args, ctx.clone()).await.unwrap();
+        assert!(out.text.starts_with("[解释器] 共 3 个："), "{out:?}");
+        assert!(
+            out.text.contains("[工具输出全文已保存: "),
+            "指针也在头区：{out:?}"
+        );
+        assert!(out.text.contains("line1\nline2\n"), "只留开头两行：{out:?}");
+        assert!(out.spill.is_some());
     }
 
     #[tokio::test]
