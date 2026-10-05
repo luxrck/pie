@@ -4,8 +4,8 @@
 `str` / `int` / `float` / `bool` / `list[...]` / `dict` / `Optional[...]` 认，其余注解直接报错；
 下划线开头的参数（注入项）不进 schema；描述取 `description` → docstring 首行 → 函数名。
 
-⚠ 只收**同步**函数：绑定现在的 `aturn` 是同步入口（`async def` 要等 M5 的 `aturn_async`，
-在这里就拒掉，别等到调用时才拿到一个 coroutine）。
+⚠ 只收**同步**函数：Python 工具的 handler 目前还没有异步支持（`async def` 在这里就拒掉，
+别等到调用时才拿到一个 coroutine）。
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def tool(
         if inspect.iscoroutinefunction(fn):
             raise ValueError(
                 f"{fn.__name__} 是 async 函数：绑定现在只支持同步 handler"
-                "（async 要等 M5 的 aturn_async）"
+                "（async handler 还没支持，请写同步函数）"
             )
         sig = inspect.signature(fn)
         try:

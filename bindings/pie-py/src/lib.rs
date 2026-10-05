@@ -190,14 +190,39 @@ pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 // ---------------------------------------------------------------- 模块
 
-/// 一次性任务（**无会话、不落盘**）：建个临时会话跑一回合，返回最终答复。
+/// `run` / `arun` 共用的默认件：`config=None` 时读 `~/.pie/config.toml`（文件不在就用默认值）；
+/// `llm` / `tools` 不传就按 config 造（内置五件）。
+///
+/// ⚠ 两者共用**同一处**解析：否则默认值（比如将来换默认模型/工具集）会分叉成两份。
+fn resolve_runtime(
+    py: Python<'_>,
+    config: Option<&crate::config::PyConfig>,
+    llm: Option<&crate::llm::PyLlmClient>,
+    tools: Option<&crate::tools::PyToolRegistry>,
+) -> PyResult<(pie::config::Config, pie::llm::LlmClient, pie::tools::ToolRegistry)> {
+    let core_config = match config {
+        Some(c) => c.inner.clone(),
+        None => pie::config::Config::load(None).map_err(config_error)?,
+    };
+    let client = match llm {
+        Some(l) => l.inner.clone(),
+        None => pie::llm::LlmClient::new(&core_config).map_err(|e| llm_error(py, e))?,
+    };
+    let registry = match tools {
+        Some(t) => t.inner.clone(),
+        None => pie::tools::ToolRegistry::new(core_config.tool_defaults()),
+    };
+    Ok((core_config, client, registry))
+}
+
+/// 一次性任务（**无会话、不落盘**）：建个临时会话跑一回合，返回最终答复。**同步版**。
 ///
 /// `config=None` 时读 `~/.pie/config.toml`
-/// （文件不在就用默认值）；`llm` / `tools` 不传就按 config 造（内置四件套）。
+/// （文件不在就用默认值）；`llm` / `tools` 不传就按 config 造（内置五件套）。
 ///
-/// 五个按次旋钮与 [`Session.aturn`] 同义（`max_steps=None` = 不限、`stream=None` = 默认流式、
-/// `parallel_tools=None` = 跟随 `Config.parallel_tools`、`reasoning_effort=None` = 用配置里的思考深度、
-/// `response_format=None` = `text`）。
+/// 五个按次旋钮与 [`Session.turn`] / [`Session.aturn`] 同义（`max_steps=None` = 不限、
+/// `stream=None` = 默认流式、`parallel_tools=None` = 跟随 `Config.parallel_tools`、
+/// `reasoning_effort=None` = 用配置里的思考深度、`response_format=None` = `text`）。
 #[pyfunction]
 #[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
 fn run(
@@ -212,23 +237,11 @@ fn run(
     reasoning_effort: Option<&str>,
     response_format: Option<&str>,
 ) -> PyResult<String> {
-    // 默认：读配置文件（不在就用默认值）
-    let core_config = match config {
-        Some(c) => c.inner.clone(),
-        None => pie::config::Config::load(None).map_err(config_error)?,
-    };
-    let client = match llm {
-        Some(l) => l.inner.clone(),
-        None => pie::llm::LlmClient::new(&core_config).map_err(|e| llm_error(py, e))?,
-    };
-    let registry = match tools {
-        Some(t) => t.inner.clone(),
-        None => pie::tools::ToolRegistry::new(core_config.tool_defaults()),
-    };
+    let (core_config, client, registry) = resolve_runtime(py, config, llm, tools)?;
     let session = crate::session::PySession::wrap(pie::session::Session::ephemeral(
         &core_config, client, registry,
     ));
-    session.aturn(
+    session.turn(
         py,
         task,
         None,
@@ -239,6 +252,47 @@ fn run(
         reasoning_effort.map(str::to_string),
         response_format.map(str::to_string),
     )
+}
+
+/// `run` 的**异步**版：语义完全一样（一次性、无会话、不落盘），但返回可 await 的对象。
+///
+/// 不绕线程：回合直接跑在**进程级** runtime 上（与 `Session.aturn` 同一条路）——
+/// `await pie.arun(...)` 期间事件循环不阻塞、也不额外占线程。
+/// ⚠ 与 `aturn` 一样要求调用时处于运行中的 asyncio loop（**一个进程一个 loop 最稳**）。
+#[cfg(feature = "asyncio")]
+#[pyfunction]
+#[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
+fn arun(
+    py: Python<'_>,
+    task: String,
+    config: Option<&crate::config::PyConfig>,
+    llm: Option<&crate::llm::PyLlmClient>,
+    tools: Option<&crate::tools::PyToolRegistry>,
+    max_steps: Option<usize>,
+    stream: Option<bool>,
+    parallel_tools: Option<bool>,
+    reasoning_effort: Option<String>,
+    response_format: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let (core_config, client, registry) = resolve_runtime(py, config, llm, tools)?;
+    // `response_format` 在持 GIL 这层解析（PyErr 不能穿过回合块）；`reasoning_effort` 是
+    // `String`（按值带进 async 块——`Option<&str>` 借自 py 数据，进不了 `'static` future）
+    let response_format = crate::parse_response_format(response_format.as_deref())?;
+    let mut session = pie::session::Session::ephemeral(&core_config, client, registry);
+    let cancel = pie::cancel::Cancel::new();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let options = pie::llm::RequestOptions::ChatCompletions {
+            reasoning_effort: reasoning_effort.as_deref(),
+            response_format,
+        };
+        // 没有事件出口（`run` 本来就不给 `on_event`）→ 丢进一个空闭包
+        let mut sink = |_event: pie::session::TurnEvent| {};
+        let result = session
+            .aturn(&task, &mut sink, &cancel, max_steps, stream, parallel_tools, options)
+            .await;
+        result.map_err(|e| Python::attach(|py| llm_error(py, e)))
+    })
+    .map(|obj| obj.unbind())
 }
 
 /// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。
@@ -275,6 +329,8 @@ fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
+    #[cfg(feature = "asyncio")]
+    m.add_function(wrap_pyfunction!(arun, m)?)?;
     m.add_function(wrap_pyfunction!(list_sessions, m)?)?;
 
     m.add_class::<PyConfig>()?;

@@ -72,7 +72,7 @@ pub struct PySession {
     path: String,
     /// 当前回合的取消信号 —— `stop()` 靠它中断（回合结束清空）。
     current: StdMutex<Option<Cancel>>,
-    /// `asyncio` 入口登记的事件队列（`aturn_async` 用；`events()` 读它）。
+    /// `asyncio` 入口登记的事件队列（`aturn` 用；`events()` 读它）。
     #[cfg(feature = "asyncio")]
     events_queue: StdMutex<Option<Py<PyAny>>>,
 }
@@ -299,6 +299,8 @@ impl PySession {
 
     /// 跑一个完整回合，返回最终答复。**阻塞**到回合结束（模型请求期间不持 GIL）。
     ///
+    /// 这是**同步**版（名字不带 `a`）；要 `await` 用 [`PySession::aturn`]。
+    ///
     /// `on_event(event: dict)` 边跑边收事件（`content_delta` / `reasoning_delta` / `tool_call` /
     /// `tool_result` / `answer`，形状见 `docs/python-bindings.md`）；
     /// 事件在**调用线程**上回调（所以回调里能安全地 print / 更新自己的状态）。
@@ -312,7 +314,7 @@ impl PySession {
     /// 模型请求失败（外部原因）抛 `pie.LlmError`，但**历史里已经补了一条 `[请求失败] <错误>` 的
     /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
     #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
-    pub(crate) fn aturn(
+    pub(crate) fn turn(
         &self,
         py: Python<'_>,
         input: String,
@@ -408,7 +410,7 @@ impl PySession {
 
     // ------------------------------------------------------------ asyncio（M5）
     //
-    // 形状：`aturn_async()` 返回一个**可 await** 的对象，事件走 `async for ev in s.events()`。
+    // 形状：`aturn()` 返回一个**可 await** 的对象，事件走 `async for ev in s.events()`。
     // 三处与同步版不同（规划 §5.2 的三个坑），都由下面这套接口兜住：
     //   ① 事件 → `asyncio.Queue`（从 tokio 线程 `loop.call_soon_threadsafe(queue.put_nowait, ev)`
     //      —— 这一步由 Python 侧组的 `sink` 干，本模块只负责「在 tokio 线程上叫它」）；
@@ -490,7 +492,7 @@ impl PySession {
         .map(|obj| obj.unbind())
     }
 
-    /// 登记事件队列（`aturn_async` 自己调；`events()` 读它）。
+    /// 登记事件队列（`aturn` 自己调；`events()` 读它）。
     #[cfg(feature = "asyncio")]
     fn _set_events_queue(&self, queue: Py<PyAny>) {
         self.store_events_queue(queue);
@@ -498,7 +500,7 @@ impl PySession {
 
     /// `async for ev in session.events()` 用的（内部就是 `pie._async._Events(queue)`）。
     ///
-    /// 没跑过 `aturn_async` 就报错——事件流是**按回合**的，没有常驻队列。
+    /// 没跑过 `aturn` 就报错——事件流是**按回合**的，没有常驻队列。
     #[cfg(feature = "asyncio")]
     fn events(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let queue = self
@@ -508,20 +510,20 @@ impl PySession {
             .and_then(|slot| slot.as_ref().map(|q| q.clone_ref(py)))
             .ok_or_else(|| {
                 busy_error_or(
-                    "还没有事件队列：先调 session.aturn_async(...)（事件流是按回合的）",
+                    "还没有事件队列：先调 session.aturn(...)（事件流是按回合的）",
                 )
             })?;
         let helper = py.import("pie._async")?.getattr("_Events")?;
         Ok(helper.call1((queue,))?.unbind())
     }
 
-    /// `await` 版回合（M5）：返回一个可 await 的对象，返回值同 `aturn`。
+    /// `await` 版回合（M5）：返回一个可 await 的对象，返回值同 [`PySession::turn`]。
     ///
     /// 事件走 `async for ev in session.events()`；`task.cancel()` / `session.stop()` 都能真停住
     /// （前者靠 Python 侧的 glue 把 `CancelledError` 桥到 `stop()`）。
     #[cfg(feature = "asyncio")]
     #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
-    fn aturn_async(
+    fn aturn(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         input: String,
@@ -532,13 +534,13 @@ impl PySession {
         reasoning_effort: Option<String>,
         response_format: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        // 队列**在这里就建好并登记**：这样 `s.aturn_async(...)` 返回后 `s.events()` 立刻能用
+        // 队列**在这里就建好并登记**：这样 `s.aturn(...)` 返回后 `s.events()` 立刻能用
         //（不用先 await 一下让协程跑起来）。胶水（哨兵 / CancelledError → stop）在 Python 侧。
         let asyncio = py.import("asyncio")?;
         let queue = asyncio.getattr("Queue")?.call0()?;
         slf.store_events_queue(queue.clone().unbind());
 
-        let helper = py.import("pie._async")?.getattr("aturn_async")?;
+        let helper = py.import("pie._async")?.getattr("aturn")?;
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("queue", queue)?;
         kwargs.set_item("cancel", cancel)?;
@@ -555,7 +557,7 @@ impl PySession {
     }
 }
 
-/// Rust 侧内部：把事件队列塞进槽位（`_set_events_queue` 与 `aturn_async` 共用）。
+/// Rust 侧内部：把事件队列塞进槽位（`_set_events_queue` 与 `aturn` 共用）。
 ///
 /// ⚠ 放在 `#[pymethods]` **外面**：它不该是 Python 方法（暴露出去只会污染接口面，
 /// 存根对拍用例也会红）。

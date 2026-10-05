@@ -153,7 +153,7 @@ class _Handler(BaseHTTPRequestHandler):
                     {"usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14}},
                 )
 
-        # 非流式（`aturn(stream=False)`）→ 一次性 JSON；与上面的 SSE 路线同一份内容
+        # 非流式（`turn(stream=False)`）→ 一次性 JSON；与上面的 SSE 路线同一份内容
         if not request.get("stream"):
             body = json.dumps(
                 {
@@ -260,7 +260,7 @@ def test_turn_runs_tool_and_streams_events(env):
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     events = []
-    answer = session.aturn("打个招呼", on_event=events.append)
+    answer = session.turn("打个招呼", on_event=events.append)
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
@@ -301,13 +301,13 @@ def test_turn_runs_tool_and_streams_events(env):
 def test_ephemeral_session_never_touches_disk(env, tmp_path):
     cfg, llm, tools, _ = env
     session = pie.Session.ephemeral(cfg, llm, tools)
-    session.aturn("打个招呼")
+    session.turn("打个招呼")
     sessions_dir = tmp_path / "pie" / "sessions"
     assert not sessions_dir.exists() or not any(sessions_dir.iterdir())
 
     # 落盘会话则真的写文件，且能被 load 回来
     saved = pie.Session.new(cfg, llm, tools, id="bindings-test")
-    saved.aturn("打个招呼")
+    saved.turn("打个招呼")
     saved.save()
     assert Path(saved.path).exists()
 
@@ -328,7 +328,7 @@ def test_callback_may_not_reenter_the_session(env):
         except RuntimeError as exc:
             busy.append(str(exc))
 
-    session.aturn("打个招呼", on_event=on_event)
+    session.turn("打个招呼", on_event=on_event)
     assert seen  # 回调确实跑过
     # ⚠️ 不能要求**每一个**回调都撞上锁：回合可能在 pump 线程排空队列之前就结束了
     # （最后几个事件是锁释放之后才被取到的）→ 只断言「回合进行中确实锁着」。
@@ -346,12 +346,12 @@ def test_parallel_tools_runs_the_batch_concurrently(env):
 
     session = pie.Session.ephemeral(cfg, llm, tools)
     started = time.monotonic()
-    session.aturn("并行跑两个")
+    session.turn("并行跑两个")
     parallel = time.monotonic() - started
 
     serial_session = pie.Session.ephemeral(cfg, llm, tools)
     started = time.monotonic()
-    serial_session.aturn("串行跑两个", parallel_tools=False)
+    serial_session.turn("串行跑两个", parallel_tools=False)
     serial = time.monotonic() - started
 
     assert parallel < 1.0, f"并发应该重叠执行，实际 {parallel:.2}s"
@@ -360,14 +360,14 @@ def test_parallel_tools_runs_the_batch_concurrently(env):
 
 
 def test_turn_accepts_per_turn_knobs(env):
-    """`max_steps` / `stream` / `parallel_tools` 是 `aturn` 的**形参**（不是配置项）：
+    """`max_steps` / `stream` / `parallel_tools` 是 `turn` 的**形参**（不是配置项）：
     `stream=False` → 不再推 `content_delta`，只推一次 `answer`。
     """
     cfg, llm, tools, _ = env
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     events = []
-    answer = session.aturn("打个招呼", on_event=events.append, stream=False)
+    answer = session.turn("打个招呼", on_event=events.append, stream=False)
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
@@ -376,7 +376,7 @@ def test_turn_accepts_per_turn_knobs(env):
 
 
 def test_request_carries_per_call_reasoning_effort_and_response_format(env):
-    """`reasoning_effort` / `response_format` 是 `aturn` / `complete` 的**按次**形参：
+    """`reasoning_effort` / `response_format` 是 `turn` / `complete` 的**按次**形参：
     `none` → 关闭思考（改发 `thinking: disabled`），`json_object` → 发 `response_format`。
     """
     cfg, llm, tools, server = env
@@ -394,7 +394,7 @@ def test_request_carries_per_call_reasoning_effort_and_response_format(env):
 
     # 回合：按次覆盖成「关闭思考」；没传的那项走默认（不发 `response_format`）
     session = pie.Session.ephemeral(cfg, llm, tools)
-    session.aturn("打个招呼", stream=False, reasoning_effort="none")
+    session.turn("打个招呼", stream=False, reasoning_effort="none")
     body = server.requests[-1]
     assert "reasoning_effort" not in body
     assert body["thinking"] == {"type": "disabled"}
@@ -402,7 +402,7 @@ def test_request_carries_per_call_reasoning_effort_and_response_format(env):
 
     # 非法值当场报错（不用等模型 400）
     with pytest.raises(pie.PieError, match="response_format"):
-        session.aturn("再来一次", response_format="xml")
+        session.turn("再来一次", response_format="xml")
 
 
 def test_stop_from_another_thread_aborts_the_turn(env):
@@ -414,7 +414,7 @@ def test_stop_from_another_thread_aborts_the_turn(env):
     result: list = []
 
     def run():
-        result.append(session.aturn("写一篇长文", cancel=token))
+        result.append(session.turn("写一篇长文", cancel=token))
 
     worker = threading.Thread(target=run)
     started = time.monotonic()
@@ -437,7 +437,7 @@ def test_llm_error_carries_status(env):
     broken = pie.LlmClient(cfg)
     session = pie.Session.ephemeral(cfg, broken, tools)
     with pytest.raises(pie.LlmError) as info:
-        session.aturn("在吗")
+        session.turn("在吗")
     assert info.value.status == 404
     assert "404" in str(info.value)
 
@@ -493,7 +493,7 @@ def test_list_sessions_returns_cli_shaped_dicts(env):
     assert isinstance(before, list)
 
     saved = pie.Session.new(cfg, llm, tools, id="list-me")
-    saved.aturn("记一笔")
+    saved.turn("记一笔")
     saved.save()
 
     rows = pie.list_sessions(limit=5)
@@ -537,7 +537,7 @@ def test_session_clear_window_setters_and_transcript(env, tmp_path, monkeypatch)
     cfg, llm, tools, _ = env
     cfg.config_file = str(tmp_path / "cfg.toml")  # 别写到用户真实的配置
     session = pie.Session.ephemeral(cfg, llm, tools)
-    session.aturn("第一问")
+    session.turn("第一问")
 
     assert session.clear_window() == 1, "首个窗口块"
     assert len(session.messages) == 2, "system + 窗口摘要"
@@ -628,7 +628,7 @@ def test_stub_event_shapes_match_the_real_events(env):
 
     cfg, llm, tools, _ = env
     events: list[dict] = []
-    pie.Session.ephemeral(cfg, llm, tools).aturn("打个招呼", on_event=events.append)
+    pie.Session.ephemeral(cfg, llm, tools).turn("打个招呼", on_event=events.append)
     assert events
     for ev in events:
         keys = typed[by_type_literal[ev["type"]]]
@@ -717,7 +717,7 @@ def test_register_python_tool_end_to_end(env):
     server.tool_name = "fetch"
     server.tool_arguments = '{"url": "https://example.com", "retries": 2}'
     events: list[dict] = []
-    answer = pie.Session.ephemeral(cfg, llm, tools).aturn("抓一下", on_event=events.append)
+    answer = pie.Session.ephemeral(cfg, llm, tools).turn("抓一下", on_event=events.append)
 
     assert answer == "搞定了"
     assert seen == [("https://example.com", 2)], "handler 按关键字拿到解析后的参数"
@@ -738,7 +738,7 @@ def test_python_tool_exception_is_textualized(env):
     server.tool_name = "boom"
     server.tool_arguments = '{"x": "1"}'
     events: list[dict] = []
-    answer = pie.Session.ephemeral(cfg, llm, tools).aturn("炸一下", on_event=events.append)
+    answer = pie.Session.ephemeral(cfg, llm, tools).turn("炸一下", on_event=events.append)
 
     assert answer == "搞定了", "回合照常跑完"
     result = next(e for e in events if e["type"] == "tool_result")
@@ -766,24 +766,39 @@ def test_register_validates_name_duplicate_and_async(env):
 # ---------------------------------------------------------------- M5：asyncio 入口
 
 
-def test_events_before_any_aturn_async_is_an_error(env):
-    """事件流是**按回合**的：没跑 `aturn_async` 就没有队列，`events()` 要报错而不是静默空转。"""
+def test_events_before_any_aturn_is_an_error(env):
+    """事件流是**按回合**的：没跑 `aturn` 就没有队列，`events()` 要报错而不是静默空转。"""
     cfg, llm, tools, _ = env
     session = pie.Session.ephemeral(cfg, llm, tools)
-    with pytest.raises(RuntimeError, match="aturn_async"):
+    with pytest.raises(RuntimeError, match="aturn"):
         session.events()
 
 
-def test_aturn_async_streams_events_and_returns_answer(env):
-    """`await session.aturn_async(...)` + `async for ev in session.events()`（事件按序、含结束）。"""
+def test_arun_is_the_async_run(env, tmp_path):
+    """`await pie.arun(...)`：与 `pie.run` 语义一样（无会话、不落盘），只是可 await。"""
+    import asyncio
+
+    cfg, llm, tools, _ = env
+
+    async def run() -> str:
+        return await pie.arun("打个招呼", config=cfg, llm=llm, tools=tools)
+
+    assert asyncio.run(run()) == "搞定了"
+    # 与 `run` 一样：临时会话 → 不写 sessions/
+    sessions_dir = tmp_path / "pie" / "sessions"
+    assert not sessions_dir.exists() or not any(sessions_dir.iterdir())
+
+
+def test_aturn_streams_events_and_returns_answer(env):
+    """`await session.aturn(...)` + `async for ev in session.events()`（事件按序、含结束）。"""
     import asyncio
 
     cfg, llm, tools, _ = env
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     async def run() -> tuple[str, list[str]]:
-        task = asyncio.create_task(session.aturn_async("打个招呼"))
-        # `aturn_async` 里就建好队列了 → 不用先 await 一下让协程跑起来
+        task = asyncio.create_task(session.aturn("打个招呼"))
+        # `aturn` 里就建好队列了 → 不用先 await 一下让协程跑起来
         kinds = [ev["type"] async for ev in session.events()]
         return await task, kinds
 
@@ -792,8 +807,8 @@ def test_aturn_async_streams_events_and_returns_answer(env):
     assert kinds == ["tool_call", "tool_result", "content_delta", "content_delta"], kinds
 
 
-def test_aturn_async_forwards_per_call_knobs(env):
-    """`aturn_async` 走的是 `_async.py` 的胶水（kwargs → `turn_future`）——新形参也要透到请求体。"""
+def test_aturn_forwards_per_call_knobs(env):
+    """`aturn` 走的是 `_async.py` 的胶水（kwargs → `turn_future`）——新形参也要透到请求体。"""
     import asyncio
 
     cfg, llm, tools, server = env
@@ -801,7 +816,7 @@ def test_aturn_async_forwards_per_call_knobs(env):
 
     async def run() -> str:
         task = asyncio.create_task(
-            session.aturn_async("打个招呼", reasoning_effort="none", response_format="json_object")
+            session.aturn("打个招呼", reasoning_effort="none", response_format="json_object")
         )
         async for _ev in session.events():
             pass
@@ -813,7 +828,7 @@ def test_aturn_async_forwards_per_call_knobs(env):
     assert body["response_format"] == {"type": "json_object"}
 
 
-def test_aturn_async_cancel_really_stops_the_turn(env):
+def test_aturn_cancel_really_stops_the_turn(env):
     """`task.cancel()` → 真的停住（模型请求还挂着也要立刻返回），之后会话仍可用。
 
     这是 M5 三个坑里最要命的那个：tokio 任务不会因为 Python 侧取消而自己停，
@@ -827,7 +842,7 @@ def test_aturn_async_cancel_really_stops_the_turn(env):
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     async def run() -> float:
-        task = asyncio.create_task(session.aturn_async("写一篇长文"))
+        task = asyncio.create_task(session.aturn("写一篇长文"))
         await asyncio.sleep(0.3)
         started = _time.monotonic()
         task.cancel()
@@ -842,7 +857,7 @@ def test_aturn_async_cancel_really_stops_the_turn(env):
     server.delay = 0.0
     for _ in range(20):  # 等 Rust 侧收尾（正常几毫秒）
         try:
-            assert session.aturn("再来一次") == "搞定了"
+            assert session.turn("再来一次") == "搞定了"
             break
         except RuntimeError:
             import time as __time

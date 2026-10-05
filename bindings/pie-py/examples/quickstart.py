@@ -121,14 +121,14 @@ async def async_entry() -> None:
     tools = pie.ToolRegistry.builtins(cfg)
     session = pie.Session.ephemeral(cfg, llm, tools)
 
-    # 事件走 asyncio.Queue：先 create_task，再 async for（队列在 aturn_async 里就建好了）
-    task = asyncio.create_task(session.aturn_async("列一下当前目录"))
+    # 事件走 asyncio.Queue：先 create_task，再 async for（队列在 aturn 里就建好了）
+    task = asyncio.create_task(session.aturn("列一下当前目录"))
     async for ev in session.events():
         print("[async]", ev["type"])
     print("[async 答复]", await task)
 
     # task.cancel() 也真能停住（Python 侧 glue 捕 CancelledError 后桥到 session.stop()）：
-    # task = asyncio.create_task(session.aturn_async("写一篇长文"))
+    # task = asyncio.create_task(session.aturn("写一篇长文"))
     # await asyncio.sleep(1.0)
     # task.cancel()
 

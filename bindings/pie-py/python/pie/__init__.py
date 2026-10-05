@@ -15,14 +15,18 @@
     tools = pie.ToolRegistry.builtins(cfg)
     session = pie.Session.ephemeral(cfg, llm, tools)   # 不落盘
 
-    answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
+    answer = session.turn("看看当前目录", on_event=lambda ev: print(ev["type"]))
     print(answer)
 
-一次性用法（无会话、不落盘）：``print(pie.run("总结这个仓库"))``。
+一次性用法（无会话、不落盘）：``print(pie.run("总结这个仓库"))``；
+异步版是 ``await pie.arun(...)`` / ``await session.aturn(...)``。
 
 约定（详见仓内 ``docs/python-bindings.md``）：
-  - **同步外观**：``aturn`` 阻塞到回合结束，期间**释放 GIL**（别的 Python 线程照常跑）。
-    要并发就用 ``asyncio.to_thread``；原生 ``await`` 版本是后续里程碑。
+  - **同步 / 异步两套名字**：``turn`` / ``run`` 阻塞到回合结束（期间**释放 GIL**，别的 Python
+    线程照常跑）；``aturn`` / ``arun`` 返回可 await 的对象（真异步：回合跑在进程级 runtime 上，
+    不绕线程）。
+    ⚠ 语义在 2026-10-04 调过：``aturn`` 过去是**同步**的那个 —— 旧代码 ``session.aturn("…")``
+    现在会拿到一个没被 await 的 coroutine（同步版改名成了 ``turn``；旧的 ``aturn_async`` 已删）。
   - **事件是 dict**：键名见 ``docs/python-bindings.md``
     （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``answer``）。
     ⚠ ``tool_result.text`` **不截断**——
@@ -46,6 +50,7 @@ from ._pie_rs import (
     Session,
     ToolError,
     ToolRegistry,
+    arun,
     list_sessions,
     run,
     version,
@@ -64,6 +69,7 @@ __all__ = [
     "ToolError",
     "ToolRegistry",
     "Tool",
+    "arun",
     "list_sessions",
     "run",
     "tool",

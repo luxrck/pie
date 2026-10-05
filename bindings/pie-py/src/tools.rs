@@ -138,7 +138,7 @@ impl PyToolRegistry {
             .is_truthy()?;
         if is_async {
             return Err(PyValueError::new_err(format!(
-                "工具 {name:?} 是 async 函数：绑定现在只支持同步 handler（async 走 M5 的 aturn_async）"
+                "工具 {name:?} 是 async 函数：绑定现在只支持同步 handler（async handler 还没支持，请写同步函数）"
             )));
         }
         let parameters_json = crate::py_to_json(&parameters)?;

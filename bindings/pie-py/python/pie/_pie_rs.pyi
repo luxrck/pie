@@ -21,6 +21,7 @@ __all__ = [
     "Session",
     "ToolError",
     "ToolRegistry",
+    "arun",
     "list_sessions",
     "run",
     "version",
@@ -299,7 +300,7 @@ class Session:
     def stop(self) -> bool:
         """停住正在跑的回合；返回是否确实发过信号。"""
 
-    def aturn(
+    def turn(
         self,
         input: str,
         on_event: Callable[[TurnEvent], None] | None = ...,
@@ -310,13 +311,14 @@ class Session:
         reasoning_effort: str | None = ...,
         response_format: Literal["text", "json_object"] | None = ...,
     ) -> str:
-        """跑一个完整回合，返回最终答复（阻塞；期间释放 GIL）。
+        """跑一个完整回合，返回最终答复（**同步**版：阻塞；期间释放 GIL）。
 
-        后五个都是**按次**的执行旋钮（不写回配置）：`reasoning_effort` = 本回合的思考深度
-        （`None` = 用配置里的；`"none"` = 关闭思考），`response_format` = `None` / `"text"`（不发
-        该字段）或 `"json_object"`（要求合法 JSON 输出——⚠ 还得自己在 prompt 里交代）。"""
+        要 await 用 `aturn`。后五个都是**按次**的执行旋钮（不写回配置）：`reasoning_effort`
+        = 本回合的思考深度（`None` = 用配置里的；`"none"` = 关闭思考），`response_format` =
+        `None` / `"text"`（不发该字段）或 `"json_object"`（要求合法 JSON 输出——⚠ 还得自己在
+        prompt 里交代）。"""
 
-    def aturn_async(
+    def aturn(
         self,
         input: str,
         cancel: Cancel | None = ...,
@@ -326,13 +328,14 @@ class Session:
         reasoning_effort: str | None = ...,
         response_format: Literal["text", "json_object"] | None = ...,
     ) -> Coroutine[Any, Any, str]:
-        """`await` 版回合（M5）：事件走 `async for ev in session.events()`；按次旋钮同 `aturn`。
+        """`await` 版回合（M5）：返回可 await 的对象，返回值同 `turn`。
 
+        事件走 `async for ev in session.events()`；按次旋钮同 `turn`。
         `task.cancel()` / `session.stop()` 都能真停住（前者靠 Python 侧 glue 桥到 `stop()`）。
         """
 
     def events(self) -> AsyncIterator[TurnEvent]:
-        """本回合的事件流（按回合：先 `aturn_async` 再 `async for`）。"""
+        """本回合的事件流（按回合：先 `aturn` 再 `async for`）。"""
 
     def turn_future(
         self,
@@ -360,7 +363,22 @@ def run(
     reasoning_effort: str | None = ...,
     response_format: Literal["text", "json_object"] | None = ...,
 ) -> str:
-    """一次性任务（无会话、不落盘），返回最终答复。按次旋钮同 `Session.aturn`。"""
+    """一次性任务（无会话、不落盘），返回最终答复。**同步**版；按次旋钮同 `Session.turn`。"""
+
+def arun(
+    task: str,
+    config: Config | None = ...,
+    llm: LlmClient | None = ...,
+    tools: ToolRegistry | None = ...,
+    max_steps: int | None = ...,
+    stream: bool | None = ...,
+    parallel_tools: bool | None = ...,
+    reasoning_effort: str | None = ...,
+    response_format: Literal["text", "json_object"] | None = ...,
+) -> Coroutine[Any, Any, str]:
+    """`run` 的**异步**版：语义一样（一次性、无会话、不落盘），返回可 await 的对象。
+
+    不绕线程（回合跑在进程级 runtime 上）；⚠ 要求调用时处于运行中的 asyncio loop。"""
 
 def list_sessions(limit: int | None = ...) -> list[SessionRow]:
     """历史会话（按 mtime 降序；`limit=None` = 全部）。"""

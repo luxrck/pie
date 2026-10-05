@@ -1,4 +1,4 @@
-"""asyncio 那一层胶水（M5）：`await session.aturn_async(...)` + `async for ev in session.events()`。
+"""asyncio 那一层胶水（M5）：`await session.aturn(...)` + `async for ev in session.events()`。
 
 为什么胶水在 Python 侧（规划 §5.2 的三个坑）：
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-__all__ = ["aturn_async"]
+__all__ = ["aturn"]
 
 # 哨兵：Rust 侧回合结束时推 `None`，这里换成它；用户看不到（迭代器见到就停）
 _DONE = object()
@@ -40,7 +40,7 @@ class _Events:
         return item
 
 
-async def aturn_async(
+async def aturn(
     session: Any,
     input: str,
     *,
@@ -52,7 +52,7 @@ async def aturn_async(
     reasoning_effort: str | None = None,
     response_format: str | None = None,
 ) -> str:
-    """`Session.aturn_async` 的实现体（Rust 侧只负责建队列 + 转交到这儿）。"""
+    """`Session.aturn` 的实现体（Rust 侧只负责建队列 + 转交到这儿）。"""
     loop = asyncio.get_running_loop()
 
     def sink(payload: Any) -> None:
