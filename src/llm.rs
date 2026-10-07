@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
@@ -549,6 +549,9 @@ fn default_retry(max_retries: u32, attempt: u32, e: &LlmError) -> Retry {
 
 impl LlmClient {
     pub fn new(config: &Config) -> Result<Self, LlmError> {
+        // TLS 的 crypto provider 只用 ring（reqwest 0.13 默认是 aws-lc-rs，要多一套 cmake/NASM 构建）；
+        // 装过一次就全局生效，重复装会返回 Err —— 忽略即可。
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs_f64(config.timeout_seconds.max(1.0)))
             .user_agent(concat!("pie/", env!("CARGO_PKG_VERSION")))
@@ -853,9 +856,10 @@ impl LlmClient {
             what,
             format!(
                 "[retry] {what}失败（{}），{delay:.1}s 后第 {attempt}/{} 次重试",
-            e.brief(),
-            self.max_retries
-        ));
+                e.brief(),
+                self.max_retries
+            ),
+        );
         tokio::time::sleep(Duration::from_secs_f64(delay)).await;
     }
 }
@@ -1226,8 +1230,12 @@ mod tests {
     #[test]
     fn compaction_markers_keep_kind_and_path_together() {
         let raw = Path::new("/tmp/raw-ab12");
-        let path_of =
-            |m: &Message| m.compaction.as_ref().and_then(Compaction::path).map(str::to_string);
+        let path_of = |m: &Message| {
+            m.compaction
+                .as_ref()
+                .and_then(Compaction::path)
+                .map(str::to_string)
+        };
 
         let mut tool = Message::tool_result("c1", "bash", "x");
         tool.compaction = Some(Compaction::tool(raw));
@@ -1318,12 +1326,14 @@ mod tests {
         assert!(!api("invalid temperature").is_context_overflow());
         assert!(!api("invalid temperature").is_stale_file_error());
         // 非 400 不算（500 里恰好包含关键词也不行）
-        assert!(!LlmError::Api {
-            status: 500,
-            body: "maximum context length".into(),
-            retry_after: None,
-        }
-        .is_context_overflow());
+        assert!(
+            !LlmError::Api {
+                status: 500,
+                body: "maximum context length".into(),
+                retry_after: None,
+            }
+            .is_context_overflow()
+        );
     }
 
     #[test]
@@ -1377,13 +1387,7 @@ mod tests {
                 "请求",
                 || {
                     calls.set(calls.get() + 1);
-                    async {
-                        if calls.get() < 3 {
-                            Err(bad())
-                        } else {
-                            Ok(7)
-                        }
-                    }
+                    async { if calls.get() < 3 { Err(bad()) } else { Ok(7) } }
                 },
                 |_, _| Retry::Now,
             )
@@ -1431,8 +1435,10 @@ mod tests {
         assert_eq!(info.topped_up_balance, "100.00");
 
         // 字段缺失也不能崩（非 DeepSeek 端点 / 老版本可能少字段）
-        let lenient: Balance = serde_json::from_str("{\"balance_infos\":[{\"currency\":\"USD\",\"total_balance\":\"1.00\"}]}")
-            .expect("缺字段按默认值");
+        let lenient: Balance = serde_json::from_str(
+            "{\"balance_infos\":[{\"currency\":\"USD\",\"total_balance\":\"1.00\"}]}",
+        )
+        .expect("缺字段按默认值");
         assert!(!lenient.is_available);
         assert_eq!(lenient.balance_infos[0].granted_balance, "");
     }
@@ -1524,7 +1530,10 @@ mod tests {
 
         // 字符串解析（Python 绑定走它）：认空串 / text / json_object，其余报错
         assert_eq!(ResponseFormat::from_name(""), Some(ResponseFormat::Text));
-        assert_eq!(ResponseFormat::from_name("text"), Some(ResponseFormat::Text));
+        assert_eq!(
+            ResponseFormat::from_name("text"),
+            Some(ResponseFormat::Text)
+        );
         assert_eq!(
             ResponseFormat::from_name(" json_object "),
             Some(ResponseFormat::JsonObject)

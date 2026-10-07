@@ -164,7 +164,10 @@ impl PyToolRegistry {
                         raw.extract::<String>().map_err(|_| {
                             PyValueError::new_err(format!(
                                 "工具 {tool_name} 必须返回 str，拿到 {}",
-                                raw.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+                                raw.get_type()
+                                    .name()
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_default()
                             ))
                         })
                     })();

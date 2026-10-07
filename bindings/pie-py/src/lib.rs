@@ -31,7 +31,12 @@ pub use tools::PyToolRegistry;
 
 // ---------------------------------------------------------------- 异常层级
 
-create_exception!(pie, PieError, pyo3::exceptions::PyException, "pie 的错误基类");
+create_exception!(
+    pie,
+    PieError,
+    pyo3::exceptions::PyException,
+    "pie 的错误基类"
+);
 create_exception!(pie, ConfigError, PieError, "配置读取 / 保存失败");
 create_exception!(pie, LlmError, PieError, "模型请求失败（实例上带 .status）");
 create_exception!(pie, ToolError, PieError, "工具执行失败");
@@ -110,7 +115,11 @@ pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
             } else if let Some(u) = n.as_u64() {
                 u.into_pyobject(py)?.into_any().unbind()
             } else {
-                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any().unbind()
+                n.as_f64()
+                    .unwrap_or(f64::NAN)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind()
             }
         }
         Value::String(s) => s.as_str().into_pyobject(py)?.into_any().unbind(),
@@ -199,7 +208,11 @@ fn resolve_runtime(
     config: Option<&crate::config::PyConfig>,
     llm: Option<&crate::llm::PyLlmClient>,
     tools: Option<&crate::tools::PyToolRegistry>,
-) -> PyResult<(pie::config::Config, pie::llm::LlmClient, pie::tools::ToolRegistry)> {
+) -> PyResult<(
+    pie::config::Config,
+    pie::llm::LlmClient,
+    pie::tools::ToolRegistry,
+)> {
     let core_config = match config {
         Some(c) => c.inner.clone(),
         None => pie::config::Config::load(None).map_err(config_error)?,
@@ -239,7 +252,9 @@ fn run(
 ) -> PyResult<String> {
     let (core_config, client, registry) = resolve_runtime(py, config, llm, tools)?;
     let session = crate::session::PySession::wrap(pie::session::Session::ephemeral(
-        &core_config, client, registry,
+        &core_config,
+        client,
+        registry,
     ));
     session.turn(
         py,
@@ -288,7 +303,15 @@ fn arun(
         // 没有事件出口（`run` 本来就不给 `on_event`）→ 丢进一个空闭包
         let mut sink = |_event: pie::session::TurnEvent| {};
         let result = session
-            .aturn(&task, &mut sink, &cancel, max_steps, stream, parallel_tools, options)
+            .aturn(
+                &task,
+                &mut sink,
+                &cancel,
+                max_steps,
+                stream,
+                parallel_tools,
+                options,
+            )
             .await;
         result.map_err(|e| Python::attach(|py| llm_error(py, e)))
     })

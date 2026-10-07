@@ -17,8 +17,8 @@
 //!   - 想中途停：别的线程调 `s.stop()`，或外部持一个 `Cancel` 传进来。
 
 use std::path::Path;
-use std::sync::mpsc;
 use std::sync::Mutex as StdMutex;
+use std::sync::mpsc;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -97,7 +97,11 @@ impl PySession {
         config: &PyConfig,
         llm: &PyLlmClient,
         tools: &PyToolRegistry,
-    ) -> (pie::config::Config, pie::llm::LlmClient, pie::tools::ToolRegistry) {
+    ) -> (
+        pie::config::Config,
+        pie::llm::LlmClient,
+        pie::tools::ToolRegistry,
+    ) {
         (config.inner.clone(), llm.inner.clone(), tools.inner.clone())
     }
 }
@@ -107,12 +111,7 @@ impl PySession {
     /// 新建会话：`id` 给纯名字 → `~/.pie/sessions/<id>.jsonl`（带目录 / 绝对路径则原样）。
     #[staticmethod]
     #[pyo3(signature = (config, llm, tools, id=None))]
-    fn new(
-        config: &PyConfig,
-        llm: &PyLlmClient,
-        tools: &PyToolRegistry,
-        id: Option<&str>,
-    ) -> Self {
+    fn new(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry, id: Option<&str>) -> Self {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
         Self::wrap(CoreSession::new(&core_config, id, llm, tools))
     }
@@ -272,7 +271,7 @@ impl PySession {
             other => {
                 return Err(PyValueError::new_err(format!(
                     "未知压缩模式: {other}（可用 auto / tools / turns）"
-                )))
+                )));
             }
         };
         let mut guard = self.lock()?;
@@ -327,7 +326,11 @@ impl PySession {
         response_format: Option<String>,
     ) -> PyResult<String> {
         // ① 独占会话：拿不到锁立刻报错（别排队等）
-        let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
+        let guard = self
+            .inner
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| busy_error())?;
 
         // ② 取消信号：外部给了就用它，否则自己造一个并登记，供 `s.stop()` 用
         let token = cancel.map(|c| c.0.clone()).unwrap_or_else(Cancel::new);
@@ -438,7 +441,11 @@ impl PySession {
         response_format: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         // ① 独占会话 + 取消信号（与同步 `aturn` 同一套）
-        let guard = self.inner.clone().try_lock_owned().map_err(|_| busy_error())?;
+        let guard = self
+            .inner
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| busy_error())?;
         let token = match &cancel {
             Some(obj) => obj
                 .bind(py)
@@ -509,9 +516,7 @@ impl PySession {
             .ok()
             .and_then(|slot| slot.as_ref().map(|q| q.clone_ref(py)))
             .ok_or_else(|| {
-                busy_error_or(
-                    "还没有事件队列：先调 session.aturn(...)（事件流是按回合的）",
-                )
+                busy_error_or("还没有事件队列：先调 session.aturn(...)（事件流是按回合的）")
             })?;
         let helper = py.import("pie._async")?.getattr("_Events")?;
         Ok(helper.call1((queue,))?.unbind())
@@ -553,7 +558,11 @@ impl PySession {
     }
 
     fn __repr__(&self) -> String {
-        format!("<pie.Session path={} busy={}>", self.path, self.inner.try_lock().is_err())
+        format!(
+            "<pie.Session path={} busy={}>",
+            self.path,
+            self.inner.try_lock().is_err()
+        )
     }
 }
 

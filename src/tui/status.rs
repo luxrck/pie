@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 use super::pane::fmt_duration;
 use super::repl::Tab;
-use super::theme::{spinner, Palette};
+use super::theme::{Palette, spinner};
 /// 当前活动（决定状态栏显示什么，也带着计时起点）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
@@ -142,7 +142,12 @@ pub fn status_line(
     let right = activity_line(palette, activity, frame, now, focused);
     let right_len = right
         .as_ref()
-        .map(|line| line.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
         .unwrap_or(0);
 
     // 最左边是视图指示（`cr`），名字跟在它后面
@@ -440,8 +445,7 @@ mod tests {
         };
         let text = balance_text(&balance).expect("有明细就有文本");
         assert_eq!(text, "¥110.00");
-        let left =
-            " cr deepseek-flash high · ~/Projects/pie │ 24,048/920,576 (2.6%) │ ¥110.00";
+        let left = " cr deepseek-flash high · ~/Projects/pie │ 24,048/920,576 (2.6%) │ ¥110.00";
 
         // 空闲：左边一串常驻信息，右边什么都没有（剩下的都是填空）
         let idle = line_text(&status_line(
@@ -475,7 +479,10 @@ mod tests {
             true,
         ));
         assert!(busy.starts_with(left), "左边不动：{busy:?}");
-        assert!(busy.ends_with("Waiting… 0.0s"), "活动指示在右边缘：{busy:?}");
+        assert!(
+            busy.ends_with("Waiting… 0.0s"),
+            "活动指示在右边缘：{busy:?}"
+        );
         assert_eq!(busy.chars().count(), 120, "{busy:?}");
 
         // 窄窗口：名字截尾，但用量/余额（左）与活动指示（右）都还在
@@ -544,7 +551,10 @@ mod tests {
                 topped_up_balance: "0.00".into(),
             }],
         });
-        assert!(detail.contains("¥0.00（赠金 ¥0.00 / 充值 ¥0.00）"), "{detail}");
+        assert!(
+            detail.contains("¥0.00（赠金 ¥0.00 / 充值 ¥0.00）"),
+            "{detail}"
+        );
         assert!(detail.contains("可调用 API：否"), "{detail}");
     }
 
@@ -561,22 +571,45 @@ mod tests {
         }
 
         let (spans, width) = view_tabs(&palette, Tab::Repl, true);
-        assert_eq!(line_text(&Line::from(spans.clone())), " cr ", "两档挨着，没有分隔符");
+        assert_eq!(
+            line_text(&Line::from(spans.clone())),
+            " cr ",
+            "两档挨着，没有分隔符"
+        );
         assert_eq!(width, 4, "宽度参与后面的填空计算");
-        assert_eq!(span_of(&spans, "r").style.fg, Some(palette.accent), "当前档：r");
-        assert!(span_of(&spans, "r").style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            span_of(&spans, "r").style.fg,
+            Some(palette.accent),
+            "当前档：r"
+        );
+        assert!(
+            span_of(&spans, "r")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(span_of(&spans, "c").style.fg, Some(palette.muted));
 
         // 对话视图：反过来说
         let (spans, _) = view_tabs(&palette, Tab::Chat, true);
         assert_eq!(span_of(&spans, "c").style.fg, Some(palette.accent));
-        assert!(span_of(&spans, "c").style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            span_of(&spans, "c")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(span_of(&spans, "r").style.fg, Some(palette.muted));
 
         // 失焦：当前档也降成 muted（不留在 accent 上）
         let (spans, _) = view_tabs(&palette, Tab::Repl, false);
         assert_eq!(span_of(&spans, "r").style.fg, Some(palette.muted));
-        assert!(!span_of(&spans, "r").style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !span_of(&spans, "r")
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     /// 光标同一口径；用量 / 余额本来就用 muted，不动。**只是颜色变，文本一个字不变**。
@@ -612,7 +645,11 @@ mod tests {
 
         let on = line(true);
         // accent 有四处：当前视图那个 tab、名字、转圈、耗时
-        assert_eq!(accent_spans(&on), 4, "聚焦：tab + 名字 + 转圈 + 耗时：{on:?}");
+        assert_eq!(
+            accent_spans(&on),
+            4,
+            "聚焦：tab + 名字 + 转圈 + 耗时：{on:?}"
+        );
         assert!(
             name_span(&on).style.add_modifier.contains(Modifier::BOLD),
             "聚焦：名字带粗体"

@@ -23,11 +23,11 @@
 pub mod app;
 pub mod clipboard;
 pub mod files;
-pub mod pane;
-pub mod repl;
 pub mod input;
 pub mod markdown;
 pub mod palette;
+pub mod pane;
+pub mod repl;
 pub mod status;
 pub mod theme;
 
@@ -44,7 +44,11 @@ use crate::session::Session;
 ///
 /// ⚠ bracketed paste 不能省：不开的话终端不会用 `\x1b[200~` 包住粘贴内容，多行粘贴会被拆成
 /// 一个个按键（换行 = 回车）→ 粘一段多行文本会在第一行就发出去。
-pub async fn run(session: Session, max_steps: Option<usize>, stream: Option<bool>) -> std::io::Result<()> {
+pub async fn run(
+    session: Session,
+    max_steps: Option<usize>,
+    stream: Option<bool>,
+) -> std::io::Result<()> {
     // 先按环境变量定好终端图像协议（**不读 stdin**，见 [`pick_terminal_protocol`]）。
     let picker = pick_terminal_protocol();
     let mut terminal = ratatui::init();
@@ -95,7 +99,8 @@ fn pick_terminal_protocol() -> ratatui_image::picker::Picker {
     let term_program = env("TERM_PROGRAM");
     let protocol = if !env("KITTY_WINDOW_ID").is_empty()
         || term_program.contains("kitty")
-        || term_program.contains("ghostty") // 它把 kitty 的 unicode placeholder 实现全了
+        || term_program.contains("ghostty")
+    // 它把 kitty 的 unicode placeholder 实现全了
     {
         ProtocolType::Kitty
     } else if term_program.contains("iTerm")

@@ -245,11 +245,11 @@ impl Repl {
             entry.images = images.to_vec();
         }
         // 立刻切到最新一张（贴底时就是它；滚在上面时下一帧会按滚动位置重选）。
-        if let Some(path) = images.last() {
-            if self.image.as_deref() != Some(path.as_path()) {
-                self.image = Some(path.clone());
-                self.cached = None;
-            }
+        if let Some(path) = images.last()
+            && self.image.as_deref() != Some(path.as_path())
+        {
+            self.image = Some(path.clone());
+            self.cached = None;
         }
         true
     }
@@ -366,11 +366,11 @@ impl Repl {
             .rev()
             .find_map(|e| e.images.last())
             .cloned();
-        if let Some(path) = picked {
-            if self.image.as_deref() != Some(path.as_path()) {
-                self.image = Some(path);
-                self.cached = None; // 换图了 → 得重编
-            }
+        if let Some(path) = picked
+            && self.image.as_deref() != Some(path.as_path())
+        {
+            self.image = Some(path);
+            self.cached = None; // 换图了 → 得重编
         }
     }
 
@@ -844,7 +844,11 @@ mod tests {
             }),
         );
         let view = Repl::from_messages(&messages, &files);
-        assert_eq!(view.entries[0].images, vec![png.clone()], "图要配回那次调用");
+        assert_eq!(
+            view.entries[0].images,
+            vec![png.clone()],
+            "图要配回那次调用"
+        );
         assert_eq!(view.image.as_ref(), Some(&png), "贴底时显示最近一张");
         assert!(
             view.split(Rect::new(0, 0, 40, 20)).1.is_some(),
@@ -948,7 +952,11 @@ mod tests {
 
         let screen = render_text(&mut view, 129, 27);
         let size = view.cached.as_ref().unwrap().protocol.size();
-        assert_eq!((size.width, size.height), (61, 8), "1210×440 ÷ 20×58 = 61×8 格");
+        assert_eq!(
+            (size.width, size.height),
+            (61, 8),
+            "1210×440 ÷ 20×58 = 61×8 格"
+        );
 
         let seq = screen.lines().find(|l| l.contains("1337;File")).unwrap();
         let head = &seq[seq.find("1337;File").unwrap()..];

@@ -7,15 +7,15 @@
 //!
 //! 参考 codex 的 `history_cell`：单元格外只保留顺序与滚动逻辑，视图细节都在这里。
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::markdown::{floor_char_boundary, MarkdownCache};
+use super::markdown::{MarkdownCache, floor_char_boundary};
 use super::theme::{Palette, Status};
 use crate::cancel::CANCEL_TEXT;
 use crate::llm::Message;
@@ -35,7 +35,9 @@ pub enum Cell {
     /// 用户输入（`› ` 前缀 + 亮色）
     User(String),
     /// 助手正文（markdown 渲染；渲染缓存在 `Pane` 里按 cell 下标存，不在 cell 里）
-    Assistant { text: String },
+    Assistant {
+        text: String,
+    },
     /// 思考耗时（一轮结束留痕：`• Thought for 3.4s`）
     Thought(Duration),
     /// 工具活动：一行摘要 + 可选正文
@@ -50,7 +52,10 @@ pub enum Cell {
     /// 系统提示（回合中不可用的命令、粘贴结果…）
     Notice(String),
     /// 重试进度（**就地更新**的单个块：`log::progress` 来的，同一个 `key` 只占一行）
-    Retry { key: String, text: String },
+    Retry {
+        key: String,
+        text: String,
+    },
     Error(String),
 }
 
@@ -77,12 +82,12 @@ impl Cell {
                 body: b,
                 ..
             } = cell
+                && n == name
+                && *status == Status::Running
             {
-                if n == name && *status == Status::Running {
-                    *status = outcome;
-                    *b = Some(body.trim().to_string());
-                    return;
-                }
+                *status = outcome;
+                *b = Some(body.trim().to_string());
+                return;
             }
         }
     }
@@ -90,10 +95,10 @@ impl Cell {
     /// 取消收尾：还挂在「运行中」的工具行结算成 `⏹`——没轮到的 `tool_calls` 不会再有结果事件。
     pub fn cancel_running(cells: &mut [Cell]) {
         for cell in cells.iter_mut() {
-            if let Cell::Tool { status, .. } = cell {
-                if *status == Status::Running {
-                    *status = Status::Cancelled;
-                }
+            if let Cell::Tool { status, .. } = cell
+                && *status == Status::Running
+            {
+                *status = Status::Cancelled;
             }
         }
     }
@@ -182,7 +187,6 @@ impl Cell {
         }
         cells
     }
-
 }
 
 /// 把 `duration` 格式化成人读的思考耗时（`3.4s` / `1m03s`）。
@@ -653,14 +657,9 @@ fn cell_key(cell: &Cell) -> u64 {
     h.finish()
 }
 
-
 /// 一条显示行的纯文本（复制用）。
 fn row_text(row: &Row) -> String {
-    row.line
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect()
+    row.line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 /// 按**单元格**区间 `[from, to)` 裁文本：宽字符占两格，只有**起点**落在区间里就整个要
@@ -697,7 +696,8 @@ pub(crate) fn char_width(c: char) -> usize {
 /// ⚠ 与控件的一处细节差异：控件的逐字断走**字素簇**（`grapheme_indices`），pie 这边走**字符**
 /// （`chars()`）——emoji 组合序列 / 组合记号在控件那边不会被劈开，在这儿可能被劈。要完全对齐得
 /// 给 `grapheme_indices` 也留一条路（目前不值当）。
-#[allow(dead_code)] // 生产只走 `WordOrGlyph`；`Glyph` 留着「换档位」与用例（改调用点那个字面量即可）
+#[allow(dead_code)]
+// 生产只走 `WordOrGlyph`；`Glyph` 留着「换档位」与用例（改调用点那个字面量即可）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WrapMode {
     /// 逐字硬断：CJK 逐字天然友好（长句能填满整行），代价是英文词 / URL / 路径会从中间切开。
@@ -830,7 +830,10 @@ mod tests {
 
     /// 排版结果的纯文本（显示行按行拼；行内 spans 直接连起来）。
     fn plain<'a>(rows: impl IntoIterator<Item = &'a Row>) -> String {
-        rows.into_iter().map(row_text).collect::<Vec<_>>().join("\n")
+        rows.into_iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// 排版一帧（`Pane` 是跨帧状态：这里每次新建，只当「跑一遍」用）。
@@ -883,7 +886,11 @@ mod tests {
 
         // —— 逐字档：英文词也会从中间切开（`alpha bet` / `a`）
         assert_eq!(glyph("alpha beta", 9), vec![(0, 9), (9, 1)]);
-        assert_eq!(glyph("中文中文", 4), vec![(0, 2), (2, 2)], "CJK 两档结果一样");
+        assert_eq!(
+            glyph("中文中文", 4),
+            vec![(0, 2), (2, 2)],
+            "CJK 两档结果一样"
+        );
         assert_eq!(glyph("中文 ab 中文", 6), vec![(0, 4), (4, 4)]);
 
         // —— 两档共同的不变量：拼起来就是原文（不丢不重）、不超宽、无空段
@@ -899,7 +906,10 @@ mod tests {
                 assert_eq!(joined, text, "{mode:?} 宽 {width}：折行丢了/重了字符");
                 for (start, len) in &segs {
                     assert!(*len > 0, "{mode:?} 宽 {width}：不能有空段");
-                    let w: usize = chars[*start..start + len].iter().map(|c| char_width(*c)).sum();
+                    let w: usize = chars[*start..start + len]
+                        .iter()
+                        .map(|c| char_width(*c))
+                        .sum();
                     // 宽字放不下也得放一个（`max(2)` 就是这个余量）
                     assert!(w <= width.max(2), "{mode:?} 宽 {width}：段超宽（{w}）");
                 }
@@ -940,11 +950,8 @@ mod tests {
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let italic = Style::default().add_modifier(Modifier::ITALIC);
         let line_style = Style::default().add_modifier(Modifier::UNDERLINED);
-        let line = Line::from(vec![
-            Span::styled("aaa", bold),
-            Span::styled("bbb", italic),
-        ])
-        .style(line_style);
+        let line = Line::from(vec![Span::styled("aaa", bold), Span::styled("bbb", italic)])
+            .style(line_style);
 
         // 宽 2、无空格 → 按字硬断：`aa` / `ab` / `bb`
         let rows = wrap_line_into(&line, 2);
@@ -1038,7 +1045,10 @@ mod tests {
         let pane = rendered(&cells, &palette, 80, false);
         let text = plain(pane.iter());
         assert!(!text.contains("SENTINEL-SYSTEM"), "system 不回放：{text}");
-        assert!(!text.contains("[图片]"), "注入的图片消息不是用户输入：{text}");
+        assert!(
+            !text.contains("[图片]"),
+            "注入的图片消息不是用户输入：{text}"
+        );
         assert!(text.contains("› 看看 a.rs"), "{text}");
         assert!(text.contains("✓ read(a.rs)"), "调用与结果要合并：{text}");
         assert!(text.contains("  fn main() {}"), "{text}");
@@ -1046,7 +1056,13 @@ mod tests {
         assert!(text.contains("  boom"), "{text}");
         assert!(text.contains("看完了"), "最终正文：{text}");
         // 两个调用各自配对（按 `tool_call_id`，不是按工具名回溯）
-        assert_eq!(cells.iter().filter(|c| matches!(c, Cell::Tool { .. })).count(), 2);
+        assert_eq!(
+            cells
+                .iter()
+                .filter(|c| matches!(c, Cell::Tool { .. }))
+                .count(),
+            2
+        );
         assert!(cells.iter().any(|c| matches!(c, Cell::User(_))));
     }
 
@@ -1091,7 +1107,9 @@ mod tests {
         let cells = Cell::from_messages(&messages);
         // 失败回合必须是 Error（红 ✗），不能是普通正文
         assert!(
-            cells.iter().any(|c| matches!(c, Cell::Error(t) if t.starts_with("[请求失败]"))),
+            cells
+                .iter()
+                .any(|c| matches!(c, Cell::Error(t) if t.starts_with("[请求失败]"))),
             "失败回合要回放成 Cell::Error（cells 里的 kinds：{:?}）",
             cells.iter().map(kind_of).collect::<Vec<_>>()
         );
@@ -1107,7 +1125,10 @@ mod tests {
         assert!(thought < answer, "Thought 行要在正文之前");
         // 没有 thought_ms 的消息不该凭空冒出思考行（这里只有一条带）
         assert_eq!(
-            cells.iter().filter(|c| matches!(c, Cell::Thought(_))).count(),
+            cells
+                .iter()
+                .filter(|c| matches!(c, Cell::Thought(_)))
+                .count(),
             1
         );
 
@@ -1252,7 +1273,13 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&cells[1], Cell::Tool { status: Status::Ok, .. }),
+            matches!(
+                &cells[1],
+                Cell::Tool {
+                    status: Status::Ok,
+                    ..
+                }
+            ),
             "已经结束的行不动"
         );
     }
@@ -1264,13 +1291,19 @@ mod tests {
             "seq 1 3"
         );
         assert_eq!(tool_summary(r#"{"path":"/tmp/a b.png"}"#), "/tmp/a b.png");
-        assert_eq!(tool_summary(r#"{"code":"print(1)","timeout":null}"#), "print(1)");
+        assert_eq!(
+            tool_summary(r#"{"code":"print(1)","timeout":null}"#),
+            "print(1)"
+        );
         assert_eq!(tool_summary("不是 JSON"), "不是 JSON");
         // 判成败只看第一行：`[exit=` 开头且不是 `[exit=0]` = 失败；没有头 = 成功
         assert_eq!(tool_status("[exit=0]\n\nhi"), Status::Ok);
         assert_eq!(tool_status("[exit=3]\n\nboom"), Status::Fail);
         // 新格式（2026-09-24 起三字段同挤一行）：只看第一行就能判成败
-        assert_eq!(tool_status("[exit=3, os=linux, shell=bash]\n\nboom"), Status::Fail);
+        assert_eq!(
+            tool_status("[exit=3, os=linux, shell=bash]\n\nboom"),
+            Status::Fail
+        );
         assert_eq!(tool_status("[exit=3, os=linux, shell=bash]"), Status::Fail);
         assert_eq!(tool_status("[工具错误] 文件不存在: x"), Status::Fail);
         assert_eq!(tool_status("plain text"), Status::Ok, "没有退出码就当成功");
@@ -1291,11 +1324,18 @@ mod tests {
         assert_eq!(b.rows.len(), 2, "`rebuild` 末尾补一条空行（消息之间那条）");
 
         // 悬挂缩进：续行的等宽空白由 `CellBlock::push_line` 补（cell 只交代 mark）
-        b.rebuild(&Cell::User("alpha beta gamma delta".into()), &palette, 14, false);
+        b.rebuild(
+            &Cell::User("alpha beta gamma delta".into()),
+            &palette,
+            14,
+            false,
+        );
         assert!(b.rows.len() > 1);
-        assert!(plain(b.rows.as_slice())
-            .lines()
-            .all(|l| l.starts_with("› ") || l.starts_with("  ")));
+        assert!(
+            plain(b.rows.as_slice())
+                .lines()
+                .all(|l| l.starts_with("› ") || l.starts_with("  "))
+        );
         let body = &b.rows[..b.rows.len() - 1]; // 末条是 `rebuild` 补的空行，不参与
         for (i, row) in body.iter().enumerate() {
             assert_eq!(row.continues, i > 0);
@@ -1303,9 +1343,18 @@ mod tests {
         }
 
         // 同样的内容走一整遍 `Pane::layout` → 折行、行号、复制切片都对得上
-        let pane = rendered(&[Cell::User("alpha beta gamma delta".into())], &palette, 14, false);
+        let pane = rendered(
+            &[Cell::User("alpha beta gamma delta".into())],
+            &palette,
+            14,
+            false,
+        );
         let rows = flat(&pane);
-        assert_eq!(rows.len(), b.rows.len(), "与直接重建这一条完全一致（含尾部空行）");
+        assert_eq!(
+            rows.len(),
+            b.rows.len(),
+            "与直接重建这一条完全一致（含尾部空行）"
+        );
         // 续行拼回一行（不含装饰）；最后一行是那条空白，所以正文到 `len-2`
         assert_eq!(
             pane.slice_text(0, 0, rows.len() - 2, 13).trim_end(),
@@ -1411,7 +1460,10 @@ mod tests {
 
         pane.layout(&[], &palette, 40, false);
         assert_eq!(pane.total(), 0, "没有 cell 就没有行");
-        assert!(pane.blocks.is_empty(), "块没了，它带的 markdown 缓存也一并没了");
+        assert!(
+            pane.blocks.is_empty(),
+            "块没了，它带的 markdown 缓存也一并没了"
+        );
         assert!(pane.slice_text(0, 0, 5, 5).is_empty(), "空流里切不出东西");
     }
 

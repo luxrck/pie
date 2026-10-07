@@ -25,7 +25,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/thinking", "查看思考深度 / /thinking <level> 切换"),
     ("/model", "查看模型 / /model <id> 切换"),
     ("/balance", "查一次账号余额（结果也显示在状态栏右下角）"),
-    ("/compact", "工具级 + 轮次级压缩（/compact [tools|turns|auto]）"),
+    (
+        "/compact",
+        "工具级 + 轮次级压缩（/compact [tools|turns|auto]）",
+    ),
     ("/compact tools", "只做工具级压缩"),
     ("/compact turns", "只做轮次级压缩"),
     ("/clear", "归档当前窗口，开新窗口"),
@@ -42,7 +45,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// 但把 `/quit` 当成情给模型就很困惑了 —— 这几个名字拦一下，告诉用户改用什么。
 pub const REMOVED: &[(&str, &str)] = &[
     ("stop", "`/stop` 已移除：按 `Esc` 停止本回合"),
-    ("paste", "`/paste` 已移除：按 `Ctrl+G` 把剪贴板里的图片路径插进输入框"),
+    (
+        "paste",
+        "`/paste` 已移除：按 `Ctrl+G` 把剪贴板里的图片路径插进输入框",
+    ),
     ("quit", "`/quit` 已移除：用 `/exit`，或直接 `Ctrl+C`"),
 ];
 
@@ -90,7 +96,11 @@ pub fn matches(value: &str, models: &[String], model: &str, effort: &str) -> Vec
             .iter()
             .filter(|m| m.starts_with(prefix))
             .map(|m| {
-                let desc = if m == model { "← 当前" } else { "切换模型" };
+                let desc = if m == model {
+                    "← 当前"
+                } else {
+                    "切换模型"
+                };
                 (format!("/model {m}"), desc.to_string())
             })
             .collect();
@@ -220,7 +230,11 @@ mod tests {
 
         let found = matches("/thinking ", &models(), "x", "high");
         assert_eq!(found.len(), 4);
-        assert!(found.iter().any(|(c, d)| c == "/thinking high" && d == "← 当前"));
+        assert!(
+            found
+                .iter()
+                .any(|(c, d)| c == "/thinking high" && d == "← 当前")
+        );
         let found = matches("/thinking l", &models(), "x", "high");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "/thinking low");
@@ -233,9 +247,18 @@ mod tests {
         assert!(!is_complete_command("/he"));
         let help = help_text();
         assert!(help.contains("/help 显示帮助"), "{help}");
-        assert!(help.contains("!cmd 直接执行 shell"), "！模式要进帮助：{help}");
-        assert!(help.contains("@path 文件路径补全"), "`@` 补全要进帮助：{help}");
-        assert!(!help.contains("/compact tools"), "多词命令不进 /help：{help}");
+        assert!(
+            help.contains("!cmd 直接执行 shell"),
+            "！模式要进帮助：{help}"
+        );
+        assert!(
+            help.contains("@path 文件路径补全"),
+            "`@` 补全要进帮助：{help}"
+        );
+        assert!(
+            !help.contains("/compact tools"),
+            "多词命令不进 /help：{help}"
+        );
     }
 
     /// `/stop` `/paste` `/quit` 已移除（2026-09-23，都是别名）：既不进候选表，也不进 `/help`；
@@ -287,7 +310,12 @@ mod tests {
         let rows_of = |index: usize| -> Vec<String> {
             panel_lines(&many, index, &palette)
                 .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
                 .collect()
         };
 
@@ -333,8 +361,17 @@ mod tests {
         let lines = panel_lines(&many, 1, &palette);
         // 面板是**滚动窗口**：最多 `MAX_SHOWN` 行（不再有「… 还有 N 个候选」那种尾巴）
         assert_eq!(lines.len(), MAX_SHOWN, "窗口最多 {MAX_SHOWN} 行");
-        let text = |l: &Line<'_>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(text(&lines[1]).starts_with("▸ /cmd1 "), "{}", text(&lines[1]));
+        let text = |l: &Line<'_>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(
+            text(&lines[1]).starts_with("▸ /cmd1 "),
+            "{}",
+            text(&lines[1])
+        );
         assert!(!text(&lines[0]).starts_with('▸'));
 
         // 项数不够就不凑数（窗口长度 = min(项数, MAX_SHOWN)）
@@ -350,7 +387,12 @@ mod tests {
             ("src/tui/app.rs".to_string(), String::new()),
             ("src/tui/".to_string(), "目录".to_string()),
         ];
-        let text = |l: &Line<'_>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let text = |l: &Line<'_>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
         let lines = panel_lines(&items, 0, &palette);
         assert_eq!(text(&lines[0]), "▸ src/tui/app.rs ");
         assert_eq!(text(&lines[1]), "  src/tui/ — 目录");

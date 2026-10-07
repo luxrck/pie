@@ -15,8 +15,8 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -152,11 +152,10 @@ impl Tool for Repl {
         }
         let mut python = _python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
         // `_python` 直接交给 `Command::new`，不会自己展开 `~`——这里只认 `~` / `~/…` → $HOME。
-        if python == "~" || python.starts_with("~/") {
-            if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-            {
-                python = format!("{}{}", home.to_string_lossy(), &python[1..]);
-            }
+        if (python == "~" || python.starts_with("~/"))
+            && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        {
+            python = format!("{}{}", home.to_string_lossy(), &python[1..]);
         }
         let driver = _driver.unwrap_or_else(|| DRIVER.to_string());
 
@@ -391,12 +390,10 @@ fn format_reply(
         .iter()
         .filter_map(|s| std::fs::read(s).ok())
         .filter_map(|data| {
-            match ctx
-                .storage
-                .store(crate::config::StoreType::Blob {
-                    data: &data,
-                    mime: "image/png",
-                }) {
+            match ctx.storage.store(crate::config::StoreType::Blob {
+                data: &data,
+                mime: "image/png",
+            }) {
                 Ok(path) => Some(path),
                 Err(e) => {
                     crate::log::warn(format!("[warn] repl 图副本写入失败: {e}"));
@@ -455,11 +452,7 @@ fn headers(reply: &Reply) -> Vec<String> {
     let mut line = if state.total == 0 {
         "[解释器] 空".to_string()
     } else {
-        let mut line = format!(
-            "[解释器] 共 {} 个：{}",
-            state.total,
-            state.names.join(", ")
-        );
+        let mut line = format!("[解释器] 共 {} 个：{}", state.total, state.names.join(", "));
         if state.total > state.names.len() {
             line.push('…');
         }
@@ -670,7 +663,9 @@ while True:
     /// `history()`：解释器里能拿到**本会话的完整转录**，压缩指针默认展开。
     #[tokio::test]
     async fn history_reads_the_transcript_and_expands_compaction() {
-        let Some(py) = python_with_ipython() else { return };
+        let Some(py) = python_with_ipython() else {
+            return;
+        };
         let tmp = tempdir("history");
         // 轮次归档：被压掉的那一轮原文（整轮的代码 + 输出）
         let archive = tmp.join("turn-abc");
@@ -722,9 +717,8 @@ while True:
 
         // 展开后：user(0) + 归档里的 assistant(0)/tool(0) + user(1) + tool(1)
         assert!(
-            out.text.contains(
-                "[('user', 0), ('assistant', 0), ('tool', 0), ('user', 1), ('tool', 1)]"
-            ),
+            out.text
+                .contains("[('user', 0), ('assistant', 0), ('tool', 0), ('user', 1), ('tool', 1)]"),
             "{out:?}"
         );
         assert!(
@@ -827,7 +821,11 @@ while True:
         let out = reg.dispatch("repl", &args, ctx).await.unwrap();
         assert_eq!(out.images.len(), 1, "{out:?}");
         let stored = &out.images[0];
-        assert_eq!(stored.parent().unwrap(), tmp.join("files"), "转存进 files/：{stored:?}");
+        assert_eq!(
+            stored.parent().unwrap(),
+            tmp.join("files"),
+            "转存进 files/：{stored:?}"
+        );
         assert!(stored.to_string_lossy().ends_with(".png"), "{stored:?}");
         assert_eq!(std::fs::read(stored).unwrap(), b"fake-png-bytes");
     }
@@ -837,10 +835,12 @@ while True:
     fn schema_exposes_code_and_hides_private_params() {
         let spec = registry().specs().remove(0);
         assert_eq!(spec["function"]["name"], "repl");
-        assert!(spec["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("IPython"));
+        assert!(
+            spec["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("IPython")
+        );
         let params = &spec["function"]["parameters"];
         assert_eq!(params["required"], json!(["code"]));
         assert!(params["properties"].get("timeout").is_some());

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 工具执行的产出：正文 + **落盘全文的路径**（`spill`）。
 ///
@@ -144,12 +144,10 @@ impl ReadSnapshots {
     fn record(&self, path: &Path, content: &str, lines: (usize, usize)) {
         let hash = crate::config::hash_id(content.as_bytes());
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mark = map
-            .entry(snapshot_key(path))
-            .or_insert_with(|| ReadMark {
-                hash: hash.clone(),
-                ranges: Vec::new(),
-            });
+        let mark = map.entry(snapshot_key(path)).or_insert_with(|| ReadMark {
+            hash: hash.clone(),
+            ranges: Vec::new(),
+        });
         if mark.hash != hash {
             // 文件变了：旧的行号对新内容没意义
             mark.hash = hash;
@@ -236,20 +234,16 @@ fn erased<T: Tool>(args: Value, ctx: ToolCtx) -> BoxFuture<ToolResult> {
 ///
 /// 要归一化的都是**实测出来的**差异：
 ///   - `$schema` / `title` 删掉（描述本来就在根上，待会儿提到 `function.description` 去）；
-///   - `Option<T>` 不要 `["integer","null"]`（`option_add_null_type = false`）；
+///   - `Option<T>` 不要 `["integer","null"]`（schemars 1.x 没那个开关了 → 在 `strip_schema_noise` 里摘）；
 ///   - `format: "int64"` 这类装饰字段删掉；
 ///   - 嵌套类型必须内联（`inline_subschemas = true`），否则出 `$ref` + `definitions`。
 fn schema_of<T: schemars::JsonSchema>() -> (String, Value) {
-    let mut settings = schemars::gen::SchemaSettings::draft07();
+    let mut settings = schemars::generate::SchemaSettings::draft07();
     settings.meta_schema = None;
     settings.inline_subschemas = true;
-    settings.option_add_null_type = false;
-    let mut schema = serde_json::to_value(
-        schemars::gen::SchemaGenerator::new(settings)
-            .root_schema_for::<T>()
-            .schema,
-    )
-    .unwrap_or(Value::Null);
+    let mut schema = schemars::generate::SchemaGenerator::new(settings)
+        .root_schema_for::<T>()
+        .to_value();
     strip_schema_noise(&mut schema);
     let description = schema
         .get("description")
@@ -266,12 +260,24 @@ fn schema_of<T: schemars::JsonSchema>() -> (String, Value) {
 /// 递归剔掉 schemars 挂上去的多余装饰字段：
 ///   - `format`（`int64` / `uint` …）；
 ///   - `minimum`：无符号整数会被自动加上 `minimum: 0`；而 `read` 的 `offset`
-///     实际从 1 起（0 会被工具回错），写 0 反而误导。
+///     实际从 1 起（0 会被工具回错），写 0 反而误导；
+///   - `type` 里的 `null`：schemars 1.x 把 `Option<T>` 一律写成 `["integer","null"]`
+///     （0.8 有 `option_add_null_type` 开关可以关掉）→ 这里手动删掉，单元素数组再塌回标量。
+///     可选性本来就由 `required` 表达（`Option` 不进 `required`），所以删了不丢信息。
 fn strip_schema_noise(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.remove("format");
             map.remove("minimum");
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                types.retain(|t| t.as_str() != Some("null"));
+                if types.len() == 1 {
+                    let only = types[0].clone();
+                    map.insert("type".to_string(), only);
+                } else if types.is_empty() {
+                    map.remove("type");
+                }
+            }
             map.values_mut().for_each(strip_schema_noise);
         }
         Value::Array(items) => items.iter_mut().for_each(strip_schema_noise),
@@ -414,12 +420,13 @@ impl Tool for Read {
         });
         if let Some((mime, dim)) = image_info {
             let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-            if let Some(max) = _max_image_bytes {
-                if max > 0 && size > max as u64 {
-                    return err(format!(
-                        "图片过大（{size} 字节 > {max} 上限），无法内联发送给模型；请先压缩/裁剪该图片再读取"
-                    ));
-                }
+            if let Some(max) = _max_image_bytes
+                && max > 0
+                && size > max as u64
+            {
+                return err(format!(
+                    "图片过大（{size} 字节 > {max} 上限），无法内联发送给模型；请先压缩/裁剪该图片再读取"
+                ));
             }
             let dim_txt = dim
                 .map(|(w, h)| format!(", dim={w}x{h}"))
@@ -440,21 +447,21 @@ impl Tool for Read {
         };
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
-        if let Some(o) = offset {
-            if o == 0 || o > total {
-                return err(format!("offset 无效: {o}（文件共 {total} 行）"));
-            }
+        if let Some(o) = offset
+            && (o == 0 || o > total)
+        {
+            return err(format!("offset 无效: {o}（文件共 {total} 行）"));
         }
-        if let Some(l) = limit {
-            if l == 0 {
-                return err(format!("limit 无效: {l}（必须为正整数）"));
-            }
+        if let Some(l) = limit
+            && l == 0
+        {
+            return err(format!("limit 无效: {l}（必须为正整数）"));
         }
         for (label, v) in [("_max_lines", _max_lines), ("_max_bytes", _max_bytes)] {
-            if let Some(v) = v {
-                if v == 0 {
-                    return err(format!("{label} 无效: {v}（必须为正整数或 None）"));
-                }
+            if let Some(v) = v
+                && v == 0
+            {
+                return err(format!("{label} 无效: {v}（必须为正整数或 None）"));
             }
         }
         let start = offset.unwrap_or(1).saturating_sub(1);
@@ -488,9 +495,11 @@ impl Tool for Read {
         let picked = &lines[start..(start + cap).min(lines.len())];
         // 记一笔快照（**整文件**内容 + 这次读到的行区间）：`edit` 靠它区分「抄错了 / 手里那份是旧的 /
         // 压根没读过这一段」
-        ctx.state
-            .get_or_init(ReadSnapshots::default)
-            .record(p, &content, (start + 1, start + picked.len()));
+        ctx.state.get_or_init(ReadSnapshots::default).record(
+            p,
+            &content,
+            (start + 1, start + picked.len()),
+        );
         let omitted = want - picked.len();
 
         let body = picked.join("\n");
@@ -544,10 +553,10 @@ pub fn parse_image_marker(text: &str) -> Option<ImageRef> {
             "mime" => mime = Some(value.to_string()),
             "size" => size = value.parse::<u64>().ok(),
             "dim" => {
-                if let Some((w, h)) = value.split_once('x') {
-                    if let (Ok(w), Ok(h)) = (w.parse::<u64>(), h.parse::<u64>()) {
-                        dim = Some((w, h));
-                    }
+                if let Some((w, h)) = value.split_once('x')
+                    && let (Ok(w), Ok(h)) = (w.parse::<u64>(), h.parse::<u64>())
+                {
+                    dim = Some((w, h));
                 }
             }
             _ => {}
@@ -711,7 +720,12 @@ impl Tool for Edit {
                 let first = content[..byte].matches('\n').count() + 1; // 起始行（1 起）
                 let from = first.saturating_sub(1 + CTX_LINES);
                 let to = (first - 1 + span + CTX_LINES).min(lines.len());
-                out.push(format!("      #{} 第 {}-{} 行：", k + 1, first, first + span - 1));
+                out.push(format!(
+                    "      #{} 第 {}-{} 行：",
+                    k + 1,
+                    first,
+                    first + span - 1
+                ));
                 for (idx, line) in lines[from..to].iter().enumerate() {
                     let n = from + idx + 1;
                     let mark = if (first..first + span).contains(&n) {
@@ -723,7 +737,11 @@ impl Tool for Edit {
                 }
             }
             if starts.len() > MAX_SHOWN {
-                out.push(format!("      …（超过 {} 处，只列前 {} 处）", starts.len(), MAX_SHOWN));
+                out.push(format!(
+                    "      …（超过 {} 处，只列前 {} 处）",
+                    starts.len(),
+                    MAX_SHOWN
+                ));
             }
             out.join("\n")
         };
@@ -886,12 +904,11 @@ impl Tool for Writ {
     async fn call(self, _ctx: ToolCtx) -> ToolResult {
         let Self { path, content } = self;
         let p = Path::new(&path);
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err(format!("创建目录失败 {}: {e}", parent.display()));
-                }
-            }
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return err(format!("创建目录失败 {}: {e}", parent.display()));
         }
         match std::fs::write(p, &content) {
             Ok(()) => Ok(ToolOutput::text(format_output(
@@ -975,7 +992,7 @@ impl Tool for Bash {
         #[cfg(unix)]
         {
             cmd.process_group(0); // 独立进程组：取消/超时时 killpg 连子孙一起杀
-                                  // stderr 合并进 stdout，保证输出顺序稳定
+            // stderr 合并进 stdout，保证输出顺序稳定
             unsafe {
                 cmd.pre_exec(|| {
                     if libc::dup2(1, 2) == -1 {
@@ -1331,12 +1348,12 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
     if restricted {
         // description 追加白名单，让模型事先知道边界、少试错
         let allow_txt = allow_cmds.join(", ");
-        if let Some(entry) = reg.entries.last_mut() {
-            if entry.name == "bash" {
-                entry
-                    .description
-                    .push_str(&format!("\n本次运行仅允许以这些命令开头: {allow_txt}"));
-            }
+        if let Some(entry) = reg.entries.last_mut()
+            && entry.name == "bash"
+        {
+            entry
+                .description
+                .push_str(&format!("\n本次运行仅允许以这些命令开头: {allow_txt}"));
         }
     }
     reg
@@ -1689,16 +1706,19 @@ mod tests {
         // 另一种写法（相对/绝对混用）也要对得上同一个文件：这里用 canonicalize 后的路径读
         let ctx2 = ToolCtx::default();
         let canon = std::fs::canonicalize(&p).unwrap();
-        reg.dispatch("read", &json!({"path": canon.to_str().unwrap()}), ctx2.clone())
-            .await
-            .unwrap();
+        reg.dispatch(
+            "read",
+            &json!({"path": canon.to_str().unwrap()}),
+            ctx2.clone(),
+        )
+        .await
+        .unwrap();
         std::fs::write(&p, "changed\n").unwrap();
         let e = reg.dispatch("edit", &miss, ctx2).await.unwrap_err();
         assert!(e.0.contains("已被改动"), "{e}");
 
         let _ = std::fs::remove_file(&p);
     }
-
 
     /// 找不到时给「最接近的位置 + 简版 diff」（缩进少两个空格的典型场景）。
     #[tokio::test]
@@ -1778,9 +1798,11 @@ mod tests {
             "integer"
         );
         // 私有参数不进 schema
-        assert!(spec["function"]["parameters"]["properties"]
-            .get("hidden")
-            .is_none());
+        assert!(
+            spec["function"]["parameters"]["properties"]
+                .get("hidden")
+                .is_none()
+        );
 
         // 分发：JSON → 结构体 → call
         let out = reg
@@ -1846,9 +1868,11 @@ mod tests {
             desc.contains("本次运行仅允许以这些命令开头: echo"),
             "{desc}"
         );
-        assert!(shell["function"]["parameters"]["properties"]
-            .get("_allow_cmds")
-            .is_none());
+        assert!(
+            shell["function"]["parameters"]["properties"]
+                .get("_allow_cmds")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1857,8 +1881,7 @@ mod tests {
         assert_eq!(reg.names(), vec!["bash"]);
         // 白名单内 → 正常执行
         let out = reg
-            .dispatch(
-                "bash", &json!({"command": "echo hi"}), ToolCtx::default())
+            .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
             .await
             .unwrap();
         assert!(out.contains("hi"), "{out}");
@@ -1874,8 +1897,7 @@ mod tests {
         assert!(e.0.contains("本次仅允许以这些命令开头: echo"), "{e}");
         assert!(e.0.contains("收到: rm"), "{e}");
         let e = reg
-            .dispatch(
-                "bash", &json!({"command": "  "}), ToolCtx::default())
+            .dispatch("bash", &json!({"command": "  "}), ToolCtx::default())
             .await
             .unwrap_err();
         assert!(e.0.contains("收到: (空命令)"), "{e}");
@@ -1922,8 +1944,7 @@ mod tests {
     #[tokio::test]
     async fn shell_reports_nonzero_exit_code() {
         let out = builtin()
-            .dispatch(
-                "bash", &json!({"command": "exit 3"}), ToolCtx::default())
+            .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
         // 没输出 → 结果就是那一行头

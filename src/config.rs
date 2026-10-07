@@ -78,6 +78,24 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 测试专用：改环境变量。
+///
+/// 2024 edition 起 `std::env::set_var` 是 `unsafe`（多线程下 `setenv` 本身不是线程安全的）——
+/// 本仓改 env 的用例都持 [`ENV_LOCK`]，所以把那一层 unsafe 收在这里一处，调用点只写
+/// `set_env("PIE_DIR", &dir)`。
+#[cfg(test)]
+pub fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: 调用点都持有 `ENV_LOCK`（见上）
+    unsafe { std::env::set_var(key, value) };
+}
+
+/// 测试专用：删环境变量，前置条件同 [`set_env`]。
+#[cfg(test)]
+pub fn unset_env(key: &str) {
+    // SAFETY: 调用点都持有 `ENV_LOCK`（见 [`set_env`]）
+    unsafe { std::env::remove_var(key) };
+}
+
 /// 数据存储：一个 root + 四个子目录 + 内容寻址落盘（[`Storage::store`]）。
 ///
 /// **唯一职责是「用户数据放哪儿、怎么落盘」**（`config` 是底层，谁都能拿来用）。默认 root 来自
@@ -255,16 +273,15 @@ pub fn hash_of(path: &Path) -> String {
         .to_string()
 }
 
-
 /// 数据根目录：`PIE_DIR`（非空才算）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造）→ `~/.pie`。
 ///
 /// 就这三步、都写在这儿：**别为了好测把顺序拆成单独的函数**（要测就改环境变量测能测的那两档，
 /// 见用例；`<cwd>/.pie` 那档得改进程 cwd，代价比收益大）。
 pub fn pie_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PIE_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = std::env::var_os("PIE_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     if let Ok(cwd) = std::env::current_dir() {
         let local = cwd.join(".pie");
@@ -355,11 +372,7 @@ pub fn thousands(n: i64) -> String {
         }
         out.push(c);
     }
-    if n < 0 {
-        format!("-{out}")
-    } else {
-        out
-    }
+    if n < 0 { format!("-{out}") } else { out }
 }
 
 pub fn global_memory_file() -> PathBuf {
@@ -382,10 +395,10 @@ pub fn ensure_global_memory_file() -> std::io::Result<(PathBuf, bool)> {
     if path.exists() {
         return Ok((path, false));
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, include_str!("../prompts/memory.md"))?;
     Ok((path, true))
@@ -396,10 +409,10 @@ pub fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    if let Some(v) = std::env::var_os("PIE_CONFIG_FILE") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Some(v) = std::env::var_os("PIE_CONFIG_FILE")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v);
     }
     default_config_file()
 }
@@ -762,7 +775,10 @@ impl Config {
         );
         put("timeout_seconds", V::Float(self.timeout_seconds));
         put("max_retries", V::Integer(self.max_retries as i64));
-        put("max_retry_delay_seconds", V::Float(self.max_retry_delay_seconds));
+        put(
+            "max_retry_delay_seconds",
+            V::Float(self.max_retry_delay_seconds),
+        );
         put("theme", V::String(self.theme.clone()));
         put(
             "tools",
@@ -948,7 +964,12 @@ pub fn build_system_prompt(
         parts.push(memories.join("\n\n"));
     }
 
-    parts.extend(append_system_prompt.iter().filter(|s| !s.is_empty()).cloned());
+    parts.extend(
+        append_system_prompt
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned(),
+    );
     // 永远**最后**一节：`Session::aturn` 每轮按 [`RUNTIME_STATE_HEADING`] 重拼它
     //（所以别把它插到中间，也别把 `append_system_prompt` 挪到它后面）。
     parts.push(runtime_state("")); // 初建：解释器那块是空的（`Session` 每轮再往里添）
@@ -1001,12 +1022,12 @@ mod tests {
         let old_home = std::env::var_os("HOME");
 
         // 1) `PIE_DIR` 非空 → 直接用它（本地就算有 `.pie` 也不看）
-        std::env::set_var("PIE_DIR", "/tmp/pie-from-env");
+        set_env("PIE_DIR", "/tmp/pie-from-env");
         assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-from-env"));
 
         // 2) 空串 = 没设 → 往下走；cwd 没有 `.pie` 时就是 `$HOME/.pie`
-        std::env::set_var("PIE_DIR", "");
-        std::env::set_var("HOME", "/tmp/pie-home-stub");
+        set_env("PIE_DIR", "");
+        set_env("HOME", "/tmp/pie-home-stub");
         let cwd_has_pie = std::env::current_dir()
             .map(|d| d.join(".pie").is_dir())
             .unwrap_or(false);
@@ -1015,12 +1036,12 @@ mod tests {
         }
 
         match old_dir {
-            Some(v) => std::env::set_var("PIE_DIR", v),
-            None => std::env::remove_var("PIE_DIR"),
+            Some(v) => set_env("PIE_DIR", v),
+            None => unset_env("PIE_DIR"),
         }
         match old_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+            Some(v) => set_env("HOME", v),
+            None => unset_env("HOME"),
         }
     }
 
@@ -1030,14 +1051,14 @@ mod tests {
     #[test]
     fn fmt_local_matches_known_instants() {
         // `libc` crate 只在 windows 那份里声明了 `tzset`（unix 那份没有）→ 自己声明
-        extern "C" {
+        unsafe extern "C" {
             fn tzset();
         }
 
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::env::var_os("TZ");
         let set_tz = |tz: &str| {
-            std::env::set_var("TZ", tz);
+            set_env("TZ", tz);
             // SAFETY: 只动 libc 的时区缓存；`ENV_LOCK` 保证没有别的用例同时读它
             unsafe { tzset() };
         };
@@ -1051,8 +1072,8 @@ mod tests {
         assert_eq!(fmt_local(1_700_000_000), "2023-11-15 06:13");
 
         match old {
-            Some(v) => std::env::set_var("TZ", v),
-            None => std::env::remove_var("TZ"),
+            Some(v) => set_env("TZ", v),
+            None => unset_env("TZ"),
         }
         unsafe { tzset() };
     }
@@ -1085,11 +1106,11 @@ mod tests {
     #[test]
     fn budget_and_limits() {
         let config = Config::default();
+        assert_eq!(config.context_budget(), config.context_window - 128_000);
         assert_eq!(
-            config.context_budget(),
-            config.context_window - 128_000
+            config.soft_limit(),
+            (config.context_budget() as f64 * 0.8) as usize
         );
-        assert_eq!(config.soft_limit(), (config.context_budget() as f64 * 0.8) as usize);
     }
 
     #[test]
@@ -1169,7 +1190,7 @@ lean = true
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        set_env("PIE_DIR", &dir);
 
         ensure_global_memory();
         let path = global_memory_file();
@@ -1191,7 +1212,7 @@ lean = true
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-report-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        set_env("PIE_DIR", &dir);
 
         // `~/.pie` 不存在：连父目录一起建，并报「已创建」
         let (path, created) = ensure_global_memory_file().expect("写种子");
@@ -1223,8 +1244,14 @@ lean = true
         let dflt = Config::default();
         assert_eq!(back.model, dflt.model);
         // `load` 会被 `OPENAI_*` 环境变量覆盖：预期值也要过同样的门
-        assert_eq!(back.base_url, env_base_url().unwrap_or_else(|| dflt.base_url.clone()));
-        assert_eq!(back.api_key, env_api_key().unwrap_or_else(|| dflt.api_key.clone()));
+        assert_eq!(
+            back.base_url,
+            env_base_url().unwrap_or_else(|| dflt.base_url.clone())
+        );
+        assert_eq!(
+            back.api_key,
+            env_api_key().unwrap_or_else(|| dflt.api_key.clone())
+        );
         assert_eq!(back.reserved_tokens, dflt.reserved_tokens);
         assert_eq!(back.context_window, dflt.context_window);
         assert_eq!(back.tui.lean, dflt.tui.lean);
@@ -1233,7 +1260,10 @@ lean = true
         std::fs::write(&path, "model = \"mine\"\n").unwrap();
         let (_, created) = ensure_config_file(Some(&path)).expect("再跑一次");
         assert!(!created, "已存在就不算新建");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \"mine\"\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"mine\"\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1256,27 +1286,27 @@ lean = true
         let prev_url = std::env::var("OPENAI_BASE_URL").ok();
 
         // 设了就用环境变量的值（压过配置文件）
-        std::env::set_var("OPENAI_API_KEY", "sk-env");
-        std::env::set_var("OPENAI_BASE_URL", "https://env.example/v1");
+        set_env("OPENAI_API_KEY", "sk-env");
+        set_env("OPENAI_BASE_URL", "https://env.example/v1");
         let config = Config::load(Some(&path)).expect("load");
         assert_eq!(config.api_key, "sk-env");
         assert_eq!(config.base_url, "https://env.example/v1");
         assert_eq!(config.config_file.as_deref(), Some(path.as_path()));
 
         // 空串 / 全空白 = 没设 → 保留配置文件里的值
-        std::env::set_var("OPENAI_API_KEY", "");
-        std::env::set_var("OPENAI_BASE_URL", "   ");
+        set_env("OPENAI_API_KEY", "");
+        set_env("OPENAI_BASE_URL", "   ");
         let config = Config::load(Some(&path)).expect("load");
         assert_eq!(config.api_key, "sk-file");
         assert_eq!(config.base_url, "https://file.example/");
 
         match prev_key {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
+            Some(v) => set_env("OPENAI_API_KEY", v),
+            None => unset_env("OPENAI_API_KEY"),
         }
         match prev_url {
-            Some(v) => std::env::set_var("OPENAI_BASE_URL", v),
-            None => std::env::remove_var("OPENAI_BASE_URL"),
+            Some(v) => set_env("OPENAI_BASE_URL", v),
+            None => unset_env("OPENAI_BASE_URL"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1286,7 +1316,7 @@ lean = true
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-prompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        set_env("PIE_DIR", &dir);
 
         let config = Config::default();
         // 按**路径**判有无：项目记忆里可能碰巧引用了「## 全局记忆（…）」这个形状
@@ -1297,7 +1327,10 @@ lean = true
 
         ensure_global_memory();
         let after = build_system_prompt(&config, None, &[]);
-        assert!(after.contains(&marker), "种子文件要进 system prompt：{after}");
+        assert!(
+            after.contains(&marker),
+            "种子文件要进 system prompt：{after}"
+        );
         assert!(after.contains("跨项目的持久记忆"), "连正文一起拼进去");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1316,8 +1349,7 @@ lean = true
     /// `tool = true` / `session = true`（只写布尔、不给参数）= **开启用默认值**。
     #[test]
     fn level_boolean_true_means_enabled_with_defaults() {
-        let config: Config =
-            toml::from_str("[compaction]\ntool = true\nsession = true").unwrap();
+        let config: Config = toml::from_str("[compaction]\ntool = true\nsession = true").unwrap();
         let c = config.compaction.unwrap();
         assert_eq!(c.tool.unwrap().head, 30, "默认 head");
         assert_eq!(c.session.unwrap().tail, 5, "默认 tail");

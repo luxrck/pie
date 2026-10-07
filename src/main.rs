@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use pie::llm::{LlmClient, RequestOptions};
 use pie::session::{Session, TurnEvent};
-use pie::tools::{tools_from_spec, ToolRegistry};
+use pie::tools::{ToolRegistry, tools_from_spec};
 use pie::{cancel, cli, config, context, tui};
 
 /// 一次性模式的输出格式（`text` / `json` / `transcript`）。
@@ -224,9 +224,11 @@ async fn run(cli: Cli) -> i32 {
             Cmd::Setup => setup_main(&cli),
             Cmd::Context { action } => context_main(&config.storage, action),
             Cmd::Files { action } => files_main(&config, action).await,
-            Cmd::Sessions { limit, all, json } => {
-                sessions_main(&config.storage, if *all { None } else { Some(*limit) }, *json)
-            }
+            Cmd::Sessions { limit, all, json } => sessions_main(
+                &config.storage,
+                if *all { None } else { Some(*limit) },
+                *json,
+            ),
         };
     }
 
@@ -262,7 +264,13 @@ async fn run(cli: Cli) -> i32 {
     // TTY 且没有任务 → 进 TUI（`-r` / `-s` 就接着那个会话聊）；非 TTY 保持原来的行为
     if task.trim().is_empty() && std::io::stdin().is_terminal() {
         let session = if session_mode {
-            match open_session(&config, cli.resume, cli.session.as_deref(), client, registry) {
+            match open_session(
+                &config,
+                cli.resume,
+                cli.session.as_deref(),
+                client,
+                registry,
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("{e}");
@@ -286,7 +294,8 @@ async fn run(cli: Cli) -> i32 {
         eprintln!(
             "pie {}（配置 {}）",
             config.model,
-            config.config_file
+            config
+                .config_file
                 .as_deref()
                 .unwrap_or(std::path::Path::new("(默认)"))
                 .display()
@@ -297,7 +306,9 @@ async fn run(cli: Cli) -> i32 {
             config.context_budget(),
             config.reserved_tokens.unwrap_or(0)
         );
-        eprintln!("请提供任务描述（`pie \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI");
+        eprintln!(
+            "请提供任务描述（`pie \"任务\"`，或从 stdin 传入）；真实终端里不带任务运行会进 TUI"
+        );
         return 2;
     }
 
@@ -326,14 +337,19 @@ async fn run(cli: Cli) -> i32 {
 
     // 会话模式（--resume / --session）：读写 `~/.pie/sessions/`，跑完落盘；一次性模式不碰磁盘。
     if session_mode {
-        let mut session =
-            match open_session(&config, cli.resume, cli.session.as_deref(), client, registry) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return 1;
-                }
-            };
+        let mut session = match open_session(
+            &config,
+            cli.resume,
+            cli.session.as_deref(),
+            client,
+            registry,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
         if task.trim().is_empty() {
             // 只恢复/建个文件：打印状态即可（交互式 REPL 属 TUI 那一块）
             eprintln!(
@@ -436,7 +452,10 @@ fn setup_main(cli: &Cli) -> i32 {
             println!("全局记忆  {label}  {}", path.display());
         }
         Err(e) => {
-            eprintln!("写入全局记忆失败（{}）: {e}", config::global_memory_file().display());
+            eprintln!(
+                "写入全局记忆失败（{}）: {e}",
+                config::global_memory_file().display()
+            );
             code = 1;
         }
     }
@@ -514,7 +533,12 @@ fn sessions_main(storage: &config::Storage, limit: Option<usize>, json: bool) ->
 /// `--mode text` 时答案已经在流式增量 / `Answer` 事件里打过了，这里只补个收尾换行
 /// （非流式时 `Answer` 事件自己已经是 `println!`，不补）；`json` / `transcript` 时
 /// stdout **一个字也不多打**（给脚本接）。`--stat` 报告走 stderr，不在这里。
-fn result_text(session: &Session, answer: &str, mode: Mode, stream: Option<bool>) -> Option<String> {
+fn result_text(
+    session: &Session,
+    answer: &str,
+    mode: Mode,
+    stream: Option<bool>,
+) -> Option<String> {
     match mode {
         Mode::Text if stream.unwrap_or(true) => Some(String::new()),
         Mode::Text => None,
@@ -649,7 +673,10 @@ fn context_main(storage: &config::Storage, action: &ContextAction) -> i32 {
                 shown += events.len();
             }
             if shown == 0 {
-                println!("暂无压缩记录（只查 {} 里的会话）", storage.sessions().display());
+                println!(
+                    "暂无压缩记录（只查 {} 里的会话）",
+                    storage.sessions().display()
+                );
             }
             0
         }
@@ -949,7 +976,9 @@ mod tests {
         assert!(Cli::try_parse_from(["pie", "-t", "off"]).is_ok());
         assert!(Cli::try_parse_from(["pie", "-t", "xhigh"]).is_ok());
         assert!(Cli::try_parse_from(["pie", "-t", "none"]).is_ok());
-        let err = Cli::try_parse_from(["pie", "-t", "乱写"]).unwrap_err().to_string();
+        let err = Cli::try_parse_from(["pie", "-t", "乱写"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("minimal"), "报错要列出合法值：{err}");
     }
 
@@ -966,17 +995,28 @@ mod tests {
             Some(String::new()),
             "只补一个换行（println! 负责那个换行）"
         );
-        assert_eq!(result_text(&session, "答案", Mode::Text, Some(false)), None, "非流式已有换行");
+        assert_eq!(
+            result_text(&session, "答案", Mode::Text, Some(false)),
+            None,
+            "非流式已有换行"
+        );
 
         let json: Value =
-            serde_json::from_str(&result_text(&session, "答案", Mode::Json, None).unwrap()).unwrap();
+            serde_json::from_str(&result_text(&session, "答案", Mode::Json, None).unwrap())
+                .unwrap();
         assert_eq!(json["answer"], "答案");
         assert_eq!(json["turns"], 0);
         assert!(json["usage"]["calls"].is_number(), "{json}");
-        assert!(json["session"].as_str().unwrap().ends_with(".jsonl"), "{json}");
+        assert!(
+            json["session"].as_str().unwrap().ends_with(".jsonl"),
+            "{json}"
+        );
 
         let transcript = result_text(&session, "答案", Mode::Transcript, None).unwrap();
-        assert!(transcript.starts_with("[\n "), "缩进 1 的 JSON 数组：{transcript}");
+        assert!(
+            transcript.starts_with("[\n "),
+            "缩进 1 的 JSON 数组：{transcript}"
+        );
     }
 
     /// `--reserved-tokens` 认 `N` / `128k` / `auto`；坏值直接报错（不静默改配置）。

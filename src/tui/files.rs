@@ -74,7 +74,9 @@ impl Index {
         for entry in builder.build() {
             // 读不了的条目（权限…）跳过就行，别让一个目录把整棵树作废
             let Ok(entry) = entry else { continue };
-            let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+            let Ok(rel) = entry.path().strip_prefix(root) else {
+                continue;
+            };
             if rel.as_os_str().is_empty() {
                 continue; // 根目录自己
             }
@@ -168,12 +170,12 @@ impl Index {
                 // 列目录（前缀模式 / 空片段）：按路径字典序，跟 `ls` 一个观感
                 true => a.1.path.cmp(&b.1.path),
                 // 模糊匹配：短的先（越靠近根通常越相关），同长度再字典序
-                false => a
-                    .1
-                    .path
-                    .len()
-                    .cmp(&b.1.path.len())
-                    .then_with(|| a.1.path.cmp(&b.1.path)),
+                false => {
+                    a.1.path
+                        .len()
+                        .cmp(&b.1.path.len())
+                        .then_with(|| a.1.path.cmp(&b.1.path))
+                }
             })
         });
         hits.truncate(limit);
@@ -212,7 +214,9 @@ pub fn matches(
     if let Some((dir, prefix, name)) = external(&fragment, root) {
         return list_dir(&dir, &prefix, &name, limit);
     }
-    index.map(|i| i.matches(&fragment, limit)).unwrap_or_default()
+    index
+        .map(|i| i.matches(&fragment, limit))
+        .unwrap_or_default()
 }
 
 /// `..` / `/` / `~/` 三档锚点 → `(要列的目录, 插入文本前缀, 名字前缀)`；不是这三档返回 `None`。
@@ -247,7 +251,9 @@ fn anchor_dir(dir: &str) -> Option<String> {
         return Some(dir.to_string());
     }
     let rest = dir.strip_prefix("~/")?;
-    let home = crate::config::home_dir().to_string_lossy().replace('\\', "/");
+    let home = crate::config::home_dir()
+        .to_string_lossy()
+        .replace('\\', "/");
     Some(format!("{home}/{rest}"))
 }
 
@@ -294,7 +300,8 @@ pub fn token(line: &str, col: usize) -> Option<(usize, String)> {
     }
     // ⚠ 防误伤只认 **ASCII** 字母数字：中文句子里的「看下@src/a.rs」必须能弹面板
     // （`char::is_alphanumeric` 对汉字是真的，用它会把最常用的场景全挡掉）。
-    if at > 0 && (before[at - 1].is_ascii_alphanumeric() || matches!(before[at - 1], '.' | '-' | '_'))
+    if at > 0
+        && (before[at - 1].is_ascii_alphanumeric() || matches!(before[at - 1], '.' | '-' | '_'))
     {
         return None;
     }
@@ -400,8 +407,14 @@ mod tests {
         let paths = paths(&index);
         assert!(paths.contains(&"a.rs".to_string()), "{paths:?}");
         assert!(paths.contains(&"sub/ok.rs".to_string()), "{paths:?}");
-        assert!(paths.contains(&"keep.log".to_string()), "`!` 取反要生效：{paths:?}");
-        assert!(!paths.contains(&"a.log".to_string()), "`*.log` 要排除：{paths:?}");
+        assert!(
+            paths.contains(&"keep.log".to_string()),
+            "`!` 取反要生效：{paths:?}"
+        );
+        assert!(
+            !paths.contains(&"a.log".to_string()),
+            "`*.log` 要排除：{paths:?}"
+        );
         assert!(
             !paths.iter().any(|p| p.starts_with("build/")),
             "`build/` 要排除：{paths:?}"
@@ -410,7 +423,10 @@ mod tests {
             !paths.iter().any(|p| p.starts_with("sub/gen/")),
             "嵌套 .gitignore 要生效：{paths:?}"
         );
-        assert!(!paths.contains(&".env".to_string()), "点文件不收：{paths:?}");
+        assert!(
+            !paths.contains(&".env".to_string()),
+            "点文件不收：{paths:?}"
+        );
         assert!(
             !paths.iter().any(|p| p.contains(".hidden")),
             "点目录不收：{paths:?}"
@@ -426,7 +442,9 @@ mod tests {
     #[test]
     fn external_anchors_resolve_parent_root_and_home() {
         let root = Path::new("/tmp/pie-files-anchor/cwd"); // 不用真存在，只看解析
-        let home = crate::config::home_dir().to_string_lossy().replace('\\', "/");
+        let home = crate::config::home_dir()
+            .to_string_lossy()
+            .replace('\\', "/");
 
         // `..` / `../…`：相对 root（保留相对写法，`read` 照相对路径能开）
         assert_eq!(
@@ -453,11 +471,7 @@ mod tests {
         // `~` / `~/…`：展开成主目录（`read` 不认 `~`）
         assert_eq!(
             external("~", root),
-            Some((
-                crate::config::home_dir(),
-                format!("{home}/"),
-                String::new()
-            ))
+            Some((crate::config::home_dir(), format!("{home}/"), String::new()))
         );
         assert_eq!(
             external("~/Doc", root),
@@ -513,9 +527,17 @@ mod tests {
         // `@/`：真列根目录——至少能给候选，且都是绝对路径
         let root_items = matches("/", None, &cwd, MATCH_LIMIT);
         assert!(!root_items.is_empty(), "根目录不会空");
-        assert!(root_items.iter().all(|(i, _)| i.starts_with('/')), "{root_items:?}");
+        assert!(
+            root_items.iter().all(|(i, _)| i.starts_with('/')),
+            "{root_items:?}"
+        );
         // `@~/`：展开成主目录（不断言有多少条，只断言前缀对）
-        let home_pfx = format!("{}/", crate::config::home_dir().to_string_lossy().replace('\\', "/"));
+        let home_pfx = format!(
+            "{}/",
+            crate::config::home_dir()
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
         let home_items = matches("~/", None, &cwd, MATCH_LIMIT);
         assert!(
             home_items.iter().all(|(i, _)| i.starts_with(&home_pfx)),
@@ -543,7 +565,11 @@ mod tests {
         assert_eq!(ins("src/"), ["src/tui/"]);
         assert_eq!(ins("app"), ["src/tui/app.rs"]);
         // 三档锚点就算有索引也走实时列目录（`..` = tmp 的上级）
-        assert!(ins("..").iter().all(|i| i.starts_with("../")), "{:?}", ins(".."));
+        assert!(
+            ins("..").iter().all(|i| i.starts_with("../")),
+            "{:?}",
+            ins("..")
+        );
     }
 
     /// 三种匹配模式：模糊 basename / shell 式目录前缀 / 空片段只列根目录。
@@ -568,8 +594,17 @@ mod tests {
         assert_eq!(ins(""), vec!["README.md", "docs/", "src/"]);
         // 模糊：basename 前缀优先，同档短路径优先
         assert_eq!(ins("app"), vec!["src/tui/app.rs"]);
-        assert_eq!(ins("rs")[0], "src/session.rs", "basename 包含：{:?}", ins("rs"));
-        assert!(ins("tui").contains(&"src/tui/".to_string()), "{:?}", ins("tui"));
+        assert_eq!(
+            ins("rs")[0],
+            "src/session.rs",
+            "basename 包含：{:?}",
+            ins("rs")
+        );
+        assert!(
+            ins("tui").contains(&"src/tui/".to_string()),
+            "{:?}",
+            ins("tui")
+        );
         // 含 `/`：只列那个目录的直接子项（更深的不列），字典序
         assert_eq!(ins("src/"), vec!["src/session.rs", "src/tui/"]);
         assert_eq!(ins("src/t"), vec!["src/tui/"]);
@@ -585,7 +620,10 @@ mod tests {
             .into_iter()
             .map(|(i, _)| i)
             .collect();
-        assert!(hit.contains(&"bindings/pie-py/setup.py".to_string()), "{hit:?}");
+        assert!(
+            hit.contains(&"bindings/pie-py/setup.py".to_string()),
+            "{hit:?}"
+        );
         assert!(hit.contains(&"bindings/pie-py/".to_string()), "{hit:?}");
         // 目录候选带「目录」说明、插进去带 `/`；文件不带说明
         let (insert, desc) = index.matches("src/", MATCH_LIMIT)[1].clone();

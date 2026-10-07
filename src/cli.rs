@@ -79,10 +79,10 @@ pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<Ses
                         && !v.get("synthetic").and_then(Value::as_bool).unwrap_or(false)
                     {
                         turns += 1;
-                        if first_query.is_empty() {
-                            if let Some(c) = v.get("content").and_then(Value::as_str) {
-                                first_query = c.trim().to_string();
-                            }
+                        if first_query.is_empty()
+                            && let Some(c) = v.get("content").and_then(Value::as_str)
+                        {
+                            first_query = c.trim().to_string();
                         }
                     }
                 }
@@ -227,10 +227,10 @@ pub fn referenced_raw_paths(storage: &config::Storage) -> HashSet<PathBuf> {
                             .get("path")
                             .or_else(|| e.get("raw_path"))
                             .and_then(Value::as_str);
-                        if let Some(raw) = raw {
-                            if let Some(abs) = absolutize(raw) {
-                                refs.insert(abs);
-                            }
+                        if let Some(raw) = raw
+                            && let Some(abs) = absolutize(raw)
+                        {
+                            refs.insert(abs);
                         }
                     }
                 }
@@ -242,10 +242,10 @@ pub fn referenced_raw_paths(storage: &config::Storage) -> HashSet<PathBuf> {
                 .get("compaction")
                 .and_then(|c| c.get("path"))
                 .and_then(Value::as_str);
-            if let Some(raw) = raw {
-                if let Some(abs) = absolutize(raw) {
-                    refs.insert(abs);
-                }
+            if let Some(raw) = raw
+                && let Some(abs) = absolutize(raw)
+            {
+                refs.insert(abs);
             }
         }
     }
@@ -389,7 +389,10 @@ mod tests {
         let garbage = collect_context_garbage(&storage);
         assert!(garbage.contains(&orphan), "{garbage:?}");
         assert!(!garbage.contains(&referenced), "{garbage:?}");
-        assert!(!garbage.contains(&in_message), "消息里的指针也算引用：{garbage:?}");
+        assert!(
+            !garbage.contains(&in_message),
+            "消息里的指针也算引用：{garbage:?}"
+        );
         assert!(referenced_raw_paths(&storage).contains(&referenced));
         assert!(referenced_raw_paths(&storage).contains(&in_message));
         let _ = std::fs::remove_dir_all(&dir);

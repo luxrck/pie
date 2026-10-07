@@ -13,11 +13,11 @@
 //! 输入框就是个**普通编辑器**：软换行固定逐字断（`Glyph`，终端原生那种）、左边不留 `› ` ——
 //! 不去镜像消息流的词级折行（两者的取舍与由来见 `docs/CHANGELOG.md` 2026-09-28）。
 
+use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
-use ratatui::Frame;
 use ratatui_textarea::{CursorMove, DataCursor, ScreenCursor, TextArea, WrapMode};
 
 use super::pane::char_width;
@@ -285,7 +285,12 @@ impl Input {
             return None;
         }
         let lines = self.area.lines();
-        let chars = |r: usize| -> Vec<char> { lines.get(r).map(|l| l.chars().collect()).unwrap_or_default() };
+        let chars = |r: usize| -> Vec<char> {
+            lines
+                .get(r)
+                .map(|l| l.chars().collect())
+                .unwrap_or_default()
+        };
         if r1 == r2 {
             let line = chars(r1);
             let from = c1.min(line.len());
@@ -471,9 +476,7 @@ impl Input {
             palette.style_emphasis(focused)
         };
         // 块（上边框）交给控件渲染；内容区从同一个块里取一次并记下（`inner` 字段）。
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(border);
+        let block = Block::default().borders(Borders::TOP).border_style(border);
         let inner = block.inner(area);
         self.inner = inner;
         self.area.set_block(block);
@@ -527,11 +530,7 @@ impl Input {
         let mut used = Vec::with_capacity(height);
         for i in 0..height {
             let mut w = if self.area.is_empty() {
-                if i == 0 {
-                    inner.width
-                } else {
-                    0
-                }
+                if i == 0 { inner.width } else { 0 }
             } else {
                 match rows.get(self.scroll_top as usize + i) {
                     Some(&(line_no, start, len)) => self
@@ -549,10 +548,10 @@ impl Input {
                     None => 0,
                 }
             };
-            if let Some((col, row)) = caret {
-                if row == inner.y + i as u16 {
-                    w = w.max(col.saturating_sub(inner.x) + 1);
-                }
+            if let Some((col, row)) = caret
+                && row == inner.y + i as u16
+            {
+                w = w.max(col.saturating_sub(inner.x) + 1);
             }
             used.push(w.min(inner.width));
         }
@@ -619,7 +618,12 @@ impl Widget for StaleTail<'_> {
                 break;
             }
             let used = used.min(self.width);
-            let prev = self.prev.get(i).copied().unwrap_or(self.width).min(self.width);
+            let prev = self
+                .prev
+                .get(i)
+                .copied()
+                .unwrap_or(self.width)
+                .min(self.width);
             for x in (area.x + used)..(area.x + prev).min(area.right()) {
                 buf[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
             }
@@ -648,7 +652,11 @@ mod tests {
     #[test]
     fn height_follows_content_within_limits() {
         let mut input = Input::new();
-        assert_eq!(input.desired_height(80), MIN_H, "空输入框默认 3 行（边框 + 2 行）");
+        assert_eq!(
+            input.desired_height(80),
+            MIN_H,
+            "空输入框默认 3 行（边框 + 2 行）"
+        );
         input.newline();
         assert_eq!(input.desired_height(80), MIN_H, "两行文本仍装得下，不长个");
         input.newline();
@@ -664,8 +672,8 @@ mod tests {
     /// 几种文本各宽度比一遍：中文长句、英文词、超长词（Glyph 会从中间切开）、短句。
     #[test]
     fn screen_rows_matches_the_widget_wrapping() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let palette = Palette::mocha();
         let samples = [
             "这是一个很长的中文句子用来测试折行是不是逐字断的顺带混一点 english words 进来",
@@ -702,7 +710,11 @@ mod tests {
                         .skip(*start)
                         .take(*len)
                         .collect();
-                    assert_eq!(shown.trim_end(), want.trim_end(), "宽 {width} 第 {i} 行（{text}）");
+                    assert_eq!(
+                        shown.trim_end(),
+                        want.trim_end(),
+                        "宽 {width} 第 {i} 行（{text}）"
+                    );
                 }
             }
         }
@@ -724,7 +736,11 @@ mod tests {
         // 宽字占两格也能数对：逐字断时右边界会剩半格，`div_ceil` 那种估算会少数一行
         let mut input = Input::new();
         input.insert(&"中".repeat(4));
-        assert_eq!(input.desired_height(3), MIN_H + 2, "宽 3：4 个字各自一行 → 5 行");
+        assert_eq!(
+            input.desired_height(3),
+            MIN_H + 2,
+            "宽 3：4 个字各自一行 → 5 行"
+        );
     }
 
     #[test]
@@ -736,8 +752,8 @@ mod tests {
 
     #[test]
     fn caret_position_is_the_screen_cell_of_the_insertion_point() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let mut input = Input::new();
         // ⚠ 插入符位置现在直接问控件（`screen_cursor()`），它那份「屏幕行」表是**渲染时**按区域
         // 重建的 → 用例必须像 App 那样先渲染一帧（以前我们自己折行，不渲染也算得出来）。
@@ -756,7 +772,11 @@ mod tests {
                 .expect("draw");
         };
         draw(&mut input);
-        assert_eq!(input.caret_position(), Some((3, 11)), "空输入 = 内容区左上角");
+        assert_eq!(
+            input.caret_position(),
+            Some((3, 11)),
+            "空输入 = 内容区左上角"
+        );
         input.insert("你好，");
         draw(&mut input);
         // 「你好，」占 6 个显示列（CJK 各两格）→ 插入符在第 7 格
@@ -765,8 +785,8 @@ mod tests {
 
     #[test]
     fn caret_position_counts_wrapped_rows() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let palette = Palette::mocha();
         let mut input = Input::new();
         input.insert("abcde");
@@ -782,8 +802,8 @@ mod tests {
     /// 插入符落在哪（命中 / 插入符 / 残影测算全读这一个值）。
     #[test]
     fn inner_rect_matches_where_the_widget_draws_the_text() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let palette = Palette::mocha();
         let mut input = Input::new();
         input.set_text("你好 xyz");
@@ -815,8 +835,8 @@ mod tests {
     /// 内容比框高才算「能滚」（`App` 据此决定滚轮给输入框还是给消息流）。
     #[test]
     fn overflows_only_when_the_text_is_taller_than_the_box() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let palette = Palette::mocha();
         let mut input = Input::new();
         input.set_text("一行");
@@ -842,8 +862,8 @@ mod tests {
     #[test]
     fn deleting_a_wide_char_repaints_the_stale_cell_behind_it() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let palette = Palette::mocha();
         let mut input = Input::new();
@@ -904,8 +924,8 @@ mod tests {
 mod scratch {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn map(input: &mut Input, width: u16) -> String {
         let palette = Palette::mocha();

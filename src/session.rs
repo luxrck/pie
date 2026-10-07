@@ -19,16 +19,16 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use futures_util::stream::{self, StreamExt};
 
-use crate::cancel::{Cancel, CANCEL_TEXT};
+use crate::cancel::{CANCEL_TEXT, Cancel};
 use crate::config::{self, Config};
 use crate::context;
 use crate::llm::{
-    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions, StreamChunk,
-    ToolCall, UsageTracker,
+    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions,
+    StreamChunk, ToolCall, UsageTracker,
 };
 use crate::tools::{self, ToolOutput, ToolRegistry};
 
@@ -47,10 +47,7 @@ pub enum TurnEvent {
     /// 思考增量
     Reasoning(String),
     /// 即将执行某个工具
-    ToolCall {
-        name: String,
-        arguments: String,
-    },
+    ToolCall { name: String, arguments: String },
     /// 工具执行完毕（按真实完成顺序推；`content` 是**原样**文本，不再截断——
     /// 少显示是展示层的事，见 `Session::tool_call`）
     ToolResult {
@@ -164,7 +161,12 @@ impl Session {
     /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
     pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
-        Self::at(resolve_path(&config.storage.sessions(), id), config, llm, tools)
+        Self::at(
+            resolve_path(&config.storage.sessions(), id),
+            config,
+            llm,
+            tools,
+        )
     }
 
     /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`，压缩事件也就不会落盘），其余完全一样。
@@ -173,7 +175,10 @@ impl Session {
     /// 就用“不记账的 Session”表达同一件事。
     pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
         Self::at(
-            config.storage.sessions().join(format!("ephemeral-{}.jsonl", timestamp())),
+            config
+                .storage
+                .sessions()
+                .join(format!("ephemeral-{}.jsonl", timestamp())),
             config,
             llm,
             tools,
@@ -356,7 +361,13 @@ impl Session {
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string());
-        Self::resume_in(&config.storage.sessions(), cwd.as_deref(), config, llm, tools)
+        Self::resume_in(
+            &config.storage.sessions(),
+            cwd.as_deref(),
+            config,
+            llm,
+            tools,
+        )
     }
 
     /// `resume` 的本体（目录可注入，便于测试）。
@@ -460,23 +471,21 @@ impl Session {
                 cancelled = true;
                 break;
             }
-            if let Some(max) = max_steps {
-                if steps >= max {
-                    // 达到步数上限：不再问模型，把历史里最后一段非空 assistant 文本当最终答复
-                    answer = self.messages.iter().rev().find_map(|m| match &m.content {
-                        Some(Content::Text(t))
-                            if m.role == "assistant" && !t.trim().is_empty() =>
-                        {
-                            Some(t.clone())
-                        }
-                        _ => None,
-                    });
-                    if !use_stream {
-                        on_event(TurnEvent::Answer(answer.clone().unwrap_or_default()));
+            if let Some(max) = max_steps
+                && steps >= max
+            {
+                // 达到步数上限：不再问模型，把历史里最后一段非空 assistant 文本当最终答复
+                answer = self.messages.iter().rev().find_map(|m| match &m.content {
+                    Some(Content::Text(t)) if m.role == "assistant" && !t.trim().is_empty() => {
+                        Some(t.clone())
                     }
-                    done = true;
-                    break;
+                    _ => None,
+                });
+                if !use_stream {
+                    on_event(TurnEvent::Answer(answer.clone().unwrap_or_default()));
                 }
+                done = true;
+                break;
             }
             steps += 1;
 
@@ -793,7 +802,11 @@ impl Session {
                         // 比 serde 的英文报错有用：把原文回给模型（上限 500 字）
                         Err(_) => Some(ToolOutput::text(format!(
                             "[参数解析失败] 模型返回了非法 JSON: {}",
-                            call.function.arguments.chars().take(500).collect::<String>()
+                            call.function
+                                .arguments
+                                .chars()
+                                .take(500)
+                                .collect::<String>()
                         ))),
                         Ok(args) => {
                             // 取消信号与数据目录随 ctx 进工具层（shell 会在等待时 race 它、
@@ -805,7 +818,8 @@ impl Session {
                                 self.tool_state.clone(),
                             )
                             .with_transcript(self.transcript_path());
-                            let out = match registry.dispatch(&call.function.name, &args, ctx).await {
+                            let out = match registry.dispatch(&call.function.name, &args, ctx).await
+                            {
                                 Ok(out) => out,
                                 Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
                             };
@@ -825,7 +839,9 @@ impl Session {
         while let Some((index, outcome)) = stream.next().await {
             // 文本**原样**推给嵌入方（不在这里截断）：要少显示是展示层的事（TUI 按行截、
             // CLI 只取首行），要少回传给模型是工具自己配容量上限的事。
-            let finished = outcome.clone().unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
+            let finished = outcome
+                .clone()
+                .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
             on_event(TurnEvent::ToolResult {
                 name: calls[index].function.name.clone(),
                 content: finished.text.clone(),
@@ -893,7 +909,10 @@ impl Session {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let entry = self.files.entry(hash_id.clone()).or_insert_with(|| json!({}));
+            let entry = self
+                .files
+                .entry(hash_id.clone())
+                .or_insert_with(|| json!({}));
             entry["hash_id"] = json!(hash_id);
             entry["size"] = json!(size);
             entry["mime"] = json!("image/png");
@@ -953,13 +972,13 @@ impl Session {
         };
         // 文件名主干就是 id（`img-<hash>`）——扫描 `files/` 时也是这么反推的
         let image_hash = config::name_of(&local);
-        if let Some(entry) = self.files.get(&image_hash) {
-            if entry_is_usable(entry, &base_url, &key_fp) {
-                return entry
-                    .get("file_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
+        if let Some(entry) = self.files.get(&image_hash)
+            && entry_is_usable(entry, &base_url, &key_fp)
+        {
+            return entry
+                .get("file_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
         let uploaded = match self
             .llm
@@ -1003,11 +1022,11 @@ impl Session {
 
     /// 整文件重写会话（历史不长，简单可靠）。
     pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("创建会话目录失败 {}: {e}", parent.display()))?;
-            }
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建会话目录失败 {}: {e}", parent.display()))?;
         }
         let mut meta = json!({
             "__meta__": true,
@@ -1263,8 +1282,7 @@ impl Session {
             }
         }
         let tmp = path.with_extension("tmp");
-        let done =
-            std::fs::write(&tmp, body.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path));
+        let done = std::fs::write(&tmp, body.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path));
         if let Err(e) = done {
             crate::log::warn(format!("[转录快照] 写入失败 {}: {e}", path.display()));
         }
@@ -1469,7 +1487,6 @@ pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
     config::now().as_secs_f64() < expires_at - 60.0 // 留 1 分钟余量，别卡在过期边缘
 }
 
-
 /// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
 fn resolve_path(dir: &Path, id: Option<&str>) -> PathBuf {
     match id {
@@ -1510,13 +1527,12 @@ fn latest_in(dir: &Path, cwd: Option<&str>) -> Option<PathBuf> {
         })
         .collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.0)); // mtime 降序
-    if let Some(cwd) = cwd {
-        if let Some((_, path)) = files
+    if let Some(cwd) = cwd
+        && let Some((_, path)) = files
             .iter()
             .find(|(_, p)| meta_cwd(p).as_deref() == Some(cwd))
-        {
-            return Some(path.clone());
-        }
+    {
+        return Some(path.clone());
     }
     files.first().map(|(_, p)| p.clone())
 }
@@ -1568,7 +1584,7 @@ mod tests {
     fn pie_dir_tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pie-img-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        crate::config::set_env("PIE_DIR", &dir);
         dir
     }
 
@@ -1673,7 +1689,9 @@ mod tests {
             );
             // 完成顺序：最快的（three）先出结果 —— 证明真的并发，而不是串行跑完再补事件
             match &events[3] {
-                TurnEvent::ToolResult { content, .. } => assert!(content.contains("three"), "{content}"),
+                TurnEvent::ToolResult { content, .. } => {
+                    assert!(content.contains("three"), "{content}")
+                }
                 other => panic!("第 4 个事件该是结果：{other:?}"),
             }
         });
@@ -1701,7 +1719,9 @@ mod tests {
             assert!(elapsed > 1.1, "串行总耗时是两个之和，实际 {elapsed:.2}s");
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
             match &events[2] {
-                TurnEvent::ToolResult { content, .. } => assert!(content.contains("one"), "{content}"),
+                TurnEvent::ToolResult { content, .. } => {
+                    assert!(content.contains("one"), "{content}")
+                }
                 other => panic!("第 3 个事件该是结果：{other:?}"),
             }
         });
@@ -1772,9 +1792,7 @@ mod tests {
         );
         // 内容寻址：同一段内容再归档一次 → 还是那个文件（已存在则不动）
         assert_eq!(
-            storage()
-                .store(config::StoreType::Window(&raw))
-                .unwrap(),
+            storage().store(config::StoreType::Window(&raw)).unwrap(),
             block,
             "同内容同路径"
         );
@@ -1824,7 +1842,6 @@ mod tests {
         assert_eq!(s.windows.len(), 1);
     }
 
-
     /// 工具输出**原样**推给嵌入方：Session 不在这里截断——少显示是展示层的事（TUI 按
     /// `TOOL_BODY_LINES` 截、CLI 只取首行），
     /// 少回传给模型是工具自己配容量上限的事。
@@ -1860,9 +1877,7 @@ mod tests {
             cancel.cancel();
             let mut events: Vec<TurnEvent> = Vec::new();
             let mut sink = |e: TurnEvent| events.push(e);
-            let outcomes = session()
-                .tool_call(&calls, true, &cancel, &mut sink)
-                .await;
+            let outcomes = session().tool_call(&calls, true, &cancel, &mut sink).await;
             assert!(outcomes.iter().all(|o| o.is_none()));
             // 被取消的也要各推一条 `CANCEL_TEXT` 结果事件（每个 `tool_call_id` 都要有交代）
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
@@ -1936,7 +1951,14 @@ mod tests {
         assert!(stem.starts_with("img-") && stem.len() == 20, "{stem}");
         assert!(p1.to_string_lossy().ends_with(".png"), "{p1:?}");
         assert_eq!(std::fs::read(&p1).unwrap(), b"same-bytes");
-        assert_ne!(stem, blob(b"other", "image/png").file_stem().unwrap().to_string_lossy(), "不同内容不同 id");
+        assert_ne!(
+            stem,
+            blob(b"other", "image/png")
+                .file_stem()
+                .unwrap()
+                .to_string_lossy(),
+            "不同内容不同 id"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1973,7 +1995,6 @@ mod tests {
         ));
     }
 
-
     /// `repl` 出的图登记两条命脉：`local`（`files gc` 才认得“还被引用”）+ `calls`（`-r` 才配回画布）。
     #[test]
     fn repl_images_are_registered_for_gc_and_resume() {
@@ -2005,9 +2026,16 @@ mod tests {
 
         let hash = config::name_of(&image);
         assert_eq!(s.files[&hash]["local"], json!(image.display().to_string()));
-        assert_eq!(s.files[&hash]["calls"], json!(["c1"]), "记下那图是哪次调用产的");
+        assert_eq!(
+            s.files[&hash]["calls"],
+            json!(["c1"]),
+            "记下那图是哪次调用产的"
+        );
         assert_eq!(s.files[&hash]["src"], json!("repl"));
-        assert!(s.files[&hash].get("file_id").is_none(), "本地图不上传，没有 file_id");
+        assert!(
+            s.files[&hash].get("file_id").is_none(),
+            "本地图不上传，没有 file_id"
+        );
 
         // 同一次调用重复产出 → 不重复记；另一次调用再产出 → 追加
         s.record_repl_images(&call("c1"), &out());
@@ -2043,11 +2071,15 @@ mod tests {
             tools(),
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt
-            .block_on(s.ensure_image_file(b"bytes", "image/png", "x.png", "/tmp/x.png"))
-            .is_none());
+        assert!(
+            rt.block_on(s.ensure_image_file(b"bytes", "image/png", "x.png", "/tmp/x.png"))
+                .is_none()
+        );
         assert!(s.files.is_empty());
-        assert!(!storage().files().exists(), "不开这个功能就没必要多存一份副本");
+        assert!(
+            !storage().files().exists(),
+            "不开这个功能就没必要多存一份副本"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2128,19 +2160,15 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let blob = serde_json::to_string(
-            &Value::Array(
-                raws.iter()
-                    .map(|m| serde_json::to_value(m).unwrap())
-                    .collect(),
-            ),
-        )
+        let blob = serde_json::to_string(&Value::Array(
+            raws.iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect(),
+        ))
         .unwrap();
         let turn = raw(&blob, "turn");
-        let mut summary = Message::assistant(format!(
-            "[轮次原文已保存: {}]\n\n旧答复",
-            turn.display()
-        ));
+        let mut summary =
+            Message::assistant(format!("[轮次原文已保存: {}]\n\n旧答复", turn.display()));
         summary.compaction = Some(Compaction::turn(Some(&turn)));
         s.messages.push(summary);
 
@@ -2153,12 +2181,14 @@ mod tests {
         assert!(text.ends_with(full_text), "工具级展开成落盘全文：{text}");
         assert!(text.starts_with("[exit=0]"), "头区（退出码）要保住：{text}");
         assert!(
-            full.iter().any(|m| m.role == "assistant"
-                && m.content_text() == "旧答复"),
+            full.iter()
+                .any(|m| m.role == "assistant" && m.content_text() == "旧答复"),
             "轮次级展开成原文序列：{full:?}"
         );
         assert!(
-            !full.iter().any(|m| matches!(m.compaction, Some(Compaction::Turn { .. }))),
+            !full
+                .iter()
+                .any(|m| matches!(m.compaction, Some(Compaction::Turn { .. }))),
             "指针消息都展开完了"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2182,8 +2212,8 @@ mod tests {
 
         let full = s.full_history();
         assert!(
-            full.iter().any(|m| m.content_text()
-                .contains("[轮次原文已保存")),
+            full.iter()
+                .any(|m| m.content_text().contains("[轮次原文已保存")),
             "退回压缩形式：{full:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2236,7 +2266,10 @@ mod tests {
         let mut s = Session::new(&config, Some("blocks.jsonl"), llm(), tools());
         s.messages.push(Message {
             role: "assistant".into(),
-            tool_calls: Some(vec![repl_call("c1", "df = 1"), repl_call("c2", "df.head()")]),
+            tool_calls: Some(vec![
+                repl_call("c1", "df = 1"),
+                repl_call("c2", "df.head()"),
+            ]),
             ..Default::default()
         });
 
@@ -2249,7 +2282,10 @@ mod tests {
         // 2) 还在对话里 → 那节不该列它（避重复）
         s.refresh_runtime_state();
         let live = s.messages[0].content_text();
-        assert!(!live.contains("df.head()"), "还在对话里就不该列进那节：{live}");
+        assert!(
+            !live.contains("df.head()"),
+            "还在对话里就不该列进那节：{live}"
+        );
         assert!(live.ends_with(&config::runtime_state("")));
 
         // 3) 什么都没压 → 重拼逐字相同（前缀缓存不受影响）
@@ -2551,11 +2587,8 @@ mod tests {
                 max_retries: 0,
                 ..Config::default()
             };
-            let mut s = Session::ephemeral(
-                &config,
-                LlmClient::new(&config).expect("client"),
-                tools(),
-            );
+            let mut s =
+                Session::ephemeral(&config, LlmClient::new(&config).expect("client"), tools());
             let err = s
                 .aturn(
                     "看一下这个 bug",
@@ -2659,9 +2692,11 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("pie-sessempty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(Session::resume_in(&empty, None, &config, llm(), tools())
-            .unwrap_err()
-            .contains("没有历史会话"));
+        assert!(
+            Session::resume_in(&empty, None, &config, llm(), tools())
+                .unwrap_err()
+                .contains("没有历史会话")
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
     }

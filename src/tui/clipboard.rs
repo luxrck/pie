@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use arboard::Clipboard;
 
-
 /// 剪贴板里的文件只认这些后缀（含多收的 TIFF）。
 /// —— 复制个 `.txt` 过来不算图片（会落回「剪贴板里没有图片」，不往输入框塞路径）。
 const IMAGE_SUFFIXES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
@@ -32,16 +31,16 @@ const IMAGE_SUFFIXES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "t
 /// 返回的路径插进输入框，回车即普通 `read`：位图是新落盘的副本，文件列表是磁盘上原文件。
 pub fn paste_image(storage: &crate::config::Storage) -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
-    if let Ok(image) = clipboard.get_image() {
-        if let Some(path) = store_image(storage, &image) {
-            return Some(path);
-        }
+    if let Ok(image) = clipboard.get_image()
+        && let Some(path) = store_image(storage, &image)
+    {
+        return Some(path);
     }
     // 没有位图：macOS 的 furl / Windows 的 CF_HDROP / Linux 的 URI 列表都从这里出来。
-    if let Ok(storage) = clipboard.get().file_list() {
-        if let Some(path) = image_from_paths(&storage) {
-            return Some(path.display().to_string());
-        }
+    if let Ok(storage) = clipboard.get().file_list()
+        && let Some(path) = image_from_paths(&storage)
+    {
+        return Some(path.display().to_string());
     }
     None
 }
@@ -126,7 +125,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-paste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        crate::config::set_env("PIE_DIR", &dir);
 
         // 2x2 红色 RGBA
         let bytes = [255u8, 0, 0, 255].repeat(4);
@@ -170,4 +169,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

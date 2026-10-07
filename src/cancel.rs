@@ -6,8 +6,8 @@
 //!
 //! `Clone` 是共享语义（内部 `Arc`），所以能随手发给工具、传给等待点。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 

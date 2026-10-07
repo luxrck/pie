@@ -27,17 +27,17 @@ use crossterm::event::{
     MouseEventKind,
 };
 use futures_util::StreamExt;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use ratatui::Frame;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::cancel::{Cancel, CANCEL_TEXT};
+use crate::cancel::{CANCEL_TEXT, Cancel};
 use crate::llm::LlmError;
 use crate::session::{Session, TurnEvent};
 
@@ -45,10 +45,10 @@ use super::clipboard;
 use super::files;
 use ratatui_image::picker::Picker;
 
-use super::pane::{self, Cell, Pane};
-use super::repl::{Repl, Tab};
 use super::input::Input;
 use super::palette;
+use super::pane::{self, Cell, Pane};
+use super::repl::{Repl, Tab};
 use super::status::{self, Activity, Snapshot};
 use super::theme::{Palette, Status};
 
@@ -67,9 +67,14 @@ pub enum UiEvent {
     /// 进程级告警（压缩 / 图片…，见 `crate::log`）：**不能写 stderr**，进消息流
     Notice(String),
     /// 进度（重试次数…）：进消息流，同 `key` 的**就地更新同一个块**（不再一行一条）
-    Retry { key: String, text: String },
+    Retry {
+        key: String,
+        text: String,
+    },
     /// 这串进度（`key`）结束了：把那个块撤掉
-    RetryDone { key: String },
+    RetryDone {
+        key: String,
+    },
 }
 
 /// tick 间隔（约 15fps）：思考计时的秒数要跟着走，但不必更高。
@@ -399,10 +404,10 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => match self.drag {
                 Some(Surface::Input) => self.input.selection_extend(mouse.column, mouse.row),
                 Some(Surface::Log) => {
-                    if let Some((start, _)) = self.selection {
-                        if let Some(pt) = self.cell_at(mouse.column, mouse.row) {
-                            self.selection = Some((start, pt));
-                        }
+                    if let Some((start, _)) = self.selection
+                        && let Some(pt) = self.cell_at(mouse.column, mouse.row)
+                    {
+                        self.selection = Some((start, pt));
                     }
                 }
                 Some(Surface::Scrollbar) => self.scrollbar_jump(mouse.row),
@@ -460,7 +465,8 @@ impl App {
     fn scrollbar_jump(&mut self, row: u16) {
         if self.tab == Tab::Repl {
             // 画布那份：`Repl` 自己按上一帧的行数/高度换算（画布视图下 `self.body` 是空的）
-            self.repl.jump_to_row(row.saturating_sub(self.bar.y) as usize);
+            self.repl
+                .jump_to_row(row.saturating_sub(self.bar.y) as usize);
             return;
         }
         let height = self.body.height as usize;
@@ -539,8 +545,11 @@ impl App {
         };
         frame.render_widget(Clear, rect);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(text, self.palette.style_assistant())))
-                .block(Block::bordered().border_style(Style::default().fg(color))),
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                self.palette.style_assistant(),
+            )))
+            .block(Block::bordered().border_style(Style::default().fg(color))),
             rect,
         );
     }
@@ -553,7 +562,9 @@ impl App {
         } else {
             ((r2, c2), (r1, c1))
         };
-        let text = self.pane.slice_text(r1 as usize, c1 as usize, r2 as usize, c2 as usize);
+        let text = self
+            .pane
+            .slice_text(r1 as usize, c1 as usize, r2 as usize, c2 as usize);
         (!text.is_empty()).then_some(text)
     }
 
@@ -561,7 +572,14 @@ impl App {
     ///
     /// 轨道那一列宽度是**固定**留出来的（见 `render`），画不画都不影响排版 —— 消息流与 REPL 画布
     /// 各调一次，`total` / `top` / `height` 都是各自那一份。
-    fn render_scrollbar(&self, frame: &mut Frame, bar: Rect, total: usize, top: usize, height: u16) {
+    fn render_scrollbar(
+        &self,
+        frame: &mut Frame,
+        bar: Rect,
+        total: usize,
+        top: usize,
+        height: u16,
+    ) {
         if bar.width == 0 || total <= height as usize {
             return;
         }
@@ -775,10 +793,10 @@ impl App {
                     Err(e) => self.cells.push(Cell::Error(format!("{e}"))),
                 }
                 // 回合里若新建了助手 cell，去掉尾部的空行（没有正文的回合不留空块）
-                if let Some(Cell::Assistant { text, .. }) = self.cells.last() {
-                    if text.trim().is_empty() {
-                        self.cells.pop();
-                    }
+                if let Some(Cell::Assistant { text, .. }) = self.cells.last()
+                    && text.trim().is_empty()
+                {
+                    self.cells.pop();
                 }
                 self.snapshot = snapshot;
                 self.snapshot.busy = false;
@@ -953,7 +971,8 @@ impl App {
         match snapshot {
             Some(snapshot) => self.snapshot = snapshot,
             // 回合进行中：cwd 已经切了（下一轮开头会反映进 system prompt），数据目录下次再切
-            None => self.push_notice("会话正忙：目录已切；数据目录的切换请等这个回合结束后再 `/cd` 一次"),
+            None => self
+                .push_notice("会话正忙：目录已切；数据目录的切换请等这个回合结束后再 `/cd` 一次"),
         }
         self.cells.push(Cell::Notice(text));
         // `@` 补全的索引与补全会话都是按旧 cwd 建的 → 作废，下次用会在新目录重建
@@ -1025,7 +1044,7 @@ impl App {
                     crate::llm::RequestOptions::default(),
                 )
                 .await;
-                let snapshot = Snapshot::capture(&guard);
+            let snapshot = Snapshot::capture(&guard);
             let _ = tx.send(UiEvent::TurnDone(result, snapshot));
         });
     }
@@ -1173,7 +1192,9 @@ impl App {
         }
         let fresh = self.file_index.is_some()
             && !self.index_stale
-            && self.index_built.is_some_and(|at| at.elapsed() < FILE_INDEX_TTL);
+            && self
+                .index_built
+                .is_some_and(|at| at.elapsed() < FILE_INDEX_TTL);
         if fresh {
             return;
         }
@@ -1300,7 +1321,9 @@ impl App {
     /// 写「没什么可滚的就给消息流」是因为光标很容易停在输入框上：那时滚轮应该照旧翻对话，
     /// 否则输入框会变成一块“死区”。
     fn wheel(&mut self, mouse: MouseEvent, delta: i32) {
-        if self.surface_at(mouse.column, mouse.row) == Some(Surface::Input) && self.input.overflows() {
+        if self.surface_at(mouse.column, mouse.row) == Some(Surface::Input)
+            && self.input.overflows()
+        {
             self.input.wheel(mouse);
         } else if self.tab == Tab::Repl {
             self.repl.scroll(delta);
@@ -1339,11 +1362,11 @@ impl App {
     /// 不会互相把内容改掉。
     fn push_retry(&mut self, key: &str, text: &str) {
         for cell in self.cells.iter_mut().rev() {
-            if let Cell::Retry { key: k, text: t } = cell {
-                if k == key {
-                    *t = text.to_string();
-                    return;
-                }
+            if let Cell::Retry { key: k, text: t } = cell
+                && k == key
+            {
+                *t = text.to_string();
+                return;
             }
         }
         self.cells.push(Cell::Retry {
@@ -1363,7 +1386,8 @@ impl App {
     /// 模型恢复响应了（或回合收尾）：重试块是**临时进度**，一并撤掉（含启动时拉模型列表
     /// 留下的那块——它已经过时了）。
     fn settle_retry(&mut self) {
-        self.cells.retain(|cell| !matches!(cell, Cell::Retry { .. }));
+        self.cells
+            .retain(|cell| !matches!(cell, Cell::Retry { .. }));
     }
 
     // ---------------------------------------------------------------- 渲染
@@ -1420,7 +1444,13 @@ impl App {
             };
             self.repl.render(frame, body, &self.palette);
             // 画布自己那份滚动条（行数/偏移都是它上一帧排版的记账）
-            self.render_scrollbar(frame, self.bar, self.repl.total(), self.repl.top(), body.height);
+            self.render_scrollbar(
+                frame,
+                self.bar,
+                self.repl.total(),
+                self.repl.top(),
+                body.height,
+            );
         } else {
             // 消息流右缘留 1 列给滚动条（**固定**留：折行宽度与 markdown 缓存键都吃 `width`，
             // 若「有溢出才留」，跨过阈值那一下会换宽度 → 整段重排 + 缓存全失效）。
@@ -1464,8 +1494,10 @@ impl App {
         if !panel.is_empty() {
             frame.render_widget(Paragraph::new(panel), palette_area);
         }
-        self.input
-            .set_placeholder(status::hint_text(self.busy, self.tab), self.palette.style_faint());
+        self.input.set_placeholder(
+            status::hint_text(self.busy, self.tab),
+            self.palette.style_faint(),
+        );
         self.input.render(frame, input, &self.palette, self.focused);
         // 插入符的屏幕位置（上面 `render` 里刚更新过 `rect` / `scroll_top`）：`run` 每帧拿它去
         // 摆终端光标，好让输入法的候选框跟在输入框的光标上（见 [`App::run`]）。
@@ -1520,8 +1552,8 @@ impl App {
     /// 用 `TestBackend` 渲染一帧并返回屏幕文本（快照测试用）。
     #[cfg(test)]
     pub fn render_to_string(&mut self, width: u16, height: u16) -> String {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| self.render(frame)).expect("draw");
@@ -1694,7 +1726,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let saved_cwd = std::env::current_dir().unwrap();
         let saved_pie = std::env::var_os("PIE_DIR");
-        std::env::remove_var("PIE_DIR");
+        crate::config::unset_env("PIE_DIR");
 
         let target = std::env::temp_dir().join(format!("pie-cd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&target);
@@ -1708,11 +1740,18 @@ mod tests {
         app.submit();
 
         assert_eq!(std::env::current_dir().unwrap(), target, "cwd 切过去了");
-        assert_eq!(app.storage.root, shown, "数据目录跟着走（新 cwd 下有 .pie）");
+        assert_eq!(
+            app.storage.root, shown,
+            "数据目录跟着走（新 cwd 下有 .pie）"
+        );
         {
             let session = app.session.try_lock().unwrap();
             assert_eq!(session.config.storage.root, shown, "会话那份也刷新了");
-            assert_eq!(session.messages.len(), 1, "历史里不该多出消息（只剩 system prompt）");
+            assert_eq!(
+                session.messages.len(),
+                1,
+                "历史里不该多出消息（只剩 system prompt）"
+            );
             assert_eq!(session.messages[0].role, "system");
         }
         let text = target.display().to_string();
@@ -1723,8 +1762,8 @@ mod tests {
 
         std::env::set_current_dir(&saved_cwd).unwrap();
         match saved_pie {
-            Some(v) => std::env::set_var("PIE_DIR", v),
-            None => std::env::remove_var("PIE_DIR"),
+            Some(v) => crate::config::set_env("PIE_DIR", v),
+            None => crate::config::unset_env("PIE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&target);
     }
@@ -1855,8 +1894,8 @@ mod tests {
 
     /// 渲染一帧并留下 `Buffer`（要断言**颜色**时用；`render_to_string` 只留文本）。
     fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| app.render(frame)).expect("draw");
@@ -1978,7 +2017,10 @@ mod tests {
         let screen = app.render_to_string(80, 24);
         let flat = squash(&screen);
         assert!(flat.contains("▸/compact"), "面板高亮首项：{screen}");
-        assert!(flat.contains("/compactturns"), "多词命令也在候选里：{screen}");
+        assert!(
+            flat.contains("/compactturns"),
+            "多词命令也在候选里：{screen}"
+        );
 
         // Tab 接受高亮候选
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1993,10 +2035,16 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.palette_visible(), "Esc 收起面板");
         let screen = app.render_to_string(80, 24);
-        assert!(!squash(&screen).contains("▸/compact"), "收起后不渲染：{screen}");
+        assert!(
+            !squash(&screen).contains("▸/compact"),
+            "收起后不渲染：{screen}"
+        );
         app.input.insert("m");
         let screen = app.render_to_string(80, 24);
-        assert!(squash(&screen).contains("▸/compact"), "输入一变又回来：{screen}");
+        assert!(
+            squash(&screen).contains("▸/compact"),
+            "输入一变又回来：{screen}"
+        );
     }
 
     #[test]
@@ -2042,7 +2090,10 @@ mod tests {
         app.input.insert("看看 @app 的实现");
         move_left(&mut app, 4); // " 的实现" ← 挪回 `app` 后面
         let (items, from) = app.completions();
-        assert_eq!(items.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(), ["src/tui/app.rs"]);
+        assert_eq!(
+            items.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(),
+            ["src/tui/app.rs"]
+        );
         assert_eq!(from, Some((0, 3)), "替换起点是 `@` 那一列（连它一起替换）");
         assert!(app.palette_visible());
         let screen = app.render_to_string(80, 24);
@@ -2061,7 +2112,11 @@ mod tests {
         let dir = files_tmp("noindex");
         let (mut app, _rx) = app_with_rx();
         app.input.set_text("@app");
-        assert!(!app.palette_visible(), "没索引就不弹：{:?}", app.completions().0);
+        assert!(
+            !app.palette_visible(),
+            "没索引就不弹：{:?}",
+            app.completions().0
+        );
 
         app.file_index = Some(Arc::new(files::Index::build(&dir)));
         assert!(app.palette_visible());
@@ -2071,7 +2126,8 @@ mod tests {
         assert!(!app.palette_visible());
         // 光标在 `@` 左边也不弹
         app.input.set_text("@app");
-        app.input.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.input
+            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert!(!app.palette_visible());
     }
 
@@ -2090,7 +2146,10 @@ mod tests {
 
         app.input.set_text("@src");
         assert_eq!(app.completions().0[0].0, "src/", "首个候选是目录自己");
-        assert!(!app.enter_accepts_candidate(), "目录候选回车不动它（那是 Tab 的活）");
+        assert!(
+            !app.enter_accepts_candidate(),
+            "目录候选回车不动它（那是 Tab 的活）"
+        );
         // 已定下来的 `/` 命令不改，半截命令仍要先补全（原有行为）
         app.input.set_text("/status");
         assert!(!app.enter_accepts_candidate());
@@ -2111,7 +2170,11 @@ mod tests {
         assert_eq!(app.input.text(), "src/");
         // 目录已接受：面板不倒，直接列这一层的子项（都是 `dir/xxx` 的完整相对路径）
         let items: Vec<String> = app.completions().0.into_iter().map(|(i, _)| i).collect();
-        assert_eq!(items, ["src/session.rs", "src/tui/"], "接着列 `src/` 的下一层");
+        assert_eq!(
+            items,
+            ["src/session.rs", "src/tui/"],
+            "接着列 `src/` 的下一层"
+        );
         assert!(app.palette_visible());
         let screen = app.render_to_string(80, 24);
         assert!(squash(&screen).contains("▸src/session.rs"), "{screen}");
@@ -2196,7 +2259,9 @@ mod tests {
         let (mut app, _rx) = app_with_rx();
         app.input.set_text("@app");
         app.index_building = true;
-        app.on_turn_event(UiEvent::FilesIndex(Some(Arc::new(files::Index::build(&dir)))));
+        app.on_turn_event(UiEvent::FilesIndex(Some(Arc::new(files::Index::build(
+            &dir,
+        )))));
         assert!(!app.index_building, "到了就不再算「在建」");
         assert!(!app.index_stale);
         assert!(app.palette_visible(), "索引到了就能弹面板");
@@ -2204,7 +2269,11 @@ mod tests {
         app.on_turn_event(UiEvent::FilesIndex(None));
         assert!(app.file_index.is_none());
         assert!(!app.palette_visible());
-        assert!(last_notice(&app).contains("索引失败"), "{}", last_notice(&app));
+        assert!(
+            last_notice(&app).contains("索引失败"),
+            "{}",
+            last_notice(&app)
+        );
     }
 
     /// 插入符位置每帧都要记下（`run` 用它在 `draw` 之后摆终端光标，IME 的候选框跟着它走）。
@@ -2277,7 +2346,9 @@ mod tests {
         let llm = crate::llm::LlmClient::new(&config).expect("client");
         let tools = crate::tools::ToolRegistry::new(Default::default());
         let mut session = Session::ephemeral(&config, llm, tools);
-        session.messages.push(crate::llm::Message::user("上次的问题"));
+        session
+            .messages
+            .push(crate::llm::Message::user("上次的问题"));
         session.messages.push(crate::llm::Message {
             role: "assistant".into(),
             content: Some(crate::llm::Content::Text("上次的回答".into())),
@@ -2382,7 +2453,11 @@ mod tests {
 
     /// 拖选从 `(x, y)` 到 `(x2, y2)`（先点后拖，不松手）。
     fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) {
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), from.0, from.1));
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            from.0,
+            from.1,
+        ));
         app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1));
     }
 
@@ -2392,7 +2467,10 @@ mod tests {
         app.toast("已复制 146 字符到剪贴板", true);
         let screen = app.render_to_string(48, 12);
         let flat = squash(&screen);
-        assert!(flat.contains("已复制146字符到剪贴板"), "弹出提示：\n{screen}");
+        assert!(
+            flat.contains("已复制146字符到剪贴板"),
+            "弹出提示：\n{screen}"
+        );
         // 右下角：盒子最后一行的右端就是屏幕右端，且**不盖住输入框**
         let lines: Vec<&str> = screen.lines().collect();
         let box_bottom = lines.iter().rposition(|l| l.contains('已')).unwrap();
@@ -2410,7 +2488,10 @@ mod tests {
             .unwrap_or_else(Instant::now);
         app.toast.as_mut().unwrap().until = past;
         let screen = app.render_to_string(48, 12);
-        assert!(!squash(&screen).contains("已复制"), "3 秒后自动消失：\n{screen}");
+        assert!(
+            !squash(&screen).contains("已复制"),
+            "3 秒后自动消失：\n{screen}"
+        );
         assert!(app.toast.is_none(), "过期就清掉状态");
     }
 
@@ -2433,7 +2514,10 @@ mod tests {
         let screen = app.render_to_string(80, 24);
         assert_eq!(screen.matches('⟳').count(), 1, "只留一个块：\n{screen}");
         assert!(squash(&screen).contains("第2/3次重试"), "{screen}");
-        assert!(!squash(&screen).contains("第1/3次重试"), "旧内容被改写：{screen}");
+        assert!(
+            !squash(&screen).contains("第1/3次重试"),
+            "旧内容被改写：{screen}"
+        );
 
         // 另一条流程（启动时拉模型列表）**各占一块**，不互相覆盖
         app.on_turn_event(retry("模型列表请求", 1));
@@ -2441,9 +2525,16 @@ mod tests {
         assert_eq!(screen.matches('⟳').count(), 2, "两条流程各一块：\n{screen}");
         app.on_turn_event(retry("模型列表请求", 2));
         let screen = app.render_to_string(80, 24);
-        assert_eq!(screen.matches('⟳').count(), 2, "同 key 刷新不新增：\n{screen}");
+        assert_eq!(
+            screen.matches('⟳').count(),
+            2,
+            "同 key 刷新不新增：\n{screen}"
+        );
         let flat = squash(&screen);
-        assert!(flat.contains("流式请求失败") && flat.contains("模型列表请求失败"), "{screen}");
+        assert!(
+            flat.contains("流式请求失败") && flat.contains("模型列表请求失败"),
+            "{screen}"
+        );
 
         // 这串进度结束（`with_retry` 出口）→ 只撤自己那块
         app.on_turn_event(UiEvent::RetryDone {
@@ -2492,11 +2583,7 @@ mod tests {
 
         // 输入框里按下 + 拖到第 5 格 → 选中 "hello"
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
-        app.on_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            x + 5,
-            y,
-        ));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y));
         assert_eq!(app.input.selection_text().as_deref(), Some("hello"));
         assert!(app.selection.is_none(), "输入框里拖选不该起消息流选区");
 
@@ -2526,8 +2613,16 @@ mod tests {
         let second = (x, rect.y + 2);
 
         // 点第二行第 2 格：光标跟着走（上下行都能命中）
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), second.0 + 2, second.1));
-        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.0 + 2, second.1));
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second.0 + 2,
+            second.1,
+        ));
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            second.0 + 2,
+            second.1,
+        ));
         let (line, col) = app.input.hit(second.0 + 2, second.1).expect("命中第二行");
         assert_eq!((line, col), (1, 1), "点在第 2 行第 2 格");
         assert!(app.input.selection_text().is_none(), "点一下不算选区");
@@ -2555,8 +2650,15 @@ mod tests {
         assert!(app.drag.is_some(), "拖动中记着拖的是哪个面");
         assert!(!app.input.has_selection());
         // 松开：走消息流那条收尾
-        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), body.x + 3, body.y));
-        assert!(app.drag.is_none() && app.selection.is_none(), "消息流选区松开即取走");
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 3,
+            body.y,
+        ));
+        assert!(
+            app.drag.is_none() && app.selection.is_none(),
+            "消息流选区松开即取走"
+        );
     }
 
     #[test]
@@ -2568,7 +2670,11 @@ mod tests {
         let body = app.body;
         let rect = app.input.rect();
         // 从消息流按下，一路拖到输入框上面：拖的还是消息流（按下那一刻定下的）
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), body.x, body.y));
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x,
+            body.y,
+        ));
         app.on_mouse(mouse(
             MouseEventKind::Drag(MouseButton::Left),
             rect.x + 2,
@@ -2581,8 +2687,9 @@ mod tests {
     #[test]
     fn mouse_drag_copies_wrapped_line_as_one_line() {
         let mut app = test_app();
-        app.cells
-            .push(Cell::User("hello world 这是一个很长的句子用来测试折行".into()));
+        app.cells.push(Cell::User(
+            "hello world 这是一个很长的句子用来测试折行".into(),
+        ));
         app.render_to_string(30, 12); // 先渲染一帧：App 才会记下区域 / 偏移 / 排版
         let body = app.body;
         drag(
@@ -2738,7 +2845,10 @@ mod tests {
             .find(|l| l.starts_with("· 第"))
             .unwrap_or_default()
             .to_string();
-        assert!(first.starts_with("· 第"), "选到的是当前可见的那一行：{text:?}");
+        assert!(
+            first.starts_with("· 第"),
+            "选到的是当前可见的那一行：{text:?}"
+        );
         assert!(
             first != "· 第19行",
             "滚上去之后选到的不该是最后一行：{text:?}"
@@ -2797,8 +2907,14 @@ mod tests {
         // 提示在输入框内容的第一行；输入框只在下面留一行（状态栏）
         let rect = app.input.rect();
         assert_eq!(rect.bottom(), h - 1, "输入框下方只剩状态栏：{rect:?}");
-        assert!(squash(row(rect.y as usize + 1)).contains("⏎发送"), "\n{screen}");
-        assert!(squash(row(rect.y as usize + 2)).is_empty(), "最后一行留白：\n{screen}");
+        assert!(
+            squash(row(rect.y as usize + 1)).contains("⏎发送"),
+            "\n{screen}"
+        );
+        assert!(
+            squash(row(rect.y as usize + 2)).is_empty(),
+            "最后一行留白：\n{screen}"
+        );
 
         // placeholder 语义：有字就不显示
         app.input.insert("你好");
@@ -2914,10 +3030,7 @@ mod tests {
             status.starts_with(" cr deepseek-flash"),
             "模型名紧跟视图指示（不再有 `pie` 前缀）：{status:?}"
         );
-        assert!(
-            dir.join("config.toml").exists(),
-            "配置写回了指定的那个文件"
-        );
+        assert!(dir.join("config.toml").exists(), "配置写回了指定的那个文件");
 
         // 补全面板的「← 当前」读的是同一份快照
         app.input.set_text("/thinking ");
@@ -2950,11 +3063,7 @@ mod tests {
         let started = since_of(&app).expect("第一个增量开表");
         std::thread::sleep(std::time::Duration::from_millis(20));
         app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("第二".into())));
-        assert_eq!(
-            since_of(&app),
-            Some(started),
-            "第二个增量不能把起点往后挪"
-        );
+        assert_eq!(since_of(&app), Some(started), "第二个增量不能把起点往后挪");
     }
 
     #[test]
@@ -3088,7 +3197,10 @@ mod tests {
                 "{cmd} 不该进消息流（那是发给模型的）"
             );
             let notice = last_notice(&app);
-            assert!(notice.contains(needle), "{cmd} → 提示里该说 {needle}：{notice}");
+            assert!(
+                notice.contains(needle),
+                "{cmd} → 提示里该说 {needle}：{notice}"
+            );
         }
         assert!(!app.should_quit, "/quit 不再退出（只有 /exit 与 Ctrl+C）");
 
@@ -3119,10 +3231,12 @@ mod tests {
     /// 不重定向就落到用户真实的 `~/.pie/`。
     #[test]
     fn clear_archives_window_and_reset_wipes_history() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-tui-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("PIE_DIR", &dir);
+        crate::config::set_env("PIE_DIR", &dir);
 
         let mut app = test_app();
         app.cells.push(Cell::User("旧消息".into()));
@@ -3148,7 +3262,11 @@ mod tests {
             !app.cells.iter().any(|c| matches!(c, Cell::User(_))),
             "reset 清屏（只剩命令反馈那条 Notice）"
         );
-        assert!(last_notice(&app).contains("已清空"), "{}", last_notice(&app));
+        assert!(
+            last_notice(&app).contains("已清空"),
+            "{}",
+            last_notice(&app)
+        );
         assert_eq!(app.session.try_lock().expect("空闲").messages.len(), 1);
     }
 
@@ -3236,7 +3354,9 @@ mod tests {
             "工具行进了消息流"
         );
         assert!(
-            app.cells.iter().any(|c| matches!(c, Cell::Assistant { text, .. } if text == "正在改文件")),
+            app.cells
+                .iter()
+                .any(|c| matches!(c, Cell::Assistant { text, .. } if text == "正在改文件")),
             "正文增量都攒在同一条上"
         );
         // 队列空着时不吃任何东西
@@ -3270,11 +3390,22 @@ mod tests {
         let buf = render_buffer(&mut app, W, 12);
         assert_eq!(app.body.width, W - 1, "右缘固定留 1 列给滚动条");
         let bar_x = app.body.right();
-        assert_eq!(app.bar, Rect { x: bar_x, width: 1, ..app.body }, "滚动条那列在消息流右缘");
+        assert_eq!(
+            app.bar,
+            Rect {
+                x: bar_x,
+                width: 1,
+                ..app.body
+            },
+            "滚动条那列在消息流右缘"
+        );
         let bar_col: Vec<&str> = (0..app.body.height)
             .map(|y| buf[(bar_x, app.body.y + y)].symbol())
             .collect();
-        assert!(bar_col.iter().all(|s| *s == " "), "没溢出就不画：{bar_col:?}");
+        assert!(
+            bar_col.iter().all(|s| *s == " "),
+            "没溢出就不画：{bar_col:?}"
+        );
 
         // 撑到溢出（行数 > 视口高）→ 出现 thumb
         for i in 0..40 {
@@ -3285,7 +3416,10 @@ mod tests {
             .filter(|y| buf[(bar_x, app.body.y + y)].symbol() == "▐")
             .count();
         assert!(drawn > 0, "溢出时该画出 thumb");
-        assert!(drawn < app.body.height as usize, "thumb 不该铺满整条：{drawn}");
+        assert!(
+            drawn < app.body.height as usize,
+            "thumb 不该铺满整条：{drawn}"
+        );
     }
 
     /// **滚到底时 thumb 必须贴住轨道底**（贴顶时贴住轨道顶）。
@@ -3352,7 +3486,11 @@ mod tests {
         assert_eq!(app.surface_at(bar_x - 1, app.body.y), Some(Surface::Log));
 
         // 点在滚动条**顶部** → 跳到最早处
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar_x, app.body.y));
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar_x,
+            app.body.y,
+        ));
         assert_eq!(app.scroll_from_bottom, app.max_scroll(), "顶部 = 贴顶");
         assert!(app.selection.is_none(), "滚动条上不起选区");
         render_buffer(&mut app, 40, 12); // `scroll_top` 只在渲染时重算
@@ -3400,8 +3538,15 @@ mod tests {
         assert_eq!(app.body, Rect::default(), "画布视图下不占消息流那份几何");
         assert_eq!(app.bar.width, 1, "画布右缘留 1 列给滚动条");
         assert_eq!(app.bar.x, 39, "就在屏幕最右缘");
-        assert_eq!(app.surface_at(app.bar.x, app.bar.y), Some(Surface::Scrollbar));
-        assert_eq!(app.surface_at(app.bar.x - 1, app.bar.y), None, "画布本身不成框选面");
+        assert_eq!(
+            app.surface_at(app.bar.x, app.bar.y),
+            Some(Surface::Scrollbar)
+        );
+        assert_eq!(
+            app.surface_at(app.bar.x - 1, app.bar.y),
+            None,
+            "画布本身不成框选面"
+        );
         let total = app.repl.total();
         assert!(total > app.bar.height as usize, "内容该溢出：total={total}");
         // thumb 真的画在那一列（`▐`），且没铺满整条
@@ -3416,7 +3561,11 @@ mod tests {
 
         // 点滚动条顶端 → 画布贴顶；消息流那份偏移不动
         let stream = app.scroll_from_bottom;
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), app.bar.x, app.bar.y));
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.bar.x,
+            app.bar.y,
+        ));
         assert!(app.selection.is_none(), "滚动条上不起选区");
         render_buffer(&mut app, 40, 12); // `top` 只在渲染时重算
         assert_eq!(app.repl.top(), 0, "画布贴顶");
@@ -3429,7 +3578,11 @@ mod tests {
             app.bar.bottom() - 1,
         ));
         render_buffer(&mut app, 40, 12);
-        assert_eq!(app.repl.top(), total - app.bar.height as usize, "拖到底 = 贴底");
+        assert_eq!(
+            app.repl.top(),
+            total - app.bar.height as usize,
+            "拖到底 = 贴底"
+        );
         app.on_mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
             app.bar.x,

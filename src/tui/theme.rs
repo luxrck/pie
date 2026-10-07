@@ -93,7 +93,9 @@ impl Palette {
         match name.trim().to_lowercase().as_str() {
             "mocha" | "catppuccin-mocha" | "catppuccin" => Some(Self::mocha()),
             "macchiato" | "catppuccin-macchiato" => Some(Self::macchiato()),
-            "frappe" | "frappé" | "catppuccin-frappe" | "catppuccin-frappé" => Some(Self::frappe()),
+            "frappe" | "frappé" | "catppuccin-frappe" | "catppuccin-frappé" => {
+                Some(Self::frappe())
+            }
             "latte" | "catppuccin-latte" => Some(Self::latte()),
             _ => None,
         }
@@ -108,7 +110,9 @@ impl Palette {
             Some(palette) => (palette, None),
             None => (
                 Self::mocha(),
-                Some(format!("[theme] 认不出的主题 `{name}`，按 catppuccin-mocha 显示")),
+                Some(format!(
+                    "[theme] 认不出的主题 `{name}`，按 catppuccin-mocha 显示"
+                )),
             ),
         }
     }
@@ -339,7 +343,14 @@ mod tests {
             let got = Palette::from_name(name).unwrap_or_else(|| panic!("`{name}` 应该认得"));
             assert_eq!(fields(&got), fields(&want), "`{name}` 解错 flavor 了");
         }
-        for name in ["", "  ", "dracula", "catppuccin-", "mochaa", "catppuccin - latte"] {
+        for name in [
+            "",
+            "  ",
+            "dracula",
+            "catppuccin-",
+            "mochaa",
+            "catppuccin - latte",
+        ] {
             assert!(Palette::from_name(name).is_none(), "`{name}` 不该认");
         }
     }
@@ -350,8 +361,14 @@ mod tests {
         let (p, warning) = Palette::resolve("dracula");
         assert_eq!(fields(&p), fields(&Palette::mocha()), "认不出就用 mocha");
         let warning = warning.expect("认不出要提一句");
-        assert!(warning.starts_with("[theme]"), "告警样式要与别的告警一致：{warning}");
-        assert!(warning.contains("dracula"), "告警里要带上认不出的名字：{warning}");
+        assert!(
+            warning.starts_with("[theme]"),
+            "告警样式要与别的告警一致：{warning}"
+        );
+        assert!(
+            warning.contains("dracula"),
+            "告警里要带上认不出的名字：{warning}"
+        );
         // 空串（用户写了 `theme = ""`）走同一条退路
         assert!(Palette::resolve("").1.is_some());
     }

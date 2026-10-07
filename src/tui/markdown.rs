@@ -172,7 +172,10 @@ mod tests {
         );
         let text = plain(narrow);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'), "{text}");
+        assert!(
+            lines[0].starts_with('┌') && lines[0].ends_with('┐'),
+            "{text}"
+        );
         assert!(
             lines.last().unwrap().starts_with('└') && lines.last().unwrap().ends_with('┘'),
             "{text}"
@@ -180,12 +183,16 @@ mod tests {
         // 边框对齐：每一行的首尾字符都是竖线（折行后的续行也是）
         for line in &lines {
             assert!(
-                line.starts_with('│') || line.starts_with('┌') || line.starts_with('├')
+                line.starts_with('│')
+                    || line.starts_with('┌')
+                    || line.starts_with('├')
                     || line.starts_with('└'),
                 "每行都要以边框开头：{line:?}"
             );
             assert!(
-                line.ends_with('│') || line.ends_with('┐') || line.ends_with('┤')
+                line.ends_with('│')
+                    || line.ends_with('┐')
+                    || line.ends_with('┤')
                     || line.ends_with('┘'),
                 "每行都要以边框结尾：{line:?}"
             );
@@ -235,11 +242,17 @@ mod tests {
         let src = "| 一个很长很长的表头单元格内容 | 另一个很长的表头 |\n|---|---|\n";
         let text = plain(cache.get(src, 30));
         assert!(text.starts_with('┌'), "{text}");
-        assert!(widths(cache.get(src, 30)).iter().all(|w| *w <= 30), "{text}");
+        assert!(
+            widths(cache.get(src, 30)).iter().all(|w| *w <= 30),
+            "{text}"
+        );
         // 单列表
         let src = "| 唯一一列很长很长很长很长的内容 |\n|---|\n| 值也很长很长很长很长很长很长 |\n";
         let text = plain(cache.get(src, 20));
-        assert!(widths(cache.get(src, 20)).iter().all(|w| *w <= 20), "{text}");
+        assert!(
+            widths(cache.get(src, 20)).iter().all(|w| *w <= 20),
+            "{text}"
+        );
         // 窄到装不下三列的边框（预算被夹住）也不能崩
         let _ = plain(cache.get(TABLE, 8));
     }

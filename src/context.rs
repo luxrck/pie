@@ -284,12 +284,16 @@ pub fn compact_session(
         let span = &messages[1..];
         let archivable: Vec<Value> = span
             .iter()
-            .filter(|m| !(m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. }))))
+            .filter(|m| {
+                !(m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. })))
+            })
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect();
         let kept: Vec<Message> = span
             .iter()
-            .filter(|m| m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. })))
+            .filter(|m| {
+                m.role == "system" && matches!(m.compaction, Some(Compaction::Session { .. }))
+            })
             .cloned()
             .collect();
         (archivable, kept)
@@ -424,10 +428,9 @@ fn compact_turns(
             if span.is_empty() {
                 continue; // 连续 user，没有内容
             }
-            if span
-                .iter()
-                .all(|m| m.role == "assistant" && matches!(m.compaction, Some(Compaction::Turn { .. })))
-            {
+            if span.iter().all(|m| {
+                m.role == "assistant" && matches!(m.compaction, Some(Compaction::Turn { .. }))
+            }) {
                 continue; // 已经轮次级压过
             }
             victim = Some((u, end));
@@ -571,10 +574,10 @@ pub fn compact(
         return (stats, events);
     };
     let mut push = |e| events.push(e);
-    if matches!(mode, CompactMode::Auto | CompactMode::Tools) {
-        if let Some(tool_config) = &compaction.tool {
-            stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
-        }
+    if matches!(mode, CompactMode::Auto | CompactMode::Tools)
+        && let Some(tool_config) = &compaction.tool
+    {
+        stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
     }
     if matches!(mode, CompactMode::Auto | CompactMode::Turns) && compaction.turn {
         stats.turns = compact_turns(messages, &config.storage, &mut push);
@@ -616,9 +619,7 @@ mod tests {
 
     /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，只为测试读起来短）。
     fn raw(body: &str, prefix: &str) -> PathBuf {
-        storage()
-            .store(StoreType::Raw { prefix, body })
-            .unwrap()
+        storage().store(StoreType::Raw { prefix, body }).unwrap()
     }
 
     /// 测试会改进程级 `PIE_DIR` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
@@ -633,7 +634,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-ctx-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("PIE_DIR", &dir);
+        crate::config::set_env("PIE_DIR", &dir);
         dir
     }
 
@@ -694,7 +695,10 @@ mod tests {
         assert_eq!(n, 1, "只压保护窗口（最近 1 个 step 批次）之外的那条");
         assert_eq!(msgs[4].compaction, None, "最近一批受保护");
         let compressed = &msgs[2];
-        assert!(matches!(compressed.compaction, Some(Compaction::Tool { .. })));
+        assert!(matches!(
+            compressed.compaction,
+            Some(Compaction::Tool { .. })
+        ));
         let text = compressed.content_text();
         assert!(text.starts_with("[工具输出全文已保存: "), "{text}");
         assert!(
@@ -793,7 +797,10 @@ mod tests {
         assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[0].content_text(), "当前提示词", "system 不动");
-        assert!(matches!(msgs[1].compaction, Some(Compaction::Session { .. })));
+        assert!(matches!(
+            msgs[1].compaction,
+            Some(Compaction::Session { .. })
+        ));
         let text = msgs[1].content_text();
         assert!(text.starts_with(WINDOW_SUMMARY_MARKER), "{text}");
         assert!(
@@ -875,7 +882,11 @@ mod tests {
         ];
         let (_, events) = maybe_compact(&mut msgs, &config, Some(9999));
         assert!(events.iter().all(|e| e.level() < 3), "{events:?}");
-        assert!(msgs.iter().all(|m| !matches!(m.compaction, Some(Compaction::Session { .. }))), "{msgs:?}");
+        assert!(
+            msgs.iter()
+                .all(|m| !matches!(m.compaction, Some(Compaction::Session { .. }))),
+            "{msgs:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -929,8 +940,15 @@ mod tests {
         // 这正是 `aturn` 回填工具结果时做的事：标工具级元数据，顺手产一条事件
         let mut msg = Message::tool_result("c1", "bash", "line 1\n...\nline 200\n");
         msg.compaction = Some(Compaction::tool(&full));
-        assert_eq!(msg.compaction, Some(Compaction::tool(&full)), "落盘即工具级");
-        assert_eq!(msg.compaction.as_ref().and_then(Compaction::path), Some(full.to_str().unwrap()));
+        assert_eq!(
+            msg.compaction,
+            Some(Compaction::tool(&full)),
+            "落盘即工具级"
+        );
+        assert_eq!(
+            msg.compaction.as_ref().and_then(Compaction::path),
+            Some(full.to_str().unwrap())
+        );
         // 没落盘 → 不标
         let plain = Message::tool_result("c2", "read", "x");
         assert!(plain.compaction.is_none());

@@ -1,7 +1,7 @@
 [package]
 name = "pie"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "pi 的 Rust 实现：极简 agent harness（YOLO——无权限确认、无沙箱；内置 read/edit/writ/bash）"
 license = "MIT"
 
@@ -45,18 +45,27 @@ tui = [
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "fs", "time", "signal", "sync"] }
 # TLS 用 rustls（provider = ring），不用 native-tls/OpenSSL：
 #   - 不依赖系统的 libssl-dev / pkg-config，跨平台行为一致；
-#   - native-roots = 读系统信任库（和 Python 那版一致，能认系统里装的企业 CA）。
+#   - 0.13 起 `rustls-tls` 改名 `rustls`，而 `rustls` 默认带 aws-lc-rs（一大坨 C 构建，跨平台要 cmake/NASM）
+#     → 我们走 `rustls-no-provider`，自己把 provider 钉回 ring（见下面那行 rustls + llm.rs 的 install_default）；
+#   - 信任根走 0.13 默认的 rustls-platform-verifier（macOS = Keychain，认系统里装的企业 CA）；
+#     ⚠ 0.12 的 native-roots 那条路（认 `SSL_CERT_FILE` / `SSL_CERT_DIR`）不再生效——要它得自己 tls_certs_only。
+#   - `query` 在 0.13 里变成默认关闭的 feature（`.query()` 要用到）。
 # default-features = false 很关键：否则会同时拉进 native-tls(OpenSSL)。
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
     "multipart",
-    "rustls-tls-native-roots",
+    "query",
+    "rustls-no-provider",
 ] }
+# 只为把 crypto provider 钉成 ring（reqwest 0.13 默认 aws-lc-rs）；装它的那一行在 `llm.rs::LlmClient::new`。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 工具的参数 schema 由结构体 + doc 注释自动派生（替代之前那个手写 JSON / 自己写 derive 的方案）
-schemars = "0.8"
+# 工具的参数 schema 由结构体 + doc 注释自动派生（替代之前那个手写 JSON / 自己写 derive 的方案）。
+# 1.x：`SchemaSettings` 搬进了 `schemars::generate`，且不再有 `option_add_null_type` 开关
+# （`Option<T>` 一律写成 `"type": [.., "null"]`）→ 归一那步见 `tools.rs::strip_schema_noise`。
+schemars = "1"
 # 图片识别（魔数 + 只读头部拿尺寸）：用 image 而不是手写解析。
 # 不开默认特性（省掉 rayon/avif/exr/tiff…），只要读的那五种格式。
 # 将来 clipboard 模块也要靠它把 raw RGBA 编码成 PNG（Python 那边是 Pillow 干的）。
@@ -67,13 +76,12 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
     "bmp",
 ] }
-toml = "0.8"
+toml = "0.9"
 clap = { version = "4", features = ["derive"], optional = true }
 futures-util = "0.3"
 # shell 工具要 dup2 合并 stderr + killpg 杀进程组（std 不暴露这两个）
 libc = "0.2"
-base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 # 以下 6 个都是 **TUI 专用**（`tui` feature）：绑定侧 `default-features = false` → 不进依赖图。
 #

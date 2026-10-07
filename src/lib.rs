@@ -19,14 +19,14 @@
 //! 绑定稳定后再收紧。TUI 与 CLI 参数结构**不属于**对外 API（`pie` 对外就是那个可执行文件）。
 
 pub mod cancel;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod llm;
 pub mod log;
-pub mod cli;
+pub mod repl;
 pub mod session;
 pub mod tools;
-pub mod repl;
 
 /// TUI（ratatui + crossterm）。**不进绑定**：`default-features = false` 时整个模块不参与编译，
 /// 相关的可选依赖（ratatui / crossterm / ratatui-textarea / tui-markdown / arboard / unicode-width）
