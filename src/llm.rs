@@ -581,7 +581,7 @@ impl LlmClient {
         format!("{}/{}", self.base_url, path)
     }
 
-    /// 请求体。`options` 是**按次**覆盖（见 [`RequestOptions`]）：
+    /// 请求体。`request_options` 是**按次**覆盖（见 [`RequestOptions`]）：
     /// 思考深度归一后为 `None` 时改发 `thinking: {type: disabled}`（关闭思考）；
     /// `response_format` 为 `Text` 时不发该字段。
     fn request_body(
@@ -590,12 +590,12 @@ impl LlmClient {
         tools: &[Value],
         stream: bool,
         with_usage: bool,
-        options: RequestOptions<'_>,
+        request_options: RequestOptions<'_>,
     ) -> Value {
         let RequestOptions::ChatCompletions {
             reasoning_effort,
             response_format,
-        } = options;
+        } = request_options;
         let mut body = json!({
             "model": self.model,
             // 只发协议字段：压缩元数据（`compaction`）不能进请求体
@@ -669,17 +669,17 @@ impl LlmClient {
     }
 
     /// 非流式完整请求（一次尝试的完整流程就写在 `with_retry` 的闭包里）。
-    /// `options` 是**按次**覆盖（见 [`RequestOptions`]）。
+    /// `request_options` 是**按次**覆盖（见 [`RequestOptions`]）。
     pub async fn complete(
         &self,
         messages: &[Message],
         tools: &[Value],
-        options: RequestOptions<'_>,
+        request_options: RequestOptions<'_>,
     ) -> Result<LlmResult, LlmError> {
         self.with_retry(
             "请求",
             || async move {
-                let body = self.request_body(messages, tools, false, false, options);
+                let body = self.request_body(messages, tools, false, false, request_options);
                 let resp = self
                     .http
                     .post(self.url("chat/completions"))
@@ -713,12 +713,12 @@ impl LlmClient {
     /// 端点以 400 拒 `stream_options` 时摘掉该参数重来一次（不占重试额度）。
     /// SSE 解析（按行切、`[DONE]` 就地收工）就在闭包里的 `async` 块中，不再单开一层 `_once`。
     ///
-    /// `options` 与 [`LlmClient::complete`] 同义（按次覆盖）。
+    /// `request_options` 与 [`LlmClient::complete`] 同义（按次覆盖）。
     pub async fn stream<F>(
         &self,
         messages: &[Message],
         tools: &[Value],
-        options: RequestOptions<'_>,
+        request_options: RequestOptions<'_>,
         on_chunk: F,
     ) -> Result<LlmResult, LlmError>
     where
@@ -740,7 +740,8 @@ impl LlmClient {
                 let with_usage = with_usage.load(Ordering::Relaxed);
                 let (on_chunk, emitted) = (&on_chunk, &emitted);
                 async move {
-                    let body = self.request_body(messages, tools, true, with_usage, options);
+                    let body =
+                        self.request_body(messages, tools, true, with_usage, request_options);
                     let resp = self
                         .http
                         .post(self.url("chat/completions"))
@@ -1461,8 +1462,10 @@ mod tests {
 
     #[test]
     fn request_body_shape() {
-        let mut config = Config::default();
-        config.reasoning_effort = "high".into();
+        let mut config = Config {
+            reasoning_effort: "high".into(),
+            ..Config::default()
+        };
         let c = LlmClient::new(&config).unwrap();
         let b = c.request_body(
             &[Message::user("hi")],
@@ -1495,8 +1498,10 @@ mod tests {
     #[test]
     fn request_body_per_call_overrides() {
         // 客户端自身是 `high`，按次覆盖压过它；`JsonObject` 才会发 `response_format`
-        let mut config = Config::default();
-        config.reasoning_effort = "high".into();
+        let config = Config {
+            reasoning_effort: "high".into(),
+            ..Config::default()
+        };
         let c = LlmClient::new(&config).unwrap();
         let b = c.request_body(
             &[Message::user("hi")],

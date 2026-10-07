@@ -85,12 +85,6 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ToolError> {
 /// 没有借用参数（参数是 `Value`、`self` 按值传）→ 是 `'static`，生命周期一下子简单了。
 pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
-/// **一个工具 = 一个结构体**：字段就是参数，doc 注释就是参数描述，`required` 由
-/// 「非 `Option` 即必填」推导——这些全由 `#[derive(Deserialize, JsonSchema)]` 包办。
-///
-/// 返回 `impl Future + Send` 而不是写成 `async fn`：trait 里的 `async fn` **表达不出 `Send`**，
-/// 而注册表要把工具 future 装箱成 `dyn Future + Send`（TUI 要 spawn 整个回合）。
-/// **impl 里仍然可以写 `async fn`**，`Send` 只在 trait 里声明一次。
 //
 // ---------------------------------------------------------------- 工具上下文
 
@@ -217,6 +211,12 @@ impl ToolCtx {
     }
 }
 
+/// **一个工具 = 一个结构体**：字段就是参数，doc 注释就是参数描述，`required` 由
+/// 「非 `Option` 即必填」推导——这些全由 `#[derive(Deserialize, JsonSchema)]` 包办。
+///
+/// 返回 `impl Future + Send` 而不是写成 `async fn`：trait 里的 `async fn` **表达不出 `Send`**，
+/// 而注册表要把工具 future 装箱成 `dyn Future + Send`（TUI 要 spawn 整个回合）。
+/// **impl 里仍然可以写 `async fn`**，`Send` 只在 trait 里声明一次。
 pub trait Tool: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static {
     fn call(self, ctx: ToolCtx) -> impl std::future::Future<Output = ToolResult> + Send;
 }

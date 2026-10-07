@@ -61,9 +61,7 @@ impl PyToolRegistry {
     #[staticmethod]
     #[pyo3(signature = (spec, config=None))]
     fn from_spec(spec: &str, config: Option<&PyConfig>) -> Self {
-        let defaults = config
-            .map(|c| c.inner.tool_defaults())
-            .unwrap_or_else(HashMap::new);
+        let defaults = config.map(|c| c.inner.tool_defaults()).unwrap_or_default();
         Self {
             inner: tools::tools_from_spec(Some(spec), defaults),
         }
@@ -171,7 +169,7 @@ impl PyToolRegistry {
                             ))
                         })
                     })();
-                    out.map(|text| tools::ToolOutput::text(text))
+                    out.map(tools::ToolOutput::text)
                         .map_err(|e| ToolError(format!("{e}")))
                 })
             })

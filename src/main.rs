@@ -370,7 +370,7 @@ async fn run(cli: Cli) -> i32 {
         }
         let answer = match session
             // 后两个按次旋钮走默认：`parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）、
-            // `options` 走 chat completions 的默认（思考深度用客户端/配置的、`response_format` = text）
+            // `request_options` 走 chat completions 的默认（思考深度用客户端/配置的、`response_format` = text）
             .aturn(
                 &task,
                 &mut printer,

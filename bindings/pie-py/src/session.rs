@@ -312,6 +312,8 @@ impl PySession {
     ///
     /// 模型请求失败（外部原因）抛 `pie.LlmError`，但**历史里已经补了一条 `[请求失败] <错误>` 的
     /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
+    // ⚠ 参数 10 个（clippy 会念）是故意的：五个按次旋钮 + `on_event` / `cancel`，与 `turn_future` / `aturn` 对齐。
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     pub(crate) fn turn(
         &self,
@@ -333,7 +335,7 @@ impl PySession {
             .map_err(|_| busy_error())?;
 
         // ② 取消信号：外部给了就用它，否则自己造一个并登记，供 `s.stop()` 用
-        let token = cancel.map(|c| c.0.clone()).unwrap_or_else(Cancel::new);
+        let token = cancel.map(|c| c.0.clone()).unwrap_or_default();
         if let Ok(mut slot) = self.current.lock() {
             *slot = Some(token.clone());
         }
@@ -347,28 +349,25 @@ impl PySession {
         let handle = crate::runtime().spawn(async move {
             let mut session = guard;
             // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
-            let options = pie::llm::RequestOptions::ChatCompletions {
+            let request_options = pie::llm::RequestOptions::ChatCompletions {
                 reasoning_effort: reasoning_effort.as_deref(),
                 response_format,
             };
-            let result = {
-                let mut emit = move |event: TurnEvent| {
-                    // 接收端没了（调用方已放弃）就静默丢弃，别把回合搞崩
-                    let _ = tx.send(event);
-                };
-                session
-                    .aturn(
-                        &input,
-                        &mut emit,
-                        &token,
-                        max_steps,
-                        stream,
-                        parallel_tools,
-                        options,
-                    )
-                    .await
+            let mut emit = move |event: TurnEvent| {
+                // 接收端没了（调用方已放弃）就静默丢弃，别把回合搞崩
+                let _ = tx.send(event);
             };
-            result
+            session
+                .aturn(
+                    &input,
+                    &mut emit,
+                    &token,
+                    max_steps,
+                    stream,
+                    parallel_tools,
+                    request_options,
+                )
+                .await
         });
 
         // ⑤ 调用线程 pump：等事件时释放 GIL，拿到事件回 GIL 调回调
@@ -427,6 +426,8 @@ impl PySession {
     /// ⚠ 它必须只做「把东西丢给 asyncio」（`pie/_async.py` 里就是 `call_soon_threadsafe` +
     /// `queue.put_nowait`）—— **别碰 Session**（回合正占着锁）。
     #[cfg(feature = "asyncio")]
+    // ⚠ 参数 9 个（clippy 会念）是故意的：与 `turn` 同形（`on_event` 换成 `sink`）。
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (input, sink, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn turn_future(
         &self,
@@ -466,7 +467,7 @@ impl PySession {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = guard;
             // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
-            let options = pie::llm::RequestOptions::ChatCompletions {
+            let request_options = pie::llm::RequestOptions::ChatCompletions {
                 reasoning_effort: reasoning_effort.as_deref(),
                 response_format,
             };
@@ -486,7 +487,7 @@ impl PySession {
                     max_steps,
                     stream,
                     parallel_tools,
-                    options,
+                    request_options,
                 )
                 .await;
             // 收尾：告诉 Python 侧「事件到头了」——`events()` 的迭代器据此 StopAsyncIteration
@@ -527,6 +528,8 @@ impl PySession {
     /// 事件走 `async for ev in session.events()`；`task.cancel()` / `session.stop()` 都能真停住
     /// （前者靠 Python 侧的 glue 把 `CancelledError` 桥到 `stop()`）。
     #[cfg(feature = "asyncio")]
+    // ⚠ 参数 8 个（clippy 会念）是故意的：与 `turn` 同一套按次旋钮。
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn aturn(
         slf: PyRef<'_, Self>,

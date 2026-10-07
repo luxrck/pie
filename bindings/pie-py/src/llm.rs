@@ -72,12 +72,12 @@ impl PyLlmClient {
         };
         let inner = &self.inner;
         // 按次覆盖的两个值拼成 [`RequestOptions`]（解析放在 `detach` 之前：PyErr 要 GIL）
-        let options = pie::llm::RequestOptions::ChatCompletions {
+        let request_options = pie::llm::RequestOptions::ChatCompletions {
             reasoning_effort,
             response_format: crate::parse_response_format(response_format)?,
         };
         let got = py
-            .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs, options)))
+            .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs, request_options)))
             .map_err(|e| llm_error(py, e))?;
         // `LlmResult` 没有 Serialize → 手拼
         let dict = pyo3::types::PyDict::new(py);

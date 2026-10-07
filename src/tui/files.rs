@@ -277,7 +277,8 @@ fn list_dir(dir: &Path, prefix: &str, name: &str, limit: usize) -> Vec<(String, 
             break; // 巨型目录：截断总比把内存吃光好（与索引同上限）
         }
     }
-    hits.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    // `sort_by_cached_key`：小写化是有分配的，每个键只算一次（`sort_by_key` 每次比较都要分配）
+    hits.sort_by_cached_key(|(child, _)| child.to_lowercase());
     hits.truncate(limit);
     hits.into_iter()
         .map(|(child, is_dir)| candidate(&format!("{prefix}{child}"), is_dir))

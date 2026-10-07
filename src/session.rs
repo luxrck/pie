@@ -424,7 +424,7 @@ impl Session {
     ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
     ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `config.parallel_tools`
     ///     （默认 true）。工具共享可变状态时必须 `Some(false)`（改为按模型返回顺序串行）。
-    ///   - `options`：本回合模型请求的**按次覆盖**（见 [`RequestOptions`]）——思考深度
+    ///   - `request_options`：本回合模型请求的**按次覆盖**（见 [`RequestOptions`]）——思考深度
     ///     （`None` = 用客户端自身的 / 配置值；空串 / `none` = 关闭思考）与 `response_format`
     ///     （`Text` 默认 = 不发该字段；`JsonObject` = 要求合法 JSON，⚠ 还得自己在 prompt 里交代）。
     ///     **只影响本回合的请求**：不改配置、不写回文件。
@@ -434,6 +434,10 @@ impl Session {
     ///   - 工具执行中的取消 → shell 会杀掉整个进程组，**未执行的 `tool_calls` 补 `CANCEL_TEXT` 的
     ///     tool 消息**（保证每个 `tool_call_id` 都有配对结果、API 序列合法）；
     ///   - 两种收尾都往历史里写一条 `CANCEL_TEXT` 的 assistant 消息，并把它作为本轮答复返回。
+    ///
+    /// ⚠ 参数 8 个（clippy 会念）是故意的：全是**按次**旋钮 —— `--max-steps` / `--no-stream` /
+    /// 按次请求覆盖都不进 `Config`（见 AGENTS.md「执行旋钮按次传」），打包成结构体只是把字段挪个地方。
+    #[allow(clippy::too_many_arguments)]
     pub async fn aturn(
         &mut self,
         input: &str,
@@ -442,7 +446,7 @@ impl Session {
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
-        options: RequestOptions<'_>,
+        request_options: RequestOptions<'_>,
     ) -> Result<String, LlmError> {
         // 每轮开头：先收解释器代码块（压缩会把 `tool_calls` 删掉，这是最后的收集机会），
         // 再校准 system prompt 末尾那节（cwd 可能被 `/cd` 改过）——都必须先于任何请求
@@ -497,7 +501,14 @@ impl Session {
 
             let specs = self.tools.specs();
             let called = match self
-                .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                .model_call(
+                    &specs,
+                    on_event,
+                    &mut clock,
+                    cancel,
+                    use_stream,
+                    request_options,
+                )
                 .await
             {
                 Ok(option) => option,
@@ -509,7 +520,14 @@ impl Session {
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
                         match self
-                            .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                            .model_call(
+                                &specs,
+                                on_event,
+                                &mut clock,
+                                cancel,
+                                use_stream,
+                                request_options,
+                            )
                             .await
                         {
                             Ok(option) => option,
@@ -541,7 +559,14 @@ impl Session {
                             stats.tools, stats.turns
                         ));
                         match self
-                            .model_call(&specs, on_event, &mut clock, cancel, use_stream, options)
+                            .model_call(
+                                &specs,
+                                on_event,
+                                &mut clock,
+                                cancel,
+                                use_stream,
+                                request_options,
+                            )
                             .await
                         {
                             Ok(option) => option,
@@ -653,7 +678,7 @@ impl Session {
         Ok(answer.unwrap_or_default())
     }
 
-    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` / `options` 由 `aturn`
+    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` / `request_options` 由 `aturn`
     /// 按次传进来。
     /// 一次模型调用；`Ok(None)` = 请求期间被取消（不 push 任何消息，收尾由 `aturn` 统一做）。
     async fn model_call(
@@ -663,7 +688,7 @@ impl Session {
         clock: &mut ThoughtClock,
         cancel: &Cancel,
         stream: bool,
-        options: RequestOptions<'_>,
+        request_options: RequestOptions<'_>,
     ) -> Result<Option<LlmResult>, LlmError> {
         if cancel.is_cancelled() {
             return Ok(None);
@@ -671,23 +696,30 @@ impl Session {
         let call = async {
             if stream {
                 self.llm
-                    .stream(&self.messages, specs, options, |chunk| match chunk {
-                        // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
-                        StreamChunk::Content(d) => {
-                            let ev = TurnEvent::AssistantText(d);
-                            clock.on(&ev);
-                            on_event(ev);
-                        }
-                        StreamChunk::Reasoning(d) => {
-                            let ev = TurnEvent::Reasoning(d);
-                            clock.on(&ev);
-                            on_event(ev);
-                        }
-                        StreamChunk::ToolCall { .. } => {}
-                    })
+                    .stream(
+                        &self.messages,
+                        specs,
+                        request_options,
+                        |chunk| match chunk {
+                            // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
+                            StreamChunk::Content(d) => {
+                                let ev = TurnEvent::AssistantText(d);
+                                clock.on(&ev);
+                                on_event(ev);
+                            }
+                            StreamChunk::Reasoning(d) => {
+                                let ev = TurnEvent::Reasoning(d);
+                                clock.on(&ev);
+                                on_event(ev);
+                            }
+                            StreamChunk::ToolCall { .. } => {}
+                        },
+                    )
                     .await
             } else {
-                self.llm.complete(&self.messages, specs, options).await
+                self.llm
+                    .complete(&self.messages, specs, request_options)
+                    .await
             }
         };
         tokio::select! {

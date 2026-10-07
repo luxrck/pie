@@ -444,8 +444,10 @@ pub fn ensure_config_file(explicit: Option<&Path>) -> Result<(PathBuf, bool), Co
     if path.exists() {
         return Ok((path, false));
     }
-    let mut config = Config::default();
-    config.config_file = Some(path.clone()); // 让 save() 写到解析出来的那个路径
+    let config = Config {
+        config_file: Some(path.clone()), // 让 save() 写到解析出来的那个路径
+        ..Config::default()
+    };
     config.save()?;
     Ok((path, true))
 }
@@ -906,12 +908,9 @@ pub fn resolve_prompt_file(name: &str) -> Option<PathBuf> {
         return p.exists().then(|| p.to_path_buf());
     }
     let root = find_project_root();
-    for candidate in [root.join(p), PathBuf::from(".").join(p)] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    [root.join(p), PathBuf::from(".").join(p)]
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn read_text(path: Option<PathBuf>) -> String {

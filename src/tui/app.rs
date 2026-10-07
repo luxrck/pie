@@ -105,6 +105,7 @@ struct Toast {
 ///     `pane::Row` 里（`Pane::slice_text` 按源文本切），高亮也是直接改 frame buffer；
 ///   - 输入框：选区在 `TextArea` 控件内部（**字符坐标**），折行、渲染、以及「输入替换
 ///     选区」都是控件白送的——搬出来反而要多写一套，还会丢掉那些语义。
+///
 /// 所以只在**手势层**统一：按下时定下拖谁、拖动与松开都交给它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
@@ -211,6 +212,10 @@ pub struct App {
     max_steps: Option<usize>,
     stream: Option<bool>,
 }
+
+/// `/` 与 `@` 补全的结果：候选 `(显示文本, 接受后插入的文本)` + **只替换输入框的哪一小段**
+/// （`Some((行, 列))` = 从这一列到光标；`None` = 整行换成候选）。
+type Completions = (Vec<(String, String)>, Option<(usize, usize)>);
 
 impl App {
     /// 建 App + 取出事件接收端（`rx` 由主循环持有，避免和 `select!` 里的 `&mut self` 打架）。
@@ -1033,7 +1038,7 @@ impl App {
             };
             let result = guard
                 // `parallel_tools: None` = 跟随 `config.parallel_tools`（TUI 没有覆盖它的入口）；
-                // `options` 走 chat completions 的默认（思考深度跟客户端、`response_format` = text）
+                // `request_options` 走 chat completions 的默认（思考深度跟客户端、`response_format` = text）
                 .aturn(
                     &input,
                     &mut on_event,
@@ -1135,7 +1140,7 @@ impl App {
     ///   - `None`：整条输入换成候选（`/` 命令，含 `/model `/`/thinking `）。
     ///
     /// 光标处的 `@` 优先：它就住在光标旁，而 `/` 命令是整行的事。
-    fn completions(&self) -> (Vec<(String, String)>, Option<(usize, usize)>) {
+    fn completions(&self) -> Completions {
         if let Some((from, fragment)) = self.file_token() {
             // `..` / `/` / `~/` 三档实时列目录（不依赖索引），其余走索引
             let items = files::matches(
@@ -1665,7 +1670,7 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     // 退出码：被信号杀死时取 -1（都是「非正常退出」）
     let code = status.code().unwrap_or(-1);
     let mark = if code == 0 { Status::Ok } else { Status::Fail };
-    (mark, format!("{}", out.trim_end_matches('\n')))
+    (mark, out.trim_end_matches('\n').to_string())
 }
 
 /// `/cd` 的 `~` 展开：`~` / `~/x` → 主目录下；其余原样（相对路径按当前 cwd 解析）。

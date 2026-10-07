@@ -236,6 +236,8 @@ fn resolve_runtime(
 /// 五个按次旋钮与 [`Session.turn`] / [`Session.aturn`] 同义（`max_steps=None` = 不限、
 /// `stream=None` = 默认流式、`parallel_tools=None` = 跟随 `Config.parallel_tools`、
 /// `reasoning_effort=None` = 用配置里的思考深度、`response_format=None` = `text`）。
+// ⚠ 参数 10 个（clippy 会念）是故意的：Python 侧五个按次旋钮 + 三个可注入对象，与 `arun` / `Session.turn` 一一对应。
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
 fn run(
@@ -275,6 +277,8 @@ fn run(
 /// `await pie.arun(...)` 期间事件循环不阻塞、也不额外占线程。
 /// ⚠ 与 `aturn` 一样要求调用时处于运行中的 asyncio loop（**一个进程一个 loop 最稳**）。
 #[cfg(feature = "asyncio")]
+// ⚠ 参数 10 个（clippy 会念）是故意的：与 `run` 同形（见上）。
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (task, config=None, llm=None, tools=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
 fn arun(
@@ -296,7 +300,7 @@ fn arun(
     let mut session = pie::session::Session::ephemeral(&core_config, client, registry);
     let cancel = pie::cancel::Cancel::new();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let options = pie::llm::RequestOptions::ChatCompletions {
+        let request_options = pie::llm::RequestOptions::ChatCompletions {
             reasoning_effort: reasoning_effort.as_deref(),
             response_format,
         };
@@ -310,7 +314,7 @@ fn arun(
                 max_steps,
                 stream,
                 parallel_tools,
-                options,
+                request_options,
             )
             .await;
         result.map_err(|e| Python::attach(|py| llm_error(py, e)))

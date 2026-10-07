@@ -52,6 +52,7 @@ pub fn paste_image(storage: &crate::config::Storage) -> Option<String> {
 ///   1. arboard 会往 **stderr** 打一行警告；TUI 期间是 raw mode + 交替屏，这行字节落在当前
 ///      光标处、而 ratatui 只重画变化的格子 → 屏幕被砸花且**再也修不回来**；
 ///   2. 剪贴板管理器可能来不及取走内容，复制其实没生效。
+///
 /// 所以持有一个进程级的长活句柄，每次写复用它。
 #[derive(Default)]
 pub struct Copier {

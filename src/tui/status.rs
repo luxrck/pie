@@ -88,6 +88,10 @@ pub fn activity_line(
 /// `balance` = [`balance_text`] 的产物（拿不到就给 `None`，那一块就不画）。
 /// `focused = false`（窗口不在前台）→ 名字与活动指示一起降成 muted（与输入框上边框 / 光标同款）；
 /// 用量 / 余额本来就用 muted，不动。
+///
+/// ⚠ 参数 9 个（clippy 会念）也是故意的：每个都来自不同来源、按帧现取，打包成结构体只是
+/// 把字段挪到调用点去一个个填，反而多一层。
+#[allow(clippy::too_many_arguments)]
 pub fn status_line(
     palette: &Palette,
     snap: &Snapshot,
