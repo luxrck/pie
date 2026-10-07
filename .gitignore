@@ -14,3 +14,7 @@ target/
 bindings/*/target/
 # maturin develop 会把编好的扩展模块放回 python-source 目录
 bindings/*/python/*/*.so
+
+docs/
+AGENTS.md
+MEMORY.md

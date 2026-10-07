@@ -1,6 +1,6 @@
 [package]
 name = "pie-py"
-version = "0.1.0"
+version = "1.3.0"
 edition = "2024"
 description = "pie 的 Python 绑定（PyO3）：把 agent harness 暴露给 Python"
 license = "MIT"
