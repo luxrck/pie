@@ -73,6 +73,17 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 展开路径开头的 `~` / `~/…` → `$HOME`（其余原样）。
+///
+/// `Command::new` / `PathBuf` 都不认 `~`，而配置里写 `~/.pie/tools` 是最自然的写法 ——
+/// `repl` 的解释器路径与 `[python]` 段都走这里（**不是 shell，不做变量展开**）。
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        return format!("{}{}", home_dir().to_string_lossy(), &path[1..]);
+    }
+    path.to_string()
+}
+
 /// 测试专用：把进程级 `PIE_DIR` 改来改去的用例共用这一把锁（跨模块串行化，
 /// 否则 `context` / `llm` 两边的测试并行跑会互相覆盖环境变量）。
 #[cfg(test)]
@@ -160,6 +171,34 @@ impl Storage {
     /// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它。
     pub fn windows(&self) -> PathBuf {
         self.root.join("windows")
+    }
+
+    /// Python 环境目录：`<root>/envs/`（`pie setup` 用 uv 建环境就建在这里）。
+    pub fn envs(&self) -> PathBuf {
+        self.root.join("envs")
+    }
+
+    /// 默认 Python 环境：`<root>/envs/base`（`repl` 与 Python 工具共用同一个）。
+    pub fn base_env(&self) -> PathBuf {
+        self.envs().join("base")
+    }
+
+    /// Python 工具文件目录：`<root>/tools/`。
+    ///
+    /// **约定目录、存在即用**（与 `envs/base` 同一条风格）：往这儿丢 `*.py` 就生效，不用写
+    /// `[python] tools`（两者可共存；见 `Config::python_tool_entries`）。
+    pub fn python_tools(&self) -> PathBuf {
+        self.root.join("tools")
+    }
+
+    /// 上面那个环境的解释器（Windows 是 `Scripts/python.exe`）。
+    pub fn base_env_python(&self) -> PathBuf {
+        let rel = if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        };
+        self.base_env().join(rel)
     }
 
     /// 内容寻址落盘：`Blob` 图片副本 / `Raw` 压缩原文 / `Window` 窗口块，见 [`StoreType`]。
@@ -537,6 +576,17 @@ impl Default for CompactionConfig {
     }
 }
 
+/// `[python]` 段：Python 相关的东西放一处 —— `interpreter` 给 `repl`（`_python` 的默认值）
+/// 与 Python 工具宿主（`pytool`）**共用**：指向同一个 venv，工具里装了的包 repl 里也就有。
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct PythonConfig {
+    /// 解释器路径/命令（缺省：各消费者自己的默认 —— `python3`，Windows `python`）。
+    pub interpreter: Option<String>,
+    /// Python 工具文件（或目录；目录取其下 `*.py`，不递归）；`~` 会展开。
+    pub tools: Vec<String>,
+}
+
 /// `[tui]` 段（TUI 还没移植，先把配置形状收着，保证老配置文件能读进来）。
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -571,6 +621,8 @@ pub struct Config {
     pub theme: String,
     /// 按工具名设默认私有参数（下划线开头，不进 schema）。
     pub tools: HashMap<String, toml::Value>,
+    /// `[python]`：解释器 + 用 Python 写的工具（见 `crate::pytool`）。
+    pub python: PythonConfig,
     pub tui: TuiConfig,
     pub files_api: bool,
     pub files_ttl_days: usize,
@@ -610,6 +662,7 @@ impl Default for Config {
             max_retry_delay_seconds: 3.0,
             theme: "catppuccin".to_string(),
             tools: HashMap::new(),
+            python: PythonConfig::default(),
             tui: TuiConfig::default(),
             files_api: true,
             files_ttl_days: 30,
@@ -689,12 +742,114 @@ impl Config {
             .or_default()
             .entry("_max_image_bytes".to_string())
             .or_insert(toml::Value::Integer(image_cap));
+        // `[python] interpreter`（没显式写就用 `envs/base`）→ `repl` 的 `_python` 默认值：
+        // 一处配置，两处消费（repl 与 pytool 宿主）。用户在 `[tools.repl] _python` 里显式写了就听用户的。
+        if let Some(interpreter) = self.python_interpreter() {
+            out.entry("repl".to_string())
+                .or_default()
+                .entry("_python".to_string())
+                .or_insert(toml::Value::String(interpreter));
+        }
         out
     }
 
     /// 归一化后的思考深度：`none` → `None`（不发送 `reasoning_effort`）。
     pub fn normalized_reasoning_effort(&self) -> Option<&str> {
         normalize_reasoning_effort(&self.reasoning_effort)
+    }
+
+    /// 解释器解析顺序：显式 `[python] interpreter` → `envs/base`（**存在才算**，`pie setup` 建的）
+    /// → `None`（= 各消费者自己的默认：`python3` / Windows `python`）。
+    ///
+    /// `repl` 的 `_python` 与 Python 工具宿主都取它（见 [`Self::tool_defaults`] 与 `crate::pytool`）
+    /// —— 一处配置、两处消费，也是「工具里 import 得到的包 repl 里也 import 得到」的实现。
+    pub fn python_interpreter(&self) -> Option<String> {
+        if let Some(explicit) = &self.python.interpreter {
+            return Some(explicit.clone());
+        }
+        let base = self.storage.base_env_python();
+        base.exists().then(|| base.to_string_lossy().into_owned())
+    }
+
+    /// Python 工具文件：`[python] tools` 里写的，加上约定目录 `<root>/tools/`（**存在才算**、
+    /// 排在后头）—— 于是「往 `~/.pie/tools/` 丢个 `.py`」就生效，不必写配置。
+    ///
+    pub fn python_tool_entries(&self) -> Vec<String> {
+        let mut out = self.python.tools.clone();
+        let dir = self.storage.python_tools();
+        if dir.is_dir() {
+            out.push(dir.to_string_lossy().into_owned());
+        }
+        out
+    }
+
+    /// 确保默认 Python 环境 `envs/base` 可用（`pie setup` 调）：没有 uv 或建不成就**回一句告警文案**
+    /// （`Err`），setup 不该因此失败。
+    ///
+    /// 幂等：venv 已在就不建；`repl` 靠的 IPython 已在就不装（用户自己的依赖自己
+    /// `uv pip install --python <环境>/bin/python …` 装进这个环境 —— `repl` 与 Python 工具都能 import）。
+    pub fn ensure_base_env(storage: &Storage) -> Result<String, String> {
+        let python = storage.base_env_python();
+        let uv_ok = std::process::Command::new("uv")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !uv_ok {
+            return Err(format!(
+                "没找到可用的 uv：装上 uv 后重跑 `pie setup`，或手写 [python] interpreter（想用的解释器路径）\n  （venv 要建在 {}）",
+                storage.base_env().display()
+            ));
+        }
+
+        let existed = python.exists();
+        if !existed {
+            let out = std::process::Command::new("uv")
+                .arg("venv")
+                .arg(storage.base_env())
+                .output()
+                .map_err(|e| format!("跑 `uv venv` 失败: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "`uv venv {}` 失败: {}",
+                    storage.base_env().display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+
+        // IPython 是 `repl` 的运行时依赖（系统 python3 通常没有）——装好它，repl 开箱可用。
+        let has_ipython = std::process::Command::new(&python)
+            .args(["-c", "import IPython"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let label = if existed { "已存在" } else { "已创建" };
+        if has_ipython {
+            return Ok(format!("{label}  {}", storage.base_env().display()));
+        }
+        let out = std::process::Command::new("uv")
+            .args(["pip", "install", "--python"])
+            .arg(&python)
+            .arg("ipython")
+            .output()
+            .map_err(|e| format!("跑 `uv pip install` 失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{label} {}，但装 IPython 失败（`repl` 要它）：{}\n  自己补：uv pip install --python {} ipython",
+                storage.base_env().display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                python.display()
+            ));
+        }
+        Ok(format!(
+            "{label} + 已装 IPython  {}",
+            storage.base_env().display()
+        ))
     }
 
     /// 写回配置文件（`config_file`，默认 `~/.pie/config.toml`）——`/model`、`/thinking` 用。
@@ -791,6 +946,17 @@ impl Config {
                     .collect(),
             ),
         );
+        let mut python = toml::map::Map::new();
+        if let Some(interpreter) = &self.python.interpreter {
+            python.insert("interpreter".to_string(), V::String(interpreter.clone()));
+        }
+        if !self.python.tools.is_empty() {
+            python.insert(
+                "tools".to_string(),
+                V::Array(self.python.tools.iter().cloned().map(V::String).collect()),
+            );
+        }
+        put("python", V::Table(python));
         let mut tui = toml::map::Map::new();
         tui.insert("lean".to_string(), V::Boolean(self.tui.lean));
         put("tui", V::Table(tui));
@@ -1149,6 +1315,59 @@ lean = true
         assert_eq!(comp.session.unwrap().tail, 5);
         assert!(comp.turn);
         assert!(config.tui.lean);
+    }
+
+    /// 解释器解析：显式 `[python] interpreter` > `envs/base`（**存在才算**）> `None`。
+    /// 后者是「`pie setup` 建了环境，`repl` 与 Python 工具自动就用它」的那条线。
+    #[test]
+    fn python_interpreter_prefers_explicit_then_base_env() {
+        let dir = std::env::temp_dir().join(format!("pie-pyenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::at(&dir);
+        let mut config = Config {
+            storage: storage.clone(),
+            ..Config::default()
+        };
+
+        // 环境还没建 → None（各消费者退到自己的 `python3` / Windows `python`），
+        // 也就没有什么 `_python` 默认值好注入
+        let repl_python = |config: &Config| {
+            config
+                .tool_defaults()
+                .get("repl")
+                .and_then(|t| t.get("_python"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(config.python_interpreter(), None);
+        assert_eq!(repl_python(&config), None);
+
+        // `envs/base` 存在 → 不写配置也用它（`pie setup` 建的就是它）
+        let python = storage.base_env_python();
+        std::fs::create_dir_all(python.parent().expect("bin/")).unwrap();
+        std::fs::write(&python, "").unwrap();
+        let base = python.to_string_lossy().into_owned();
+        assert_eq!(config.python_interpreter(), Some(base.clone()));
+        assert_eq!(
+            repl_python(&config),
+            Some(base),
+            "repl 的 `_python` 默认要跟解释器解析同一条（一处配置、两处消费）"
+        );
+
+        // 显式配置最高优先
+        config.python.interpreter = Some("~/my/python".to_string());
+        assert_eq!(config.python_interpreter().as_deref(), Some("~/my/python"));
+        assert_eq!(repl_python(&config), Some("~/my/python".to_string()));
+
+        // 工具级 `_python` 仍然最高（用户显式写的那层）
+        let mut table = toml::Table::new();
+        table.insert("_python".to_string(), toml::Value::String("python3".into()));
+        config
+            .tools
+            .insert("repl".to_string(), toml::Value::Table(table));
+        assert_eq!(repl_python(&config), Some("python3".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `save` → `load` 往返：TOML 没有 null，`reserved_tokens = None` 要写成 `"auto"` 再读回 None；

@@ -29,7 +29,7 @@ use crate::cancel::CANCEL_TEXT;
 use crate::tools::{self, Tool, ToolCtx, ToolError, ToolOutput, ToolResult};
 
 /// 驱动脚本正文（编译期嵌入；它自己用 IPython 的 `InteractiveShell`）。
-const DRIVER: &str = include_str!("repl_driver.py");
+const DRIVER: &str = include_str!("python/repl_driver.py");
 
 /// 默认解释器：Unix `python3`，其它 `python`。
 #[cfg(unix)]
@@ -64,7 +64,8 @@ pub struct Repl {
     pub code: String,
     /// 超时秒数（可选，无默认）
     pub timeout: Option<i64>,
-    /// 私有参数：解释器（默认 python3；IPython 装在别的 venv 就指过去；开头的 `~` 会展开成 $HOME）
+    /// 私有参数：解释器（缺省 `[python] interpreter`，没配则 `python3` / Windows `python`；
+    /// IPython 装在别的 venv 就指过去；开头的 `~` 会展开成 $HOME）
     #[schemars(skip)]
     pub _python: Option<String>,
     /// 私有参数：输出行/字节上限（超限只留开头 + 落盘全文）
@@ -150,13 +151,8 @@ impl Tool for Repl {
         if code.trim().is_empty() {
             return Ok(ToolOutput::text(""));
         }
-        let mut python = _python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
-        // `_python` 直接交给 `Command::new`，不会自己展开 `~`——这里只认 `~` / `~/…` → $HOME。
-        if (python == "~" || python.starts_with("~/"))
-            && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-        {
-            python = format!("{}{}", home.to_string_lossy(), &python[1..]);
-        }
+        let python =
+            crate::config::expand_tilde(&_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()));
         let driver = _driver.unwrap_or_else(|| DRIVER.to_string());
 
         // 取本会话的 REPL 槽；锁住整段交互（同一会话的 repl 调用串行）。
@@ -637,21 +633,25 @@ while True:
         assert!(out.spill.is_some());
     }
 
-    /// 真驱动要 IPython（系统 `python3` 通常没有）→ 优先 `~/.pie/repl/bin/python`。
+    /// 真驱动要 IPython（系统 `python3` 通常没有）→ 优先 `pie setup` 建的 `~/.pie/envs/base`
+    /// （旧的手工约定 `~/.pie/repl` 仍然认），再退到 `python3`。
     fn python_with_ipython() -> Option<String> {
-        let venv = std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h)
-                .join(".pie/repl/bin/python")
-                .to_string_lossy()
-                .to_string()
-        });
-        venv.into_iter().chain(["python3".to_string()]).find(|py| {
-            std::process::Command::new(py)
-                .args(["-c", "import IPython"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        })
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let candidates = [".pie/envs/base/bin/python", ".pie/repl/bin/python"];
+        candidates
+            .into_iter()
+            .filter_map(|rel| {
+                home.clone()
+                    .map(|h| h.join(rel).to_string_lossy().into_owned())
+            })
+            .chain(["python3".to_string()])
+            .find(|py| {
+                std::process::Command::new(py)
+                    .args(["-c", "import IPython"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
     }
 
     /// 跑**真驱动**（不传 `_driver`）——`history()` 那条路只有真解释器才有。

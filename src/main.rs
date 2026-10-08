@@ -85,7 +85,7 @@ struct Cli {
     #[arg(long)]
     models: bool,
 
-    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash/repl）启用该工具，其他名字当 shell 子命令白名单
+    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash/repl）启用该工具，Python 工具名启用它，其余名字当 shell 子命令白名单
     /// （如 `--tools read,ls,grep` = read + 只允许 ls/grep 的受限 bash）
     #[arg(long)]
     tools: Option<String>,
@@ -259,7 +259,19 @@ async fn run(cli: Cli) -> i32 {
             return 1;
         }
     };
-    let registry = tools_from_spec(cli.tools.as_deref(), config.tool_defaults());
+    // 工具集：先装出**全量**（内置 + 用 Python 写的工具），再按 `--tools` 裁剪。
+    // ⚠ 顺序要紧：`--tools` 里非内置的名字要先跟 Python 工具对（对上 = 放行该工具，
+    // 对不上 = shell 子命令白名单），所以 Python 工具得先装、名字先知道。
+    // Python 工具走一个长活宿主子进程（`[python] tools`）；没配就是零开销，起不来 / 报错只告警。
+    let interpreter = config.python_interpreter();
+    let entries = config.python_tool_entries();
+    let registry = pie::pytool::load(
+        ToolRegistry::new(config.tool_defaults()),
+        interpreter.as_deref(),
+        &entries,
+    )
+    .await;
+    let registry = tools_from_spec(cli.tools.as_deref(), registry);
 
     // TTY 且没有任务 → 进 TUI（`-r` / `-s` 就接着那个会话聊）；非 TTY 保持原来的行为
     if task.trim().is_empty() && std::io::stdin().is_terminal() {
@@ -459,14 +471,24 @@ fn setup_main(cli: &Cli) -> i32 {
             code = 1;
         }
     }
+    // 默认 Python 环境（`repl` 与 Python 工具共用）：`uv` 建的 `envs/base`。
+    // 建不成**不算 setup 失败**——只是 `repl` / Python 工具没得用，说清楚就行（`Err` 只打告警）。
+    match config::Config::ensure_base_env(&config::Storage::from_env()) {
+        Ok(msg) => println!("Python 环境  {msg}"),
+        Err(msg) => eprintln!("Python 环境  跳过  {msg}"),
+    }
 
     if code != 0 {
         return code;
     }
     if created_config {
         println!("接着：按需改上面的 model / base_url / api_key，再跑 `pie \"任务\"`。");
+        println!(
+            "Python 依赖装进这一处就行（`repl` 与用 Python 写的工具共用同一个环境）：\n  uv pip install --python {} <包>",
+            config::Storage::from_env().base_env_python().display()
+        );
     } else {
-        println!("两份文件都在，未改动。");
+        println!("三样都在，未改动。");
     }
     0
 }

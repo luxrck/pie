@@ -9,6 +9,7 @@
 //!   - [`llm`]     —— OpenAI 兼容客户端（reqwest + 手写 SSE，无 SDK）+ 重试 + Files API
 //!   - [`tools`]   —— read / edit / writ / bash（结构体即参数：一个工具 = 一个结构体）
 //!   - [`repl`]    —— `repl`：会话内持久的 IPython（长活子进程，状态挂 `tools::SessionState`）
+//!   - [`pytool`]  —— 用 Python 写的工具：长活宿主子进程 + 同一张 `ToolRegistry`（无 CPython 嵌入）
 //!   - [`cli`] —— 会话/图片文件的列表与维护（`pie sessions` / `files list|gc` 的数据源）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + gc
@@ -24,6 +25,7 @@ pub mod config;
 pub mod context;
 pub mod llm;
 pub mod log;
+pub mod pytool;
 pub mod repl;
 pub mod session;
 pub mod tools;

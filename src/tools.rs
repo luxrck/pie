@@ -1275,47 +1275,57 @@ impl ToolRegistry {
     }
 }
 
-/// 按 `--tools` 说明构建可用工具集（无 spec / 空串 → 默认全量）。
+/// 按 `--tools` 说明裁剪**已注册的工具集**（无 spec / 空串 → 原样全量）。
 ///
-/// 解析优先级：内置工具名 > shell 子命令。
+/// 解析优先级：内置工具名 > Python 工具名 > shell 子命令。
 ///   - 名字 ∈ 内置（read/edit/writ/bash/repl）→ 启用该工具；
+///   - 名字 ∈ `registry` 里动态注册的 Python 工具（`pytool::load` 装进来的）→ 启用它；
 ///   - 其他名字 → 收集成 shell 允许的子命令白名单，并隐式启用**受限 shell**；
 ///   - 未显式列 shell 且没有任何非内置名 → shell 工具禁用。
 ///
 /// 示例：`"read"` → 仅 read；`"read,bash"` → read + 不限子命令的 bash；
-/// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash；`"ls,grep"` → 仅受限 bash。
-pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table>) -> ToolRegistry {
+/// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash（当 `ls`/`grep` 不是已注册的
+/// Python 工具时）；`"ls,grep"` → 仅受限 bash。
+///
+/// 传进来的 `registry` 是**全量**（内置 + Python 工具，见 `pytool::load`）：
+/// 「一个非内置名字是 Python 工具还是 shell 子命令」得先知道 Python 工具都叫什么。
+pub fn tools_from_spec(spec: Option<&str>, registry: ToolRegistry) -> ToolRegistry {
     const BUILTINS: [&str; 5] = ["read", "edit", "writ", "bash", "repl"];
 
+    let pytools: Vec<&str> = registry
+        .names()
+        .into_iter()
+        .filter(|n| !BUILTINS.contains(n))
+        .collect();
     let mut enabled: Vec<&'static str> = Vec::new();
+    let mut enabled_py: Vec<String> = Vec::new();
     let mut allow_cmds: Vec<String> = Vec::new();
     for token in spec.unwrap_or("").split(',').map(str::trim) {
         if token.is_empty() {
             continue;
         }
-        match BUILTINS.iter().find(|b| **b == token) {
-            Some(&name) => {
-                if !enabled.contains(&name) {
-                    enabled.push(name);
-                }
+        if let Some(&name) = BUILTINS.iter().find(|b| **b == token) {
+            if !enabled.contains(&name) {
+                enabled.push(name);
             }
-            None => {
-                if !allow_cmds.iter().any(|c| c == token) {
-                    allow_cmds.push(token.to_string());
-                }
+        } else if pytools.contains(&token) {
+            if !enabled_py.iter().any(|n| n == token) {
+                enabled_py.push(token.to_string());
             }
+        } else if !allow_cmds.iter().any(|c| c == token) {
+            allow_cmds.push(token.to_string());
         }
     }
 
-    // 无 spec、或「四个内置全列且无白名单」→ 默认全量
-    if (enabled.is_empty() && allow_cmds.is_empty())
-        || (allow_cmds.is_empty() && enabled.len() == BUILTINS.len())
+    // 无 spec、或「五个内置全列且没有 Python 工具 / 白名单」→ 默认全量
+    if (enabled.is_empty() && enabled_py.is_empty() && allow_cmds.is_empty())
+        || (allow_cmds.is_empty() && enabled_py.is_empty() && enabled.len() == BUILTINS.len())
     {
-        return ToolRegistry::new(defaults);
+        return registry;
     }
 
     let restricted = !allow_cmds.is_empty();
-    let mut defaults = defaults;
+    let mut defaults = registry.defaults.clone();
     if restricted {
         // 白名单走「私有参数注入」这条路：Shell 里有 `_allow_cmds` 字段（→ `#[schemars(skip)]`，不进 schema）
         let mut table = defaults.remove("bash").unwrap_or_default();
@@ -1345,12 +1355,16 @@ pub fn tools_from_spec(spec: Option<&str>, defaults: HashMap<String, toml::Table
             _ => reg.with_tool::<Bash>("bash"),
         };
     }
+    // Python 工具：从全量表里按名字搬过来（定义与调用体一起，别重造）
+    for entry in &registry.entries {
+        if enabled_py.iter().any(|n| n == &entry.name) {
+            reg.entries.push(entry.clone());
+        }
+    }
     if restricted {
         // description 追加白名单，让模型事先知道边界、少试错
         let allow_txt = allow_cmds.join(", ");
-        if let Some(entry) = reg.entries.last_mut()
-            && entry.name == "bash"
-        {
+        if let Some(entry) = reg.entries.iter_mut().find(|e| e.name == "bash") {
             entry
                 .description
                 .push_str(&format!("\n本次运行仅允许以这些命令开头: {allow_txt}"));
@@ -1838,25 +1852,25 @@ mod tests {
     #[test]
     fn tools_from_spec_selects_and_restricts() {
         // 无 spec → 全量
-        let all = tools_from_spec(None, HashMap::new());
+        let all = tools_from_spec(None, builtin());
         let mut names = all.names();
         names.sort();
         assert_eq!(names, vec!["bash", "edit", "read", "repl", "writ"]);
 
         // 内置全列且无白名单 → 也走全量
-        let reg = tools_from_spec(Some("read,edit,writ,bash,repl"), HashMap::new());
+        let reg = tools_from_spec(Some("read,edit,writ,bash,repl"), builtin());
         assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash", "repl"]);
 
         // 只列老四件 → 不给 repl（没列就不给）
-        let reg = tools_from_spec(Some("read,edit,writ,bash"), HashMap::new());
+        let reg = tools_from_spec(Some("read,edit,writ,bash"), builtin());
         assert_eq!(reg.names(), vec!["read", "edit", "writ", "bash"]);
 
         // 仅 read → shell 禁用
-        let reg = tools_from_spec(Some("read"), HashMap::new());
+        let reg = tools_from_spec(Some("read"), builtin());
         assert_eq!(reg.names(), vec!["read"]);
 
         // 非内置名 → 隐式启用受限 shell；description 追加白名单；私有参数仍不进 schema
-        let reg = tools_from_spec(Some("read, echo ,echo"), HashMap::new());
+        let reg = tools_from_spec(Some("read, echo ,echo"), builtin());
         assert_eq!(reg.names(), vec!["read", "bash"]);
         let shell = reg
             .specs()
@@ -1875,9 +1889,34 @@ mod tests {
         );
     }
 
+    /// 非内置名先跟已注册的 Python 工具对：对上 = 放行该工具（**不进** shell 白名单），对不上 = shell 子命令。
+    #[test]
+    fn tools_from_spec_matches_python_tools_before_shell() {
+        let call: CallFn = Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::text("ok")) }));
+        let seed = builtin().with_dynamic(
+            "word_count",
+            "数词",
+            json!({"type": "object", "properties": {}}),
+            call,
+        );
+        let reg = tools_from_spec(Some("read,word_count,ls"), seed);
+        assert_eq!(reg.names(), vec!["read", "bash", "word_count"]);
+        // `word_count` 是工具、不是子命令 → 白名单里只有 ls
+        let shell = reg
+            .specs()
+            .into_iter()
+            .find(|s| s["function"]["name"] == "bash")
+            .expect("有 shell");
+        let desc = shell["function"]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("本次运行仅允许以这些命令开头: ls"),
+            "{desc}"
+        );
+    }
+
     #[tokio::test]
     async fn restricted_shell_rejects_commands_outside_allowlist() {
-        let reg = tools_from_spec(Some("echo"), HashMap::new());
+        let reg = tools_from_spec(Some("echo"), builtin());
         assert_eq!(reg.names(), vec!["bash"]);
         // 白名单内 → 正常执行
         let out = reg

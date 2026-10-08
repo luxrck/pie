@@ -58,12 +58,13 @@ impl PyToolRegistry {
 
     /// 按 `--tools` 那套说明裁剪：内置名启用该工具，其它名字当 shell 子命令白名单
     /// （`"read,ls,grep"` = read + 只允许 ls/grep 的 shell）。
+    /// Python 工具由你自己 `register(...)` 加进来，所以这里只能裁内置那几件。
     #[staticmethod]
     #[pyo3(signature = (spec, config=None))]
     fn from_spec(spec: &str, config: Option<&PyConfig>) -> Self {
         let defaults = config.map(|c| c.inner.tool_defaults()).unwrap_or_default();
         Self {
-            inner: tools::tools_from_spec(Some(spec), defaults),
+            inner: tools::tools_from_spec(Some(spec), ToolRegistry::new(defaults)),
         }
     }
 
