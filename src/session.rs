@@ -30,7 +30,7 @@ use crate::llm::{
     self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions,
     StreamChunk, ToolCall, UsageTracker,
 };
-use crate::tools::{self, ToolOutput, ToolRegistry};
+use crate::tools::{self, Attachment, ToolOutput, ToolRegistry};
 
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
@@ -622,8 +622,10 @@ impl Session {
                 .await;
             // 全部收尾后**按原顺序**回填 ToolMessage（并发/串行都是这个顺序 → 历史扁平序列一致，
             // compaction 的 step 批次 / keep_last_steps 认定不受影响）
-            let mut batch_results: Vec<String> = Vec::with_capacity(tool_calls.len());
             let mut interrupted = false;
+            // `read` 读到图的那几条：记下**消息下标**，循环外统一上传并挂进那条 tool 消息
+            //（上传是 async；拿不到 `file_id` 就什么都不改 = 天然降级）
+            let mut pending_attachments: Vec<(usize, Attachment)> = Vec::new();
             for (call, outcome) in tool_calls.iter().zip(outcomes) {
                 let out = match outcome {
                     Some(out) => out,
@@ -635,27 +637,34 @@ impl Session {
                     }
                 };
                 let name = call.function.name.as_str();
-                // 工具自带落盘（bash / repl 超限）→ 消息**进历史前**就带上原文指针（工具级），
+                // 工具自带落盘（bash / repl / pytool 超限）→ 消息**进历史前**就带上原文指针（工具级），
                 // 并同步一条压缩流水（gc 靠它保住那份落盘原文）。
                 // ⚠ 只有真落了盘才设：`compact_tools` 靠 `compaction.is_some()` 跳过「已压过」的
                 // 消息，没落盘却设一段元数据会让工具级压缩永远压不动（曾经就是无条件标）。
-                let mut msg = Message::tool_result(&call.id, name, out.text.clone());
-                if let Some(path) = &out.spill {
+                let mut msg = Message::tool_result(&call.id, name, out.to_text());
+                if let Some(path) = &out.body.spill {
                     compacted.push(context::CompactEvent::tool(name, path));
                     msg.compaction = Some(Compaction::tool(path));
                 }
+                let msg_index = self.messages.len();
                 self.messages.push(msg);
+                // 要送给模型的图（`Attachment::Model`）——先记下标，循环外挂（见 `attach_read_images`）
+                if let Some(att) = out
+                    .attachments
+                    .iter()
+                    .find(|a| matches!(a, Attachment::Model { .. }))
+                {
+                    pending_attachments.push((msg_index, att.clone()));
+                }
                 // `repl` 出的图登记进 `__meta__.files`（本地副本保命 + `calls` 供 resume 配对）
                 self.record_repl_images(call, &out);
-                batch_results.push(out.text);
             }
             if interrupted {
                 cancelled = true;
                 break;
             }
-            // 工具结果全部回填后，把本批 `read` 读到的图片作为多模态 user 消息注入
-            //（紧随结果之后；图片消息是 synthetic → 不是轮次边界，不影响压缩/轮数）
-            self.inject_read_images(&tool_calls, &batch_results).await;
+            // 本批 `read` 读到的图：挂到**那条 tool 消息**的 content 上（`text` + `file` 两个 part）
+            self.attach_read_images(&pending_attachments).await;
         }
 
         // 会话级压缩（level 3）产出的窗口块 → 登记进 `self.windows`
@@ -728,59 +737,51 @@ impl Session {
         }
     }
 
-    /// 把本批 `read` 工具读到的图片作为多模态 user 消息注入（下一轮请求模型就能看到图）。
+    /// 把本批 `read` 读到的图挂到**那条 tool 消息**的 content 上：
+    /// `[{type:text, 原正文}, {type:file, file_id}]`。
     ///
-    /// **只走 Files API**：拿不到 `file_id`（未开启 / 模型不支持 / 上传失败）就不注入——
-    /// **不回退内联 base64**。标记文本仍在工具结果里，模型知道有这张图；
-    /// 本地副本与记录也会留下，下次同图直接命中不再重传。
-    async fn inject_read_images(&mut self, calls: &[ToolCall], results: &[String]) {
-        for (call, text) in calls.iter().zip(results.iter()) {
-            if call.function.name != "read" || text.is_empty() {
+    /// **只走 Files API**：拿不到 `file_id`（未开启 / 模型不支持 / 上传失败）就**什么都不改**——
+    /// 消息保持纯文本，正文里那行 `[图片已读取: …]` 仍在，模型知道有这张图；本地副本与记录也会留下，
+    /// 下次同图直接命中不再重传。**不回退内联 base64**。
+    ///
+    /// 为什么挂 tool 消息而不是另推一条 user 消息：官方文档里 tool 消息的 content 就是
+    /// `string | content parts`（text / image_url / file 三档，2026-10-08 逐档实测过——见
+    /// docs/CHANGELOG.md 那条探测），图本来就是**工具产出**的，挂在工具结果上语义更正，
+    /// 还省掉一条消息（而且 `synthetic` 那条特殊路径再也不用走）。
+    async fn attach_read_images(&mut self, pending: &[(usize, Attachment)]) {
+        for (idx, att) in pending {
+            let Attachment::Model {
+                path, mime, size, ..
+            } = att
+            else {
                 continue;
-            }
-            let Some(image) = tools::parse_image_marker(text) else {
-                continue; // 不是读图
             };
-            let Ok(data) = std::fs::read(&image.path) else {
-                continue; // 文件没了 → 标记仍在工具结果里，不硬塞
+            let Ok(data) = std::fs::read(path) else {
+                continue; // 文件没了 → 正文那行说明仍在，不硬塞
             };
-            if image.size > 0 && data.len() as u64 != image.size {
+            if *size > 0 && data.len() as u64 != *size {
                 continue; // 文件被换过（大小对不上）
             }
-            let filename = Path::new(&image.path)
+            let filename = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let file_id = self
-                .ensure_image_file(&data, &image.mime, &filename, &image.path)
-                .await;
+            let src = path.to_string_lossy().into_owned();
+            let file_id = self.ensure_image_file(&data, mime, &filename, &src).await;
             let Some(file_id) = file_id else {
                 continue;
             };
-            let dim = match (image.width, image.height) {
-                (Some(w), Some(h)) => format!("{w}x{h} "),
-                _ => String::new(),
+            // 把那条第 tool 消息的纯文本正文换成 parts：文本 + 文件（拿不到就维持纯文本）
+            let Some(msg) = self.messages.get_mut(*idx) else {
+                continue;
             };
-            let parts = json!([
-                {
-                    "type": "text",
-                    "text": format!(
-                        "[图片（由 read 工具读取，非用户输入）: {} {dim}{} 字节 {}]",
-                        image.path,
-                        data.len(),
-                        image.mime
-                    )
-                },
-                {"type": "file", "file_id": file_id},
-            ]);
-            self.messages.push(Message {
-                role: "user".into(),
-                content: Some(Content::Parts(
-                    parts.as_array().cloned().unwrap_or_default(),
-                )),
-                synthetic: true,
-                ..Default::default()
-            });
+            let Some(Content::Text(text)) = msg.content.take() else {
+                continue;
+            };
+            msg.content = Some(Content::Parts(vec![
+                json!({"type": "text", "text": text}),
+                json!({"type": "file", "file_id": file_id}),
+            ]));
         }
     }
 
@@ -849,13 +850,15 @@ impl Session {
                                 self.config.storage.clone(),
                                 self.tool_state.clone(),
                             )
-                            .with_transcript(self.transcript_path());
+                            .with_transcript(self.transcript_path())
+                            // 工具名 → `ToolBody::fit` 的落盘前缀（`ctx.name`）
+                            .named(&call.function.name);
                             let out = match registry.dispatch(&call.function.name, &args, ctx).await
                             {
                                 Ok(out) => out,
                                 Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
                             };
-                            (out.text != CANCEL_TEXT).then_some(out) // shell 被杀 → 哨兵 → 算取消
+                            (out.to_text() != CANCEL_TEXT).then_some(out) // shell 被杀 → 哨兵 → 算取消
                         }
                     }
                 };
@@ -876,9 +879,9 @@ impl Session {
                 .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
             on_event(TurnEvent::ToolResult {
                 name: calls[index].function.name.clone(),
-                content: finished.text.clone(),
+                content: finished.to_text().clone(),
                 arguments: calls[index].function.arguments.clone(),
-                images: finished.images.clone(),
+                images: finished.canvas_images(),
             });
             outcomes[index] = outcome;
         }
@@ -928,10 +931,11 @@ impl Session {
     /// 与 `read` 那条路（[`Self::ensure_image_file`]）共用同一张表（同内容 = 同 hash），所以
     /// **按字段合并**：已有的 `file_id` / `base_url` 等照旧留着，只补自己这几项。
     fn record_repl_images(&mut self, call: &ToolCall, out: &ToolOutput) {
-        if call.function.name != "repl" || out.images.is_empty() {
-            return;
-        }
-        for path in &out.images {
+        // 只认 `Canvas` 那批（去向在产出时就定了，不必再看工具名）
+        for att in &out.attachments {
+            let Attachment::Canvas { path } = att else {
+                continue;
+            };
             if !path.is_file() {
                 continue;
             }
@@ -1667,7 +1671,7 @@ mod tests {
             .iter()
             .map(|o| {
                 o.clone()
-                    .map(|o| o.text)
+                    .map(|o| o.to_text())
                     .unwrap_or_else(|| "[cancelled]".into())
             })
             .collect()
@@ -1889,10 +1893,14 @@ mod tests {
                 .tool_call(&calls, true, &Cancel::new(), &mut sink)
                 .await;
             let text = outcomes[0].clone().expect("跑成功了");
-            assert!(text.len() > 500, "工具输出本来就很长：{} 字", text.len());
+            assert!(
+                text.to_text().len() > 500,
+                "工具输出本来就很长：{} 字",
+                text.to_text().len()
+            );
             match &events[1] {
                 TurnEvent::ToolResult { content, .. } => {
-                    assert_eq!(content, &text.text, "事件里的文本要原样（不截断）")
+                    assert_eq!(content, &text.to_text(), "事件里的文本要原样（不截断）")
                 }
                 other => panic!("第 2 个事件该是结果：{other:?}"),
             }
@@ -2053,7 +2061,13 @@ mod tests {
                 arguments: "{}".into(),
             },
         };
-        let out = || ToolOutput::text("").with_images(vec![image.clone()]);
+        let out = || {
+            let mut o = ToolOutput::text("");
+            o.attachments = vec![Attachment::Canvas {
+                path: image.clone(),
+            }];
+            o
+        };
         s.record_repl_images(&call("c1"), &out());
 
         let hash = config::name_of(&image);
@@ -2082,6 +2096,46 @@ mod tests {
             !garbage.contains(&image),
             "登记过 `local` 就该留住：{garbage:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 图拿不到 `file_id`（这儿用 `files_api = false`，**不联网**）→ 那条 tool 消息**什么都不改**：
+    /// 仍是纯文本，正文那行 `[图片已读取: …]` 还在（模型知道有图）—— 这就是天然降级。
+    ///
+    /// 用 `block_on` 而不是 `#[tokio::test]`：与旁边那个用例同款写法（不过这里没持环境锁）。
+    #[test]
+    fn attach_read_images_keeps_plain_text_when_files_api_is_off() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("pie-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("x.png");
+        std::fs::write(&png, b"fake-png").unwrap();
+
+        let config = Config {
+            files_api: false,
+            ..Default::default()
+        };
+        let mut s = Session::ephemeral(&config, llm(), tools());
+        s.messages.push(Message::tool_result(
+            "call_1",
+            "read",
+            "[图片已读取: path=…, mime=image/png, size=8]",
+        ));
+        let att = Attachment::Model {
+            path: png.clone(),
+            mime: "image/png".into(),
+            size: 8,
+            dim: Some((13, 7)),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(s.attach_read_images(&[(0, att)]));
+
+        assert!(
+            matches!(s.messages[0].content, Some(Content::Text(_))),
+            "拿不到 `file_id` 就该保持纯文本：{:?}",
+            s.messages[0].content
+        );
+        assert!(s.files.is_empty(), "没上传就不该留记录");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

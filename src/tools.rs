@@ -15,50 +15,134 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// 工具执行的产出：正文 + **落盘全文的路径**（`spill`）。
+/// 输出上限：工具的私有参数 `_max_lines` / `_max_bytes` 的形状。
 ///
-/// `spill` 只在工具把全文写到盘上时给（`bash` / `repl` 超 `_max_lines` / `_max_bytes` 时）
-/// —— 消息层据此**进历史前**就把 `compaction` 设好（`Compaction::tool(path)`），
-/// 不用事后拿正文里那行 `[工具输出全文已保存: …]` 去嗅探。**没落盘就什么都别设**：
-/// `compact_tools` 靠 `compaction.is_some()` 跳过已压过的消息。
+/// 包一层是因为 `bash` / `repl` / `pytool` 都成对持有它，而 `fit(full, a, b)` 里两个
+/// `Option<i64>` 传反了编译器不会报错。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub lines: Option<i64>,
+    pub bytes: Option<i64>,
+}
+
+/// 工具的正文：一段文本 + 「全文太长已落盘」时的指针。
+///
+/// `content` 永远是**正文本身**（没落盘 = 全文；落盘 = 头段预览）。
+/// ⚠ **指针行不进这里**：`[工具输出全文已保存: …]` 由 [`ToolOutput::to_text`] 从 `spill`
+/// 生成 —— 指针只有一个来源（以前是构造点手写、拼进正文，同一件事两处表达）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolBody {
+    pub content: String,
+    /// 落盘全文的路径（`None` = 这次没落盘：没超限，或超限但落盘失败）
+    pub spill: Option<PathBuf>,
+}
+
+impl ToolBody {
+    /// 超限就落盘、正文只留头段预览；没超限就是全文。
+    ///
+    /// 判据是**不可再生才落盘**，所以只能由工具自己调 —— 只有它知道这次输出可不可再生
+    /// （`bash` 的 stdout 进程一结束就没了；`read` 的内容原文件还在，所以它自己截断、不走这里）。
+    /// 落盘失败 → 保留全文、`spill: None`（**不写假指针**去骗模型说「有文件可读」）。
+    pub fn fit(ctx: &ToolCtx, full: &str, limits: Limits) -> ToolBody {
+        let Some(head) = head_prefix(full, limits.lines, limits.bytes) else {
+            return ToolBody {
+                content: full.to_string(),
+                spill: None,
+            };
+        };
+        // 前缀 = 工具名（`context/<名字>-<hash>`，看目录 / `pie context info` 时认得出是哪个工具）
+        let prefix = if ctx.name.is_empty() {
+            "tool"
+        } else {
+            &ctx.name
+        };
+        let spill = ctx
+            .storage
+            .store(crate::config::StoreType::Raw { prefix, body: full })
+            .ok();
+        ToolBody {
+            content: head,
+            spill,
+        }
+    }
+}
+
+/// 工具产出的一张图（**本地可读文件**）。
+///
+/// **去向在产出时就定了**（工具最清楚自己这张图是给谁看的），所以用 enum 而不是 `struct + bool`：
+/// 两条路要的字段本来就不同（`Canvas` 只要路径，`Model` 还要 mime / size / dim 去上传和写说明），
+/// 用 struct 会逼前者填一堆占位值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attachment {
+    /// **送给模型**：`Session` 走 Files API 上传 → 作为 `file` part 挂进那条 tool 消息。
+    Model {
+        /// 本地文件（`read` 给的是**用户读的源文件**路径，`Session` 再转存内容寻址副本）
+        path: PathBuf,
+        mime: String,
+        /// 字节数：投递前与磁盘对一下，文件被换过就别送
+        size: u64,
+        /// 像素尺寸（写进给模型的说明文字；读不出来就是 `None`）
+        dim: Option<(u64, u64)>,
+    },
+    /// **只给界面**（TUI 的 REPL 画布）——模型看不到。
+    Canvas {
+        /// 工具侧已经转存好的内容寻址副本（`files/img-<hash>.png`）
+        path: PathBuf,
+    },
+}
+
+/// 工具执行的产出：**头区**（工具声明的那几行）+ 正文 + 产出的图。
+///
+/// 序列化只有 [`ToolOutput::to_text`] 一个出口（头区 → 落盘指针 → 正文），消息层 / 事件层 /
+/// 绑定都走它 —— 与旧的 `format_output(headers, body)` 逐字同义。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolOutput {
-    pub text: String,
-    pub spill: Option<PathBuf>,
-    /// 给界面的**图像附件**（本地文件路径）——模型看不到，只有 TUI 的 REPL 画布用
-    /// （`repl` 里 matplotlib 出的图走这条）。和 `spill` 一样是**结构化**通道：
-    /// 不靠正文里贴一行路径去嗅探。
-    pub images: Vec<PathBuf>,
+    /// 头区：一行一个 `[...]`（`[exit=N, os=…, shell=…]`、`[解释器] 共 3 个：…` …）
+    pub headers: Vec<String>,
+    pub body: ToolBody,
+    /// 产出的图（见 [`Attachment`]）—— `Model` 那条会进请求体，`Canvas` 只给界面
+    pub attachments: Vec<Attachment>,
 }
 
 impl ToolOutput {
-    /// 只有正文（没有落盘、没有图）——绝大多数工具的返回。
+    /// 只有正文（没有头区、没有落盘、没有图）——绝大多数工具的返回。
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            text: text.into(),
-            spill: None,
-            images: Vec::new(),
+            headers: Vec::new(),
+            body: ToolBody {
+                content: text.into(),
+                spill: None,
+            },
+            attachments: Vec::new(),
         }
     }
 
-    /// 带图像附件（`repl` 用）：正文照旧，额外给界面一组图。
-    pub fn with_images(mut self, images: Vec<PathBuf>) -> Self {
-        self.images = images;
-        self
+    /// 给界面的图（`Canvas` 那批）—— `TurnEvent` 只送这些（模型看不到它们）。
+    pub fn canvas_images(&self) -> Vec<PathBuf> {
+        self.attachments
+            .iter()
+            .filter_map(|a| match a {
+                Attachment::Canvas { path } => Some(path.clone()),
+                Attachment::Model { .. } => None,
+            })
+            .collect()
+    }
+
+    /// **唯一序列化出口**：头区 → （落盘了才有的）指针行 → 正文。
+    ///
+    /// 指针行在这儿生成（工具里不再手写）—— 「有没有落盘」只有 `body.spill` 一处事实。
+    pub fn to_text(&self) -> String {
+        let mut headers = self.headers.clone();
+        if let Some(path) = &self.body.spill {
+            headers.push(format!("[工具输出全文已保存: {}]", path.display()));
+        }
+        format_output(&headers, &self.body.content)
     }
 }
 
 impl std::fmt::Display for ToolOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.text)
-    }
-}
-
-/// 直接当 `&str` 用（`out.starts_with(…)` / `out.lines()` / `format!("{out}")`…）。
-impl std::ops::Deref for ToolOutput {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.text
+        f.write_str(&self.to_text())
     }
 }
 
@@ -188,6 +272,9 @@ pub struct ToolCtx {
     pub transcript: Option<PathBuf>,
     /// 会话级工具状态槽（有状态的工具用它存长活对象；调用方每轮把它 clone 进 ctx）。
     pub state: Arc<SessionState>,
+    /// **这次调用的工具名**（注册名）——落盘文件名前缀（`context/<名字>-<hash>`）取它。
+    /// 分发时由 `Session` 填（[`ToolCtx::named`]）；空串兜底成 `"tool"`。
+    pub name: String,
 }
 
 impl ToolCtx {
@@ -201,7 +288,14 @@ impl ToolCtx {
             storage,
             transcript: None,
             state,
+            name: String::new(),
         }
+    }
+
+    /// 带上工具名（注册名）——`Session` 分发时调，[`ToolBody::fit`] 拿它当落盘前缀。
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
     }
 
     /// 带上转录快照路径（`repl` 的 `history()` 读它）。
@@ -309,12 +403,8 @@ pub(crate) fn format_output(headers: &[String], body: &str) -> String {
 /// 超限只保留**开头**连续段（未超限 → `None`）。
 ///
 /// 取头部而不是尾部：`cat 大文件` / 一大段 `print`，开头才是你要看的那部分；被截掉的尾巴由
-/// `[工具输出全文已保存: …]` 指针给出。`bash` 与 `repl` 共用（两者输出都不可再生 + 都要落盘）。
-pub(crate) fn head_prefix(
-    out: &str,
-    max_lines: Option<i64>,
-    max_bytes: Option<i64>,
-) -> Option<String> {
+/// `[工具输出全文已保存: …]` 指针给出。只由 [`ToolBody::fit`] 调（不可再生的输出才走那条）。
+fn head_prefix(out: &str, max_lines: Option<i64>, max_bytes: Option<i64>) -> Option<String> {
     if max_lines.is_none() && max_bytes.is_none() {
         return None;
     }
@@ -431,9 +521,22 @@ impl Tool for Read {
             let dim_txt = dim
                 .map(|(w, h)| format!(", dim={w}x{h}"))
                 .unwrap_or_default();
-            return Ok(ToolOutput::text(format!(
-                "[图片已读取: path={path}, mime={mime}, size={size}{dim_txt}]"
-            )));
+            // 正文那行说明与结构化附件用**同一份数据**拼（不用事后从文本里嗅探回来）
+            return Ok(ToolOutput {
+                headers: Vec::new(),
+                body: ToolBody {
+                    content: format!(
+                        "[图片已读取: path={path}, mime={mime}, size={size}{dim_txt}]"
+                    ),
+                    spill: None,
+                },
+                attachments: vec![Attachment::Model {
+                    path: PathBuf::from(&path),
+                    mime: mime.to_string(),
+                    size,
+                    dim,
+                }],
+            });
         }
 
         let content = match std::fs::read_to_string(p) {
@@ -517,58 +620,6 @@ impl Tool for Read {
         }
         Ok(ToolOutput::text(format_output(&headers, &body)))
     }
-}
-
-/// `read` 读到的图片引用（从返回文本里的机器可读标记解析而来）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageRef {
-    pub path: String,
-    pub mime: String,
-    /// 原始字节数（用于跟磁盘上的文件对一下，看有没有变）。
-    pub size: u64,
-    pub width: Option<u64>,
-    pub height: Option<u64>,
-}
-
-/// 从 `read` 的返回文本解析图片标记；非图片结果返回 None。
-///
-/// 标记是 read 自己写的（见 `Read::call`）：
-/// `[图片已读取: path=<路径>, mime=<mime>, size=<字节>[, dim=<宽>x<高>]]`
-/// 路径里不会出现 `,` 或 `]`，所以手写解析足够，不用引 regex。
-pub fn parse_image_marker(text: &str) -> Option<ImageRef> {
-    const MARK: &str = "[图片已读取: ";
-    let start = text.find(MARK)? + MARK.len();
-    let rest = &text[start..];
-    let end = rest.find(']')?;
-    let mut path: Option<String> = None;
-    let mut mime: Option<String> = None;
-    let mut size: Option<u64> = None;
-    let mut dim: Option<(u64, u64)> = None;
-    for field in rest[..end].split(", ") {
-        let Some((key, value)) = field.split_once('=') else {
-            continue;
-        };
-        match key {
-            "path" => path = Some(value.to_string()),
-            "mime" => mime = Some(value.to_string()),
-            "size" => size = value.parse::<u64>().ok(),
-            "dim" => {
-                if let Some((w, h)) = value.split_once('x')
-                    && let (Ok(w), Ok(h)) = (w.parse::<u64>(), h.parse::<u64>())
-                {
-                    dim = Some((w, h));
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(ImageRef {
-        path: path?,
-        mime: mime?,
-        size: size?,
-        width: dim.map(|d| d.0),
-        height: dim.map(|d| d.1),
-    })
 }
 
 // ⚠ 工具描述（`function.description`）**不能**只靠 doc 注释：schemars 会把 doc 里的单换行
@@ -1084,10 +1135,6 @@ impl Tool for Bash {
         let code = status.code().unwrap_or(-1);
         let out: String = chunks.concat();
 
-        // —— 超限只保留**开头**连续段（未超限用原文，也不落盘）——
-        // 截断规则见 `head_prefix`（与 `repl` 共用，别在这儿再写一份）。
-        let head = head_prefix(&out, _max_lines, _max_bytes);
-
         // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
         // 「判成败」：Rust TUI 的 `pane::tool_status` 只看**第一行**，所以失败必须
         // 从这行就能认出来——判据是「`[exit=` 开头且不是 `[exit=0`」= 失败（没有任何头 = 成功）。
@@ -1101,27 +1148,21 @@ impl Tool for Bash {
             ));
         }
 
-        match head {
-            None => Ok(ToolOutput::text(format_output(&headers, &out))),
-            Some(head) => {
-                // shell 的 stdout 不可再生（进程结束就没了）→ 全文落盘 + 独立指针（模型据此读回），
-                // 同时把路径**结构化**地放进 `ToolOutput.spill`（消息层构造时就带上 `compaction`）。
-                // 落盘走 `Storage::store`（内容 hash 寻址，按内容去重）。
-                let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
-                    prefix: "bash",
-                    body: &out,
-                }) {
-                    Ok(path) => (Some(path.clone()), path.display().to_string()),
-                    Err(e) => (None, format!("(落盘失败: {e})")),
-                };
-                headers.push(format!("[工具输出全文已保存: {spill_txt}]"));
-                Ok(ToolOutput {
-                    text: format_output(&headers, &head),
-                    spill,
-                    images: Vec::new(),
-                })
-            }
-        }
+        // shell 的 stdout 不可再生（进程一结束就没了）→ 超限就把**全文**落盘、正文只留头段预览。
+        // （截断/落盘/指针的规矩都住在 `ToolBody::fit` 里一处。）
+        let body = ToolBody::fit(
+            &ctx,
+            &out,
+            Limits {
+                lines: _max_lines,
+                bytes: _max_bytes,
+            },
+        );
+        Ok(ToolOutput {
+            headers,
+            body,
+            attachments: Vec::new(),
+        })
     }
 }
 
@@ -1410,28 +1451,87 @@ mod tests {
     }
 
     #[test]
-    fn parses_image_marker() {
-        let text = "[图片已读取: path=/tmp/a b.png, mime=image/png, size=1234, dim=13x7]";
-        let r = parse_image_marker(text).expect("应能解析");
-        assert_eq!(r.path, "/tmp/a b.png"); // 路径里的空格不影响
-        assert_eq!(r.mime, "image/png");
-        assert_eq!(r.size, 1234);
-        assert_eq!((r.width, r.height), (Some(13), Some(7)));
-        // 没有 dim（读不出尺寸时）也能解
-        let r = parse_image_marker("[图片已读取: path=x.jpg, mime=image/jpeg, size=9]").unwrap();
-        assert_eq!((r.width, r.height), (None, None));
-        // 非图片结果 / 文本里只是提到这个形状 → None
-        assert!(parse_image_marker("[行 1-2，共 5 行]\n\nab").is_none());
-        assert!(parse_image_marker("代码里写着 [图片已读取: 但没写全]").is_none());
-    }
-
-    #[test]
     fn format_output_omits_blank_line_when_body_empty() {
         assert_eq!(format_output(&["[exit=0]".into()], ""), "[exit=0]");
         assert_eq!(format_output(&["[exit=0]".into()], "hi"), "[exit=0]\n\nhi");
         // 没有头区 → 直接给正文（`bash` 成功时就是这种；别以空串 join 出多余空行）
         assert_eq!(format_output(&[], "hi"), "hi");
         assert_eq!(format_output(&[], ""), "");
+    }
+
+    /// 指针行**只有一个来源**（`body.spill`）：序列化后它的出现次数恒等于 `spill.is_some()`。
+    /// 守住这条是为了防哪天有人在 `body.content` 里又拼一遍指针（那就又变成两处事实）。
+    #[test]
+    fn spill_pointer_comes_only_from_body_spill() {
+        let inline = ToolOutput::text("hi");
+        assert_eq!(inline.to_text(), "hi");
+        assert_eq!(inline.to_text().matches("[工具输出全文已保存:").count(), 0);
+
+        let spilled = ToolOutput {
+            headers: vec!["[exit=1]".into()],
+            body: ToolBody {
+                content: "head".into(),
+                spill: Some(PathBuf::from("/tmp/raw-x")),
+            },
+            attachments: Vec::new(),
+        };
+        assert_eq!(
+            spilled.to_text(),
+            "[exit=1]\n[工具输出全文已保存: /tmp/raw-x]\n\nhead",
+            "顺序与旧的 `format_output` 一致：头区（指针行也是头区的一行）→ 空行 → 正文"
+        );
+        assert_eq!(spilled.to_text().matches("[工具输出全文已保存:").count(), 1);
+
+        // 正文里自己写了一个「像指针」的行 → 那只是正文，不构成事实来源
+        let fake = ToolOutput::text("[工具输出全文已保存: /nope]");
+        assert!(fake.body.spill.is_none());
+        assert_eq!(fake.to_text(), "[工具输出全文已保存: /nope]");
+    }
+
+    /// `ToolBody::fit`：没超限就是全文、不碰盘；超限落盘（文件名前缀 = `ctx.name`）
+    /// 且落盘的是**全文**（不是预览）。
+    #[test]
+    fn fit_spills_full_text_under_tool_name_prefix() {
+        let tmp = tmp("fit");
+        let ctx = ToolCtx {
+            storage: crate::config::Storage::at(tmp.join("storage")),
+            ..ToolCtx::default()
+        }
+        .named("bash");
+        let full: String = (1..=50).map(|i| format!("line{i}\n")).collect();
+
+        let plain = ToolBody::fit(&ctx, &full, Limits::default());
+        assert_eq!(plain.content, full, "没超限 = 全文");
+        assert!(plain.spill.is_none(), "没超限不落盘");
+
+        let cut = ToolBody::fit(
+            &ctx,
+            &full,
+            Limits {
+                lines: Some(3),
+                bytes: None,
+            },
+        );
+        assert!(
+            cut.content.starts_with("line1\nline2\nline3\n"),
+            "{}",
+            cut.content
+        );
+        assert!(!cut.content.contains("line50"), "只留开头");
+        let path = cut.spill.clone().expect("超限要落盘");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("bash-"),
+            "文件名前缀 = 工具名：{path:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            full,
+            "落盘的是全文，不是预览"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// 图片识别走 **read 的公开路径**（原 `probe_image` 已并进 `Read::call`，没有可单测的内部函数了）。
@@ -1461,13 +1561,38 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(out.starts_with("[图片已读取: path="), "{format:?}: {out}");
-            assert!(out.contains(&format!("mime={mime}")), "{format:?}: {out}");
             assert!(
-                out.contains(&format!("size={}", bytes.len())),
+                out.to_text().starts_with("[图片已读取: path="),
                 "{format:?}: {out}"
             );
-            assert!(out.contains("dim=13x7"), "{format:?}: {out}");
+            assert!(
+                out.to_text().contains(&format!("mime={mime}")),
+                "{format:?}: {out}"
+            );
+            assert!(
+                out.to_text().contains(&format!("size={}", bytes.len())),
+                "{format:?}: {out}"
+            );
+            assert!(out.to_text().contains("dim=13x7"), "{format:?}: {out}");
+            // 结构化附件（给模型那条）：与正文那行说明**同一份数据**（不用事后嗅探文本）
+            let [
+                Attachment::Model {
+                    path: ap,
+                    mime: am,
+                    size: asize,
+                    dim,
+                },
+            ] = &out.attachments[..]
+            else {
+                panic!(
+                    "{format:?}：read 的图该是 `Attachment::Model`：{:?}",
+                    out.attachments
+                )
+            };
+            assert_eq!(ap, &p);
+            assert_eq!(am, mime);
+            assert_eq!(*asize, bytes.len() as u64);
+            assert_eq!(*dim, Some((13, 7)));
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -1509,8 +1634,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(!out.contains("图片已读取"), "{name}: {out}");
-            assert!(out.starts_with(marker), "{name}: {out}");
+            assert!(!out.to_text().contains("图片已读取"), "{name}: {out}");
+            assert!(out.to_text().starts_with(marker), "{name}: {out}");
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -1533,8 +1658,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.starts_with("[行 1-2，共 5 行]"), "{out}");
-        assert!(out.ends_with("a\nb"), "{out}");
+        assert!(out.to_text().starts_with("[行 1-2，共 5 行]"), "{out}");
+        assert!(out.to_text().ends_with("a\nb"), "{out}");
 
         // limit 是模型显式分页（不算截断）；_max_lines（配置注入的私有参数）才给续读提示
         let out = reg
@@ -1545,7 +1670,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("[已截断：可用 offset=3 继续读]"), "{out}");
+        assert!(
+            out.to_text().contains("[已截断：可用 offset=3 继续读]"),
+            "{out}"
+        );
 
         // 字节预算：行不含换行 → 每行 "a" 算 2 字节（+1）；5 字节装得下 2 行
         let out = reg
@@ -1556,8 +1684,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.starts_with("[行 1-2，共 5 行]"), "{out}");
-        assert!(out.contains("[已截断：可用 offset=3 继续读]"), "{out}");
+        assert!(out.to_text().starts_with("[行 1-2，共 5 行]"), "{out}");
+        assert!(
+            out.to_text().contains("[已截断：可用 offset=3 继续读]"),
+            "{out}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1617,7 +1748,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("已替换 2 处"), "{out}");
+        assert!(out.to_text().contains("已替换 2 处"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "ALPHA\nBETA\n");
 
         // 重叠 → 报错且不写入
@@ -1827,7 +1958,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.text, "hi:2:true");
+        assert_eq!(out.to_text(), "hi:2:true");
 
         // 未知工具：带上可用列表（对模型有用）
         let e = reg
@@ -1908,10 +2039,7 @@ mod tests {
             .find(|s| s["function"]["name"] == "bash")
             .expect("有 shell");
         let desc = shell["function"]["description"].as_str().unwrap();
-        assert!(
-            desc.contains("本次运行仅允许以这些命令开头: ls"),
-            "{desc}"
-        );
+        assert!(desc.contains("本次运行仅允许以这些命令开头: ls"), "{desc}");
     }
 
     #[tokio::test]
@@ -1923,7 +2051,7 @@ mod tests {
             .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
             .await
             .unwrap();
-        assert!(out.contains("hi"), "{out}");
+        assert!(out.to_text().contains("hi"), "{out}");
         // 白名单外（含空命令）→ 直接回给模型，不启动进程
         let e = reg
             .dispatch(
@@ -1974,7 +2102,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out.text, "out\nerr\n",
+            out.to_text(),
+            "out\nerr\n",
             "成功：纯正文、没有退出码头：{out:?}"
         );
         // stderr 已合并到 stdout（顺序稳定：同一个管道）
@@ -1987,7 +2116,7 @@ mod tests {
             .await
             .unwrap();
         // 没输出 → 结果就是那一行头
-        assert_eq!(out.text, fail_header(3), "{out}");
+        assert_eq!(out.to_text(), fail_header(3), "{out}");
     }
 
     /// 失败：只给一行头 `[exit=N, os=…, shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
@@ -1998,14 +2127,15 @@ mod tests {
             .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(ok.text, "hi\n", "成功：只有正文");
+        assert_eq!(ok.to_text(), "hi\n", "成功：只有正文");
 
         let silent = reg
             .dispatch("bash", &json!({"command": "true"}), ToolCtx::default())
             .await
             .unwrap();
         assert_eq!(
-            silent.text, "",
+            silent.to_text(),
+            "",
             "成功且没输出：结果为空（没有 `[exit=0]` 可给）"
         );
 
@@ -2014,7 +2144,7 @@ mod tests {
             .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(bad.text, headers, "失败且没输出：只有一行头");
+        assert_eq!(bad.to_text(), headers, "失败且没输出：只有一行头");
 
         let bad = reg
             .dispatch(
@@ -2024,10 +2154,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(bad.text, format!("{headers}\n\nboom\n"), "头 + 空行 + 正文");
+        assert_eq!(
+            bad.to_text(),
+            format!("{headers}\n\nboom\n"),
+            "头 + 空行 + 正文"
+        );
         // 前端（Rust TUI 的 `pane::tool_status`）只拿**第一行**判成败：
         // `[exit=` 开头且不是 `[exit=0…` = 失败（成功根本没有头）
-        let first = bad.lines().next().unwrap_or_default();
+        let bad_text = bad.to_text();
+        let first = bad_text.lines().next().unwrap_or_default();
         assert_eq!(first, headers, "{bad}");
         assert!(
             first.starts_with("[exit=") && !first.starts_with("[exit=0"),
@@ -2047,7 +2182,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.starts_with(&fail_header(-1)), "{out}");
+        assert!(out.to_text().starts_with(&fail_header(-1)), "{out}");
     }
 
     #[tokio::test]
@@ -2061,19 +2196,25 @@ mod tests {
             .await
             .unwrap();
         // 超限 → 只留**开头** + 独立指针（shell 的 stdout 不可再生，是唯一该落盘的）
-        assert!(out.contains("[工具输出全文已保存: "), "{out}");
-        let body = out.split("\n\n").nth(1).expect("有 body");
+        assert!(out.to_text().contains("[工具输出全文已保存: "), "{out}");
+        let full = out.to_text();
+        let body = full.split("\n\n").nth(1).expect("有 body");
         assert!(body.starts_with("1\n"), "{body}");
         assert!(body.contains("5\n") && !body.contains("6\n"), "{body}");
 
         // 但全文仍然落盘（经指针可取回）——「取头部」丢的只是可见性，不是信息
-        let spill = out
+        let text = out.to_text();
+        let spill = text
             .lines()
             .find_map(|l| l.strip_prefix("[工具输出全文已保存: ")?.strip_suffix(']'))
             .expect("有落盘指针");
         let full = std::fs::read_to_string(spill).expect("落盘文件可读");
         // 结构化：路径也随结果交出来（消息层据此**构造时**就设 `compaction`，不再靠文本嗅探）
-        let spilled = out.spill.clone().expect("落盘 → ToolOutput.spill 有值");
+        let spilled = out
+            .body
+            .spill
+            .clone()
+            .expect("落盘 → ToolOutput.body.spill 有值");
         assert_eq!(
             spilled,
             PathBuf::from(spill),
@@ -2100,7 +2241,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out.text, "1\n2\n3\n4\n5\n",
+            out.to_text(),
+            "1\n2\n3\n4\n5\n",
             "成功且未超限：纯正文，没有头也没有指针"
         );
 
@@ -2113,8 +2255,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("全文已保存"), "{out}");
-        assert_eq!(out.split("\n\n").nth(1).unwrap(), "1\n2\n3\n", "{out}");
+        assert!(out.to_text().contains("全文已保存"), "{out}");
+        assert_eq!(
+            out.to_text().split("\n\n").nth(1).unwrap(),
+            "1\n2\n3\n",
+            "{out}"
+        );
     }
 
     #[tokio::test]
@@ -2130,7 +2276,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("超时"), "{out}");
+        assert!(out.to_text().contains("超时"), "{out}");
         assert!(
             started.elapsed().as_secs() < 10,
             "超时路径被卡住了: {:?}",

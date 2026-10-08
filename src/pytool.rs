@@ -36,9 +36,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::cancel::CANCEL_TEXT;
-use crate::config::StoreType;
 use crate::tools::{
-    CallFn, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolResult, format_output, head_prefix,
+    CallFn, Limits, ToolBody, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolResult,
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
@@ -370,7 +369,7 @@ impl Host {
         tokio::pin!(cancel_wait);
         tokio::select! {
             reply = rx => match reply {
-                Ok(reply) => reply.into_result(tool, &ctx, max_lines, max_bytes),
+                Ok(reply) => reply.into_result(&ctx, max_lines, max_bytes),
                 Err(_) => Err(ToolError(
                     "[pytool] 宿主没有应答（进程已退出，下次调用会自动重启）".to_string()
                 )),
@@ -393,7 +392,6 @@ impl Reply {
     /// 应答 → 工具结果：`error` 文本化（`session` 会包成 `[工具错误] …`），正文过截断/落盘。
     fn into_result(
         self,
-        tool: &str,
         ctx: &ToolCtx,
         max_lines: Option<i64>,
         max_bytes: Option<i64>,
@@ -402,21 +400,19 @@ impl Reply {
             return Err(ToolError(error));
         }
         let text = self.text.unwrap_or_default();
-        let Some(head) = head_prefix(&text, max_lines, max_bytes) else {
-            return Ok(ToolOutput::text(text));
-        };
-        // 与 `bash` 同款：全文落盘 + 独立指针（`spill` 结构化带上，消息层据此设压缩）
-        let (spill, spill_txt) = match ctx.storage.store(StoreType::Raw {
-            prefix: tool,
-            body: &text,
-        }) {
-            Ok(path) => (Some(path.clone()), path.display().to_string()),
-            Err(e) => (None, format!("(落盘失败: {e})")),
-        };
+        // 与 `bash` / `repl` 同款：单元格输出一旦被消费就没了（不可再生）→ 超限把**全文**落盘、
+        // 正文只留头段预览（截断/落盘/指针的规矩都在 `ToolBody::fit` 里一处；前缀取 `ctx.name`）。
         Ok(ToolOutput {
-            text: format_output(&[format!("[工具输出全文已保存: {spill_txt}]")], &head),
-            spill,
-            images: Vec::new(),
+            headers: Vec::new(),
+            body: ToolBody::fit(
+                ctx,
+                &text,
+                Limits {
+                    lines: max_lines,
+                    bytes: max_bytes,
+                },
+            ),
+            attachments: Vec::new(),
         })
     }
 }
@@ -508,6 +504,7 @@ mod tests {
                 crate::config::Storage::at(self.dir.join("storage")),
                 Arc::new(crate::tools::SessionState::default()),
             )
+            .named("pytool")
         }
     }
 
@@ -593,7 +590,7 @@ def loud() -> str:
             .dispatch("echo", &json!({"text": "你好"}), ctx.clone())
             .await
             .expect("echo 成功");
-        assert_eq!(out.text, "echo:你好");
+        assert_eq!(out.to_text(), "echo:你好");
 
         // 中文来回：`-X utf8` 没生效的话这里会炸/乱码
         let err = registry
@@ -630,8 +627,8 @@ def loud() -> str:
             registry.dispatch("slow", &args_b, ctx.clone()),
         );
         let elapsed = started.elapsed();
-        assert_eq!(a.unwrap().text, "slept:a");
-        assert_eq!(b.unwrap().text, "slept:b");
+        assert_eq!(a.unwrap().to_text(), "slept:a");
+        assert_eq!(b.unwrap().to_text(), "slept:b");
         assert!(
             elapsed < Duration::from_millis(550),
             "两个 0.3s 的调用应当重叠跑（实测 {elapsed:?}）"
@@ -657,7 +654,7 @@ def loud() -> str:
             .dispatch("slow", &json!({"seconds": 5.0}), cancelled)
             .await
             .expect("取消不是错误");
-        assert_eq!(out.text, CANCEL_TEXT);
+        assert_eq!(out.to_text(), CANCEL_TEXT);
 
         // 新的一轮：进程该被重启，工具照常可用
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
@@ -666,7 +663,7 @@ def loud() -> str:
                 .dispatch("echo", &json!({"text": "again"}), ctx)
                 .await
                 .unwrap()
-                .text,
+                .to_text(),
             "echo:again"
         );
     }
@@ -692,7 +689,7 @@ def loud() -> str:
                 .dispatch("echo", &json!({"text": "back"}), ctx)
                 .await
                 .unwrap()
-                .text,
+                .to_text(),
             "echo:back"
         );
     }
@@ -723,19 +720,23 @@ def loud() -> str:
             .await
             .expect("big 成功");
         assert!(
-            out.text.contains("[工具输出全文已保存: "),
+            out.to_text().contains("[工具输出全文已保存: "),
             "超限要给指针：{}",
-            out.text
+            out.to_text()
         );
         assert!(
-            out.text.contains("line 0\nline 1"),
+            out.to_text().contains("line 0\nline 1"),
             "只留开头：{}",
-            out.text
+            out.to_text()
         );
-        assert!(!out.text.contains("line 9"), "尾巴被截掉：{}", out.text);
+        assert!(
+            !out.to_text().contains("line 9"),
+            "尾巴被截掉：{}",
+            out.to_text()
+        );
 
         // 全文在盘上（`spill` 是结构化给的，不用拿指针文本去嗅探）
-        let spill = out.spill.expect("落盘路径要结构化带上");
+        let spill = out.body.spill.expect("落盘路径要结构化带上");
         let full = std::fs::read_to_string(&spill).unwrap();
         assert!(full.contains("line 99"), "落盘的是全文");
     }
@@ -757,7 +758,7 @@ def loud() -> str:
                 .dispatch("loud", &json!({}), ctx)
                 .await
                 .unwrap()
-                .text,
+                .to_text(),
             "ok"
         );
     }

@@ -26,7 +26,9 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cancel::CANCEL_TEXT;
-use crate::tools::{self, Tool, ToolCtx, ToolError, ToolOutput, ToolResult};
+use crate::tools::{
+    Attachment, Limits, Tool, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
+};
 
 /// 驱动脚本正文（编译期嵌入；它自己用 IPython 的 `InteractiveShell`）。
 const DRIVER: &str = include_str!("python/repl_driver.py");
@@ -381,7 +383,8 @@ fn format_reply(
     // 目录（`files/img-<hash>.png`）——会话 `__meta__.files` 记的 `local` 才立得住，`files gc`
     // 也才认得出它还被引用（见 `session::record_repl_images`）。读不到字节的（已被删掉的
     // 临时图）直接跳过。
-    let images: Vec<std::path::PathBuf> = reply
+    // 去向是 `Canvas`：**只给界面**（TUI 画布），模型看不到——模型自己知道它画了什么。
+    let attachments: Vec<Attachment> = reply
         .images
         .iter()
         .filter_map(|s| std::fs::read(s).ok())
@@ -390,7 +393,7 @@ fn format_reply(
                 data: &data,
                 mime: "image/png",
             }) {
-                Ok(path) => Some(path),
+                Ok(path) => Some(Attachment::Canvas { path }),
                 Err(e) => {
                     crate::log::warn(format!("[warn] repl 图副本写入失败: {e}"));
                     None
@@ -413,25 +416,19 @@ fn format_reply(
         body.push_str(part);
     }
 
-    match tools::head_prefix(&body, max_lines, max_bytes) {
-        None => ToolOutput::text(tools::format_output(&headers(&reply), &body)).with_images(images),
-        Some(head) => {
-            // 单元格输出一旦被消费就没了（不可再生）→ 超限落盘 + 指针，与 `bash` 同款。
-            let (spill, spill_txt) = match ctx.storage.store(crate::config::StoreType::Raw {
-                prefix: "repl",
-                body: &body,
-            }) {
-                Ok(path) => (Some(path.clone()), path.display().to_string()),
-                Err(e) => (None, format!("(落盘失败: {e})")),
-            };
-            let mut headers = headers(&reply);
-            headers.push(format!("[工具输出全文已保存: {spill_txt}]"));
-            ToolOutput {
-                text: tools::format_output(&headers, &head),
-                spill,
-                images,
-            }
-        }
+    // 单元格输出一旦被消费就没了（不可再生）→ 超限把**全文**落盘、正文只留头段预览
+    // （截断/落盘/指针的规矩都在 `ToolBody::fit` 里一处；落盘前缀取 `ctx.name`）。
+    ToolOutput {
+        headers: headers(&reply),
+        body: ToolBody::fit(
+            ctx,
+            &body,
+            Limits {
+                lines: max_lines,
+                bytes: max_bytes,
+            },
+        ),
+        attachments,
     }
 }
 
@@ -552,6 +549,7 @@ while True:
             storage: Storage::at(tmp.to_path_buf()),
             transcript: None,
             state: Arc::new(crate::tools::SessionState::default()),
+            name: "repl".to_string(),
         }
     }
 
@@ -569,16 +567,19 @@ while True:
 
         let a = run_code(&reg, &ctx, py, "hello").await;
         let b = run_code(&reg, &ctx, py, "world").await;
-        assert!(a.text.starts_with("call#1:"), "{a:?}");
+        assert!(a.to_text().starts_with("call#1:"), "{a:?}");
         assert!(
-            b.text.starts_with("call#2:"),
+            b.to_text().starts_with("call#2:"),
             "同一会话应复用同一进程: {b:?}"
         );
 
         // 另一个会话（另一个 state）→ 全新进程
         let other = ctx_at(&tmp);
         let c = run_code(&reg, &other, py, "hello").await;
-        assert!(c.text.starts_with("call#1:"), "新会话应是新进程: {c:?}");
+        assert!(
+            c.to_text().starts_with("call#1:"),
+            "新会话应是新进程: {c:?}"
+        );
     }
 
     #[tokio::test]
@@ -588,9 +589,9 @@ while True:
         let ctx = ctx_at(&tempdir("body"));
 
         let e = run_code(&reg, &ctx, py, "stderr").await;
-        assert_eq!(e.text, "oops\n");
+        assert_eq!(e.to_text(), "oops\n");
         let t = run_code(&reg, &ctx, py, "error").await;
-        assert_eq!(t.text, "ValueError: boom");
+        assert_eq!(t.to_text(), "ValueError: boom");
         // 异常是 REPL 的正常输出，不是工具失败（dispatch 返回 Ok）
     }
 
@@ -603,13 +604,13 @@ while True:
 
         let out = run_code(&reg, &ctx, py, "ns:any").await;
         assert!(
-            out.text
+            out.to_text()
                 .starts_with("[解释器] 共 3 个：df, f, math（本次新增：df）\n\nline1\n"),
             "{out:?}"
         );
         // 没上报状态的驱动（上面的 FAKE）不该凭空多出这一行
         let plain = run_code(&reg, &ctx, py, "hello").await;
-        assert!(plain.text.starts_with("call#"), "{plain:?}");
+        assert!(plain.to_text().starts_with("call#"), "{plain:?}");
     }
 
     /// 输出超限落盘时状态行**得留在头区**（`head_prefix` 保留开头）——不然最需要它的场合恰好丢掉。
@@ -624,13 +625,16 @@ while True:
             "code": "ns:long", "_python": py, "_driver": FAKE, "_max_lines": 2
         });
         let out = reg.dispatch("repl", &args, ctx.clone()).await.unwrap();
-        assert!(out.text.starts_with("[解释器] 共 3 个："), "{out:?}");
+        assert!(out.to_text().starts_with("[解释器] 共 3 个："), "{out:?}");
         assert!(
-            out.text.contains("[工具输出全文已保存: "),
+            out.to_text().contains("[工具输出全文已保存: "),
             "指针也在头区：{out:?}"
         );
-        assert!(out.text.contains("line1\nline2\n"), "只留开头两行：{out:?}");
-        assert!(out.spill.is_some());
+        assert!(
+            out.to_text().contains("line1\nline2\n"),
+            "只留开头两行：{out:?}"
+        );
+        assert!(out.body.spill.is_some());
     }
 
     /// 真驱动要 IPython（系统 `python3` 通常没有）→ 优先 `pie setup` 建的 `~/.pie/envs/base`
@@ -717,20 +721,20 @@ while True:
 
         // 展开后：user(0) + 归档里的 assistant(0)/tool(0) + user(1) + tool(1)
         assert!(
-            out.text
+            out.to_text()
                 .contains("[('user', 0), ('assistant', 0), ('tool', 0), ('user', 1), ('tool', 1)]"),
             "{out:?}"
         );
         assert!(
-            out.text.contains("4 3"),
+            out.to_text().contains("4 3"),
             "expand=False 是压缩态（4 条）、turn=0 只那一轮（3 条）：{out:?}"
         );
         assert!(
-            out.text.contains(r#"{"code": "df = 42"}"#),
+            out.to_text().contains(r#"{"code": "df = 42"}"#),
             "归档里的代码要能被查到：{out:?}"
         );
         assert!(
-            out.text.contains("/tmp/全文.txt"),
+            out.to_text().contains("/tmp/全文.txt"),
             "落盘全文的路径要带出来：{out:?}"
         );
     }
@@ -746,12 +750,12 @@ while True:
             "code": "l1\nl2\nl3\nl4", "_python": py, "_driver": FAKE, "_max_lines": 2
         });
         let out = reg.dispatch("repl", &args, ctx.clone()).await.unwrap();
-        assert!(out.text.starts_with("[工具输出全文已保存:"), "{out:?}");
+        assert!(out.to_text().starts_with("[工具输出全文已保存:"), "{out:?}");
         assert!(
-            out.text.contains("call#1: l1\nl2\n"),
+            out.to_text().contains("call#1: l1\nl2\n"),
             "只留开头两行: {out:?}"
         );
-        let spill = out.spill.expect("应落盘");
+        let spill = out.body.spill.expect("应落盘");
         let full = std::fs::read_to_string(&spill).unwrap();
         assert!(full.contains("l4"), "落盘件应是全文: {full:?}");
         assert_eq!(spill.parent().unwrap(), tmp.join("context"));
@@ -791,7 +795,7 @@ while True:
         });
         let args = json!({"code": "stall", "_python": py, "_driver": FAKE});
         let out = reg.dispatch("repl", &args, ctx).await.unwrap();
-        assert_eq!(out.text, CANCEL_TEXT);
+        assert_eq!(out.to_text(), CANCEL_TEXT);
     }
 
     #[tokio::test]
@@ -801,7 +805,7 @@ while True:
         let ctx = ctx_at(&tempdir("timeout"));
         let args = json!({"code": "stall", "_python": py, "_driver": FAKE, "timeout": 1});
         let out = reg.dispatch("repl", &args, ctx).await.unwrap();
-        assert!(out.text.contains("超过 1s"), "{out:?}");
+        assert!(out.to_text().contains("超过 1s"), "{out:?}");
     }
 
     /// driver 出的图是**临时** PNG → 工具层转存成 `files/img-<hash>.png`（会话才留得住它）。
@@ -819,8 +823,10 @@ while True:
             "code": src.display().to_string(), "_python": py, "_driver": FAKE_IMAGES
         });
         let out = reg.dispatch("repl", &args, ctx).await.unwrap();
-        assert_eq!(out.images.len(), 1, "{out:?}");
-        let stored = &out.images[0];
+        assert_eq!(out.attachments.len(), 1, "{out:?}");
+        let crate::tools::Attachment::Canvas { path: stored } = &out.attachments[0] else {
+            panic!("repl 的图只给界面：{:?}", out.attachments[0]);
+        };
         assert_eq!(
             stored.parent().unwrap(),
             tmp.join("files"),

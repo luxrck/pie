@@ -367,6 +367,9 @@ fn compact_tools(
         if m.role != "tool" || m.compaction.is_some() || protected.contains(&i) {
             continue;
         }
+        // ⚠ 只压**纯文本**：`Content::Parts` 的 tool 消息（`read` 读到图、图挂在 content 上那种）
+        // 正文就一行标记，本来就短到不值得压 —— 先跳过。哪天出现「长正文 + 图」的 parts 消息，
+        // 在这里支持即可（把 text part 拿出来做头尾预览 + 落盘，其余 part 原样接回去）。
         let Some(Content::Text(content)) = &m.content else {
             continue;
         };
