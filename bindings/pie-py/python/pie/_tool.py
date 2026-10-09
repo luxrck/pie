@@ -3,9 +3,10 @@
 规则与 schema 形状：
 `str` / `int` / `float` / `bool` / `list[...]` / `dict` / `Optional[...]` 认，其余注解直接报错；
 下划线开头的参数（注入项）不进 schema；描述取 `description` → docstring 首行 → 函数名。
+三种写法都行：`@tool`（裸用）/ `@tool()` / `@tool(name="…", description="…")`。
 
-⚠ 只收**同步**函数：Python 工具的 handler 目前还没有异步支持（`async def` 在这里就拒掉，
-别等到调用时才拿到一个 coroutine）。
+`async def` 也**能**装饰：`pytool` 宿主有后台 loop，会跑协程（同步 handler 仍走线程池）。
+**绑定**跑不了协程，所以它那边的 `ToolRegistry.register(...)` 会在注册那一步拦。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import inspect
 import types
 from dataclasses import dataclass
-from typing import Any, Callable, Union, get_args, get_origin, get_type_hints
+from typing import Any, Callable, Union, get_args, get_origin, get_type_hints, overload
 
 __all__ = ["Tool", "tool"]
 
@@ -64,22 +65,37 @@ def _type_to_schema(annotation: Any) -> dict[str, Any]:
     )
 
 
+@overload
+def tool(fn: Callable[..., str]) -> Tool: ...
+
+
+@overload
 def tool(
     name: str | None = None,
     description: str | None = None,
     parameters: dict[str, dict[str, Any]] | None = None,
-) -> Callable[[Callable[..., str]], Tool]:
+) -> Callable[[Callable[..., str]], Tool]: ...
+
+
+def tool(
+    name: str | Callable[..., str] | None = None,
+    description: str | None = None,
+    parameters: dict[str, dict[str, Any]] | None = None,
+):
     """把普通函数变成 [`Tool`][pie.Tool]：类型注解自动生成参数 schema。
 
+    三种写法都行：`@tool`（裸用）/ `@tool()` / `@tool(name="…", description="…")`。
     `parameters` 传入时按参数名覆盖自动生成的结果（例：给某个字段补 `"enum"`）。
     """
 
+    # `@tool` 裸用（不带括号）时 Python 把被装饰的函数当**第一个位置参数**递进来。
+    # 不认这一种会返回 `decorate` 而不是 `Tool`：调用方（pytool 宿主 / 绑定）只挑 `Tool` 实例，
+    # 于是那个工具**静默消失**（连一条告警都没有），而且裸用还顺带跳过了下面那道 async 检查。
+    # 真踩过 —— 所以裸用必须认。
+    direct = name if name is not None and not isinstance(name, str) else None
+    tool_name = name if isinstance(name, str) else None
+
     def decorate(fn: Callable[..., str]) -> Tool:
-        if inspect.iscoroutinefunction(fn):
-            raise ValueError(
-                f"{fn.__name__} 是 async 函数：绑定现在只支持同步 handler"
-                "（async handler 还没支持，请写同步函数）"
-            )
         sig = inspect.signature(fn)
         try:
             hints = get_type_hints(fn)  # 处理 `from __future__ import annotations` 的字符串注解
@@ -104,10 +120,10 @@ def tool(
                 required.append(pname)
         desc = description or (fn.__doc__ or fn.__name__).strip().splitlines()[0]
         return Tool(
-            name=name or fn.__name__,
+            name=tool_name or fn.__name__,
             description=desc,
             parameters={"type": "object", "properties": props, "required": required},
             handler=fn,
         )
 
-    return decorate
+    return decorate(direct) if direct is not None else decorate

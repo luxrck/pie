@@ -66,16 +66,16 @@ pub(crate) fn config_error(e: pie::config::ConfigError) -> PyErr {
     ConfigError::new_err(e.to_string())
 }
 
-/// 核心的 `LlmError` → Python `LlmError`，并把 HTTP 状态码挂到实例的 `.status` 上
-/// （`None` = 不是服务端返回的错误，比如连接失败）。
+/// 核心的 `LlmError` → Python `LlmError`，并把 HTTP 状态码挂到实例的 `.status` 上。
+///
+/// ⚠ `status` **永远**挂上（不是服务端返回的错就是 `None`，如连接失败）—— 存根写的是
+/// `status: int | None`，只挂 `Some` 会让「连不上」那条路读到 `AttributeError`（与存根/文档不符）。
 pub(crate) fn llm_error(py: Python<'_>, e: pie::llm::LlmError) -> PyErr {
     let status = e.status();
     let type_object = py.get_type::<LlmError>();
     match type_object.call1((e.to_string(),)) {
         Ok(instance) => {
-            if let Some(code) = status {
-                let _ = instance.setattr("status", code);
-            }
+            let _ = instance.setattr("status", status);
             PyErr::from_value(instance)
         }
         // 连异常都造不出来（内存不足之类）：退回普通写法，别把原始错误吞了
@@ -359,6 +359,9 @@ fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "asyncio")]
     m.add_function(wrap_pyfunction!(arun, m)?)?;
     m.add_function(wrap_pyfunction!(list_sessions, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::llm::llm, m)?)?;
+    #[cfg(feature = "asyncio")]
+    m.add_function(wrap_pyfunction!(crate::llm::allm, m)?)?;
 
     m.add_class::<PyConfig>()?;
     m.add_class::<PyLlmClient>()?;

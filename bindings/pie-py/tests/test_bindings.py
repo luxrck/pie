@@ -92,12 +92,26 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         request = json.loads(self.rfile.read(length) or b"{}")
         self.server.requests.append(request)  # type: ignore[attr-defined]
+        # 键统一小写（hyper 发出来的就是小写，`dict(self.headers)` 是原样大小写）
+        self.server.last_headers = {  # type: ignore[attr-defined]
+            k.lower(): v for k, v in self.headers.items()
+        }
 
         if self.server.delay:  # type: ignore[attr-defined]
             time.sleep(self.server.delay)  # type: ignore[attr-defined]
 
         role_of_last = request["messages"][-1]["role"]
-        if role_of_last == "tool":  # 工具结果已回传 → 给最终答复
+        if getattr(self.server, "answer", None) is not None:
+            # `server.answer = "…"` → 不看历史，直接回这一句
+            # （给 `pie.llm(...)` 这种「一次性问一句」的用例用）
+            text = self.server.answer
+            tool_calls = None
+            chunks = (
+                {"choices": [{"delta": {"content": text}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}},
+            )
+        elif role_of_last == "tool":  # 工具结果已回传 → 给最终答复
             text = "搞定了"
             tool_calls = None
             chunks = (
@@ -193,6 +207,7 @@ def fake_llm():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     server.requests = []  # type: ignore[attr-defined]
     server.delay = 0.0  # type: ignore[attr-defined]
+    server.answer = None  # type: ignore[attr-defined]  # 置上就不看历史、直接回这一句
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -554,6 +569,95 @@ def test_session_clear_window_setters_and_transcript(env, tmp_path, monkeypatch)
     assert session.config.reasoning_effort == "low"
 
 
+# ---------------------------------------------------------------- `pie.llm(...)` 一次性问一句
+
+
+def test_llm_is_a_one_shot_over_the_client(env):
+    """`pie.llm(...)`：`LlmClient.complete` 那条路（同端点 / 同一份 api_key / 不发 stream），返回正文。"""
+    cfg, _, _, server = env
+    server.answer = "你好呀"
+    assert pie.llm("打个招呼", system="你是助手", config=cfg) == "你好呀"
+
+    sent, headers = server.requests[-1], server.last_headers
+    assert sent["model"] == cfg.model
+    assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+    assert not sent.get("stream"), "这条路一次性拿完整 JSON（不流式）"
+    assert headers["authorization"] == f"Bearer {cfg.api_key}", "用同一份 api_key"
+
+
+def test_llm_overrides_and_errors_are_the_native_ones(env):
+    """`model` / `max_tokens` 是按次覆盖（`max_tokens` → 配置里的 `reserved_tokens`）；
+    出错是原生 `pie.LlmError`（带 `.status`），不再是自己造的 `RuntimeError`。"""
+    cfg, _, _, server = env
+    server.answer = "好"
+    assert pie.llm("hi", config=cfg, model="另一个模型", max_tokens=64) == "好"
+    sent = server.requests[-1]
+    assert sent["model"] == "另一个模型"
+    assert sent["max_tokens"] == 64
+    assert cfg.model == "test-model", "按次覆盖不改传进来的那份 config"
+
+    broken = pie.Config()
+    broken.base_url = f"http://127.0.0.1:{server.server_port}/nope"  # 404
+    broken.api_key = cfg.api_key
+    broken.model = cfg.model
+    with pytest.raises(pie.LlmError) as info:
+        pie.llm("hi", config=broken)
+    assert info.value.status == 404
+
+    # 连不上（不是服务端返回的错）→ `.status` 是 None，而不是「没这个属性」（存根写的是 int | None）
+    dead = pie.Config()
+    dead.base_url = "http://127.0.0.1:1/v1"
+    dead.api_key = cfg.api_key
+    dead.model = cfg.model
+    dead.max_retries = 0  # 别为这条测试等重试退避
+    with pytest.raises(pie.LlmError) as info:
+        pie.llm("hi", config=dead)
+    assert info.value.status is None
+
+
+def test_allm_is_the_async_one(env):
+    """`pie.allm(...)`：同样的语义，但返回可 await 的对象（跑在进程级 runtime 上）。"""
+    import asyncio
+
+    cfg, _, _, server = env
+    server.answer = "异步答复"
+
+    async def run() -> str:
+        return await pie.allm("hi", config=cfg)
+
+    assert asyncio.run(run()) == "异步答复"
+    assert server.requests[-1]["model"] == cfg.model
+
+
+def test_llm_without_config_reads_the_config_file(env, monkeypatch, tmp_path):
+    """`config=None` → 读 `~/.pie/config.toml`（与 `pie.run` 同一处解析），并吃 `OPENAI_*` 环境覆盖。"""
+    cfg, _, _, server = env
+    server.answer = "来自配置文件"
+    # 别让开发机上的 OPENAI_* 抢了文件里的值（`Config::load` 会按环境覆盖）
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    config_file = tmp_path / "cfg.toml"
+    config_file.write_text(
+        f'model = "file-model"\nbase_url = "http://127.0.0.1:{server.server_port}/v1/"\n'
+        'api_key = "file-key"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PIE_CONFIG_FILE", str(config_file))
+    assert pie.llm("hi") == "来自配置文件"
+    assert server.requests[-1]["model"] == "file-model"
+    assert server.last_headers["authorization"] == "Bearer file-key"
+
+    # `OPENAI_BASE_URL` 环境覆盖优先于文件（口径同 `Config::load`）
+    monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    assert pie.llm("hi") == "来自配置文件"
+    assert server.last_headers["authorization"] == "Bearer env-key"
+    assert cfg.model, "env 只在这一路生效，不动传进来的 config"
+
+
+# ---------------------------------------------------------------- 存根对拍（防漂移）
+
+
 # ---------------------------------------------------------------- 存根对拍（防漂移）
 
 
@@ -699,6 +803,24 @@ def test_tool_schema_shape_is_stable():
 
     assert list(pie.tool()(hidden).parameters["properties"]) == ["x"]
 
+    # `@tool` **裸用**（不带括号）= 直接当装饰器用：以前会把函数当 `name` → 返回 `decorate`
+    # 而不是 `Tool` → 调用方（pytool 宿主 / 绑定）只挑 `Tool` 实例，工具**静默消失**
+    def bare(q: str) -> str:
+        """裸用的工具"""
+        return q
+
+    t = pie.tool(bare)  # 等价于 `@pie.tool`
+    assert isinstance(t, pie.Tool)
+    assert (t.name, t.description) == ("bare", "裸用的工具")
+    assert t.parameters["required"] == ["q"]
+
+    async def a(x: str) -> str:
+        return x
+
+    # async 现在**能**装饰（pytool 宿主有后台 loop，会跑协程）；**绑定跑不了** → 在
+    # `register(...)` 那一步拦（见 test_register_validates_name_duplicate_and_async）
+    assert pie.tool(a).handler is a
+
 
 def test_register_python_tool_end_to_end(env):
     """注册的 Python 工具能被模型调起来：参数按名字给、返回值当结果文本回传。"""
@@ -759,8 +881,10 @@ def test_register_validates_name_duplicate_and_async(env):
 
     with pytest.raises(ValueError, match="async"):
         tools.register(name="a", handler=a)
+    # 装饰器现在**收** async（pytool 宿主有后台 loop 能跑协程）；绑定跑不了 → 注册那一步拦
+    decorated = pie.tool(a)
     with pytest.raises(ValueError, match="async"):
-        pie.tool()(a)   # 装饰期就拦
+        tools.register(decorated)
 
 
 # ---------------------------------------------------------------- M5：asyncio 入口

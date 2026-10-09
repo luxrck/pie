@@ -21,6 +21,10 @@
 一次性用法（无会话、不落盘）：``print(pie.run("总结这个仓库"))``；
 异步版是 ``await pie.arun(...)`` / ``await session.aturn(...)``。
 
+工具里想随手问一次模型：``pie.llm("…", config=cfg)`` —— 就是 ``pie.LlmClient.complete`` 那条路
+（同步、有重试、期间释放 GIL）的最短写法；异步版是 ``await pie.allm(...)``（跑在进程级 runtime 上，不占线程）。
+要 ``usage`` / ``tool_calls`` 等原始字段用 ``pie.LlmClient.complete``，要工具循环 / 流式用 ``pie.Session``。
+
 约定（详见仓内 ``docs/python-bindings.md``）：
   - **同步 / 异步两套名字**：``turn`` / ``run`` 阻塞到回合结束（期间**释放 GIL**，别的 Python
     线程照常跑）；``aturn`` / ``arun`` 返回可 await 的对象（真异步：回合跑在进程级 runtime 上，
@@ -50,8 +54,10 @@ from ._pie_rs import (
     Session,
     ToolError,
     ToolRegistry,
+    allm,
     arun,
     list_sessions,
+    llm,
     run,
     version,
 )
@@ -69,8 +75,10 @@ __all__ = [
     "ToolError",
     "ToolRegistry",
     "Tool",
+    "allm",
     "arun",
     "list_sessions",
+    "llm",
     "run",
     "tool",
     "version",

@@ -1,43 +1,61 @@
-# pie 的 Python 工具宿主：由二进制以 `python -X utf8 -u -c "<_tool.py 正文><本文件正文>" <工具文件…>`
-# 启动（`rust` 侧见 `pytool.rs`）。所以本文件里**不能**出现模块级 docstring / `from __future__`
-# 之类必须是「文件第一条语句」的东西——上面那段 `_tool.py` 的 `from __future__ import annotations`
-# 才是整个程序的第一条语句（它也顺带作用于本段代码）。
+# pie 的 Python 工具宿主：由二进制以 `python -X utf8 -u -c "<本文件正文>" <工具文件…>` 启动
+# （`rust` 侧见 `pytool.rs`）。
 #
 # 协议：一行一个 JSON，一问一答；**应答可乱序**（调用并发跑在线程池里），靠 `id` 配对。
 #   stdout 第一行  ← {"tools":[{name,description,parameters}…], "warnings":[…]}
 #   stdin  每行    → {"id":N,"tool":"名字","arguments":{…}}
 #   stdout 之后    ← {"id":N,"text":"…"} 或 {"id":N,"error":"…"}
 #
-# 上面用到的 `tool` / `Tool` 就是拼接在前面的 `_tool.py`（**与 Python 绑定同一份文件**：
-# schema 生成只有一处实现）。
+# **用真绑定，不嵌副本**：`tool` / `Tool` 直接 `from pie import …`，所以**那个解释器里得装着
+# Python 绑定 `pie`**（工具文件里的 `@tool` 就是它提供的）；装不上整个宿主起不来（这里打印原因，
+# Rust 侧再报一句「没有任何工具」）。好处是只有一份实现：与绑定永远同版本、不会分叉。
+#
+# 为了让工具文件少写一行，加载每个文件前把 `tool` / `Tool` **注进它的 globals** —— `@tool()`
+# 直接用就行；写 `from pie import tool` 也一样（本来就是同一个类）。
 #
 # 三条纪律：
 #   - 工具文件 import 期抛异常 → 记进 `warnings` 跳过，不带走宿主；
 #   - 工具 handler 抛异常 / 返回非 str → 变成 `error` 行（Rust 侧文本化回给模型，回合照跑）；
 #   - handler 缺省什么都不写 stdout：**协议行走 dup 出来的原始 fd 1**，`sys.stdout` 已换成
 #     stderr，用户工具里任何 `print` 都污染不了协议。
+#
+# 同步/异步都能装：**async handler 跑在一个后台 loop 上**（`_LOOP`，进程级一份 → 跨调用共享
+# 连接池，一个 handler 内部还能 `asyncio.gather` 并发），同步 handler 照旧跑在线程池里。
 
+import asyncio
 import concurrent.futures
 import importlib.util
+import inspect
 import json
 import os
 import sys
 import threading
-import types
 
 # 协议输出：dup 一份**原始** stdout（后面就把 sys.stdout 换成 stderr）
 _PROTOCOL = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
 sys.stdout = sys.stderr
 
-# 用户工具文件写 `from pie import tool` —— 这里造个同名模块塞进 sys.modules，
-# 于是**不需要装 Python 绑定**（`_tool.py` 是编译期嵌进来的）。
-_pie = types.ModuleType("pie")
-_pie.tool = tool  # noqa: F821 —— 来自上面拼接的 `_tool.py`
-_pie.Tool = Tool  # noqa: F821
-sys.modules["pie"] = _pie
+# 真绑定（见文件头）：装不上就整个宿主起不来 —— 把原因写清楚（会进 pie 的告警）。
+try:
+    from pie import Tool, tool
+except ImportError:
+    print(
+        "pytool 需要 Python 绑定 `pie`（工具里的 @tool 就是它提供的）：请把它装进 %s"
+        % sys.executable,
+        file=sys.stderr,
+    )
+    raise
 
 # 并发度 = 一批 tool_calls 的条数（真并发只对 IO 型 handler 有效：GIL 会串起纯 CPU 的）。
+# ⚠ async handler 也占一个 worker（线程在 `run_coroutine_threadsafe(...).result()` 上等），
+# 所以这里就是「一批同时最多几条」的上限。
 _MAX_WORKERS = 8
+
+# async handler 的后台 loop（进程级一份）：跑在一个 daemon 线程里，用
+# `run_coroutine_threadsafe` 把协程递过去。共享一份 loop = 跨调用复用 client / 连接池。
+# ⚠ async handler 里别干重的 CPU 活（那是单线程，会把别的 async 调用一起卡住）。
+_LOOP = asyncio.new_event_loop()
+threading.Thread(target=_LOOP.run_forever, daemon=True, name="pie-pytool-loop").start()
 
 
 def _emit(obj, lock=None):
@@ -51,19 +69,27 @@ def _emit(obj, lock=None):
 
 
 def _load(path, index):
-    """按文件路径导入用户工具文件（同一路径的文件共用同一模块名，import 只跑一次）。"""
+    """按文件路径导入用户工具文件（同一路径的文件共用同一模块名，import 只跑一次）。
+
+    执行前把 `tool` / `Tool` 注进这个模块的 globals → 工具文件不写 `from pie import tool`
+    也能用 `@tool()`；写了的走真绑定，是同一个类。
+    """
     name = "_pie_user_tools_%d" % index
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    module.__dict__["tool"] = tool
+    module.__dict__["Tool"] = Tool
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
 def _run(tool_obj, rid, kwargs, lock):
-    """一次工具调用（跑在线程池里）。"""
+    """一次工具调用（跑在线程池里；async handler 丢给后台 loop 跑完再交回来）。"""
     try:
         out = tool_obj.handler(**kwargs)
+        if inspect.isawaitable(out):  # async handler（或者同步 handler 返回了协程）
+            out = asyncio.run_coroutine_threadsafe(out, _LOOP).result()
     except BaseException as e:  # 含 sys.exit()：工具怎么炸都不该带走宿主
         _emit({"id": rid, "error": "%s: %s" % (type(e).__name__, e)}, lock)
         return
@@ -92,7 +118,7 @@ def _main():
             warnings.append("%s 导入失败: %s: %s" % (path, type(e).__name__, e))
             continue
         for value in list(vars(module).values()):
-            if not isinstance(value, Tool):  # noqa: F821
+            if not isinstance(value, Tool):
                 continue
             if value.name in found:
                 warnings.append("工具重名，跳过: %s（%s）" % (value.name, path))

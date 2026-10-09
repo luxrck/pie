@@ -383,4 +383,31 @@ def arun(
 def list_sessions(limit: int | None = ...) -> list[SessionRow]:
     """历史会话（按 mtime 降序；`limit=None` = 全部）。"""
 
+def llm(
+    prompt: str,
+    *,
+    system: str | None = ...,
+    model: str | None = ...,
+    config: Config | None = ...,
+    max_tokens: int | None = ...,
+    reasoning_effort: str | None = ...,
+    response_format: Literal["text", "json_object"] | None = ...,
+) -> str:
+    """一次性问一句，返回 assistant 正文（内部就是 `LlmClient.complete`：有重试、期间释放 GIL）。
+
+    `config=None` → 读 `~/.pie/config.toml`；`model` / `max_tokens` 是按次覆盖。
+    要 `usage` / `tool_calls` 用 `LlmClient.complete`；要工具循环 / 事件 / 流式用 `Session`。"""
+
+def allm(
+    prompt: str,
+    *,
+    system: str | None = ...,
+    model: str | None = ...,
+    config: Config | None = ...,
+    max_tokens: int | None = ...,
+    reasoning_effort: str | None = ...,
+    response_format: Literal["text", "json_object"] | None = ...,
+) -> Coroutine[Any, Any, str]:
+    """`llm` 的**异步**版：跑在进程级 runtime 上（不占线程）；⚠ 要求运行中的 asyncio loop。"""
+
 def version() -> str: ...

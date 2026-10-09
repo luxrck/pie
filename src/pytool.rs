@@ -9,6 +9,10 @@
 //!   - 启动（`load`）时 spawn + 读第一行清单 → 逐个 `with_dynamic`；
 //!   - 调用 = 写一行请求、等一行应答，靠 `id` 配对 → **一批 tool_calls 可以真并发**
 //!     （并发度由 `Session` 那侧决定：`parallel_tools` 关掉时就只会有一个在飞）；
+//!   - **同步 / 异步 handler 都能装**：同步的跑在宿主的线程池里，`async def` 跑在宿主那个
+//!     后台 loop 上（跨调用共享连接池）；本侧只管「写一行等一行」，两种都一样；
+//!   - **宿主用真绑定**（`from pie import tool`）：那个解释器里得装着 `pie`（工具里的 `@tool` 就是它
+//!     提供的）。不内嵌副本 → 实现只有一处、不会与绑定分叉；代价是 pytool 不再「零安装」。
 //!   - 取消（Esc）= `killpg` 杀进程组 → 所有在飞的调用一起失败 → **下次调用懒重启**；
 //!   - 任何失败（起不来 / 导入错 / 重名 / 名字非法）都只告警、不阻断会话。
 //!
@@ -41,9 +45,10 @@ use crate::tools::{
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
+///
+/// ⚠ 宿主**依赖真绑定**（`from pie import tool`）—— 不再内嵌 `_tool.py` / `_llm.py` 的副本：
+/// 实现只有绑定那一处，不会分叉（用户拍板：宁可装真包，也不要两份代码）。
 const HOST: &str = include_str!("python/pytool_host.py");
-/// `@pie.tool` 的实现正文——**直接复用绑定那一份文件**（schema 生成只有一处实现，不会分叉）。
-const TOOL_PY: &str = include_str!("../bindings/pie-py/python/pie/_tool.py");
 
 /// 默认解释器：Unix `python3`，其它 `python`（与 `repl` 同口径）。
 #[cfg(unix)]
@@ -56,19 +61,17 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 装载 Python 工具：起宿主、读清单、逐个注册。**任何失败都只告警**，原样返回 `registry`。
 ///
-/// `entries` 是配置给的路径（`[python] tools` + `<root>/tools`；文件或目录；目录取其下 `*.py`，不递归）。
-/// 空 → 直接返回（零开销，不 spawn）。
-pub async fn load(
-    registry: ToolRegistry,
-    python: Option<&str>,
-    entries: &[String],
-) -> ToolRegistry {
-    let files = files_of(entries);
+/// 解释器与工具文件都从 `config` 取（`[python] interpreter` → `envs/base` → `python3`；
+/// `[python] tools` + 约定目录 `<root>/tools`）。文件列表为空 → 直接返回（零开销，不 spawn）。
+pub async fn load(registry: ToolRegistry, config: &crate::config::Config) -> ToolRegistry {
+    let files = files_of(&config.python_tool_entries());
     if files.is_empty() {
         return registry;
     }
-    let python = python.unwrap_or(DEFAULT_PYTHON);
-    let host = match Host::start(python, files).await {
+    let python = config
+        .python_interpreter()
+        .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
+    let host = match Host::start(&python, files).await {
         Ok(host) => Arc::new(host),
         Err(e) => {
             crate::log::warn(format!("[pytool] {e}"));
@@ -231,11 +234,10 @@ impl Host {
 
     /// spawn 一个宿主进程，读第一行清单，把剩余的 stdout 交给读线程。
     async fn spawn(&self) -> Result<(Proc, Vec<ToolSpec>, Vec<String>), String> {
-        // `_tool.py` 的 `from __future__ import annotations` 必须是程序第一条语句 → 它必须拼在最前
-        let program = format!("{TOOL_PY}\n{HOST}");
+        let program = HOST;
         let mut cmd = tokio::process::Command::new(&self.python);
         // `-X utf8`：中文经 stdin/stdout 进出不能靠 locale；`-u`：别让 stdout 缓冲住一行应答
-        cmd.arg("-X").arg("utf8").arg("-u").arg("-c").arg(&program);
+        cmd.arg("-X").arg("utf8").arg("-u").arg("-c").arg(program);
         cmd.args(&self.files);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -464,19 +466,28 @@ fn kill_group(pid: u32) {
     let _ = pid;
 }
 
-/// 测试用真解释器 + 临时工具文件跑（没有 `python3` 就跳过，与 `repl` 的测试同款）。
+/// 测试用真解释器 + 临时工具文件跑（没找到能用的就跳过，与 `repl` 的测试同款）。
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn python3() -> Option<&'static str> {
-        let ok = std::process::Command::new("python3")
-            .arg("-c")
-            .arg("import json, concurrent.futures")
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        ok.then_some("python3")
+    /// 宿主**依赖真绑定**（工具里 `from pie import tool`），所以测试解释器得能 `import pie`：
+    /// 先试绑定自己的 venv（本仓开发态就是它），再退 `python3`（用户自己往里装过）。
+    /// 都没有 → `None`，那几条用例直接跳过（不在 CI 上装绑定也能跑整个套件）。
+    fn host_python() -> Option<&'static str> {
+        const BINDING_PY: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bindings/pie-py/.venv/bin/python"
+        );
+        [BINDING_PY, "python3"].into_iter().find(|python| {
+            std::process::Command::new(python)
+                .arg("-c")
+                .arg("import json, concurrent.futures, pie")
+                .stderr(Stdio::null()) // 探测失败别往测试输出里喷 traceback
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
     }
 
     /// 临时工具文件 + 注册表（没有 python3 就跳过——本机 Linux/macOS 一般都有）。
@@ -494,8 +505,16 @@ mod tests {
             Self { dir }
         }
 
-        fn entries(&self) -> Vec<String> {
-            vec![self.dir.to_string_lossy().to_string()]
+        /// 测试用配置：解释器 + 只装这个目录里的工具。
+        fn config(&self, python: &str) -> crate::config::Config {
+            crate::config::Config {
+                python: crate::config::PythonConfig {
+                    interpreter: Some(python.to_string()),
+                    tools: vec![self.dir.to_string_lossy().into_owned()],
+                },
+                storage: crate::config::Storage::at(self.dir.join("storage")),
+                ..Default::default()
+            }
         }
 
         fn ctx(&self, cancel: crate::cancel::Cancel) -> ToolCtx {
@@ -523,6 +542,10 @@ import time
 def echo(text: str) -> str:
     return "echo:" + text
 
+@tool
+def bare(text: str) -> str:
+    return "bare:" + text
+
 @tool()
 def slow(seconds: float, marker: str = "x") -> str:
     time.sleep(seconds)
@@ -548,17 +571,12 @@ def loud() -> str:
 
     #[tokio::test]
     async fn registers_python_tools_and_parses_schema() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("register", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
 
         let names = registry.names();
-        for want in ["echo", "slow", "boom", "not_a_string", "die"] {
+        for want in ["echo", "bare", "slow", "boom", "not_a_string", "die"] {
             assert!(names.contains(&want), "缺工具 {want}：{names:?}");
         }
         let spec = registry
@@ -572,18 +590,22 @@ def loud() -> str:
             spec["function"]["parameters"]["properties"]["text"]["type"],
             "string"
         );
+        // `@tool` **裸用**（不带括号）也得注册：曾经它会返回 `decorate` 而不是 `Tool`，
+        // 于是工具静默消失（描述也退到函数名）
+        let bare = registry
+            .specs()
+            .into_iter()
+            .find(|s| s["function"]["name"] == "bare")
+            .expect("裸用 `@tool` 的 schema");
+        assert_eq!(bare["function"]["description"], "bare");
+        assert_eq!(bare["function"]["parameters"]["required"], json!(["text"]));
     }
 
     #[tokio::test]
     async fn calls_tool_and_textualizes_errors() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("call", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let out = registry
@@ -609,14 +631,9 @@ def loud() -> str:
     /// 一批调用并发跑：两个各睡 0.3s 的工具，总耗时远小于 0.6s（串行就会 ≥0.6s）。
     #[tokio::test]
     async fn parallel_calls_do_not_queue() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("parallel", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let started = std::time::Instant::now();
@@ -635,17 +652,170 @@ def loud() -> str:
         );
     }
 
+    /// async handler：整批跑在宿主的**同一个后台 loop** 上（跨调用复用连接池、批内还能重叠），
+    /// 协程里抛异常照样文本化，宿主不重启。
+    #[tokio::test]
+    async fn async_handlers_share_one_background_loop() {
+        const BODY: &str = r#"
+import asyncio
+from pie import tool
+
+@tool()
+async def loopid() -> str:
+    return "loop=%d" % id(asyncio.get_running_loop())
+
+@tool()
+async def slow(seconds: float, marker: str) -> str:
+    await asyncio.sleep(seconds)
+    return "slept:" + marker
+
+@tool()
+async def boom() -> str:
+    raise RuntimeError("协程里炸了")
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("async", BODY);
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let ctx = fixture.ctx(crate::cancel::Cancel::new());
+
+        let first = registry
+            .dispatch("loopid", &json!({}), ctx.clone())
+            .await
+            .expect("loopid 成功");
+        let second = registry
+            .dispatch("loopid", &json!({}), ctx.clone())
+            .await
+            .expect("loopid 成功");
+        assert_eq!(
+            first.to_text(),
+            second.to_text(),
+            "两次调用得在同一个 loop 上"
+        );
+
+        let started = std::time::Instant::now();
+        let args_a = json!({"seconds": 0.3, "marker": "a"});
+        let args_b = json!({"seconds": 0.3, "marker": "b"});
+        let (a, b) = tokio::join!(
+            registry.dispatch("slow", &args_a, ctx.clone()),
+            registry.dispatch("slow", &args_b, ctx.clone()),
+        );
+        assert_eq!(a.unwrap().to_text(), "slept:a");
+        assert_eq!(b.unwrap().to_text(), "slept:b");
+        assert!(
+            started.elapsed() < Duration::from_millis(550),
+            "两个 0.3s 的异步调用应当重叠跑（实测 {:?}）",
+            started.elapsed()
+        );
+
+        let err = registry
+            .dispatch("boom", &json!({}), ctx.clone())
+            .await
+            .expect_err("协程抛异常要文本化");
+        assert!(err.0.contains("协程里炸了"), "{}", err.0);
+        let after = registry
+            .dispatch("loopid", &json!({}), ctx)
+            .await
+            .expect("宿主还活着");
+        assert_eq!(
+            after.to_text(),
+            first.to_text(),
+            "同一个 loop（宿主没被重启）"
+        );
+    }
+
+    /// `[tools.<名字>]` 里 `_` 开头的键会注入到 Python 工具的 handler —— 与内置工具同一条
+    /// `ToolRegistry::inject_defaults`（按**注册名**查表，跟工具是怎么注册的无关）。
+    #[tokio::test]
+    async fn config_defaults_reach_python_handlers() {
+        const BODY: &str = r#"
+from pie import tool
+
+@tool()
+def peek(text: str, _secret: str = "没注入") -> str:
+    return "%s|%s" % (text, _secret)
+
+@tool()
+def tight(text: str) -> str:
+    return text
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("defaults", BODY);
+        let with_secret = |name: &str| {
+            let mut table = toml::Table::new();
+            table.insert(
+                "_secret".to_string(),
+                toml::Value::String("来自配置".to_string()),
+            );
+            let mut defaults: HashMap<String, toml::Table> = HashMap::new();
+            defaults.insert(name.to_string(), table);
+            defaults
+        };
+        let ctx = fixture.ctx(crate::cancel::Cancel::new());
+
+        let registry = load(
+            ToolRegistry::empty(with_secret("peek")),
+            &fixture.config(python),
+        )
+        .await;
+        let out = registry
+            .dispatch("peek", &json!({"text": "hi"}), ctx.clone())
+            .await
+            .expect("注入的 `_secret` 该被 handler 收到");
+        assert_eq!(out.to_text(), "hi|来自配置");
+
+        // 显式传参优先（`inject_defaults` 只塞「还没有的键」）
+        let out = registry
+            .dispatch(
+                "peek",
+                &json!({"text": "hi", "_secret": "显式"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("显式参数该压过配置");
+        assert_eq!(out.to_text(), "hi|显式");
+
+        // 签名里没声明那个 `_` 键 → 宿主照样当 kwarg 传下去 → TypeError（不是静默忽略）
+        let registry = load(
+            ToolRegistry::empty(with_secret("tight")),
+            &fixture.config(python),
+        )
+        .await;
+        let err = registry
+            .dispatch("tight", &json!({"text": "hi"}), ctx)
+            .await
+            .expect_err("没声明的注入键会炸");
+        assert!(
+            err.0.contains("unexpected keyword argument"),
+            "该是 Python 的 TypeError：{}",
+            err.0
+        );
+    }
+
+    /// 工具文件**不用 import** 也能用 `@tool`：宿主把 `tool` / `Tool` 注进了每个被加载模块的 globals。
+    #[tokio::test]
+    async fn tool_names_are_injected_into_module_globals() {
+        const BODY: &str = r#"
+@tool(description="连 import 都不用写")
+def ping(text: str) -> str:
+    return "pong:" + text
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("inject", BODY);
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let ctx = fixture.ctx(crate::cancel::Cancel::new());
+        let out = registry
+            .dispatch("ping", &json!({"text": "hi"}), ctx)
+            .await
+            .expect("ping 成功");
+        assert_eq!(out.to_text(), "pong:hi");
+    }
+
     /// 取消：`Esc` → 返回 CANCEL_TEXT 并杀掉宿主；**下次调用还能用**（懒重启）。
     #[tokio::test]
     async fn cancel_kills_and_next_call_restarts() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("cancel", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
 
         let cancel = crate::cancel::Cancel::new();
         let cancelled = fixture.ctx(cancel.clone());
@@ -671,14 +841,9 @@ def loud() -> str:
     /// 宿主进程猝死（工具里 `os._exit`）→ 本次调用报错、**下一次调用自动重启**。
     #[tokio::test]
     async fn dead_host_is_restarted_on_demand() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("dead", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let err = registry.dispatch("die", &json!({}), ctx.clone()).await;
@@ -698,7 +863,7 @@ def loud() -> str:
     /// 超限 → 全文落盘 + 指针 + `spill`。
     #[tokio::test]
     async fn host_knob_truncates_and_spills() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new(
             "spill",
             "from pie import tool\n\n@tool()\ndef big() -> str:\n    return '\\n'.join('line %d' % i for i in range(100))\n",
@@ -708,12 +873,7 @@ def loud() -> str:
         let mut defaults = HashMap::new();
         defaults.insert("big".to_string(), table);
 
-        let registry = load(
-            ToolRegistry::empty(defaults),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(defaults), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
         let out = registry
             .dispatch("big", &json!({}), ctx)
@@ -744,14 +904,9 @@ def loud() -> str:
     /// 用户工具里的 `print` 不能污染协议（它走 stderr，工具结果照样正确）。
     #[tokio::test]
     async fn tool_prints_do_not_corrupt_protocol() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new("loud", TOOLS);
-        let registry = load(
-            ToolRegistry::empty(HashMap::new()),
-            Some(python),
-            &fixture.entries(),
-        )
-        .await;
+        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
         assert_eq!(
             registry
@@ -771,32 +926,29 @@ def loud() -> str:
         let before = ToolRegistry::new(HashMap::new());
         let after = load(
             before.clone(),
-            Some("definitely-not-an-interpreter-xyz"),
-            &fixture.entries(),
+            &fixture.config("definitely-not-an-interpreter-xyz"),
         )
         .await;
         assert_eq!(after.names(), before.names());
 
         // 导入期抛异常
+        let Some(python) = host_python() else { return };
         let before = ToolRegistry::new(HashMap::new());
-        let after = load(before.clone(), python3(), &fixture.entries()).await;
+        let after = load(before.clone(), &fixture.config(python)).await;
         assert_eq!(after.names(), before.names());
 
         // 路径不存在
+        let mut nowhere = fixture.config(python);
+        nowhere.python.tools = vec!["/definitely/not/here".to_string()];
         let before = ToolRegistry::new(HashMap::new());
-        let after = load(
-            before.clone(),
-            python3(),
-            &["/definitely/not/here".to_string()],
-        )
-        .await;
+        let after = load(before.clone(), &nowhere).await;
         assert_eq!(after.names(), before.names());
     }
 
     /// 与内置工具重名 / 名字非法 → 跳过那条，不动已有注册表。
     #[tokio::test]
     async fn name_clash_is_skipped() {
-        let Some(python) = python3() else { return };
+        let Some(python) = host_python() else { return };
         let fixture = Fixture::new(
             "clash",
             r#"
@@ -816,7 +968,7 @@ def fine() -> str:
 "#,
         );
         let before = ToolRegistry::new(HashMap::new());
-        let after = load(before.clone(), Some(python), &fixture.entries()).await;
+        let after = load(before.clone(), &fixture.config(python)).await;
         let names = after.names();
         assert_eq!(
             names.iter().filter(|n| **n == "read").count(),

@@ -126,3 +126,115 @@ impl PyLlmClient {
         format!("<pie.LlmClient model={}>", self.inner.model)
     }
 }
+
+// ---------------------------------------------------------------- 一次性问一句
+
+/// `llm` / `allm` 共用的前半段：参数 →（配置 → 客户端）+ 消息列表。
+///
+/// `config=None` → 读 `~/.pie/config.toml`（与 `pie.run` 同一处解析）；
+/// `model` / `max_tokens` 是按次覆盖（`max_tokens` 就是发给 API 的 `max_tokens`＝配置里的 `reserved_tokens`）。
+fn prepare(
+    py: Python<'_>,
+    prompt: &str,
+    system: Option<&str>,
+    model: Option<&str>,
+    config: Option<&PyConfig>,
+    max_tokens: Option<usize>,
+) -> PyResult<(LlmClient, Vec<pie::llm::Message>)> {
+    let mut core_config = match config {
+        Some(c) => c.inner.clone(),
+        None => pie::config::Config::load(None).map_err(crate::config_error)?,
+    };
+    if let Some(model) = model {
+        core_config.model = model.to_string();
+    }
+    if let Some(max_tokens) = max_tokens {
+        core_config.reserved_tokens = Some(max_tokens);
+    }
+    let client = LlmClient::new(&core_config).map_err(|e| llm_error(py, e))?;
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(pie::llm::Message::system(system));
+    }
+    messages.push(pie::llm::Message::user(prompt));
+    Ok((client, messages))
+}
+
+/// 一次性问一句（**同步**，返回 assistant 正文）。
+///
+/// 内部就是 [`PyLlmClient::complete`] 那条路（进程级 runtime + 重试 + 期间释放 GIL），
+/// 只是替你把消息拼好、把 `content` 取出来 —— 「拿模型当纯函数用」的最短写法。
+/// 要 `usage` / `tool_calls` 等原始字段用 `pie.LlmClient.complete`；要工具循环 / 事件 / 流式用 `pie.Session`。
+///
+/// `config=None` → 读 `~/.pie/config.toml`；`model` / `max_tokens` 是按次覆盖；
+/// `reasoning_effort` / `response_format` 口径同 `Session.aturn`。
+#[pyfunction]
+#[pyo3(signature = (prompt, *, system=None, model=None, config=None, max_tokens=None, reasoning_effort=None, response_format=None))]
+#[allow(clippy::too_many_arguments)] // 与 `run` / `Session.turn` 的按次旋钮对齐，参数多是故意的
+pub(crate) fn llm(
+    py: Python<'_>,
+    prompt: String,
+    system: Option<String>,
+    model: Option<String>,
+    config: Option<&PyConfig>,
+    max_tokens: Option<usize>,
+    reasoning_effort: Option<String>,
+    response_format: Option<String>,
+) -> PyResult<String> {
+    let (client, messages) = prepare(
+        py,
+        &prompt,
+        system.as_deref(),
+        model.as_deref(),
+        config,
+        max_tokens,
+    )?;
+    let request_options = pie::llm::RequestOptions::ChatCompletions {
+        reasoning_effort: reasoning_effort.as_deref(),
+        response_format: crate::parse_response_format(response_format.as_deref())?,
+    };
+    let got = py
+        .detach(|| crate::runtime().block_on(client.complete(&messages, &[], request_options)))
+        .map_err(|e| llm_error(py, e))?;
+    Ok(got.content.unwrap_or_default())
+}
+
+/// `llm` 的**异步**版：同样返回正文，但返回可 await 的对象（不绕线程，跑在**进程级** runtime 上）。
+///
+/// ⚠ 与 `arun` / `aturn` 一样，要求调用时处于运行中的 asyncio loop（**一个进程一个 loop 最稳**）。
+#[cfg(feature = "asyncio")]
+#[pyfunction]
+#[pyo3(signature = (prompt, *, system=None, model=None, config=None, max_tokens=None, reasoning_effort=None, response_format=None))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn allm(
+    py: Python<'_>,
+    prompt: String,
+    system: Option<String>,
+    model: Option<String>,
+    config: Option<&PyConfig>,
+    max_tokens: Option<usize>,
+    reasoning_effort: Option<String>,
+    response_format: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let (client, messages) = prepare(
+        py,
+        &prompt,
+        system.as_deref(),
+        model.as_deref(),
+        config,
+        max_tokens,
+    )?;
+    // PyErr 不能穿过 async 块 → `response_format` 在持 GIL 这层先解析掉
+    let response_format = crate::parse_response_format(response_format.as_deref())?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let request_options = pie::llm::RequestOptions::ChatCompletions {
+            reasoning_effort: reasoning_effort.as_deref(),
+            response_format,
+        };
+        let result = client.complete(&messages, &[], request_options).await;
+        result
+            .map(|got| got.content.unwrap_or_default())
+            .map_err(|e| Python::attach(|py| llm_error(py, e)))
+    })
+    .map(|obj| obj.unbind())
+}

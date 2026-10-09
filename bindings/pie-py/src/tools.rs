@@ -89,7 +89,7 @@ impl PyToolRegistry {
     /// 不打断整个回合。
     ///
     /// ⚠ 三条纪律：
-    ///   1. handler 得是**同步**函数（`async def` 要等 M5 的 async 入口）；
+    ///   1. handler 得是**同步**函数（绑定这条链是同步调用它；`async def` 只有 pytool 宿主能跑）；
     ///   2. 它跑在 runtime 的 worker 线程上、期间持有 GIL —— 别在里面等别的线程；
     ///   3. **别在 handler 里碰同一个 Session**（会拿到「session 正忙」，那是防死锁）。
     #[pyo3(signature = (tool=None, *, name=None, description=None, parameters=None, handler=None))]
@@ -136,9 +136,11 @@ impl PyToolRegistry {
             .call1((handler.bind(py),))?
             .is_truthy()?;
         if is_async {
-            return Err(PyValueError::new_err(format!(
-                "工具 {name:?} 是 async 函数：绑定现在只支持同步 handler（async handler 还没支持，请写同步函数）"
-            )));
+            return Err(PyValueError::new_err(
+                format!(
+                    "工具 {name:?} 是 async 函数：绑定是同步调用 handler 的（拿到的会是个没 await 的协程）"
+                ) + "——写成同步函数，或把工具文件交给 `pie` 二进制的 pytool（`~/.pie/tools/`）跑",
+            ));
         }
         let parameters_json = crate::py_to_json(&parameters)?;
 

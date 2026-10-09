@@ -84,14 +84,27 @@ df.plot()                              # 图直接回到界面（见下）
 
 ## 用 Python 写工具
 
-`pie` 二进制可以直接加载 **Python 写的工具**（不嵌 CPython、不用装 Python 绑定）：文件里用与绑定同款的
-`@pie.tool`，启动时起一个长活宿主进程读清单，把工具注册进**同一张**工具表 —— 模型看不出它和内置工具有什么区别。
+`pie` 二进制可以直接加载 **Python 写的工具**（不嵌 CPython）：文件里用 `@pie.tool`（就是 Python 绑定那个装饰器），
+启动时起一个长活宿主进程读清单，把工具注册进**同一张**工具表 —— 模型看不出它和内置工具有什么区别。
+
+⚠ **前提：那个解释器里装着 Python 绑定 `pie`**（工具就是用它写的 → 只有一份实现，不会与绑定分叉）。
+`pie setup` 建的 `envs/base` 里只有 IPython，所以自己装一下（它不在 PyPI 上，别 `pip install pie`）：
+
+```bash
+cd bindings/pie-py && VIRTUAL_ENV=~/.pie/envs/base .venv/bin/maturin develop   # 用开发 venv 的 maturin 瞄准 base
+# 或先出 wheel 再装：maturin build --out dist → uv pip install --python ~/.pie/envs/base/bin/python dist/pie-*.whl
+```
+
+上例里 `~/.pie/envs/base` 的实际路径跟着数据根走（`PIE_DIR` 一改就是 `<PIE_DIR>/envs/base`）。
+⚠ 它是**没开 abi3** 的扩展（按解释器版本编的）：base 是 3.13 就只要 `cp313` 那份，以后改了 Rust 要重跑同一条命令刷新。
 
 ```python
 # ~/.pie/tools/word_count.py
 from pie import tool
 
 @tool(description="统计文本字符数")      # 描述可省（退到 docstring 首行 → 函数名）
+                                         # `@tool` 也能裸用（不带括号）；
+                                         # 连 import 都能省（宿主把 tool 注进了模块 globals）
 def word_count(text: str) -> str:
     return str(len(text))
 ```
@@ -112,9 +125,18 @@ tools = ["~/.pie/tools"]                     # 文件或目录（目录取其下
 - **取消**：`Esc` 杀掉宿主进程组（在飞的调用一起失败），**下次调用自动重启**。
 - **失败不阻断**：起不来 / 导入报错 / 与内置工具重名 / 名字不合法（只收 `[A-Za-z0-9_-]{1,64}`）→ 只告警，那一条不注册，会话照跑。
 - 工具里的 `print` 与 traceback 走 stderr → pie 的告警通道，**不会污染工具结果**（协议走单独的 fd）。
+- **同步 / 异步 handler 都行**：同步的跑在宿主的线程池里，`async def` 跑在宿主那个**后台 loop** 上
+  （整进程共享一份 loop → 跨调用能复用 `httpx2.AsyncClient` / aiohttp 的连接池，一个 handler 内还能 `asyncio.gather`）。
+  两种都得**返回 `str`**。⚠ async handler 里别干重的 CPU 活（单线程，会卡住别的 async 调用）。
 - 参数 schema 从**类型注解**生成（`str/int/float/bool/list/dict/Optional`）；下划线开头的参数是注入项、不进 schema；
-  handler 必须**同步**、必须返回 `str`。超限与内置工具同款：`[tools.<名字>] _max_lines` / `_max_bytes`
+  `@tool` 裸用、`@tool()`、`@tool(name=…)` 三种写法都行。超限与内置工具同款：`[tools.<名字>] _max_lines` / `_max_bytes`
   （这两个是**宿主**的旋钮，不会传给 handler；超限→ 全文落盘 + `[工具输出全文已保存: …]` 指针）。
+- **`[tools.<名字>]` 里其它 `_` 开头的键会注入给 handler**（和内置工具走同一条 `inject_defaults`，按注册名查表）：
+  签名里声明同名的 `_参数` 就收得到，**显式传参优先**。例：`[tools.web_search] _max_characters = 3000`
+  （注：`[tools.repl] _python` 这类内置工具键只对内置工具有意义）。
+- **整个绑定都能用**：工具里 `import pie` 拿到的就是真包（`pie.llm(...)` / `pie.Config` / `pie.ToolRegistry` / …）。
+  想顺手问一句就用 `pie.llm("…")` —— 它按环境变量（`PIE_DIR` / `PIE_CONFIG_FILE`）自己读配置，所以多数情况下
+  与本次 `pie` 同一份；⚠ 命令行里的 `-c` / `-m` 这类**按次覆盖看不到**。
 - 与 `repl` 的关系：**共用解释器（同一个 venv），不共用进程**——工具里 `import` 得到的包，repl 里也 import 得到；
   但两边状态不互通（repl 的命名空间是模型可写的，工具不该和它共享）。解释器解析顺序：
   `[python] interpreter` → `~/.pie/envs/base`（存在即用，`pie setup` 建的） → `python3`。
@@ -167,7 +189,14 @@ import pie
 cfg = pie.Config.load()                          # ~/.pie/config.toml（只改内存，不写盘）
 session = pie.Session.ephemeral(cfg, pie.LlmClient(cfg), pie.ToolRegistry.builtins(cfg))
 answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
+
+pie.llm("顺手问一句", config=cfg)                 # 一次性问一句（内部就是 LlmClient.complete）
+await pie.allm("异步的那份")                      # 同一语义，跑在进程级 runtime 上（不占线程）
 ```
+
+`pie.llm(...)` / `pie.allm(...)` 不是另一套 HTTP，而是 `pie.LlmClient.complete` 的最短写法：同样有**重试**、
+同样释放 GIL、出错同样抛 `pie.LlmError`（带 `.status`）；`config=None` 就读 `~/.pie/config.toml`，
+`model=` / `max_tokens=` 是按次覆盖。要 `usage` / `tool_calls` 用 `LlmClient.complete`，要工具循环 / 流式用 `Session`。
 
 ## 更多
 
