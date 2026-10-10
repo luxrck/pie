@@ -75,9 +75,13 @@ impl PyLlmClient {
         let request_options = pie::llm::RequestOptions::ChatCompletions {
             reasoning_effort,
             response_format: crate::parse_response_format(response_format)?,
+            // 绑定侧的一次性调用**不走流式**（要增量就用 `Session.aturn` 的事件流）
+            stream: Some(false),
         };
         let got = py
-            .detach(|| crate::runtime().block_on(inner.complete(&msgs, &specs, request_options)))
+            .detach(|| {
+                crate::runtime().block_on(inner.complete(&msgs, &specs, request_options, |_| {}))
+            })
             .map_err(|e| llm_error(py, e))?;
         // `LlmResult` 没有 Serialize → 手拼
         let dict = pyo3::types::PyDict::new(py);
@@ -192,9 +196,12 @@ pub(crate) fn llm(
     let request_options = pie::llm::RequestOptions::ChatCompletions {
         reasoning_effort: reasoning_effort.as_deref(),
         response_format: crate::parse_response_format(response_format.as_deref())?,
+        stream: Some(false),
     };
     let got = py
-        .detach(|| crate::runtime().block_on(client.complete(&messages, &[], request_options)))
+        .detach(|| {
+            crate::runtime().block_on(client.complete(&messages, &[], request_options, |_| {}))
+        })
         .map_err(|e| llm_error(py, e))?;
     Ok(got.content.unwrap_or_default())
 }
@@ -230,8 +237,11 @@ pub(crate) fn allm(
         let request_options = pie::llm::RequestOptions::ChatCompletions {
             reasoning_effort: reasoning_effort.as_deref(),
             response_format,
+            stream: Some(false),
         };
-        let result = client.complete(&messages, &[], request_options).await;
+        let result = client
+            .complete(&messages, &[], request_options, |_| {})
+            .await;
         result
             .map(|got| got.content.unwrap_or_default())
             .map_err(|e| Python::attach(|py| llm_error(py, e)))

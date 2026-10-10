@@ -55,8 +55,61 @@ class AnswerEvent(TypedDict):
     type: Literal["answer"]
     text: str
 
+# ———— 会话生命周期（`SessionEvent`）————
+
+class TurnStartEvent(TypedDict):
+    type: Literal["turn_start"]
+    input: str
+
+class TurnDoneEvent(TypedDict):
+    type: Literal["turn_done"]
+    answer: str
+    error: str | None
+    elapsed_ms: int
+
+class CompactedEvent(TypedDict):
+    type: Literal["compacted"]
+    level: int
+    path: str
+    hash: str
+
+class ClearedEvent(TypedDict):
+    type: Literal["cleared"]
+    archived: str
+    count: int
+
+class ModelChangedEvent(TypedDict):
+    type: Literal["model_changed"]
+    # 不叫 `from`：那是 Python 关键字（Rust 侧原就叫 `from`，已特意避开）
+    previous: str
+    current: str
+
+class CwdChangedEvent(TypedDict):
+    type: Literal["cwd_changed"]
+    to: str
+
+class StartEvent(TypedDict):
+    type: Literal["start"]
+    id: str
+    # `True` = 从磁盘恢复的会话（`Session.load`），`False` = 新建的
+    resume: bool
+
 TurnEvent = ContentDelta | ReasoningDelta | ToolCallEvent | ToolResultEvent | AnswerEvent
-"""`on_event` 收到的事件。"""
+"""回合内事件（模型说话 / 工具活动）。"""
+
+SessionEvent = (
+    TurnStartEvent
+    | TurnDoneEvent
+    | CompactedEvent
+    | ClearedEvent
+    | ModelChangedEvent
+    | CwdChangedEvent
+    | StartEvent
+)
+"""会话生命周期事件。"""
+
+PieEvent = TurnEvent | SessionEvent
+"""`on_event` / `session.events()` 收到的**统一信封**（回合 + 会话）。"""
 
 class Usage(TypedDict):
     """token 是**最近一次** provider 上报值（不求和），只有 `calls` 累计。"""
@@ -240,12 +293,25 @@ class ToolRegistry:
 # ---------------------------------------------------------------- 会话
 
 class Cancel:
-    """取消信号：传给 `Session.aturn(cancel=…)`，或从别的线程停住正在跑的回合。"""
+    """取消信号（独立对象，不绑定任何会话）。`Session` 自己有取消信号 —— `Session.stop()` 就够用。"""
 
     def __init__(self) -> None: ...
     def cancel(self) -> None: ...
     @property
     def cancelled(self) -> bool: ...
+
+class Subscription:
+    """`Session.on(..)` 的返回值：退订凭据。
+
+    ⚠ **要留着它** —— 一被回收（或 `.close()`）就自动退订，之后就再也收不到事件。
+    """
+
+    def close(self) -> None:
+        """退订（幂等）。之后不再收到任何事件。"""
+
+    @property
+    def closed(self) -> bool:
+        """已经退订了吗？"""
 
 class Session:
     @staticmethod
@@ -300,11 +366,21 @@ class Session:
     def stop(self) -> bool:
         """停住正在跑的回合；返回是否确实发过信号。"""
 
+    def on(self, callback: Callable[[dict[str, Any]], None]) -> Subscription:
+        """**跨回合订阅**本会话的事件：`callback(event: dict)`，形状与 `turn(on_event=…)` 同一套。
+
+        与 `turn(on_event=…)` 的区别：那个只管**这一次**回合；`on` 一直有效，直到丢掉返回的
+        `Subscription`（或 `.close()`）—— 所以 `set_model()` / `clear_window()` 这些**回合之外**
+        的动作也能收到。
+
+        ⚠ 回调跑在**发事件那条线程**上（回合期间是 Rust 侧的 worker 线程）：回调里别阻塞、
+        别碰同一个 Session；回调抛异常会打到 stderr（不会传回调用方）。
+        """
+
     def turn(
         self,
         input: str,
-        on_event: Callable[[TurnEvent], None] | None = ...,
-        cancel: Cancel | None = ...,
+        on_event: Callable[[TurnEvent | SessionEvent], None] | None = ...,
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,
@@ -321,7 +397,6 @@ class Session:
     def aturn(
         self,
         input: str,
-        cancel: Cancel | None = ...,
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,
@@ -334,14 +409,13 @@ class Session:
         `task.cancel()` / `session.stop()` 都能真停住（前者靠 Python 侧 glue 桥到 `stop()`）。
         """
 
-    def events(self) -> AsyncIterator[TurnEvent]:
+    def events(self) -> AsyncIterator[TurnEvent | SessionEvent]:
         """本回合的事件流（按回合：先 `aturn` 再 `async for`）。"""
 
     def turn_future(
         self,
         input: str,
         sink: Callable[[dict[str, Any] | None], None],
-        cancel: Cancel | None = ...,
         max_steps: int | None = ...,
         stream: bool | None = ...,
         parallel_tools: bool | None = ...,

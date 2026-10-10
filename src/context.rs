@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::{Config, Storage, StoreType};
@@ -44,97 +44,8 @@ const TOOL_GAP: &str = "...[中间省略]...";
 // 落盘本身住 `config::Storage`（`store()`：内容寻址 + 原子写都在那儿）——这里只管
 // 「什么时候写、写哪个前缀」，即 `context/`（压缩原文）与 `windows/`（窗口块）两个目录的用法。
 
-/// 一次压缩的记录（`Session.compaction_events` 的一条，随会话落盘）。
-///
-/// 类型由 variant 决定，落盘写成 `kind` 标签（`#[serde(tag = "kind")]`）——不再另存冗余的
-/// `level`（要数字用 [`CompactEvent::level`]）；旧会话里多出来的 `level` 键被 serde 忽略，照读。
-///
-/// 字段名不带 `raw_` 前缀（`path` / `hash`）：事件本身已经说明这是压缩件。旧会话里叫
-/// `raw_path` / `raw_hash` → `#[serde(alias)]` 兜住。
-///
-/// `hash` 取自**文件名**里的 hash：它总是内容寻址得到的那段，
-/// 而 shell 自带落盘的内容是 stdout 原文——若拿结果文本重算就对不上了。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum CompactEvent {
-    /// 工具级（level 1）：工具输出落盘。`tool` 是触发落盘的工具名。
-    Tool {
-        ts: i64,
-        tool: String,
-        #[serde(alias = "raw_path")]
-        path: PathBuf,
-        #[serde(alias = "raw_hash")]
-        hash: String,
-    },
-    /// 轮次级（level 2）：已完成的轮次压成摘要。
-    Turn {
-        ts: i64,
-        #[serde(alias = "raw_path")]
-        path: PathBuf,
-        #[serde(alias = "raw_hash")]
-        hash: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        summary: String,
-    },
-    /// 会话级（level 3）：整段历史落盘成窗口块。
-    Session {
-        ts: i64,
-        #[serde(alias = "raw_path")]
-        path: PathBuf,
-        #[serde(alias = "raw_hash")]
-        hash: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        summary: String,
-    },
-}
-
-impl CompactEvent {
-    /// 工具级事件（level 1）。
-    pub fn tool(tool: &str, path: &Path) -> Self {
-        Self::Tool {
-            ts: crate::config::now().as_secs() as i64,
-            tool: tool.to_string(),
-            path: path.to_path_buf(),
-            hash: crate::config::hash_of(path),
-        }
-    }
-
-    /// 轮次级事件（level 2）。摘要只留前 200 字。
-    pub fn turn(path: &Path, summary: &str) -> Self {
-        Self::Turn {
-            ts: crate::config::now().as_secs() as i64,
-            path: path.to_path_buf(),
-            hash: crate::config::hash_of(path),
-            summary: summary.chars().take(200).collect(),
-        }
-    }
-
-    /// 会话级事件（level 3）。摘要只留前 200 字。
-    pub fn session(path: &Path, summary: &str) -> Self {
-        Self::Session {
-            ts: crate::config::now().as_secs() as i64,
-            path: path.to_path_buf(),
-            hash: crate::config::hash_of(path),
-            summary: summary.chars().take(200).collect(),
-        }
-    }
-
-    /// 压缩级别（1 工具级 / 2 轮次级 / 3 会话级，与 `Message.compaction` 的变体同口径）。
-    pub fn level(&self) -> u8 {
-        match self {
-            Self::Tool { .. } => 1,
-            Self::Turn { .. } => 2,
-            Self::Session { .. } => 3,
-        }
-    }
-
-    /// 落盘原文的路径。
-    pub fn raw_path(&self) -> &Path {
-        match self {
-            Self::Tool { path, .. } | Self::Turn { path, .. } | Self::Session { path, .. } => path,
-        }
-    }
-}
+/// 压缩事件（定义已搬去 [`crate::event`]；这里再导出，`crate::context::CompactEvent` 路径不变）。
+pub use crate::event::CompactEvent;
 
 /// JSON 美化（缩进 1 空格）——落盘原文 / `--mode transcript` 用。
 pub fn pretty_indent1(value: &Value) -> String {

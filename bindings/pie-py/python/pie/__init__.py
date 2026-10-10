@@ -32,7 +32,9 @@
     ⚠ 语义在 2026-10-04 调过：``aturn`` 过去是**同步**的那个 —— 旧代码 ``session.aturn("…")``
     现在会拿到一个没被 await 的 coroutine（同步版改名成了 ``turn``；旧的 ``aturn_async`` 已删）。
   - **事件是 dict**：键名见 ``docs/python-bindings.md``
-    （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``answer``）。
+    （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``answer``
+    + 会话生命周期的 ``turn_start`` / ``turn_done`` / ``compacted`` / ``cleared`` /
+    ``model_changed`` / ``cwd_changed`` / ``start``）。
     ⚠ ``tool_result.text`` **不截断**——
     要少显示自己截；同理，一批多个 tool_call 时事件顺序是「先全部 tool_call、再按完成顺序
     tool_result」（``parallel_tools`` 只在并发度上有区别）。
@@ -40,6 +42,10 @@
     （含压缩元数据），与 CLI 写下的会话可互读。
   - **一个 Session 同一时刻只跑一个回合**：回合进行中再调 ``aturn`` / 读属性会抛
     ``RuntimeError("session 正忙")``；**事件回调里不要碰同一个 Session**。
+  - **订阅事件有两种**：``turn(on_event=cb)`` 只管这一次回合；``session.on(cb)`` **跨回合**
+    （返回的 ``Subscription`` 要留着 —— 丢掉或 ``.close()`` 就退订），于是 ``set_model()`` /
+    ``clear_window()`` 这些回合之外的动作也收得到。两种的回调都跑在**发事件那条线程**上
+    （回合期间是 Rust 侧的 worker），所以**别阻塞、别碰同一个 Session**。
 """
 
 from typing import TYPE_CHECKING
@@ -52,6 +58,7 @@ from ._pie_rs import (
     LlmError,
     PieError,
     Session,
+    Subscription,
     ToolError,
     ToolRegistry,
     allm,
@@ -72,6 +79,7 @@ __all__ = [
     "LlmError",
     "PieError",
     "Session",
+    "Subscription",
     "ToolError",
     "ToolRegistry",
     "Tool",

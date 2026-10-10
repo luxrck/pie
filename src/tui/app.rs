@@ -38,6 +38,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::cancel::{CANCEL_TEXT, Cancel};
+use crate::event::{SessionEvent, Subscription};
 use crate::llm::LlmError;
 use crate::session::{Session, TurnEvent};
 
@@ -55,6 +56,8 @@ use super::theme::{Palette, Status};
 /// 主循环只 select 三路：终端事件、回合事件、tick。
 pub enum UiEvent {
     Turn(TurnEvent),
+    /// 会话生命周期（`TurnStart` / `TurnDone` / `Compacted` …）
+    Session(SessionEvent),
     TurnDone(Result<String, LlmError>, Snapshot),
     /// 手动 `!cmd` 跑完了（状态 + 结果正文）
     ShellDone(Status, String),
@@ -130,6 +133,12 @@ fn inside(area: Rect, column: u16, row: u16) -> bool {
 pub struct App {
     /// 会话（回合任务与 UI 共用；回合期间锁被任务握着）。
     session: Arc<Mutex<Session>>,
+    /// 会话事件的订阅凭据：**必须留着** —— 一 drop 就自动退订，UI 就再也收不到回合事件。
+    _session_events: Subscription,
+    /// **停止信号**（`Esc` 触发）——就是会话的取消句柄（`Session::cancel_handle`，构造时留一份）。
+    /// 回合跑着时锁被那个任务握着，**拿不到 `&Session`** 去调 `session.cancel()`，所以得提前取。
+    /// 手动 `!cmd` 与回合**共用它**（跑前 `reset()`）——UI 上只有一个「停」。
+    cancel: Cancel,
     /// 数据目录（`Ctrl+G` 粘图要落盘；从 `session.config.storage` 拄一份，
     /// 免得为一个同步路径去异步锁会话）。
     storage: crate::config::Storage,
@@ -143,8 +152,6 @@ pub struct App {
     activity: Activity,
     /// 思考起点（首个 reasoning 增量时记）
     thought_started: Option<Instant>,
-    /// 当前回合的取消信号（`Esc` 触发；每回合新建）
-    cancel: Cancel,
     /// 距底部的滚动偏移（0 = 贴底跟随）
     scroll_from_bottom: u16,
     /// 上一帧的消息流**文本区**（鼠标坐标 → 显示行/列；**不含**右缘那列滚动条）
@@ -226,6 +233,20 @@ impl App {
         picker: Picker,
     ) -> (Self, UnboundedReceiver<UiEvent>) {
         let (tx, rx) = unbounded_channel();
+        // 把会话事件接进 UI 主循环：监听者只往 channel 一丢（不阻塞回合）。
+        // 订阅凭据挂在 `App` 上 —— 它一 drop 就退订，所以和 App 同寿。
+        let session_events = session.on({
+            let tx = tx.clone();
+            move |event: &crate::event::Event| {
+                let ui = match event {
+                    crate::event::Event::Turn(t) => UiEvent::Turn(t.clone()),
+                    crate::event::Event::Session(s) => UiEvent::Session(s.clone()),
+                };
+                let _ = tx.send(ui);
+            }
+        });
+        // 取消句柄也先留一份（同理：回合期间拿不到 `&Session`）
+        let cancel = session.cancel_handle();
         let lean = session.config.tui.lean;
         let storage = session.config.storage.clone();
         let snapshot = Snapshot::capture(&session);
@@ -240,6 +261,8 @@ impl App {
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
         let app = Self {
             session: Arc::new(Mutex::new(session)),
+            _session_events: session_events,
+            cancel,
             storage,
             tx,
             cells,
@@ -250,7 +273,6 @@ impl App {
             snapshot,
             activity: Activity::Idle,
             thought_started: None,
-            cancel: Cancel::new(),
             scroll_from_bottom: 0,
             body: Rect::default(),
             bar: Rect::default(),
@@ -712,6 +734,8 @@ impl App {
             UiEvent::Notice(text) => self.push_notice(&text),
             UiEvent::Retry { key, text } => self.push_retry(&key, &text),
             UiEvent::RetryDone { key } => self.clear_retry(&key),
+            // 会话生命周期事件：TUI 暂不消费（回合结束仍走自己的 `TurnDone`）
+            UiEvent::Session(_) => {}
             UiEvent::Turn(TurnEvent::Reasoning(_)) => {
                 self.settle_retry(); // 模型有响应了 = 重试成功
                 let since = *self.thought_started.get_or_insert_with(Instant::now);
@@ -1027,26 +1051,18 @@ impl App {
         self.scroll_from_bottom = 0; // 回到贴底跟随
         let session = self.session.clone();
         let tx = self.tx.clone();
-        self.cancel = Cancel::new();
-        let cancel = self.cancel.clone();
+        // `self.cancel` 就是会话的取消信号（`App::new` 里留的句柄）；`aturn` 开头会 reset 它。
         let (max_steps, stream) = (self.max_steps, self.stream);
         tokio::spawn(async move {
             let mut guard = session.lock().await;
-            let event_tx = tx.clone();
-            let mut on_event = move |event: TurnEvent| {
-                let _ = event_tx.send(UiEvent::Turn(event));
-            };
             let result = guard
                 // `parallel_tools: None` = 跟随 `config.parallel_tools`（TUI 没有覆盖它的入口）；
-                // `request_options` 走 chat completions 的默认（思考深度跟客户端、`response_format` = text）
+                // `request_options`：思考深度跟客户端、`response_format` = text，**流式开关在这里**
                 .aturn(
                     &input,
-                    &mut on_event,
-                    &cancel,
                     max_steps,
-                    stream,
                     None,
-                    crate::llm::RequestOptions::default(),
+                    crate::llm::RequestOptions::default().with_stream(stream),
                 )
                 .await;
             let snapshot = Snapshot::capture(&guard);
@@ -1077,7 +1093,9 @@ impl App {
             since: Instant::now(),
         };
         self.scroll_from_bottom = 0; // 回到贴底跟随
-        self.cancel = Cancel::new();
+        // 手动 `!cmd` 与回合**共用同一个停止信号**（UI 上只有一个「停」）——所以要先把上一回合
+        // 可能留下的取消清掉（这一路径不经 `aturn`，没人替它 reset）。
+        self.cancel.reset();
         let cancel = self.cancel.clone();
         let cmd = cmd.to_string();
         let tx = self.tx.clone();

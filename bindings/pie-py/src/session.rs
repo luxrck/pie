@@ -28,6 +28,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use pie::cancel::Cancel;
 use pie::context::CompactMode;
+use pie::event::{Event, EventBus, Subscription};
 use pie::session::{Session as CoreSession, TurnEvent};
 
 use crate::config::PyConfig;
@@ -37,7 +38,9 @@ use crate::{busy_error, llm_error, pie_error};
 
 // ---------------------------------------------------------------- Cancel
 
-/// 取消信号：给 `aturn(cancel=...)` 用，或从别的线程停住一个正在跑的回合。
+/// 取消信号（独立的东西，不绑定任何会话）：可从别的线程发信号。
+///
+/// 注意：`Session` 自己有取消信号（`Session.stop()` 就够用），**这个类不需要传给它**。
 #[pyclass(name = "Cancel", module = "pie")]
 pub struct PyCancel(pub(crate) Cancel);
 
@@ -63,6 +66,34 @@ impl PyCancel {
     }
 }
 
+/// `Session.on(..)` 的返回值：**退订凭据**。
+///
+/// ⚠ **要留着它**：一被回收（或 `.close()`）就自动退订，之后就再也收不到事件了。
+#[pyclass(name = "Subscription", module = "pie")]
+pub struct PySubscription {
+    inner: StdMutex<Option<Subscription>>,
+}
+
+#[pymethods]
+impl PySubscription {
+    /// 退订（幂等）。之后不再收到任何事件。
+    fn close(&self) {
+        if let Ok(mut slot) = self.inner.lock() {
+            *slot = None;
+        }
+    }
+
+    /// 已经退订了吗？
+    #[getter]
+    fn closed(&self) -> bool {
+        self.inner.lock().map(|s| s.is_none()).unwrap_or(true)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<pie.Subscription closed={}>", self.closed())
+    }
+}
+
 // ---------------------------------------------------------------- Session
 
 #[pyclass(name = "Session", module = "pie")]
@@ -70,8 +101,12 @@ pub struct PySession {
     inner: std::sync::Arc<TokioMutex<CoreSession>>,
     /// 会话文件路径（构造后就固定；单拎出来是为了不为了读个路径去抢锁）。
     path: String,
-    /// 当前回合的取消信号 —— `stop()` 靠它中断（回合结束清空）。
-    current: StdMutex<Option<Cancel>>,
+    /// 当前回合的取消句柄（`CoreSession::cancel_handle`，回合外拿；`Cancel` 内部是 `Arc`，克隆即共享）——
+    /// 回合跑着时 `inner` 被锁住，`stop()` 只能靠这份句柄去中断。
+    cancel: Cancel,
+    /// 事件出口句柄（`CoreSession::bus_handle`，构造时拿）——`on()` 靠它订阅，
+    /// 于是**不必抢会话锁**（回合跑着时锁在任务手里）。
+    bus: EventBus,
     /// `asyncio` 入口登记的事件队列（`aturn` 用；`events()` 读它）。
     #[cfg(feature = "asyncio")]
     events_queue: StdMutex<Option<Py<PyAny>>>,
@@ -81,8 +116,10 @@ impl PySession {
     pub(crate) fn wrap(session: CoreSession) -> Self {
         Self {
             path: session.path.display().to_string(),
+            // 取消 / 事件出口句柄要在 `session` 被移进 `Arc` 之前取（字段按书写顺序求值）
+            cancel: session.cancel_handle(),
+            bus: session.bus_handle(),
             inner: std::sync::Arc::new(TokioMutex::new(session)),
-            current: StdMutex::new(None),
             #[cfg(feature = "asyncio")]
             events_queue: StdMutex::new(None),
         }
@@ -286,13 +323,45 @@ impl PySession {
 
     /// 请求停止当前回合（别的线程调也行）。返回是否真的发出了取消。
     fn stop(&self) -> bool {
-        let token = self.current.lock().ok().and_then(|slot| slot.clone());
-        match token {
-            Some(t) => {
-                t.cancel();
-                true
+        // 空闲时（拿得到锁）别乱按 —— 语义同以前：没回合在跑就返回 false
+        if self.inner.try_lock().is_ok() {
+            return false;
+        }
+        self.cancel.cancel();
+        true
+    }
+
+    /// **跨回合订阅本会话的事件**：`on(callback)`，回调收到 dict（形状与 `turn(on_event=…)` 同一套）。
+    ///
+    /// 与 `turn(on_event=…)` 的区别：那个只在**这一次回合**有效；`on` 一直有效，直到你把返回的
+    /// [`Subscription`] 丢掉（或 `.close()`）—— 所以 `set_model(..)` / `clear_window()` 这些
+    /// **回合之外**的动作也能收到。
+    ///
+    /// ⚠ **必须留着返回值**：`session.on(cb)` 的返回值被回收 = 自动退订（`session.on(cb);` 这种
+    /// 丢掉写法只能收到零个事件）。
+    ///
+    /// ⚠ 回调跑在**发事件那条线程**上（回合期间是 Rust 侧的 worker 线程）⇒
+    /// ① 回调里**别阻塞**（会拖慢回合）；② 回调里**别碰同一个 Session**（回合正占着它）；
+    /// ③ 回调抛异常**不会**传回调用方（`emit` 无返回值），会打到 stderr——事件是旁路，不该带崩回合。
+    fn on(&self, callback: Py<PyAny>) -> PySubscription {
+        let sub = self.bus.on(move |event: &Event| {
+            // 监听者是「发事件方」调用的，所以得现取 GIL（回到 Python 才能调回调）。
+            let outcome = Python::attach(|py| -> PyResult<()> {
+                let dict = event_to_py(py, event)?;
+                callback.call1(py, (dict,))?;
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                // 没人能接住这个异常（`emit` 无返回值）—— 打到 stderr，别把回合带崩。
+                let _ = Python::attach(|py| {
+                    let _ = py
+                        .import("traceback")
+                        .and_then(|tb| tb.call_method1("print_exception", (e,)));
+                });
             }
-            None => false,
+        });
+        PySubscription {
+            inner: StdMutex::new(Some(sub)),
         }
     }
 
@@ -314,13 +383,12 @@ impl PySession {
     /// assistant 消息**（不让那条 user 成为没人应答的提问）；取消则返回 `用户手动终止`。
     // ⚠ 参数 10 个（clippy 会念）是故意的：五个按次旋钮 + `on_event` / `cancel`，与 `turn_future` / `aturn` 对齐。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (input, on_event=None, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
+    #[pyo3(signature = (input, on_event=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     pub(crate) fn turn(
         &self,
         py: Python<'_>,
         input: String,
         on_event: Option<Py<PyAny>>,
-        cancel: Option<PyRef<'_, PyCancel>>,
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
@@ -334,40 +402,32 @@ impl PySession {
             .try_lock_owned()
             .map_err(|_| busy_error())?;
 
-        // ② 取消信号：外部给了就用它，否则自己造一个并登记，供 `s.stop()` 用
-        let token = cancel.map(|c| c.0.clone()).unwrap_or_default();
-        if let Ok(mut slot) = self.current.lock() {
-            *slot = Some(token.clone());
-        }
-
         // ③ `response_format` 先在这里解析：PyErr 只能在持 GIL 的这层抛
         //（回合块里返回的是 `LlmError`，`?` 二者不通用）
         let response_format = crate::parse_response_format(response_format.as_deref())?;
 
         // ④ 回合扔到 runtime 上跑，事件只进 channel（tokio 线程里不碰 Python）
-        let (tx, rx) = mpsc::channel::<TurnEvent>();
+        let (tx, rx) = mpsc::channel::<Event>();
+        // 订阅本会话的事件：监听者只往 std channel 一丢（`std::sync::mpsc::Sender::send` 是同步的，
+        // 不会阻塞回合）。⚠ 凭据交给下面那个任务持有 —— 回合一结束它就 drop → `tx` 随之 drop →
+        // 调用线程那侧的 `rx.recv()` 才会断开（否则这里会一直挂着等事件）。
+        let subscription = guard.on(move |event: &Event| {
+            let _ = tx.send(event.clone());
+        });
         let handle = crate::runtime().spawn(async move {
             let mut session = guard;
             // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
             let request_options = pie::llm::RequestOptions::ChatCompletions {
                 reasoning_effort: reasoning_effort.as_deref(),
                 response_format,
+                // 流式是**请求的属性**（`aturn` 不再单收一个 `stream`）
+                stream,
             };
-            let mut emit = move |event: TurnEvent| {
-                // 接收端没了（调用方已放弃）就静默丢弃，别把回合搞崩
-                let _ = tx.send(event);
-            };
-            session
-                .aturn(
-                    &input,
-                    &mut emit,
-                    &token,
-                    max_steps,
-                    stream,
-                    parallel_tools,
-                    request_options,
-                )
-                .await
+            let result = session
+                .aturn(&input, max_steps, parallel_tools, request_options)
+                .await;
+            drop(subscription);
+            result
         });
 
         // ⑤ 调用线程 pump：等事件时释放 GIL，拿到事件回 GIL 调回调
@@ -396,9 +456,6 @@ impl PySession {
             }
         }
         let outcome = py.detach(|| crate::runtime().block_on(handle));
-        if let Ok(mut slot) = self.current.lock() {
-            *slot = None;
-        }
 
         if let Some(e) = callback_error {
             return Err(e);
@@ -428,68 +485,50 @@ impl PySession {
     #[cfg(feature = "asyncio")]
     // ⚠ 参数 9 个（clippy 会念）是故意的：与 `turn` 同形（`on_event` 换成 `sink`）。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (input, sink, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
+    #[pyo3(signature = (input, sink, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn turn_future(
         &self,
         py: Python<'_>,
         input: String,
         sink: Py<PyAny>,
-        cancel: Option<Py<PyAny>>,
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
         reasoning_effort: Option<String>,
         response_format: Option<String>,
     ) -> PyResult<Py<PyAny>> {
-        // ① 独占会话 + 取消信号（与同步 `aturn` 同一套）
+        // ① 独占会话（取消信号住在 `CoreSession` 里，`stop()` 拿句柄直接发）
         let guard = self
             .inner
             .clone()
             .try_lock_owned()
             .map_err(|_| busy_error())?;
-        let token = match &cancel {
-            Some(obj) => obj
-                .bind(py)
-                .extract::<PyRef<'_, PyCancel>>()
-                .map_err(|_| pie_error("cancel= 只接受 pie.Cancel（或 None）"))?
-                .0
-                .clone(),
-            None => Cancel::new(),
-        };
-        if let Ok(mut slot) = self.current.lock() {
-            *slot = Some(token.clone());
-        }
-
         // `response_format` 先解析：PyErr 只能在持 GIL 的这层抛（回合块返回的是 `LlmError`）
         let response_format = crate::parse_response_format(response_format.as_deref())?;
         let sink_for_events = sink.clone_ref(py);
         let sink_end = sink;
+        // 订阅本会话的事件（凭据随回合一起 drop）
+        let subscription = guard.on(move |event: &Event| {
+            // 事件：只会「往 asyncio 队列里丢」，失败就当没发生（别把回合弄崩）
+            let _ = Python::attach(|py| -> PyResult<()> {
+                let obj = event_to_py(py, event)?;
+                sink_for_events.bind(py).call1((obj,))?;
+                Ok(())
+            });
+        });
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = guard;
             // 按次覆盖的两个值在这里拼成 [`RequestOptions`]（`response_format` 已是解析好的枚举）
             let request_options = pie::llm::RequestOptions::ChatCompletions {
                 reasoning_effort: reasoning_effort.as_deref(),
                 response_format,
-            };
-            let mut emit = move |event: TurnEvent| {
-                // 事件：只会「往 asyncio 队列里丢」，失败就当没发生（别把回合弄崩）
-                let _ = Python::attach(|py| -> PyResult<()> {
-                    let obj = event_to_py(py, &event)?;
-                    sink_for_events.bind(py).call1((obj,))?;
-                    Ok(())
-                });
+                // 流式是**请求的属性**（`aturn` 不再单收一个 `stream`）
+                stream,
             };
             let result = session
-                .aturn(
-                    &input,
-                    &mut emit,
-                    &token,
-                    max_steps,
-                    stream,
-                    parallel_tools,
-                    request_options,
-                )
+                .aturn(&input, max_steps, parallel_tools, request_options)
                 .await;
+            drop(subscription);
             // 收尾：告诉 Python 侧「事件到头了」——`events()` 的迭代器据此 StopAsyncIteration
             let _ = Python::attach(|py| -> PyResult<()> {
                 sink_end.bind(py).call1((py.None(),))?;
@@ -530,12 +569,11 @@ impl PySession {
     #[cfg(feature = "asyncio")]
     // ⚠ 参数 8 个（clippy 会念）是故意的：与 `turn` 同一套按次旋钮。
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (input, cancel=None, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
+    #[pyo3(signature = (input, max_steps=None, stream=None, parallel_tools=None, reasoning_effort=None, response_format=None))]
     fn aturn(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         input: String,
-        cancel: Option<Py<PyAny>>,
         max_steps: Option<usize>,
         stream: Option<bool>,
         parallel_tools: Option<bool>,
@@ -551,7 +589,6 @@ impl PySession {
         let helper = py.import("pie._async")?.getattr("aturn")?;
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("queue", queue)?;
-        kwargs.set_item("cancel", cancel)?;
         kwargs.set_item("max_steps", max_steps)?;
         kwargs.set_item("stream", stream)?;
         kwargs.set_item("parallel_tools", parallel_tools)?;
@@ -588,10 +625,21 @@ fn busy_error_or(msg: &str) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(msg.to_string())
 }
 
-/// `TurnEvent` → dict（键名与 JSONL / 事件形状对齐）。
-fn event_to_py(py: Python<'_>, event: &TurnEvent) -> PyResult<Py<PyAny>> {
+/// `Event` → dict（键名与 JSONL / 事件形状对齐）。
+///
+/// 回合事件手写映射（`content_delta` / `reasoning_delta` / `tool_call` / `tool_result` / `answer`）；
+/// 会话事件直接走 serde（`SessionEvent` 自带 `#[serde(tag = "type")]`，同一套扁平词表）。
+fn event_to_py(py: Python<'_>, event: &Event) -> PyResult<Py<PyAny>> {
+    let turn = match event {
+        Event::Turn(turn) => turn,
+        Event::Session(session) => {
+            let value = serde_json::to_value(session)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return crate::json_to_py(py, &value);
+        }
+    };
     let dict = PyDict::new(py);
-    match event {
+    match turn {
         TurnEvent::AssistantText(text) => {
             dict.set_item("type", "content_delta")?;
             dict.set_item("text", text)?;

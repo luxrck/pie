@@ -279,21 +279,33 @@ def test_turn_runs_tool_and_streams_events(env):
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
-    assert kinds == ["tool_call", "tool_result", "content_delta", "content_delta"]
+    # 会话生命周期事件包在两头：`turn_start`（带原始输入）/ `turn_done`（带答复）
+    assert kinds == [
+        "turn_start",
+        "tool_call",
+        "tool_result",
+        "content_delta",
+        "content_delta",
+        "turn_done",
+    ]
+    assert events[0]["input"] == "打个招呼"
+    assert events[-1]["answer"] == "搞定了"
+    assert events[-1]["error"] is None
+    assert isinstance(events[-1]["elapsed_ms"], int)
 
-    call = events[0]
+    call = events[1]
     assert call["name"] == "bash"
     assert call["arguments"] == {"command": "echo hi"}  # 参数已解析成 dict
     assert call["arguments_raw"] == '{"command": "echo hi"}'
 
-    result = events[1]
+    result = events[2]
     assert result["name"] == "bash"
     # 成功**只有正文**（`[exit=N]` 头只在失败时给，2026-09-23 定稿）：正文就是 `echo` 的输出，
     # 说明 shell 真跑了
     assert result["text"] == "hi\n"
     assert "hi" in result["text"]
 
-    assert [e["text"] for e in events[2:]] == ["搞定", "了"]
+    assert [e["text"] for e in events[3:5]] == ["搞定", "了"]
 
     # 历史：user → assistant(tool_calls) → tool → assistant
     roles = [m["role"] for m in session.messages]
@@ -386,8 +398,8 @@ def test_turn_accepts_per_turn_knobs(env):
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
-    assert kinds == ["tool_call", "tool_result", "answer"], kinds
-    assert events[-1]["text"] == "搞定了"
+    assert kinds == ["turn_start", "tool_call", "tool_result", "answer", "turn_done"], kinds
+    assert events[-2]["text"] == "搞定了"
 
 
 def test_request_carries_per_call_reasoning_effort_and_response_format(env):
@@ -421,29 +433,79 @@ def test_request_carries_per_call_reasoning_effort_and_response_format(env):
 
 
 def test_stop_from_another_thread_aborts_the_turn(env):
+    """`Session.stop()`：别的线程也能停住正在跑的回合。
+
+    取消信号住在**会话里**（不是 `turn` 的形参）—— 回合跑着时会话锁被那个线程握着，
+    所以 `stop()` 走的是构造时留好的句柄。
+    """
     cfg, llm, tools, server = env
     server.delay = 3.0  # 让模型请求挂住，好从中途取消
     session = pie.Session.ephemeral(cfg, llm, tools)
 
-    token = pie.Cancel()
     result: list = []
 
     def run():
-        result.append(session.turn("写一篇长文", cancel=token))
+        result.append(session.turn("写一篇长文"))
 
     worker = threading.Thread(target=run)
     started = time.monotonic()
     worker.start()
     time.sleep(0.4)
-    assert token.cancelled is False
-    token.cancel()
+    assert session.stop() is True
     worker.join(timeout=10)
     assert not worker.is_alive(), "取消之后回合没停下来"
 
-    assert token.cancelled is True
     assert result == ["用户手动终止"]
     assert time.monotonic() - started < 3.0  # 没等模型回完
     assert session.messages[-1]["content"] == "用户手动终止"
+    # 空闲时再按一次 → 没有回合在跑，返回 False
+    assert session.stop() is False
+
+
+def test_on_subscribes_across_turns(env, tmp_path):
+    """`session.on(cb)` 是**跨回合**订阅：`set_model` / `clear_window` 这些回合**之外**的动作也收得到。
+
+    对比 `turn(on_event=…)`：那个只在这一次回合有效（监听者随回合结束一起注销）。
+    """
+    cfg, llm, tools, _ = env
+    cfg.config_file = str(tmp_path / "cfg.toml")  # 别写到用户真实的配置
+    session = pie.Session.ephemeral(cfg, llm, tools)
+
+    seen: list[dict] = []
+    sub = session.on(seen.append)
+    assert sub.closed is False
+
+    # ① 回合**之外**的动作 —— `on_event=` 收不到，`on` 收得到
+    session.set_model("deepseek-v4-pro")
+    assert [e["type"] for e in seen] == ["model_changed"], seen
+    assert seen[0]["previous"] == "test-model"
+    assert seen[0]["current"] == "deepseek-v4-pro"
+
+    # ② 回合**之内**的也来（与 `on_event=` 同一套形状、同一批事件）
+    session.turn("打个招呼")
+    assert [e["type"] for e in seen[1:]] == [
+        "turn_start",
+        "tool_call",
+        "tool_result",
+        "content_delta",
+        "content_delta",
+        "turn_done",
+    ], seen
+
+    # ③ 显式退订之后不再收到
+    before = len(seen)
+    sub.close()
+    assert sub.closed is True
+    session.set_model("m2")
+    assert len(seen) == before, "close() 之后不该再有事件"
+
+    # ④ **丢掉引用**也等于退订（CPython 引用计数即时回收 → Rust 侧 Subscription drop）
+    keep = session.on(seen.append)
+    session.set_model("m3")
+    assert len(seen) == before + 1
+    del keep
+    session.set_model("m4")
+    assert len(seen) == before + 1, "丢掉 Subscription 之后不该再有事件"
 
 
 def test_llm_error_carries_status(env):
@@ -728,6 +790,13 @@ def test_stub_event_shapes_match_the_real_events(env):
         "tool_call": "ToolCallEvent",
         "tool_result": "ToolResultEvent",
         "answer": "AnswerEvent",
+        "turn_start": "TurnStartEvent",
+        "turn_done": "TurnDoneEvent",
+        "compacted": "CompactedEvent",
+        "cleared": "ClearedEvent",
+        "model_changed": "ModelChangedEvent",
+        "cwd_changed": "CwdChangedEvent",
+        "start": "StartEvent",
     }
 
     cfg, llm, tools, _ = env
@@ -928,7 +997,14 @@ def test_aturn_streams_events_and_returns_answer(env):
 
     answer, kinds = asyncio.run(run())
     assert answer == "搞定了"
-    assert kinds == ["tool_call", "tool_result", "content_delta", "content_delta"], kinds
+    assert kinds == [
+        "turn_start",
+        "tool_call",
+        "tool_result",
+        "content_delta",
+        "content_delta",
+        "turn_done",
+    ], kinds
 
 
 def test_aturn_forwards_per_call_knobs(env):

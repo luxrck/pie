@@ -45,7 +45,6 @@ async def aturn(
     input: str,
     *,
     queue: "asyncio.Queue[Any]",
-    cancel: Any = None,
     max_steps: int | None = None,
     stream: bool | None = None,
     parallel_tools: bool | None = None,
@@ -62,7 +61,6 @@ async def aturn(
     fut = session.turn_future(
         input,
         sink,
-        cancel,
         max_steps,
         stream,
         parallel_tools,

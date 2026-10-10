@@ -37,6 +37,14 @@ impl Cancel {
         self.notify.notify_waiters();
     }
 
+    /// 复位成「未取消」——下一个回合开头用。
+    ///
+    /// `Notify` 不用清：它不存 permit（`notify_waiters` 只唤醒**当时**在等的人），而 `cancelled()`
+    /// 每次都先查标志位，所以旧回合遗留的唤醒不会误伤新回合。
+    pub fn reset(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }

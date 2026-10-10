@@ -26,7 +26,7 @@ use serde_json::Value;
 
 pub use config::PyConfig;
 pub use llm::PyLlmClient;
-pub use session::{PyCancel, PySession};
+pub use session::{PyCancel, PySession, PySubscription};
 pub use tools::PyToolRegistry;
 
 // ---------------------------------------------------------------- 异常层级
@@ -262,7 +262,6 @@ fn run(
         py,
         task,
         None,
-        None,
         max_steps,
         stream,
         parallel_tools,
@@ -298,24 +297,15 @@ fn arun(
     // `String`（按值带进 async 块——`Option<&str>` 借自 py 数据，进不了 `'static` future）
     let response_format = crate::parse_response_format(response_format.as_deref())?;
     let mut session = pie::session::Session::ephemeral(&core_config, client, registry);
-    let cancel = pie::cancel::Cancel::new();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let request_options = pie::llm::RequestOptions::ChatCompletions {
             reasoning_effort: reasoning_effort.as_deref(),
             response_format,
+            stream,
         };
-        // 没有事件出口（`run` 本来就不给 `on_event`）→ 丢进一个空闭包
-        let mut sink = |_event: pie::session::TurnEvent| {};
+        // 没有事件出口（`run` 本来就不订阅）→ 不注册监听者就行，总线自己会丢弃
         let result = session
-            .aturn(
-                &task,
-                &mut sink,
-                &cancel,
-                max_steps,
-                stream,
-                parallel_tools,
-                request_options,
-            )
+            .aturn(&task, max_steps, parallel_tools, request_options)
             .await;
         result.map_err(|e| Python::attach(|py| llm_error(py, e)))
     })
@@ -368,6 +358,7 @@ fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyToolRegistry>()?;
     m.add_class::<PySession>()?;
     m.add_class::<PyCancel>()?;
+    m.add_class::<PySubscription>()?;
 
     m.add("PieError", py.get_type::<PieError>())?;
     m.add("ConfigError", py.get_type::<ConfigError>())?;

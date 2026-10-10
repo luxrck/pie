@@ -10,10 +10,11 @@ use std::io::{IsTerminal, Write};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+use pie::event::Event;
 use pie::llm::{LlmClient, RequestOptions};
 use pie::session::{Session, TurnEvent};
 use pie::tools::{ToolRegistry, tools_from_spec};
-use pie::{cancel, cli, config, context, tui};
+use pie::{cli, config, context, tui};
 
 /// 一次性模式的输出格式（`text` / `json` / `transcript`）。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -322,24 +323,32 @@ async fn run(cli: Cli) -> i32 {
     // 与调试日志都不往 stderr 写（`--mode text` 时 stdout = 答案本身，shell 能直接接住；
     // `stream` 只影响到达时间）。
     let mode = cli.mode;
-    let mut printer = move |ev: TurnEvent| match ev {
-        TurnEvent::AssistantText(delta) => {
-            if mode == Mode::Text {
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
+
+    /// 一次性 / 会话模式的 stdout 打印（`--mode text` 时 stdout = 答案本身，shell 能直接接住；
+    /// `stream` 只影响到达时间）。注册到会话的事件总线上，见下面各分支里的 `session.on(..)`。
+    fn print_event(ev: &Event, mode: Mode) {
+        match ev {
+            Event::Turn(TurnEvent::AssistantText(delta)) => {
+                if mode == Mode::Text {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                }
             }
-        }
-        TurnEvent::Reasoning(_) => {}
-        // 非流式（`--no-stream`）时的最终答复：流式下走 AssistantText 增量，这里不会来
-        TurnEvent::Answer(text) => {
-            if mode == Mode::Text {
-                println!("{text}");
+            Event::Turn(TurnEvent::Reasoning(_)) => {}
+            // 非流式（`--no-stream`）时的最终答复：流式下走 AssistantText 增量，这里不会来
+            Event::Turn(TurnEvent::Answer(text)) => {
+                if mode == Mode::Text {
+                    println!("{text}");
+                }
             }
+            // 工具活动不打印（stdout 只放结果；曾经的 `[tNsM]` / `[tool] …←…` 日志是 verbose 门控的，
+            // 已随 `Config.verbose` 一起删除）
+            Event::Turn(TurnEvent::ToolCall { .. }) | Event::Turn(TurnEvent::ToolResult { .. }) => {
+            }
+            // 会话生命周期（TurnStart/TurnDone/Compacted…）：一次性模式的 stdout 只放结果，不打印
+            Event::Session(_) => {}
         }
-        // 工具活动不打印（stdout 只放结果；曾经的 `[tNsM]` / `[tool] …←…` 日志是 verbose 门控的，
-        // 已随 `Config.verbose` 一起删除）
-        TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. } => {}
-    };
+    }
 
     // 会话模式（--resume / --session）：读写 `~/.pie/sessions/`，跑完落盘；一次性模式不碰磁盘。
     if session_mode {
@@ -374,17 +383,16 @@ async fn run(cli: Cli) -> i32 {
                 }
             };
         }
+        // 事件出口：订阅本会话（`print_event` 只写 stdout，不阻塞回合）
+        let _printer = session.on(move |ev| print_event(ev, mode));
         let answer = match session
-            // 后两个按次旋钮走默认：`parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）、
-            // `request_options` 走 chat completions 的默认（思考深度用客户端/配置的、`response_format` = text）
+            // `parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）；`stream` 是**请求的属性**
+            //（思考深度用客户端/配置的、`response_format` = text，其余走默认）
             .aturn(
                 &task,
-                &mut printer,
-                &cancel::Cancel::new(),
                 max_steps,
-                stream,
                 None,
-                RequestOptions::default(),
+                RequestOptions::default().with_stream(stream),
             )
             .await
         {
@@ -410,15 +418,13 @@ async fn run(cli: Cli) -> i32 {
     // 回合循环现在就在 `Session::aturn` 里（原 loop.rs 已并入）；
     // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 config
     let mut session = Session::ephemeral(&config, client, registry);
+    let _printer = session.on(move |ev| print_event(ev, mode));
     match session
         .aturn(
             &task,
-            &mut printer,
-            &cancel::Cancel::new(),
             max_steps,
-            stream,
             None,
-            RequestOptions::default(),
+            RequestOptions::default().with_stream(stream),
         )
         .await
     {

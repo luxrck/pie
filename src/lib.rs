@@ -13,6 +13,7 @@
 //!   - [`cli`] —— 会话/图片文件的列表与维护（`pie sessions` / `files list|gc` 的数据源）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + gc
+//!   - [`event`] —— 事件词汇表（`TurnEvent` / `StreamChunk` / `CompactEvent` / `SessionEvent`）+ 观察信封 `Event`
 //!   - [`cancel`]  —— 取消信号（TUI 的 Esc）
 //!   - [`log`]     —— 告警出口（TUI 期间不能直接写 stderr）
 //!
@@ -23,6 +24,7 @@ pub mod cancel;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod event;
 pub mod llm;
 pub mod log;
 pub mod pytool;

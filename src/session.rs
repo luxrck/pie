@@ -32,37 +32,13 @@ use crate::llm::{
 };
 use crate::tools::{self, Attachment, ToolOutput, ToolRegistry};
 
+/// 回合事件（定义已搬去 [`crate::event`]；这里再导出，`pie::session::TurnEvent` 路径不变）。
+pub use crate::event::TurnEvent;
+use crate::event::{Event, EventBus, SessionEvent, Subscription};
+
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
 pub(crate) const ERROR_TURN_PREFIX: &str = "[请求失败] ";
-
-/// 回合过程中推给调用方的事件（TUI / CLI 边跑边渲染用）。
-///
-/// 事件形状与绑定的 `on_event` dict 一一对应（`{"type": …}`）；`arguments` 传**原始 JSON 字符串**，
-/// 由消费者自己解析出「这次调的是哪个文件 / 命令」的摘要。
-#[derive(Debug, Clone)]
-pub enum TurnEvent {
-    /// 正文增量
-    AssistantText(String),
-    /// 思考增量
-    Reasoning(String),
-    /// 即将执行某个工具
-    ToolCall { name: String, arguments: String },
-    /// 工具执行完毕（按真实完成顺序推；`content` 是**原样**文本，不再截断——
-    /// 少显示是展示层的事，见 `Session::tool_call`）
-    ToolResult {
-        name: String,
-        content: String,
-        arguments: String,
-        /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
-        images: Vec<PathBuf>,
-    },
-    /// 最终答复。
-    ///
-    /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `AssistantText` 增量
-    /// 推过了，再推一次消费者会重复显示。
-    Answer(String),
-}
 
 /// 解释器跑过的单个代码块（写进 `__meta__.repl_blocks`）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -119,6 +95,11 @@ pub struct Session {
     pub turn_count: usize,
     /// 启动时拉取的可用模型 id（`/model` 的候选；**不持久化**）。
     pub available_models: Option<Vec<String>>,
+    /// 事件出口（订阅 / 广播）。**私有**：对外只经 [`Session::on`] 订阅（内部 `aturn` 自己 emit）。
+    bus: EventBus,
+    /// 当前回合的取消信号。**私有**：对外只经 [`Session::cancel`]（就地取消）与
+    /// [`Session::cancel_handle`]（回合外先留个句柄）。`aturn` 开头会 `reset()`。
+    cancel: Cancel,
 }
 
 /// 「思考」计时：实时视图里那行 `• Thought for 3.4s` 的来源。
@@ -201,8 +182,14 @@ impl Session {
     /// ⚠ 暂时只有单测在读它：入口是交互层的 `/model` 命令。
     #[allow(dead_code)]
     pub fn set_model(&mut self, name: &str) -> String {
-        self.config.model = name.to_string();
+        let previous = std::mem::replace(&mut self.config.model, name.to_string());
         self.llm.model = name.to_string();
+        if previous != name {
+            self.bus.emit(Event::Session(SessionEvent::ModelChanged {
+                previous,
+                current: name.to_string(),
+            }));
+        }
         self.persist_config()
     }
 
@@ -412,6 +399,45 @@ impl Session {
             .push(Message::assistant(format!("{ERROR_TURN_PREFIX}{err}")));
     }
 
+    /// 订阅本会话的事件（按注册顺序回调）。返回的凭据 **drop 即退订**。
+    ///
+    /// ⚠ 监听者跑在**发事件的那条线程**上，`aturn` 期间 Session 还正被 `&mut` 借用 ——
+    /// 所以监听者里别阻塞、更别碰同一个 `Session`（要异步就自己往 channel 里丢）。
+    pub fn on(&self, listener: impl Fn(&Event) + Send + Sync + 'static) -> Subscription {
+        self.bus.on(listener)
+    }
+
+    /// 请求取消当前回合（`Esc` 就是它）。
+    ///
+    /// ⚠ 回合跑到一半时 `Session` 正被 `&mut` 借走（TUI / 绑定的锁都握在跑回合的那个任务里）
+    /// —— 外部**拿不到 `&Session`** 来调这个。要回合外取消，先取一份
+    /// [`Session::cancel_handle`]，见那里的例子。`aturn` 开头会 `reset()`，所以上一回合的取消
+    /// 不会污染下一回合。
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// 拿一个**取消句柄**（`Cancel` 的克隆，内部共享同一个信号）——**在回合开始之前**取。
+    ///
+    /// 为什么需要这个接口：回合跑着时 `Session` 正被 `&mut` 借走，外部拿不到 `&Session` 去调
+    /// [`Session::cancel`]。所以调用方（TUI 的 `Esc` / 绑定的 `stop()`）都在构造时留一份：
+    ///
+    /// ```ignore
+    /// let cancel = session.cancel_handle();   // 回合前留好
+    /// // …另一个任务里 session.aturn(..) 正在跑…
+    /// cancel.cancel();                        // 想停就停
+    /// ```
+    pub fn cancel_handle(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
+    /// 拿一个**事件出口句柄**（`EventBus` 的克隆，内部是 `Arc`）——同样给「拿不到 `&Session`」的场合：
+    /// 回合跑着时锁被那个任务握着，订阅方（比如 Python 绑定）在构造时先留一份，之后就能随时 `on(..)`。
+    /// 大多数 Rust 调用方直接用 [`Session::on`]。
+    pub fn bus_handle(&self) -> EventBus {
+        self.bus.clone()
+    }
+
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
     /// **不落盘会话**（由调用方 `save`）；压缩事件攒在 `compaction_events`，随 `save` 一起落盘。
     ///
@@ -421,7 +447,7 @@ impl Session {
     /// 按次（不在配置里）的执行旋钮：
     ///   - `max_steps`：单回合最多问几次模型；`None` = 不限。
     ///   - `stream`：`None` = 默认（客户端都实现了 `stream()` → 流式）；`Some(false)` 强制一次性
-    ///     `complete()`（`on_event` 不再有增量，只推一次 `Answer`）。
+    ///     `complete()`（事件里不再有增量，只推一次 `Answer`）。
     ///   - `parallel_tools`：同一批 `tool_calls` 是否**并发**执行；`None` = 跟随 `config.parallel_tools`
     ///     （默认 true）。工具共享可变状态时必须 `Some(false)`（改为按模型返回顺序串行）。
     ///   - `request_options`：本回合模型请求的**按次覆盖**（见 [`RequestOptions`]）——思考深度
@@ -429,25 +455,68 @@ impl Session {
     ///     （`Text` 默认 = 不发该字段；`JsonObject` = 要求合法 JSON，⚠ 还得自己在 prompt 里交代）。
     ///     **只影响本回合的请求**：不改配置、不写回文件。
     ///
-    /// `cancel` 触发时（TUI 的 `Esc`）：
+    /// **取消不是形参**：信号住在 [`Session::cancel`]，`aturn` 开头 `reset()` 一次。触发时：
     ///   - 模型请求中的取消 → 直接收尾（不追加 assistant 消息）；
     ///   - 工具执行中的取消 → shell 会杀掉整个进程组，**未执行的 `tool_calls` 补 `CANCEL_TEXT` 的
     ///     tool 消息**（保证每个 `tool_call_id` 都有配对结果、API 序列合法）；
     ///   - 两种收尾都往历史里写一条 `CANCEL_TEXT` 的 assistant 消息，并把它作为本轮答复返回。
-    ///
-    /// ⚠ 参数 8 个（clippy 会念）是故意的：全是**按次**旋钮 —— `--max-steps` / `--no-stream` /
-    /// 按次请求覆盖都不进 `Config`（见 AGENTS.md「执行旋钮按次传」），打包成结构体只是把字段挪个地方。
-    #[allow(clippy::too_many_arguments)]
     pub async fn aturn(
         &mut self,
         input: &str,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
-        cancel: &Cancel,
         max_steps: Option<usize>,
-        stream: Option<bool>,
         parallel_tools: Option<bool>,
         request_options: RequestOptions<'_>,
     ) -> Result<String, LlmError> {
+        // 回合的入口 / 出口在这里统一发（**覆盖所有退出路径**：正常结束、取消、请求失败）——
+        // 主体挪进 `aturn_inner`，否则那几处 `return Err(..)` 会漏掉 `TurnDone`。
+        let started = std::time::Instant::now();
+        // 取消信号是**会话级**的（不是形参）：新回合从「未取消」开始。
+        self.cancel.reset();
+        // 先把出口 clone 出来（`EventBus` 内部是 `Arc`）：之后就不必再借 `self`。
+        let bus = self.bus.clone();
+        bus.emit(Event::Session(SessionEvent::TurnStart {
+            input: input.to_string(),
+        }));
+        let result = self
+            .aturn_inner(input, max_steps, parallel_tools, request_options)
+            .await;
+        let (answer, error) = match &result {
+            Ok(answer) => (answer.clone(), None),
+            Err(e) => (String::new(), Some(e.to_string())),
+        };
+        bus.emit(Event::Session(SessionEvent::TurnDone {
+            answer,
+            error,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }));
+        result
+    }
+
+    /// 回合主体（原 `aturn`）：`TurnStart` / `TurnDone` 已由 [`Session::aturn`] 统一包住。
+    #[allow(clippy::too_many_arguments)]
+    async fn aturn_inner(
+        &mut self,
+        input: &str,
+        max_steps: Option<usize>,
+        parallel_tools: Option<bool>,
+        request_options: RequestOptions<'_>,
+    ) -> Result<String, LlmError> {
+        /// 把刚产生的压缩事件投影成观察事件（三个压缩点共用）。
+        fn emit_compacted(bus: &EventBus, events: &[context::CompactEvent]) {
+            for e in events {
+                bus.emit(Event::Session(SessionEvent::Compacted {
+                    level: e.level(),
+                    path: e.raw_path().to_path_buf(),
+                    hash: e.hash().to_string(),
+                }));
+            }
+        }
+
+        // 事件出口：后面 `self.messages` 要被 `&mut` 借出去（压缩就地改写它）——先 clone 出来，
+        // 整轮就不再借 `self` 了（`EventBus` 内部是 `Arc`）；取消信号同理。
+        let bus = self.bus.clone();
+        let cancel = self.cancel.clone();
+
         // 每轮开头：先收解释器代码块（压缩会把 `tool_calls` 删掉，这是最后的收集机会），
         // 再校准 system prompt 末尾那节（cwd 可能被 `/cd` 改过）——都必须先于任何请求
         self.collect_repl_blocks();
@@ -459,8 +528,9 @@ impl Session {
         let mut compacted: Vec<context::CompactEvent> = Vec::new();
 
         // 配置值拷出来（不长期借 `self.config`：后面还要 `&mut self` 做注入/降级）
-        // `stream: None` = 用默认（客户端都实现了流式）
-        let use_stream = stream.unwrap_or(true);
+        // 流式与否是**请求的属性**（`RequestOptions::stream()`：`None` = 客户端默认，即流式）——
+        // 这里只问它一次，用来决定「非流式时要不要补一条 `Answer` 事件」。
+        let use_stream = request_options.stream();
         // `parallel_tools: None` = 跟随配置
         let use_parallel = parallel_tools.unwrap_or(self.config.parallel_tools);
         let mut steps = 0usize;
@@ -486,7 +556,9 @@ impl Session {
                     _ => None,
                 });
                 if !use_stream {
-                    on_event(TurnEvent::Answer(answer.clone().unwrap_or_default()));
+                    bus.emit(Event::Turn(TurnEvent::Answer(
+                        answer.clone().unwrap_or_default(),
+                    )));
                 }
                 done = true;
                 break;
@@ -496,21 +568,12 @@ impl Session {
             // 请求前：拿上一次 API 上报的水位判一次（本次会话还没发过请求 → 不压）
             let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            emit_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
 
             let specs = self.tools.specs();
-            let called = match self
-                .model_call(
-                    &specs,
-                    on_event,
-                    &mut clock,
-                    cancel,
-                    use_stream,
-                    request_options,
-                )
-                .await
-            {
+            let called = match self.model_call(&specs, &mut clock, request_options).await {
                 Ok(option) => option,
                 Err(e) => {
                     // file_id 失效（服务端删了 / 中途换了 key）：把历史里的图片块降级成文本占位、
@@ -519,17 +582,7 @@ impl Session {
                         crate::log::warn(format!(
                             "[warn] file_id 已失效，已把历史里的图片降级为占位文本并重试：{e}"
                         ));
-                        match self
-                            .model_call(
-                                &specs,
-                                on_event,
-                                &mut clock,
-                                cancel,
-                                use_stream,
-                                request_options,
-                            )
-                            .await
-                        {
+                        match self.model_call(&specs, &mut clock, request_options).await {
                             Ok(option) => option,
                             Err(e) => {
                                 self.push_error_turn(&e);
@@ -544,6 +597,7 @@ impl Session {
                             &self.config,
                             context::CompactMode::Auto,
                         );
+                        emit_compacted(&bus, &events);
                         compacted.append(&mut events);
                         if stats.tools == 0 && stats.turns == 0 {
                             // 工具级 / 轮次级都压不动了 → **不自动归档**：换窗口是用户的动作，
@@ -558,17 +612,7 @@ impl Session {
                             "[warn] 上下文超限，已强制压缩（工具级 {} 条 / 轮次级 {} 轮）并重试一次",
                             stats.tools, stats.turns
                         ));
-                        match self
-                            .model_call(
-                                &specs,
-                                on_event,
-                                &mut clock,
-                                cancel,
-                                use_stream,
-                                request_options,
-                            )
-                            .await
-                        {
+                        match self.model_call(&specs, &mut clock, request_options).await {
                             Ok(option) => option,
                             Err(e) => {
                                 self.push_error_turn(&e);
@@ -592,6 +636,7 @@ impl Session {
             // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再判一次
             let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            emit_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
             self.messages.push(Message {
@@ -610,16 +655,16 @@ impl Session {
                 answer = result.content;
                 if !use_stream {
                     // 非流式：正文从没被推过 → 用 answer 事件交出去（流式下已增量推过）
-                    on_event(TurnEvent::Answer(answer.clone().unwrap_or_default()));
+                    bus.emit(Event::Turn(TurnEvent::Answer(
+                        answer.clone().unwrap_or_default(),
+                    )));
                 }
                 done = true;
                 break;
             }
 
             // —— 一批工具调用：并发（默认）或按模型返回顺序串行
-            let outcomes = self
-                .tool_call(&tool_calls, use_parallel, cancel, on_event)
-                .await;
+            let outcomes = self.tool_call(&tool_calls, use_parallel).await;
             // 全部收尾后**按原顺序**回填 ToolMessage（并发/串行都是这个顺序 → 历史扁平序列一致，
             // compaction 的 step 批次 / keep_last_steps 认定不受影响）
             let mut interrupted = false;
@@ -679,7 +724,7 @@ impl Session {
             // 历史里留一条终止消息，并把它当本轮答复
             self.messages.push(Message::assistant(CANCEL_TEXT));
             if !use_stream {
-                on_event(TurnEvent::Answer(CANCEL_TEXT.to_string()));
+                bus.emit(Event::Turn(TurnEvent::Answer(CANCEL_TEXT.to_string())));
             }
             return Ok(CANCEL_TEXT.to_string());
         }
@@ -687,50 +732,41 @@ impl Session {
         Ok(answer.unwrap_or_default())
     }
 
-    /// 一次模型调用（流式 / 非流式两条路），增量经 `on_event` 推；`stream` / `request_options` 由 `aturn`
-    /// 按次传进来。
-    /// 一次模型调用；`Ok(None)` = 请求期间被取消（不 push 任何消息，收尾由 `aturn` 统一做）。
+    /// 一次模型调用（流式 / 非流式两条路）；`Ok(None)` = 请求期间被取消（不 push 任何消息，
+    /// 收尾由 `aturn` 统一做）。增量经本会话的 [`EventBus`] 推。
     async fn model_call(
         &self,
         specs: &[Value],
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
         clock: &mut ThoughtClock,
-        cancel: &Cancel,
-        stream: bool,
         request_options: RequestOptions<'_>,
     ) -> Result<Option<LlmResult>, LlmError> {
+        // 取消信号住在 `self`：先 clone 出来（`Arc`），后面就不必再借 `self`。
+        let cancel = self.cancel.clone();
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let call = async {
-            if stream {
-                self.llm
-                    .stream(
-                        &self.messages,
-                        specs,
-                        request_options,
-                        |chunk| match chunk {
-                            // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
-                            StreamChunk::Content(d) => {
-                                let ev = TurnEvent::AssistantText(d);
-                                clock.on(&ev);
-                                on_event(ev);
-                            }
-                            StreamChunk::Reasoning(d) => {
-                                let ev = TurnEvent::Reasoning(d);
-                                clock.on(&ev);
-                                on_event(ev);
-                            }
-                            StreamChunk::ToolCall { .. } => {}
-                        },
-                    )
-                    .await
-            } else {
-                self.llm
-                    .complete(&self.messages, specs, request_options)
-                    .await
-            }
-        };
+        let bus = self.bus.clone();
+        // 流式与否交给 `complete` 自己定（它看 `request_options`）——这里只管把增量翻成事件；
+        // 非流式时这个闭包压根不会被调用。
+        let call = self.llm.complete(
+            &self.messages,
+            specs,
+            request_options,
+            |chunk| match chunk {
+                // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
+                StreamChunk::Content(d) => {
+                    let ev = TurnEvent::AssistantText(d);
+                    clock.on(&ev);
+                    bus.emit(ev.into());
+                }
+                StreamChunk::Reasoning(d) => {
+                    let ev = TurnEvent::Reasoning(d);
+                    clock.on(&ev);
+                    bus.emit(ev.into());
+                }
+                StreamChunk::ToolCall { .. } => {}
+            },
+        );
         tokio::select! {
             result = call => result.map(Some),
             _ = cancel.cancelled() => Ok(None),
@@ -804,22 +840,18 @@ impl Session {
     ///
     /// 参数非法 JSON **不执行工具**、只把原文回给模型；单个工具失败文本化后照常返回，
     /// 不拖累同批其他工具。
-    async fn tool_call(
-        &self,
-        calls: &[ToolCall],
-        parallel: bool,
-        cancel: &Cancel,
-        on_event: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> Vec<Option<ToolOutput>> {
+    async fn tool_call(&self, calls: &[ToolCall], parallel: bool) -> Vec<Option<ToolOutput>> {
+        // 出口与取消信号先 clone 出来：都是 `Arc`，能进 future（旧版按次传 `&mut dyn FnMut`
+        // 进不去，所以事件只能在「完成的当下」由外面推）。
+        let bus = self.bus.clone();
+        let cancel = self.cancel.clone();
         for call in calls {
-            on_event(TurnEvent::ToolCall {
+            bus.emit(Event::Turn(TurnEvent::ToolCall {
                 name: call.function.name.clone(),
                 arguments: call.function.arguments.clone(),
-            });
+            }));
         }
-        // ⚠ `on_event` **不能**进 future：`&mut dyn FnMut` 没实现 `Sync`，一旦被 future 捕获，
-        // `aturn` 的 future 就不再是 `Send`，TUI 那边的 `tokio::spawn` 直接编不过。
-        // 所以 future 只负责算出结果，事件在下面这个循环里「完成的当下」推。
+        // 事件在下面这个循环里「完成的当下」推（顺序 = 真实完成顺序）。
         //
         // ⚠ future 必须在 `for` 里造（而不是 `map(|(i, call)| async move {…})`）：
         // 闭包参数的生命周期会变成 HRTB，撞上 rustc 的已知限制（#100013，报在调用方
@@ -827,6 +859,8 @@ impl Session {
         let registry = &self.tools;
         let mut futures = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().enumerate() {
+            // 每个 future 各拿一份（`Cancel` 内部是 `Arc`，克隆即共享）
+            let cancel = cancel.clone();
             futures.push(async move {
                 let outcome = if cancel.is_cancelled() {
                     None // 还没轮到就取消了
@@ -877,12 +911,12 @@ impl Session {
             let finished = outcome
                 .clone()
                 .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
-            on_event(TurnEvent::ToolResult {
+            bus.emit(Event::Turn(TurnEvent::ToolResult {
                 name: calls[index].function.name.clone(),
                 content: finished.to_text().clone(),
                 arguments: calls[index].function.arguments.clone(),
                 images: finished.canvas_images(),
-            });
+            }));
             outcomes[index] = outcome;
         }
         outcomes
@@ -1349,10 +1383,16 @@ impl Session {
             .as_ref()
             .and_then(|c| c.session.clone())
             .unwrap_or_default();
+        // 归档前的消息条数（`count` 就是它：本次有多少条被压进了窗口块）
+        let before = self.messages.len();
         if let Some((path, event)) =
             context::compact_session(&mut self.messages, &session_config, &self.config.storage)?
         {
             self.compaction_events.push(event);
+            self.bus.emit(Event::Session(SessionEvent::Cleared {
+                archived: path.clone(),
+                count: before,
+            }));
             self.windows.push(path);
         }
         // `/clear` 的特性（兜底没有）：system prompt 顺便重建一次（记忆变化要反映进来；
@@ -1464,6 +1504,8 @@ impl Session {
             title: None,
             turn_count: 0,
             available_models: None,
+            bus: EventBus::new(),
+            cancel: Cancel::new(),
         }
     }
 }
@@ -1688,6 +1730,26 @@ mod tests {
             .collect()
     }
 
+    /// 收本会话的**回合事件**（会话生命周期事件忽略）：事件现在走 `Session.bus`，
+    /// 不再按次传回调，所以测试也得先订阅一下。返回共享收集器 + 订阅凭据（后者要留到回合结束）。
+    fn collect_turn_events(
+        session: &Session,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<TurnEvent>>>,
+        Subscription,
+    ) {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = session.on({
+            let got = std::sync::Arc::clone(&got);
+            move |e: &Event| {
+                if let Event::Turn(t) = e {
+                    got.lock().unwrap().push(t.clone());
+                }
+            }
+        });
+        (got, sub)
+    }
+
     /// 并发执行：三个工具（两个 0.6s + 一个 0.05s）总耗时 ≈ 最慢那个（串行要 1.25s+）。
     /// 同时验证：结果**按调用顺序**返回（快的先跑完也不抢位），
     /// 事件形状是「先全部 tool_call、再按完成顺序 tool_result」。
@@ -1700,25 +1762,22 @@ mod tests {
                 shell_call("c2", "sleep 0.6; echo two"),
                 shell_call("c3", "sleep 0.05; echo three"),
             ];
-            let mut events: Vec<TurnEvent> = Vec::new();
+            let s = session();
+            let (events, _sub) = collect_turn_events(&s);
             let started = std::time::Instant::now();
-            {
-                let mut sink = |e: TurnEvent| events.push(e);
-                let outcomes = session()
-                    .tool_call(&calls, true, &Cancel::new(), &mut sink)
-                    .await;
-                // 结果与入参等长同序：慢的那两条仍占下标 0 / 1
-                let texts = texts(&outcomes);
-                assert!(texts[0].contains("one"), "{texts:?}");
-                assert!(texts[1].contains("two"), "{texts:?}");
-                assert!(texts[2].contains("three"), "{texts:?}");
-            }
+            let outcomes = s.tool_call(&calls, true).await;
+            // 结果与入参等长同序：慢的那两条仍占下标 0 / 1
+            let texts = texts(&outcomes);
+            assert!(texts[0].contains("one"), "{texts:?}");
+            assert!(texts[1].contains("two"), "{texts:?}");
+            assert!(texts[2].contains("three"), "{texts:?}");
             let elapsed = started.elapsed().as_secs_f64();
             assert!(
                 elapsed < 1.1,
                 "三个工具应当重叠执行（串行要 1.25s+），实际 {elapsed:.2}s"
             );
 
+            let events = events.lock().unwrap();
             assert_eq!(
                 event_kinds(&events),
                 ["call", "call", "call", "result", "result", "result"]
@@ -1743,16 +1802,13 @@ mod tests {
                 shell_call("c1", "sleep 0.6; echo one"),
                 shell_call("c2", "sleep 0.6; echo two"),
             ];
-            let mut events: Vec<TurnEvent> = Vec::new();
+            let s = session();
+            let (events, _sub) = collect_turn_events(&s);
             let started = std::time::Instant::now();
-            {
-                let mut sink = |e: TurnEvent| events.push(e);
-                session()
-                    .tool_call(&calls, false, &Cancel::new(), &mut sink)
-                    .await;
-            }
+            s.tool_call(&calls, false).await;
             let elapsed = started.elapsed().as_secs_f64();
             assert!(elapsed > 1.1, "串行总耗时是两个之和，实际 {elapsed:.2}s");
+            let events = events.lock().unwrap();
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
             match &events[2] {
                 TurnEvent::ToolResult { content, .. } => {
@@ -1776,14 +1832,13 @@ mod tests {
                     arguments: "{不是 JSON".into(),
                 },
             }];
-            let mut events: Vec<TurnEvent> = Vec::new();
-            let mut sink = |e: TurnEvent| events.push(e);
-            let outcomes = session()
-                .tool_call(&calls, true, &Cancel::new(), &mut sink)
-                .await;
+            let s = session();
+            let (events, _sub) = collect_turn_events(&s);
+            let outcomes = s.tool_call(&calls, true).await;
             let text = texts(&outcomes)[0].clone();
             assert!(text.starts_with("[参数解析失败]"), "{text}");
             assert!(!text.contains("[exit="), "没执行工具，不该有退出码：{text}");
+            let events = events.lock().unwrap();
             assert_eq!(event_kinds(&events), ["call", "result"]);
         });
     }
@@ -1887,17 +1942,16 @@ mod tests {
         rt.block_on(async {
             // `seq 1 300` → 1000+ 字，远超 500
             let calls = vec![shell_call("c1", "seq 1 300")];
-            let mut events: Vec<TurnEvent> = Vec::new();
-            let mut sink = |e: TurnEvent| events.push(e);
-            let outcomes = session()
-                .tool_call(&calls, true, &Cancel::new(), &mut sink)
-                .await;
+            let s = session();
+            let (events, _sub) = collect_turn_events(&s);
+            let outcomes = s.tool_call(&calls, true).await;
             let text = outcomes[0].clone().expect("跑成功了");
             assert!(
                 text.to_text().len() > 500,
                 "工具输出本来就很长：{} 字",
                 text.to_text().len()
             );
+            let events = events.lock().unwrap();
             match &events[1] {
                 TurnEvent::ToolResult { content, .. } => {
                     assert_eq!(content, &text.to_text(), "事件里的文本要原样（不截断）")
@@ -1907,19 +1961,38 @@ mod tests {
         });
     }
 
+    /// 取消信号是**会话级**的：`reset()` 之后照常干活（`aturn` 开头就 reset 一次，
+    /// 所以上一回合的取消不会污染下一回合）。
+    #[test]
+    fn cancel_is_reset_and_then_the_session_runs_again() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let s = session();
+            let calls = vec![shell_call("c1", "echo hi")];
+            s.cancel.cancel();
+            assert!(s.tool_call(&calls, true).await[0].is_none(), "取消后不执行");
+            s.cancel.reset();
+            assert!(
+                s.tool_call(&calls, true).await[0].is_some(),
+                "复位后照常执行"
+            );
+        });
+    }
+
     /// 整批开始前就已被取消：一条都不执行（全 `None`），但仍各推一条 `CANCEL_TEXT` 结果事件。
     #[test]
     fn cancelled_batch_skips_every_tool() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let calls = vec![shell_call("c1", "echo hi"), shell_call("c2", "echo hi")];
-            let cancel = Cancel::new();
-            cancel.cancel();
-            let mut events: Vec<TurnEvent> = Vec::new();
-            let mut sink = |e: TurnEvent| events.push(e);
-            let outcomes = session().tool_call(&calls, true, &cancel, &mut sink).await;
+            let s = session();
+            // 取消信号现在住在会话里
+            s.cancel.cancel();
+            let (events, _sub) = collect_turn_events(&s);
+            let outcomes = s.tool_call(&calls, true).await;
             assert!(outcomes.iter().all(|o| o.is_none()));
             // 被取消的也要各推一条 `CANCEL_TEXT` 结果事件（每个 `tool_call_id` 都要有交代）
+            let events = events.lock().unwrap();
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
             for event in &events[2..] {
                 match event {
@@ -2678,12 +2751,9 @@ mod tests {
             let err = s
                 .aturn(
                     "看一下这个 bug",
-                    &mut |_| {},
-                    &Cancel::new(),
                     None,
-                    Some(false),
                     None,
-                    RequestOptions::default(),
+                    RequestOptions::default().with_stream(Some(false)),
                 )
                 .await
                 .expect_err("请求必定失败");
@@ -2697,6 +2767,54 @@ mod tests {
             // user 后面跟着 assistant，不再是连续两条 user
             let roles: Vec<&str> = s.messages.iter().map(|m| m.role.as_str()).collect();
             assert_eq!(roles, vec!["system", "user", "assistant"], "{roles:?}");
+        });
+    }
+
+    /// `aturn` 的入口 / 出口各推一条会话生命周期事件：`TurnStart`（带原始输入）+ `TurnDone`
+    /// （带答复 / 错误 / 耗时）——**请求失败也要发**，否则订阅方永远等不到「回合结束」。
+    #[test]
+    fn aturn_brackets_every_turn_with_start_and_done() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            // 同上：解析不了的地址 → 立刻失败，不联网
+            let config = Config {
+                base_url: "不是地址".into(),
+                max_retries: 0,
+                ..Config::default()
+            };
+            let mut s =
+                Session::ephemeral(&config, LlmClient::new(&config).expect("client"), tools());
+            // 会话生命周期事件也在这里收（这轮要断言的就是它们），所以不用 `collect_turn_events`
+            let events: std::sync::Arc<std::sync::Mutex<Vec<Event>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _sub = s.on({
+                let events = std::sync::Arc::clone(&events);
+                move |e: &Event| events.lock().unwrap().push(e.clone())
+            });
+            let _ = s
+                .aturn(
+                    "看一下这个 bug",
+                    None,
+                    None,
+                    RequestOptions::default().with_stream(Some(false)),
+                )
+                .await
+                .expect_err("请求必定失败");
+
+            let events = events.lock().unwrap();
+            match events.first() {
+                Some(Event::Session(SessionEvent::TurnStart { input })) => {
+                    assert_eq!(input, "看一下这个 bug")
+                }
+                other => panic!("第一条该是 TurnStart：{other:?}"),
+            }
+            match events.last() {
+                Some(Event::Session(SessionEvent::TurnDone { answer, error, .. })) => {
+                    assert_eq!(answer, "");
+                    assert!(error.is_some(), "失败也要带上原因");
+                }
+                other => panic!("最后一条该是 TurnDone：{other:?}"),
+            }
         });
     }
 

@@ -312,18 +312,8 @@ pub struct LlmResult {
     pub reasoning_content: Option<String>,
 }
 
-/// 流式增量。`done` 不在这里——最终结果由 `stream()` 直接返回。
-#[derive(Clone, Debug)]
-pub enum StreamChunk {
-    Reasoning(String),
-    Content(String),
-    ToolCall {
-        index: usize,
-        id: String,
-        name: String,
-        arguments: String,
-    },
-}
+/// 流式增量（定义已搬去 [`crate::event`]；这里再导出，`crate::llm::StreamChunk` 路径不变）。
+pub use crate::event::StreamChunk;
 
 // ---------------------------------------------------------------- 错误
 
@@ -499,15 +489,43 @@ pub enum RequestOptions<'a> {
         reasoning_effort: Option<&'a str>,
         /// `Text`（默认）= **不发**这个字段。
         response_format: ResponseFormat,
+        /// 是否流式。`None` = 客户端默认（**流式**——所有后端都实现了）。
+        /// 只有 [`LlmClient::complete`] 看它：流式则把增量交给它那个 `on_chunk`。
+        stream: Option<bool>,
     },
 }
 
+impl RequestOptions<'_> {
+    /// 是否流式（`None` = 默认流式）。调用点用它决定「有没有增量事件」那套分支。
+    pub fn stream(&self) -> bool {
+        match self {
+            RequestOptions::ChatCompletions { stream, .. } => stream.unwrap_or(true),
+        }
+    }
+
+    /// 只覆盖 `stream`（其余走默认）—— 给「只关心流式开关」的调用点省一段字面量。
+    pub fn with_stream(self, stream: Option<bool>) -> Self {
+        match self {
+            RequestOptions::ChatCompletions {
+                reasoning_effort,
+                response_format,
+                ..
+            } => RequestOptions::ChatCompletions {
+                reasoning_effort,
+                response_format,
+                stream,
+            },
+        }
+    }
+}
+
 impl Default for RequestOptions<'_> {
-    /// 默认 = chat completions + 两项都走默认（`None` / `Text`）—— 调用点写 `RequestOptions::default()`。
+    /// 默认 = chat completions + 三项都走默认（`None` / `Text` / 流式）—— 调用点写 `RequestOptions::default()`。
     fn default() -> Self {
         RequestOptions::ChatCompletions {
             reasoning_effort: None,
             response_format: ResponseFormat::Text,
+            stream: None,
         }
     }
 }
@@ -595,6 +613,8 @@ impl LlmClient {
         let RequestOptions::ChatCompletions {
             reasoning_effort,
             response_format,
+            // `stream` 只决定「走不走 SSE」，请求体形状与它无关（`with_usage` 才是体上的那个开关）
+            stream: _,
         } = request_options;
         let mut body = json!({
             "model": self.model,
@@ -668,9 +688,31 @@ impl LlmClient {
         result
     }
 
+    /// **唯一的公开入口**：一次模型调用。
+    ///
+    /// 流式与否由 `request_options.stream()` 决定（`None` = 客户端默认，**流式**）：流式把增量
+    /// 交给 `on_chunk`，非流式则完全不调它（传 `|_| {}` 即可）。调用方不必再自己分流。
+    pub async fn complete<F>(
+        &self,
+        messages: &[Message],
+        tools: &[Value],
+        request_options: RequestOptions<'_>,
+        on_chunk: F,
+    ) -> Result<LlmResult, LlmError>
+    where
+        F: FnMut(StreamChunk) + Send,
+    {
+        if request_options.stream() {
+            self.stream_once(messages, tools, request_options, on_chunk)
+                .await
+        } else {
+            self.complete_once(messages, tools, request_options).await
+        }
+    }
+
     /// 非流式完整请求（一次尝试的完整流程就写在 `with_retry` 的闭包里）。
     /// `request_options` 是**按次**覆盖（见 [`RequestOptions`]）。
-    pub async fn complete(
+    async fn complete_once(
         &self,
         messages: &[Message],
         tools: &[Value],
@@ -714,7 +756,7 @@ impl LlmClient {
     /// SSE 解析（按行切、`[DONE]` 就地收工）就在闭包里的 `async` 块中，不再单开一层 `_once`。
     ///
     /// `request_options` 与 [`LlmClient::complete`] 同义（按次覆盖）。
-    pub async fn stream<F>(
+    async fn stream_once<F>(
         &self,
         messages: &[Message],
         tools: &[Value],
@@ -1511,6 +1553,7 @@ mod tests {
             RequestOptions::ChatCompletions {
                 reasoning_effort: Some("low"),
                 response_format: ResponseFormat::JsonObject,
+                stream: None,
             },
         );
         assert_eq!(b["reasoning_effort"], "low");
@@ -1527,6 +1570,7 @@ mod tests {
                 RequestOptions::ChatCompletions {
                     reasoning_effort: Some(level),
                     response_format: ResponseFormat::Text,
+                    stream: None,
                 },
             );
             assert!(b.get("reasoning_effort").is_none(), "{level}");
