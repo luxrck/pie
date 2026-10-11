@@ -1633,7 +1633,10 @@ impl Session {
     /// 只有拿到 `&mut self` 的地方能调 —— 现在就 `aturn` 的「每步开头」一处（那里上一批工具已回填完，
     /// 改配置 / 压缩都不会把序列弄乱）。立即档（`cancel`）走不到这儿：它在 [`crate::action::Actions`]
     /// 里当场就办了。
-    fn drain_actions(&mut self) {
+    ///
+    /// `pub(crate)`：`pytool` 的集成测试靠它把「真插件排的队」推到 apply point（那一端不许走
+    /// `aturn` —— 测试里不能真发模型请求）。
+    pub(crate) fn drain_actions(&mut self) {
         for MethodCall { method, args } in self.actions.take() {
             match method.as_str() {
                 "set_model" => match args.get("name").and_then(Value::as_str) {

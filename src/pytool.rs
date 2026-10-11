@@ -564,6 +564,50 @@ session.on("tool_call", stop)
         );
     }
 
+    /// **排队档也走通了真宿主**：插件 `S.set_model(…)` → 帧 → Rust 受理 → 入队；再由 apply point
+    /// （`drain_actions`）真的落到 `Session::set_model` 上。
+    ///
+    /// 立即档（`cancel`）在 `a_plugin_can_act_on_the_session` 里已经端到端过了；排队档与它的差别
+    /// 只在 `Actions::submit` 走哪个分支，所以这里一路验到「配置真的变了」。
+    ///
+    /// 两个断言的分工：`drain` **之前**没变 = 确实入了队（而不是当场办）；`drain` **之后**变了
+    /// = 入队的东西真的被执行了。而 `submit` 只可能在宿主帧的处理器里被调到，所以这也顺带证明了
+    /// `Registry` 的动作路由（按 `session_id`）是通的。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_can_queue_an_action_that_lands_at_the_apply_point() {
+        const SETTER: &str = r#"
+def switch(ev, S):
+    S.set_model("from-plugin")      # 排队档：要 &mut self → 等 apply point
+    return None
+
+session.on("tool_call", switch)
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("queue", SETTER);
+        let config = fixture.config(python);
+        let registry = load(Registry::empty(HashMap::new()), &config).await;
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
+        let mut session = Session::new(&config, Some("queue.jsonl"), llm, registry);
+        let before = session.config.model.clone();
+
+        let call = crate::event::Event::Turn(crate::session::TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: json!({"command": "echo hi"}).to_string(),
+        });
+        session.bus_handle().ask(&call);
+        assert_eq!(
+            session.config.model, before,
+            "排队档在 submit 时不该生效（帧往返 + 入队都发生了）"
+        );
+
+        // apply point（这里手动调：`aturn` 要先发一次真模型请求，测试里不能那么干）
+        session.drain_actions();
+        assert_eq!(
+            session.config.model, "from-plugin",
+            "apply point 该把它落地"
+        );
+    }
+
     #[tokio::test]
     async fn registers_python_tools_and_parses_schema() {
         let Some(python) = host_python() else { return };
