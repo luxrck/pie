@@ -1,8 +1,8 @@
 # pie
 
 `pie` 是 [`pi`](https://github.com/earendil-works/pi)（TypeScript 写的 agent harness）的 **Rust 重实现**：一个极简的
-agent harness —— 内置 read / edit / **writ** / **bash** / **repl** 五个工具，另可加载**用 Python 写的工具**
-（见「用 Python 写工具」）。对外提供 cli 可执行文件、Rust API 库和相应的 Python 绑定。
+agent harness —— 内置 read / edit / **writ** / **bash** / **repl** 五个工具，另可加载**用 Python 写的工具与扩展**
+（见「用 Python 写工具与扩展」）。对外提供 cli 可执行文件、Rust API 库和相应的 Python 绑定。
 
 五个工具里，`repl` 不是「跑一段 Python 就完」的沙箱，而是**本会话的一台长活解释器**（见下面那节）。
 
@@ -82,7 +82,7 @@ df.plot()                              # 图直接回到界面（见下）
 
 ⚠ `pie -r` 恢复会话**不带回**解释器内存（新进程里是空的解释器：只有历史，没有变量）；`history()` 照旧能查到之前跑过的代码。
 
-## 用 Python 写工具
+## 用 Python 写工具与扩展
 
 `pie` 二进制可以直接加载 **Python 写的工具**（不嵌 CPython）：文件里用 `@pie.tool`（就是 Python 绑定那个装饰器），
 启动时起一个长活宿主进程读清单，把工具注册进**同一张**工具表 —— 模型看不出它和内置工具有什么区别。
@@ -128,7 +128,7 @@ plugins = ["~/.pie/plugins"]                   # 文件或目录（目录取其�
 - **失败不阻断**：起不来 / 导入报错 / 与内置工具重名 / 名字不合法（只收 `[A-Za-z0-9_-]{1,64}`）→ 只告警，那一条不注册，会话照跑。
 - 工具里的 `print` 与 traceback 走 stderr → pie 的告警通道，**不会污染工具结果**（协议走单独的 fd）。
 - **同步 / 异步 handler 都行**：同步的跑在宿主的线程池里，`async def` 跑在宿主那个**后台 loop** 上
-  （整进程共享一份 loop → 跨调用能复用 `httpx2.AsyncClient` / aiohttp 的连接池，一个 handler 内还能 `asyncio.gather`）。
+  （整进程共享一份 loop → 跨调用能复用 `httpx.AsyncClient` / aiohttp 的连接池，一个 handler 内还能 `asyncio.gather`）。
   两种都得**返回 `str`**。⚠ async handler 里别干重的 CPU 活（单线程，会卡住别的 async 调用）。
 - 参数 schema 从**类型注解**生成（`str/int/float/bool/list/dict/Optional`）；下划线开头的参数是注入项、不进 schema；
   `@tool` 裸用、`@tool()`、`@tool(name=…)` 三种写法都行。超限与内置工具同款：`[tools.<名字>] _max_lines` / `_max_bytes`
@@ -143,6 +143,39 @@ plugins = ["~/.pie/plugins"]                   # 文件或目录（目录取其�
   但两边状态不互通（repl 的命名空间是模型可写的，工具不该和它共享）。解释器解析顺序：
   `[python] interpreter` → `~/.pie/envs/base`（存在即用，`pie setup` 建的） → `python3`。
 - 两条边界：工具进程的 **cwd 固定在启动时**（TUI 里 `/cd` 不改它，要跟 cwd 走请用绝对路径）；**会话中途改工具文件不生效**，重启 `pie`。
+
+### 扩展：订阅事件 + 改当前实例
+
+同一个插件文件也可以**只当扩展用**（不注册工具）：`session.on(kind, fn)` 订阅会话事件，
+回调 `fn(event, S)` 里的 `S` 是**当前会话的代理** —— 属性是只读事实，方法是动作。
+
+```python
+# ~/.pie/plugins/no_rm.py —— 拦下危险的 bash 命令
+def no_rm(event, S):
+    if event.get("name") != "bash":
+        return None
+    if "rm " in (event.get("arguments") or {}).get("command", ""):
+        return "策略拒绝：检测到 rm"     # 返回一句理由 = 否决这次调用
+    return None                          # None = 通过
+
+session.on("tool_call", no_rm)
+```
+
+- **订阅按名字**（`kind` 就是事件 dict 里的 `type`，`"*"` = 全部）：回合事件 `tool_call` / `tool_result` /
+  `answer` / `content_delta` / `reasoning_delta`，会话事件 `turn_start` / `turn_done` / `compacted` /
+  `cleared` / `model_changed` / `cwd_changed` / `start`。**没订的不发**（逐字增量默认不订，别把它灌进来）。
+- **只有 `tool_call` 能拦**：回调返回字符串 = 否决 —— 那次调用不执行，模型收到 `[策略拒绝] <理由>`
+  （历史里仍是一对配好的消息）；返回 `None` = 通过。别的 kind 返回字符串只当写错（忽略），
+  回调抛异常一律**当通过**（fail-open）。
+- **`S` 能改当前会话**：属性 `S.session_id` / `S.session_path` / `S.cwd` / `S.model` 是事实；
+  方法 `S.cancel()`（**当场生效**，回合立刻收尾）、`S.set_model(…)` / `S.set_reasoning_effort(…)` /
+  `S.compact(mode)` / `S.clear_window()` / `S.reset()`（排到**下一步**生效 —— 回执里的 `effective`
+  说清是哪档）。方法白名单就是会话自己那批公开操作，拼错名字会当场 `AttributeError`。
+- 加载方式与工具完全一样：同一个目录、同一个宿主进程；也同一个前提（那个解释器里装着 Python 绑定 `pie`）。
+- 要按会话存状态就自己用 `S.session_id` 分（宿主是**进程级共享**的，多会话共用一个进程）；
+  插件进程里的状态不落盘，`pie` 重启即清空。
+- 与 Python 绑定的 `Session.on(kind, cb)` 是**一套语义两种外形**：绑定里回调只收 `event`（没有 `S` ——
+  直接就在 Python 进程里，调 `Session` 的方法即可）；插件里的 `S` 只是「隔了一道进程」的那份代理。
 
 ## 上下文压缩
 
@@ -190,7 +223,7 @@ tail = 5
 import pie
 cfg = pie.Config.load()                          # ~/.pie/config.toml（只改内存，不写盘）
 session = pie.Session.ephemeral(cfg, pie.LlmClient(cfg), pie.Registry.builtins(cfg))
-answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
+answer = session.turn("看看当前目录", on_event=lambda ev: print(ev["type"]))
 
 pie.llm("顺手问一句", config=cfg)                 # 一次性问一句（内部就是 LlmClient.complete）
 await pie.allm("异步的那份")                      # 同一语义，跑在进程级 runtime 上（不占线程）
