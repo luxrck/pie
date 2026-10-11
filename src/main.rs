@@ -13,7 +13,7 @@ use serde_json::Value;
 use pie::event::Event;
 use pie::llm::{LlmClient, RequestOptions};
 use pie::session::{Session, TurnEvent};
-use pie::tools::{ToolRegistry, tools_from_spec};
+use pie::tools::{Registry, tools_from_spec};
 use pie::{cli, config, context, tui};
 
 /// 一次性模式的输出格式（`text` / `json` / `transcript`）。
@@ -265,7 +265,7 @@ async fn run(cli: Cli) -> i32 {
     // 对不上 = shell 子命令白名单），所以 Python 工具得先装、名字先知道。
     // Python 工具走一个长活宿主子进程（`[python] tools`）；没配就是零开销，起不来 / 报错只告警。
     // 解释器 / 工具文件 / 给宿主的 `PIE_*` 快照都从 `config` 取（一处解析，见 `pytool.rs`）。
-    let registry = pie::pytool::load(ToolRegistry::new(config.tool_defaults()), &config).await;
+    let registry = pie::pytool::load(Registry::new(config.tool_defaults()), &config).await;
     let registry = tools_from_spec(cli.tools.as_deref(), registry);
 
     // TTY 且没有任务 → 进 TUI（`-r` / `-s` 就接着那个会话聊）；非 TTY 保持原来的行为
@@ -931,19 +931,22 @@ fn open_session(
     resume: bool,
     id: Option<&str>,
     llm: LlmClient,
-    tools: ToolRegistry,
+    registry: Registry,
 ) -> Result<Session, String> {
     if resume {
-        let s = Session::resume(config, llm, tools)?;
+        let s = Session::resume(config, llm, registry)?;
         return Ok(s);
     }
-    let candidate = Session::new(config, id, llm, tools);
+    let candidate = Session::new(config, id, llm, registry);
     if candidate.path.exists() {
         // 已存在 → 载入它（把客户端 / 工具集从刚建好的壳里取出来再用）
         let Session {
-            path, llm, tools, ..
+            path,
+            llm,
+            registry,
+            ..
         } = candidate;
-        let s = Session::load(&path, config, llm, tools)?;
+        let s = Session::load(&path, config, llm, registry)?;
         Ok(s)
     } else {
         Ok(candidate)
@@ -1009,7 +1012,7 @@ mod tests {
     fn result_text_covers_the_three_modes() {
         let config = config::Config::default();
         let llm = pie::llm::LlmClient::new(&config).expect("client");
-        let tools = pie::tools::ToolRegistry::new(Default::default());
+        let tools = pie::tools::Registry::new(Default::default());
         let session = Session::ephemeral(&config, llm, tools);
 
         assert_eq!(

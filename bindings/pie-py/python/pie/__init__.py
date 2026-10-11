@@ -12,7 +12,7 @@
     cfg = pie.Config.load()                 # ~/.pie/config.toml
     cfg.model = "deepseek-flash"
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
     session = pie.Session.ephemeral(cfg, llm, tools)   # 不落盘
 
     answer = session.turn("看看当前目录", on_event=lambda ev: print(ev["type"]))
@@ -60,7 +60,7 @@ from ._pie_rs import (
     Session,
     Subscription,
     ToolError,
-    ToolRegistry,
+    Registry,
     allm,
     arun,
     list_sessions,
@@ -81,7 +81,7 @@ __all__ = [
     "Session",
     "Subscription",
     "ToolError",
-    "ToolRegistry",
+    "Registry",
     "Tool",
     "allm",
     "arun",

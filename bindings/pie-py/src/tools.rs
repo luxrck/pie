@@ -1,6 +1,6 @@
-//! `ToolRegistry`：发给模型的工具集 —— 内置工具 + **从 Python 注册的工具**（M3）。
+//! `Registry`：发给模型的工具集 —— 内置工具 + **从 Python 注册的工具**（M3）。
 //!
-//! 注册进来的工具走核心的 `ToolRegistry::with_dynamic`：名字/描述/schema 由 Python 侧给
+//! 注册进来的工具走核心的 `Registry::with_dynamic`：名字/描述/schema 由 Python 侧给
 //!（`@pie.tool` 从函数签名 + 类型注解生成），调用体就是下面这段「往 Python 里再叫一次」。
 //! 两条路（内置 / Python）在核心那边是同一条分发链，模型看不出区别。
 
@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json::Value;
 
-use pie::tools::{self, CallFn, ToolError, ToolRegistry};
+use pie::tools::{self, CallFn, Registry, ToolError};
 
 use crate::config::PyConfig;
 
@@ -33,18 +33,18 @@ fn check_tool_name(name: &str) -> PyResult<()> {
     }
 }
 
-#[pyclass(name = "ToolRegistry", module = "pie")]
-pub struct PyToolRegistry {
-    pub inner: ToolRegistry,
+#[pyclass(name = "Registry", module = "pie")]
+pub struct PyRegistry {
+    pub inner: Registry,
 }
 
 #[pymethods]
-impl PyToolRegistry {
+impl PyRegistry {
     /// 空注册表（自己往里 `register(...)`）。内置工具用 `builtins()`。
     #[new]
     fn new() -> Self {
         Self {
-            inner: ToolRegistry::empty(HashMap::new()),
+            inner: Registry::empty(HashMap::new()),
         }
     }
 
@@ -52,7 +52,7 @@ impl PyToolRegistry {
     #[staticmethod]
     fn builtins(config: &PyConfig) -> Self {
         Self {
-            inner: ToolRegistry::new(config.inner.tool_defaults()),
+            inner: Registry::new(config.inner.tool_defaults()),
         }
     }
 
@@ -64,7 +64,7 @@ impl PyToolRegistry {
     fn from_spec(spec: &str, config: Option<&PyConfig>) -> Self {
         let defaults = config.map(|c| c.inner.tool_defaults()).unwrap_or_default();
         Self {
-            inner: tools::tools_from_spec(Some(spec), ToolRegistry::new(defaults)),
+            inner: tools::tools_from_spec(Some(spec), Registry::new(defaults)),
         }
     }
 
@@ -73,8 +73,8 @@ impl PyToolRegistry {
     }
 
     /// 发给模型的 `tools` 数组（OpenAI 线上形状），可直接拿去自查工具 schema。
-    fn specs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::to_py(py, &self.inner.specs())
+    fn tool_specs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::to_py(py, &self.inner.tool_specs())
     }
 
     /// 注册一个 **Python 函数**当工具。
@@ -187,6 +187,6 @@ impl PyToolRegistry {
     }
 
     fn __repr__(&self) -> String {
-        format!("<pie.ToolRegistry {:?}>", self.inner.names())
+        format!("<pie.Registry {:?}>", self.inner.names())
     }
 }

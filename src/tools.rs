@@ -1177,7 +1177,7 @@ pub type CallFn = std::sync::Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult>
 /// `Clone` 是给嵌入方用的（Python 绑定要能拿一份副本建会话，见 `bindings/pie-py`）；
 /// `Debug` 手写（`Box<dyn Fn>` 不是 `Debug`，打印成 `<call>` 就够）。
 #[derive(Clone)]
-pub struct Entry {
+pub struct Plugin {
     /// 工具名（`String`：Python 工具的名字是运行时给的，不是 `&'static str`）。
     pub name: String,
     pub description: String,
@@ -1185,9 +1185,9 @@ pub struct Entry {
     pub call: CallFn,
 }
 
-impl std::fmt::Debug for Entry {
+impl std::fmt::Debug for Plugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Entry")
+        f.debug_struct("Plugin")
             .field("name", &self.name)
             .field("description", &self.description)
             .field("parameters", &self.parameters)
@@ -1197,16 +1197,16 @@ impl std::fmt::Debug for Entry {
 }
 
 #[derive(Debug, Clone)]
-pub struct ToolRegistry {
-    entries: Vec<Entry>,
+pub struct Registry {
+    plugins: Vec<Plugin>,
     defaults: HashMap<String, toml::Table>,
 }
 
-impl ToolRegistry {
+impl Registry {
     /// 空注册表，用 `.with_tool::<T>("名字")` 往里加。
     pub fn empty(defaults: HashMap<String, toml::Table>) -> Self {
         Self {
-            entries: Vec::new(),
+            plugins: Vec::new(),
             defaults,
         }
     }
@@ -1217,11 +1217,11 @@ impl ToolRegistry {
     /// 一个值表达式（`Read` 这三个字写不出来）。名字得手动给。
     pub fn with_tool<T: Tool>(mut self, name: &str) -> Self {
         assert!(
-            !self.entries.iter().any(|e| e.name == name),
+            !self.plugins.iter().any(|p| p.name == name),
             "工具已存在: {name}"
         );
         let (description, parameters) = schema_of::<T>();
-        self.entries.push(Entry {
+        self.plugins.push(Plugin {
             name: name.to_string(),
             description,
             parameters,
@@ -1242,10 +1242,10 @@ impl ToolRegistry {
         call: CallFn,
     ) -> Self {
         assert!(
-            !self.entries.iter().any(|e| e.name == name),
+            !self.plugins.iter().any(|p| p.name == name),
             "工具已存在: {name}"
         );
-        self.entries.push(Entry {
+        self.plugins.push(Plugin {
             name: name.to_string(),
             description: description.to_string(),
             parameters,
@@ -1265,15 +1265,15 @@ impl ToolRegistry {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.entries.iter().map(|e| e.name.as_str()).collect()
+        self.plugins.iter().map(|p| p.name.as_str()).collect()
     }
 
     /// 发给模型的 `tools` 数组（OpenAI 线上形状：`{"type": "function", "function": …}`）。
     ///
     /// 形状知识就放在这儿（工具层自己出 `definition`），
     /// llm 层只管把整个数组塞进请求体的 `tools` 键。
-    pub fn specs(&self) -> Vec<Value> {
-        self.entries
+    pub fn tool_specs(&self) -> Vec<Value> {
+        self.plugins
             .iter()
             .map(|e| {
                 json!({
@@ -1291,28 +1291,89 @@ impl ToolRegistry {
     /// 注入私有参数：配置里 `_` 开头的键塞进 args，由 serde 自己挑对应字段——
     /// 结构体里没有的键会被忽略，所以不需要再维护一张「私有参数名单」。
     pub fn inject_defaults(&self, name: &str, args: &mut Value) {
-        let Some(values) = self.defaults.get(name) else {
-            return;
-        };
-        let Some(map) = args.as_object_mut() else {
-            return;
-        };
-        for (key, value) in values {
-            if key.starts_with('_') && !map.contains_key(key) {
-                map.insert(key.clone(), toml_to_json(value));
-            }
+        if let Some(values) = self.defaults.get(name) {
+            inject_private_defaults(values, args);
         }
+    }
+
+    /// 造一个**可调用的句柄**（[`ToolHandle`]，`Session::tool` 给扩展的入口）：
+    /// 定义与私有参数默认值都从这一条注册项里填，调用方只管给 `ctx`。
+    pub fn handle(&self, name: &str, ctx: ToolCtx) -> Option<ToolHandle> {
+        let plugin = self.get(name)?;
+        Some(ToolHandle {
+            name: plugin.name.clone(),
+            description: plugin.description.clone(),
+            parameters: plugin.parameters.clone(),
+            call: Arc::clone(&plugin.call),
+            defaults: self.defaults.get(name).cloned().unwrap_or_default(),
+            ctx: ctx.named(name),
+        })
+    }
+
+    /// 按注册名取一条（`None` = 没这个工具）。
+    pub fn get(&self, name: &str) -> Option<&Plugin> {
+        self.plugins.iter().find(|plugin| plugin.name == name)
     }
 
     /// 按名字分发（解析 + 调用都在工具自己那边，注册表只管找）。
     pub async fn dispatch(&self, name: &str, args: &Value, ctx: ToolCtx) -> ToolResult {
-        let Some(entry) = self.entries.iter().find(|e| e.name.as_str() == name) else {
-            let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+        let Some(plugin) = self.plugins.iter().find(|p| p.name.as_str() == name) else {
+            let names: Vec<&str> = self.plugins.iter().map(|p| p.name.as_str()).collect();
             return err(format!("未知工具: {name}（可用: {}）", names.join(", ")));
         };
         let mut args = args.clone();
         self.inject_defaults(name, &mut args);
-        (entry.call)(args, ctx).await
+        (plugin.call)(args, ctx).await
+    }
+}
+
+/// 注入私有参数：`_` 开头的键塞进 args（已经有了的不动）。
+///
+/// 两个消费者：[`Registry::dispatch`]（模型发起的调用）与 [`ToolHandle::call`]（扩展里再调一次）
+/// —— 走同一条注入路，保证「同样的 args 得到同样的行为」。
+fn inject_private_defaults(defaults: &toml::Table, args: &mut Value) {
+    let Some(map) = args.as_object_mut() else {
+        return;
+    };
+    for (key, value) in defaults {
+        if key.starts_with('_') && !map.contains_key(key) {
+            map.insert(key.clone(), toml_to_json(value));
+        }
+    }
+}
+
+/// 一个**已注册工具的句柄**（[`Session::tool`] 给的）：拿到它就能再把原来的工具调一次
+/// —— 扩展里「包装 / 增强某个工具」用的就是这条路。
+///
+/// 句柄自带一份 [`ToolCtx`]（取消信号 / 数据目录 / 会话级状态 / 转录快照都从会话取）与它那条
+/// 注册项的私有参数默认值，所以 [`ToolHandle::call`] 除了参数不要别的上下文。
+/// `Clone` 便宜（内部是 `Arc` 与一张小表）。
+#[derive(Clone)]
+pub struct ToolHandle {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    call: CallFn,
+    /// 该工具的私有参数默认值（`[tools.<名字>]` 里 `_` 开头的键）。
+    defaults: toml::Table,
+    ctx: ToolCtx,
+}
+
+impl ToolHandle {
+    /// 调一次这个工具（与 [`Registry::dispatch`] 同一条路：私有默认值先注入，
+    /// 结果照旧带截断 / 落盘 / 头区）。
+    pub async fn call(&self, args: Value) -> ToolResult {
+        let mut args = args;
+        inject_private_defaults(&self.defaults, &mut args);
+        (self.call)(args, self.ctx.clone()).await
+    }
+}
+
+impl std::fmt::Debug for ToolHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolHandle")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1330,7 +1391,7 @@ impl ToolRegistry {
 ///
 /// 传进来的 `registry` 是**全量**（内置 + Python 工具，见 `pytool::load`）：
 /// 「一个非内置名字是 Python 工具还是 shell 子命令」得先知道 Python 工具都叫什么。
-pub fn tools_from_spec(spec: Option<&str>, registry: ToolRegistry) -> ToolRegistry {
+pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
     const BUILTINS: [&str; 5] = ["read", "edit", "writ", "bash", "repl"];
 
     let pytools: Vec<&str> = registry
@@ -1383,7 +1444,7 @@ pub fn tools_from_spec(spec: Option<&str>, registry: ToolRegistry) -> ToolRegist
         defaults.insert("bash".to_string(), table);
     }
 
-    let mut reg = ToolRegistry::empty(defaults);
+    let mut reg = Registry::empty(defaults);
     for name in BUILTINS {
         if !(enabled.contains(&name) || (name == "bash" && restricted)) {
             continue;
@@ -1397,16 +1458,16 @@ pub fn tools_from_spec(spec: Option<&str>, registry: ToolRegistry) -> ToolRegist
         };
     }
     // Python 工具：从全量表里按名字搬过来（定义与调用体一起，别重造）
-    for entry in &registry.entries {
-        if enabled_py.iter().any(|n| n == &entry.name) {
-            reg.entries.push(entry.clone());
+    for plugin in &registry.plugins {
+        if enabled_py.iter().any(|n| n == &plugin.name) {
+            reg.plugins.push(plugin.clone());
         }
     }
     if restricted {
         // description 追加白名单，让模型事先知道边界、少试错
         let allow_txt = allow_cmds.join(", ");
-        if let Some(entry) = reg.entries.iter_mut().find(|e| e.name == "bash") {
-            entry
+        if let Some(plugin) = reg.plugins.iter_mut().find(|p| p.name == "bash") {
+            plugin
                 .description
                 .push_str(&format!("\n本次运行仅允许以这些命令开头: {allow_txt}"));
         }
@@ -1436,8 +1497,8 @@ mod tests {
         p
     }
 
-    fn builtin() -> ToolRegistry {
-        ToolRegistry::new(HashMap::new())
+    fn builtin() -> Registry {
+        Registry::new(HashMap::new())
     }
 
     /// bash 失败时的唯一一行头（`impl Bash` 里那行格式的**测试侧镜像**）：
@@ -1929,10 +1990,10 @@ mod tests {
 
     #[tokio::test]
     async fn with_tool_registers_and_dispatches() {
-        let reg = ToolRegistry::empty(HashMap::new()).with_tool::<Demo>("demo");
+        let reg = Registry::empty(HashMap::new()).with_tool::<Demo>("demo");
         assert_eq!(reg.names(), vec!["demo"]);
 
-        let spec = reg.specs().remove(0);
+        let spec = reg.tool_specs().remove(0);
         assert_eq!(spec["function"]["name"], "demo");
         // 结构体 doc 注释 → function.description
         assert_eq!(spec["function"]["description"], "自测工具");
@@ -1973,7 +2034,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "工具已存在")]
     fn with_tool_rejects_duplicate_name() {
-        let _ = ToolRegistry::empty(HashMap::new())
+        let _ = Registry::empty(HashMap::new())
             .with_tool::<Demo>("demo")
             .with_tool::<Demo>("demo");
     }
@@ -2004,7 +2065,7 @@ mod tests {
         let reg = tools_from_spec(Some("read, echo ,echo"), builtin());
         assert_eq!(reg.names(), vec!["read", "bash"]);
         let shell = reg
-            .specs()
+            .tool_specs()
             .into_iter()
             .find(|s| s["function"]["name"] == "bash")
             .expect("有 shell");
@@ -2034,7 +2095,7 @@ mod tests {
         assert_eq!(reg.names(), vec!["read", "bash", "word_count"]);
         // `word_count` 是工具、不是子命令 → 白名单里只有 ls
         let shell = reg
-            .specs()
+            .tool_specs()
             .into_iter()
             .find(|s| s["function"]["name"] == "bash")
             .expect("有 shell");
@@ -2077,7 +2138,7 @@ mod tests {
         table.insert("_max_lines".into(), toml::Value::Integer(7));
         table.insert("path".into(), toml::Value::Integer(99)); // 非 `_` 开头：不该注入
         defaults.insert("read".into(), table);
-        let reg = ToolRegistry::new(defaults);
+        let reg = Registry::new(defaults);
 
         let mut args = json!({"path": "x"});
         reg.inject_defaults("read", &mut args);
@@ -2087,6 +2148,25 @@ mod tests {
         let mut args = json!({"path": "x", "_max_lines": 3});
         reg.inject_defaults("read", &mut args);
         assert_eq!(args["_max_lines"], 3); // 显式传参优先
+    }
+
+    /// 句柄（`Registry::handle`）把该注册项的私有默认值一起带上、名字错了给 `None`——
+    /// `Session::tool` 就给扩展这个东西，`ToolHandle::call` 靠它跟 `dispatch` 对齐。
+    #[test]
+    fn handle_carries_the_private_defaults_of_its_plugin() {
+        let mut defaults: HashMap<String, toml::Table> = HashMap::new();
+        let mut table = toml::Table::new();
+        table.insert("_max_lines".into(), toml::Value::Integer(7));
+        defaults.insert("read".into(), table);
+        let reg = Registry::new(defaults);
+
+        let handle = reg.handle("read", ToolCtx::default()).expect("read 已注册");
+        assert_eq!(handle.name, "read");
+        assert_eq!(
+            handle.defaults.get("_max_lines"),
+            Some(&toml::Value::Integer(7))
+        );
+        assert!(reg.handle("没这个工具", ToolCtx::default()).is_none());
     }
 
     // ---------------------------------------------------------------- shell

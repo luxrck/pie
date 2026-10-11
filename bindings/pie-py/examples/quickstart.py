@@ -39,7 +39,7 @@ def chat_with_events() -> None:
     cfg.reasoning_effort = "high"
 
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)   # read / edit / writ / bash
+    tools = pie.Registry.builtins(cfg)   # read / edit / writ / bash
 
     # new() 落盘；.ephemeral() 临时（服务 / notebook 用）；.load(path, …) / .resume(…) 续前话
     session = pie.Session.new(cfg, llm, tools)
@@ -67,7 +67,7 @@ def chat_with_events() -> None:
 def with_python_tool() -> None:
     cfg = pie.Config.load()
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
 
     # 装饰器：类型注解自动导出 JSON schema（str/int/float/bool/list/dict/Optional）
     @pie.tool(name="word_count", description="统计一段文本的字符数")
@@ -95,7 +95,7 @@ def with_python_tool() -> None:
 def cancellable() -> None:
     cfg = pie.Config.load()
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     token = pie.Cancel()
@@ -118,7 +118,7 @@ def cancellable() -> None:
 async def async_entry() -> None:
     cfg = pie.Config.load()
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     # 事件走 asyncio.Queue：先 create_task，再 async for（队列在 aturn 里就建好了）
@@ -141,7 +141,7 @@ def history_and_resume() -> None:
 
     cfg = pie.Config.load()
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
 
     # 续最近一次会话（等价 CLI 的 `pie -r`）；指定文件用 Session.load(path, …)
     session = pie.Session.resume(cfg, llm, tools)

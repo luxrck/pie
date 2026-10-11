@@ -1,5 +1,5 @@
 //! `pytool` —— **用 Python 写的工具**：起一个长活的 Python 宿主子进程，把它的工具注册进
-//! [`ToolRegistry`]（与内置工具、Python 绑定注册的工具共用同一条分发链）。
+//! [`Registry`]（与内置工具、Python 绑定注册的工具共用同一条分发链）。
 //!
 //! 为什么是子进程而不是嵌 CPython：不内嵌 → **零新依赖、默认构建行为不变**（没配
 //! `[python] tools` 就什么都不发生），也不必为一个可选功能把 libpython 拉进每一次构建。
@@ -41,7 +41,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::cancel::CANCEL_TEXT;
 use crate::tools::{
-    CallFn, Limits, ToolBody, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolResult,
+    CallFn, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
@@ -63,7 +63,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// 解释器与工具文件都从 `config` 取（`[python] interpreter` → `envs/base` → `python3`；
 /// `[python] tools` + 约定目录 `<root>/tools`）。文件列表为空 → 直接返回（零开销，不 spawn）。
-pub async fn load(registry: ToolRegistry, config: &crate::config::Config) -> ToolRegistry {
+pub async fn load(registry: Registry, config: &crate::config::Config) -> Registry {
     let files = files_of(&config.python_tool_entries());
     if files.is_empty() {
         return registry;
@@ -573,14 +573,14 @@ def loud() -> str:
     async fn registers_python_tools_and_parses_schema() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("register", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
 
         let names = registry.names();
         for want in ["echo", "bare", "slow", "boom", "not_a_string", "die"] {
             assert!(names.contains(&want), "缺工具 {want}：{names:?}");
         }
         let spec = registry
-            .specs()
+            .tool_specs()
             .into_iter()
             .find(|s| s["function"]["name"] == "echo")
             .expect("echo 的 schema");
@@ -593,7 +593,7 @@ def loud() -> str:
         // `@tool` **裸用**（不带括号）也得注册：曾经它会返回 `decorate` 而不是 `Tool`，
         // 于是工具静默消失（描述也退到函数名）
         let bare = registry
-            .specs()
+            .tool_specs()
             .into_iter()
             .find(|s| s["function"]["name"] == "bare")
             .expect("裸用 `@tool` 的 schema");
@@ -605,7 +605,7 @@ def loud() -> str:
     async fn calls_tool_and_textualizes_errors() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("call", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let out = registry
@@ -633,7 +633,7 @@ def loud() -> str:
     async fn parallel_calls_do_not_queue() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("parallel", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let started = std::time::Instant::now();
@@ -675,7 +675,7 @@ async def boom() -> str:
 "#;
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("async", BODY);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let first = registry
@@ -724,7 +724,7 @@ async def boom() -> str:
     }
 
     /// `[tools.<名字>]` 里 `_` 开头的键会注入到 Python 工具的 handler —— 与内置工具同一条
-    /// `ToolRegistry::inject_defaults`（按**注册名**查表，跟工具是怎么注册的无关）。
+    /// `Registry::inject_defaults`（按**注册名**查表，跟工具是怎么注册的无关）。
     #[tokio::test]
     async fn config_defaults_reach_python_handlers() {
         const BODY: &str = r#"
@@ -753,7 +753,7 @@ def tight(text: str) -> str:
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let registry = load(
-            ToolRegistry::empty(with_secret("peek")),
+            Registry::empty(with_secret("peek")),
             &fixture.config(python),
         )
         .await;
@@ -776,7 +776,7 @@ def tight(text: str) -> str:
 
         // 签名里没声明那个 `_` 键 → 宿主照样当 kwarg 传下去 → TypeError（不是静默忽略）
         let registry = load(
-            ToolRegistry::empty(with_secret("tight")),
+            Registry::empty(with_secret("tight")),
             &fixture.config(python),
         )
         .await;
@@ -801,7 +801,7 @@ def ping(text: str) -> str:
 "#;
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("inject", BODY);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
         let out = registry
             .dispatch("ping", &json!({"text": "hi"}), ctx)
@@ -815,7 +815,7 @@ def ping(text: str) -> str:
     async fn cancel_kills_and_next_call_restarts() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("cancel", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
 
         let cancel = crate::cancel::Cancel::new();
         let cancelled = fixture.ctx(cancel.clone());
@@ -843,7 +843,7 @@ def ping(text: str) -> str:
     async fn dead_host_is_restarted_on_demand() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("dead", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
 
         let err = registry.dispatch("die", &json!({}), ctx.clone()).await;
@@ -873,7 +873,7 @@ def ping(text: str) -> str:
         let mut defaults = HashMap::new();
         defaults.insert("big".to_string(), table);
 
-        let registry = load(ToolRegistry::empty(defaults), &fixture.config(python)).await;
+        let registry = load(Registry::empty(defaults), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
         let out = registry
             .dispatch("big", &json!({}), ctx)
@@ -906,7 +906,7 @@ def ping(text: str) -> str:
     async fn tool_prints_do_not_corrupt_protocol() {
         let Some(python) = host_python() else { return };
         let fixture = Fixture::new("loud", TOOLS);
-        let registry = load(ToolRegistry::empty(HashMap::new()), &fixture.config(python)).await;
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
         let ctx = fixture.ctx(crate::cancel::Cancel::new());
         assert_eq!(
             registry
@@ -923,7 +923,7 @@ def ping(text: str) -> str:
     async fn failures_only_warn() {
         let fixture = Fixture::new("broken", "raise RuntimeError('导入期就炸')\n");
         // 解释器都不存在
-        let before = ToolRegistry::new(HashMap::new());
+        let before = Registry::new(HashMap::new());
         let after = load(
             before.clone(),
             &fixture.config("definitely-not-an-interpreter-xyz"),
@@ -933,14 +933,14 @@ def ping(text: str) -> str:
 
         // 导入期抛异常
         let Some(python) = host_python() else { return };
-        let before = ToolRegistry::new(HashMap::new());
+        let before = Registry::new(HashMap::new());
         let after = load(before.clone(), &fixture.config(python)).await;
         assert_eq!(after.names(), before.names());
 
         // 路径不存在
         let mut nowhere = fixture.config(python);
         nowhere.python.tools = vec!["/definitely/not/here".to_string()];
-        let before = ToolRegistry::new(HashMap::new());
+        let before = Registry::new(HashMap::new());
         let after = load(before.clone(), &nowhere).await;
         assert_eq!(after.names(), before.names());
     }
@@ -967,7 +967,7 @@ def fine() -> str:
     return "ok"
 "#,
         );
-        let before = ToolRegistry::new(HashMap::new());
+        let before = Registry::new(HashMap::new());
         let after = load(before.clone(), &fixture.config(python)).await;
         let names = after.names();
         assert_eq!(

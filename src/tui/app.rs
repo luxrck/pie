@@ -1900,7 +1900,7 @@ mod tests {
     /// 同上，但自己给 `Config`（要试非默认 `theme` 这类字段时用）。
     fn app_with_rx_for(config: Config) -> (App, UnboundedReceiver<UiEvent>) {
         let llm = crate::llm::LlmClient::new(&config).expect("client");
-        let tools = crate::tools::ToolRegistry::new(Default::default());
+        let tools = crate::tools::Registry::new(Default::default());
         // 用例里不探终端：`halfblocks` 那一档永远可用（也不会去读写 stdin）
         App::new(
             Session::ephemeral(&config, llm, tools),
@@ -2367,7 +2367,7 @@ mod tests {
             ..Default::default()
         };
         let llm = crate::llm::LlmClient::new(&config).expect("client");
-        let tools = crate::tools::ToolRegistry::new(Default::default());
+        let tools = crate::tools::Registry::new(Default::default());
         let mut session = Session::ephemeral(&config, llm, tools);
         session
             .messages
@@ -3025,7 +3025,7 @@ mod tests {
             ..Default::default()
         };
         let llm = crate::llm::LlmClient::new(&config).expect("client");
-        let tools = crate::tools::ToolRegistry::new(Default::default());
+        let tools = crate::tools::Registry::new(Default::default());
         let mut app = App::new(
             Session::ephemeral(&config, llm, tools),
             None,

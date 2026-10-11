@@ -33,7 +33,7 @@ use pie::session::{Session as CoreSession, TurnEvent};
 
 use crate::config::PyConfig;
 use crate::llm::PyLlmClient;
-use crate::tools::PyToolRegistry;
+use crate::tools::PyRegistry;
 use crate::{busy_error, llm_error, pie_error};
 
 // ---------------------------------------------------------------- Cancel
@@ -133,11 +133,11 @@ impl PySession {
     fn build(
         config: &PyConfig,
         llm: &PyLlmClient,
-        tools: &PyToolRegistry,
+        tools: &PyRegistry,
     ) -> (
         pie::config::Config,
         pie::llm::LlmClient,
-        pie::tools::ToolRegistry,
+        pie::tools::Registry,
     ) {
         (config.inner.clone(), llm.inner.clone(), tools.inner.clone())
     }
@@ -148,14 +148,14 @@ impl PySession {
     /// 新建会话：`id` 给纯名字 → `~/.pie/sessions/<id>.jsonl`（带目录 / 绝对路径则原样）。
     #[staticmethod]
     #[pyo3(signature = (config, llm, tools, id=None))]
-    fn new(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry, id: Option<&str>) -> Self {
+    fn new(config: &PyConfig, llm: &PyLlmClient, tools: &PyRegistry, id: Option<&str>) -> Self {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
         Self::wrap(CoreSession::new(&core_config, id, llm, tools))
     }
 
     /// 临时会话：**不落盘、不写压缩 manifest**（一次性任务 / notebook / 服务用）。
     #[staticmethod]
-    fn ephemeral(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry) -> Self {
+    fn ephemeral(config: &PyConfig, llm: &PyLlmClient, tools: &PyRegistry) -> Self {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
         Self::wrap(CoreSession::ephemeral(&core_config, llm, tools))
     }
@@ -166,7 +166,7 @@ impl PySession {
         path: &str,
         config: &PyConfig,
         llm: &PyLlmClient,
-        tools: &PyToolRegistry,
+        tools: &PyRegistry,
     ) -> PyResult<Self> {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
         CoreSession::load(Path::new(path), &core_config, llm, tools)
@@ -176,7 +176,7 @@ impl PySession {
 
     /// 恢复最近的会话（同工作目录优先）——与 CLI 的 `-r` 同款。
     #[staticmethod]
-    fn resume(config: &PyConfig, llm: &PyLlmClient, tools: &PyToolRegistry) -> PyResult<Self> {
+    fn resume(config: &PyConfig, llm: &PyLlmClient, tools: &PyRegistry) -> PyResult<Self> {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
         CoreSession::resume(&core_config, llm, tools)
             .map(Self::wrap)
@@ -342,7 +342,7 @@ impl PySession {
     ///
     /// ⚠ 回调跑在**发事件那条线程**上（回合期间是 Rust 侧的 worker 线程）⇒
     /// ① 回调里**别阻塞**（会拖慢回合）；② 回调里**别碰同一个 Session**（回合正占着它）；
-    /// ③ 回调抛异常**不会**传回调用方（`emit` 无返回值），会打到 stderr——事件是旁路，不该带崩回合。
+    /// ③ 回调抛异常**不会**传回调用方（`send` 无返回值），会打到 stderr——事件是旁路，不该带崩回合。
     fn on(&self, callback: Py<PyAny>) -> PySubscription {
         let sub = self.bus.on(move |event: &Event| {
             // 监听者是「发事件方」调用的，所以得现取 GIL（回到 Python 才能调回调）。
@@ -352,8 +352,8 @@ impl PySession {
                 Ok(())
             });
             if let Err(e) = outcome {
-                // 没人能接住这个异常（`emit` 无返回值）—— 打到 stderr，别把回合带崩。
-                let _ = Python::attach(|py| {
+                // 没人能接住这个异常（`send` 无返回值）—— 打到 stderr，别把回合带崩。
+                Python::attach(|py| {
                     let _ = py
                         .import("traceback")
                         .and_then(|tb| tb.call_method1("print_exception", (e,)));

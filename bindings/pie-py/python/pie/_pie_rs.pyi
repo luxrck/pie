@@ -20,7 +20,7 @@ __all__ = [
     "PieError",
     "Session",
     "ToolError",
-    "ToolRegistry",
+    "Registry",
     "arun",
     "list_sessions",
     "run",
@@ -259,21 +259,21 @@ class LlmClient:
 
 # ---------------------------------------------------------------- 工具
 
-class ToolRegistry:
-    """工具集：`ToolRegistry()` 空表自己 register，或 `builtins()` / `from_spec()`。"""
+class Registry:
+    """工具集：`Registry()` 空表自己 register，或 `builtins()` / `from_spec()`。"""
 
     def __init__(self) -> None: ...
 
     @staticmethod
-    def builtins(config: Config) -> ToolRegistry:
+    def builtins(config: Config) -> Registry:
         """内置工具（read / edit / writ / bash / repl）。"""
 
     @staticmethod
-    def from_spec(spec: str, config: Config | None = ...) -> ToolRegistry:
+    def from_spec(spec: str, config: Config | None = ...) -> Registry:
         """按 `--tools` 那套 spec 裁剪（非内置名 → 受限 bash 的子命令白名单）。"""
 
     def names(self) -> list[str]: ...
-    def specs(self) -> list[dict[str, Any]]:
+    def tool_specs(self) -> list[dict[str, Any]]:
         """OpenAI 形状的工具定义（可直接塞进请求体）。"""
 
     def register(
@@ -315,17 +315,17 @@ class Subscription:
 
 class Session:
     @staticmethod
-    def new(config: Config, llm: LlmClient, tools: ToolRegistry, id: str | None = ...) -> Session:
+    def new(config: Config, llm: LlmClient, tools: Registry, id: str | None = ...) -> Session:
         """新建会话（落盘，`save()` 时写文件）。"""
 
     @staticmethod
-    def ephemeral(config: Config, llm: LlmClient, tools: ToolRegistry) -> Session:
+    def ephemeral(config: Config, llm: LlmClient, tools: Registry) -> Session:
         """临时会话：不落盘、不写 manifest（服务 / notebook 用）。"""
 
     @staticmethod
-    def load(path: str, config: Config, llm: LlmClient, tools: ToolRegistry) -> Session: ...
+    def load(path: str, config: Config, llm: LlmClient, tools: Registry) -> Session: ...
     @staticmethod
-    def resume(config: Config, llm: LlmClient, tools: ToolRegistry) -> Session: ...
+    def resume(config: Config, llm: LlmClient, tools: Registry) -> Session: ...
 
     path: str
     messages: list[Message]
@@ -430,7 +430,7 @@ def run(
     task: str,
     config: Config | None = ...,
     llm: LlmClient | None = ...,
-    tools: ToolRegistry | None = ...,
+    tools: Registry | None = ...,
     max_steps: int | None = ...,
     stream: bool | None = ...,
     parallel_tools: bool | None = ...,
@@ -443,7 +443,7 @@ def arun(
     task: str,
     config: Config | None = ...,
     llm: LlmClient | None = ...,
-    tools: ToolRegistry | None = ...,
+    tools: Registry | None = ...,
     max_steps: int | None = ...,
     stream: bool | None = ...,
     parallel_tools: bool | None = ...,

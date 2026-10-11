@@ -27,10 +27,10 @@ use crate::cancel::{CANCEL_TEXT, Cancel};
 use crate::config::{self, Config};
 use crate::context;
 use crate::llm::{
-    self, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions,
-    StreamChunk, ToolCall, UsageTracker,
+    self, ChunkEvent, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions,
+    ToolCall, UsageTracker,
 };
-use crate::tools::{self, Attachment, ToolOutput, ToolRegistry};
+use crate::tools::{self, Attachment, Registry, SessionState, ToolCtx, ToolHandle, ToolOutput};
 
 /// 回合事件（定义已搬去 [`crate::event`]；这里再导出，`pie::session::TurnEvent` 路径不变）。
 pub use crate::event::TurnEvent;
@@ -63,9 +63,13 @@ pub struct Session {
     /// 模型后端（会话自己持有）。
     pub llm: LlmClient,
     /// 工具集（`--tools` 裁剪过的注册表就从这里进来）。
-    pub tools: ToolRegistry,
+    pub registry: Registry,
     /// 会话级工具状态（同一 Session 的所有工具调用共享；`repl` 的 IPython 子进程就挂这儿）。
-    pub tool_state: std::sync::Arc<crate::tools::SessionState>,
+    ///
+    /// 类型住 `tools`（不搬过来）：它是 [`ToolCtx`] 的一部分（工具调用的第三个参数里就带着它），
+    /// 而工具不该认识 `Session` —— 反过来依赖会把分层倒过来。会话只是**持有**它，
+    /// 就像 `Config` / `Cancel` / `EventBus` 也都住在各自的模块里。
+    pub state: std::sync::Arc<SessionState>,
     /// 压缩事件流水（每条落盘成 `{kind, ts, path, hash, summary?}`，`kind` 就是类型标签；
     /// 旧会话里的键是 `raw_path` / `raw_hash`，靠 `CompactEvent` 的 serde alias 读回）。
     ///
@@ -141,12 +145,12 @@ impl Session {
     ///
     /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
-    pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, tools: ToolRegistry) -> Self {
+    pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, registry: Registry) -> Self {
         Self::at(
             resolve_path(&config.storage.sessions(), id),
             config,
             llm,
-            tools,
+            registry,
         )
     }
 
@@ -154,7 +158,7 @@ impl Session {
     ///
     /// 既然回合循环已经并在 `Session` 上，
     /// 就用“不记账的 Session”表达同一件事。
-    pub fn ephemeral(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
+    pub fn ephemeral(config: &Config, llm: LlmClient, registry: Registry) -> Self {
         Self::at(
             config
                 .storage
@@ -162,7 +166,7 @@ impl Session {
                 .join(format!("ephemeral-{}.jsonl", timestamp())),
             config,
             llm,
-            tools,
+            registry,
         )
     }
 
@@ -185,10 +189,13 @@ impl Session {
         let previous = std::mem::replace(&mut self.config.model, name.to_string());
         self.llm.model = name.to_string();
         if previous != name {
-            self.bus.emit(Event::Session(SessionEvent::ModelChanged {
-                previous,
-                current: name.to_string(),
-            }));
+            self.bus.send(
+                Event::Session(SessionEvent::ModelChanged {
+                    previous,
+                    current: name.to_string(),
+                }),
+                None,
+            );
         }
         self.persist_config()
     }
@@ -214,11 +221,11 @@ impl Session {
         path: &Path,
         config: &Config,
         llm: LlmClient,
-        tools: ToolRegistry,
+        registry: Registry,
     ) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|e| format!("读取会话失败 {}: {e}", path.display()))?;
-        let mut session = Self::at(path.to_path_buf(), config, llm, tools);
+        let mut session = Self::at(path.to_path_buf(), config, llm, registry);
         let mut restored: Vec<Message> = Vec::new();
         for (n, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -344,7 +351,7 @@ impl Session {
     }
 
     /// 恢复最近的会话：优先**当前工作目录**下最新的，没有则全局最新。
-    pub fn resume(config: &Config, llm: LlmClient, tools: ToolRegistry) -> Result<Self, String> {
+    pub fn resume(config: &Config, llm: LlmClient, registry: Registry) -> Result<Self, String> {
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string());
@@ -353,7 +360,7 @@ impl Session {
             cwd.as_deref(),
             config,
             llm,
-            tools,
+            registry,
         )
     }
 
@@ -363,11 +370,11 @@ impl Session {
         cwd: Option<&str>,
         config: &Config,
         llm: LlmClient,
-        tools: ToolRegistry,
+        registry: Registry,
     ) -> Result<Self, String> {
         let path =
             latest_in(dir, cwd).ok_or_else(|| format!("{} 中没有历史会话", dir.display()))?;
-        Self::load(&path, config, llm, tools)
+        Self::load(&path, config, llm, registry)
     }
 
     /// 追加一条用户消息（不含模型调用）。
@@ -438,6 +445,25 @@ impl Session {
         self.bus.clone()
     }
 
+    /// 按注册名取一个工具的**句柄**（[`crate::tools::ToolHandle`]）：拿到它就能再把那个工具调一次。
+    ///
+    /// 给扩展（以及内置策略）用：想在某个工具外面包一层（先看/改参数、再看/改结果），就得能
+    /// 调回原来的实现。句柄自带本会话的取消信号 / 数据目录 / 会话级状态 / 转录快照，
+    /// 所以 [`crate::tools::ToolHandle::call`] 除了参数不要别的上下文。
+    ///
+    /// ⚠ **回合进行中拿不到**：那时 `Session` 正被跑回合的任务 `&mut` 借走（绑定那句
+    /// 「session 正忙」就是它）。所以扩展要「调回原工具」只有两条路：回合开始前就把句柄取好留着，
+    /// 或者走决策点的回话（`ReplaceCall`）让循环自己调。名字不在注册表里 → `None`。
+    pub fn tool(&self, name: &str) -> Option<ToolHandle> {
+        let ctx = ToolCtx::with_cancel(
+            self.cancel.clone(),
+            self.config.storage.clone(),
+            self.state.clone(),
+        )
+        .with_transcript(self.transcript_path());
+        self.registry.handle(name, ctx)
+    }
+
     /// 跑一个完整回合：追加用户消息 → 反复「问模型 → 执行工具」→ 返回最终答复。
     /// **不落盘会话**（由调用方 `save`）；压缩事件攒在 `compaction_events`，随 `save` 一起落盘。
     ///
@@ -474,9 +500,12 @@ impl Session {
         self.cancel.reset();
         // 先把出口 clone 出来（`EventBus` 内部是 `Arc`）：之后就不必再借 `self`。
         let bus = self.bus.clone();
-        bus.emit(Event::Session(SessionEvent::TurnStart {
-            input: input.to_string(),
-        }));
+        bus.send(
+            Event::Session(SessionEvent::TurnStart {
+                input: input.to_string(),
+            }),
+            None,
+        );
         let result = self
             .aturn_inner(input, max_steps, parallel_tools, request_options)
             .await;
@@ -484,11 +513,14 @@ impl Session {
             Ok(answer) => (answer.clone(), None),
             Err(e) => (String::new(), Some(e.to_string())),
         };
-        bus.emit(Event::Session(SessionEvent::TurnDone {
-            answer,
-            error,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        }));
+        bus.send(
+            Event::Session(SessionEvent::TurnDone {
+                answer,
+                error,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            }),
+            None,
+        );
         result
     }
 
@@ -502,13 +534,16 @@ impl Session {
         request_options: RequestOptions<'_>,
     ) -> Result<String, LlmError> {
         /// 把刚产生的压缩事件投影成观察事件（三个压缩点共用）。
-        fn emit_compacted(bus: &EventBus, events: &[context::CompactEvent]) {
+        fn send_compacted(bus: &EventBus, events: &[context::CompactEvent]) {
             for e in events {
-                bus.emit(Event::Session(SessionEvent::Compacted {
-                    level: e.level(),
-                    path: e.raw_path().to_path_buf(),
-                    hash: e.hash().to_string(),
-                }));
+                bus.send(
+                    Event::Session(SessionEvent::Compacted {
+                        level: e.level(),
+                        path: e.raw_path().to_path_buf(),
+                        hash: e.hash().to_string(),
+                    }),
+                    None,
+                );
             }
         }
 
@@ -556,9 +591,10 @@ impl Session {
                     _ => None,
                 });
                 if !use_stream {
-                    bus.emit(Event::Turn(TurnEvent::Answer(
-                        answer.clone().unwrap_or_default(),
-                    )));
+                    bus.send(
+                        Event::Turn(TurnEvent::Answer(answer.clone().unwrap_or_default())),
+                        None,
+                    );
                 }
                 done = true;
                 break;
@@ -568,11 +604,11 @@ impl Session {
             // 请求前：拿上一次 API 上报的水位判一次（本次会话还没发过请求 → 不压）
             let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
-            emit_compacted(&bus, &events);
+            send_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
 
-            let specs = self.tools.specs();
+            let specs = self.registry.tool_specs();
             let called = match self.model_call(&specs, &mut clock, request_options).await {
                 Ok(option) => option,
                 Err(e) => {
@@ -597,7 +633,7 @@ impl Session {
                             &self.config,
                             context::CompactMode::Auto,
                         );
-                        emit_compacted(&bus, &events);
+                        send_compacted(&bus, &events);
                         compacted.append(&mut events);
                         if stats.tools == 0 && stats.turns == 0 {
                             // 工具级 / 轮次级都压不动了 → **不自动归档**：换窗口是用户的动作，
@@ -636,7 +672,7 @@ impl Session {
             // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再判一次
             let (stats, mut events) =
                 context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
-            emit_compacted(&bus, &events);
+            send_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
             self.messages.push(Message {
@@ -655,9 +691,10 @@ impl Session {
                 answer = result.content;
                 if !use_stream {
                     // 非流式：正文从没被推过 → 用 answer 事件交出去（流式下已增量推过）
-                    bus.emit(Event::Turn(TurnEvent::Answer(
-                        answer.clone().unwrap_or_default(),
-                    )));
+                    bus.send(
+                        Event::Turn(TurnEvent::Answer(answer.clone().unwrap_or_default())),
+                        None,
+                    );
                 }
                 done = true;
                 break;
@@ -724,7 +761,10 @@ impl Session {
             // 历史里留一条终止消息，并把它当本轮答复
             self.messages.push(Message::assistant(CANCEL_TEXT));
             if !use_stream {
-                bus.emit(Event::Turn(TurnEvent::Answer(CANCEL_TEXT.to_string())));
+                bus.send(
+                    Event::Turn(TurnEvent::Answer(CANCEL_TEXT.to_string())),
+                    None,
+                );
             }
             return Ok(CANCEL_TEXT.to_string());
         }
@@ -754,17 +794,17 @@ impl Session {
             request_options,
             |chunk| match chunk {
                 // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
-                StreamChunk::Content(d) => {
+                ChunkEvent::Content(d) => {
                     let ev = TurnEvent::AssistantText(d);
                     clock.on(&ev);
-                    bus.emit(ev.into());
+                    bus.send(ev.into(), None);
                 }
-                StreamChunk::Reasoning(d) => {
+                ChunkEvent::Reasoning(d) => {
                     let ev = TurnEvent::Reasoning(d);
                     clock.on(&ev);
-                    bus.emit(ev.into());
+                    bus.send(ev.into(), None);
                 }
-                StreamChunk::ToolCall { .. } => {}
+                ChunkEvent::ToolCall { .. } => {}
             },
         );
         tokio::select! {
@@ -846,17 +886,20 @@ impl Session {
         let bus = self.bus.clone();
         let cancel = self.cancel.clone();
         for call in calls {
-            bus.emit(Event::Turn(TurnEvent::ToolCall {
-                name: call.function.name.clone(),
-                arguments: call.function.arguments.clone(),
-            }));
+            bus.send(
+                Event::Turn(TurnEvent::ToolCall {
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                }),
+                None,
+            );
         }
         // 事件在下面这个循环里「完成的当下」推（顺序 = 真实完成顺序）。
         //
         // ⚠ future 必须在 `for` 里造（而不是 `map(|(i, call)| async move {…})`）：
         // 闭包参数的生命周期会变成 HRTB，撞上 rustc 的已知限制（#100013，报在调用方
         // `tokio::spawn` 上一头雾水）。`for` 循环里的绑定没有这层问题。
-        let registry = &self.tools;
+        let registry = &self.registry;
         let mut futures = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().enumerate() {
             // 每个 future 各拿一份（`Cancel` 内部是 `Arc`，克隆即共享）
@@ -882,7 +925,7 @@ impl Session {
                             let ctx = tools::ToolCtx::with_cancel(
                                 cancel.clone(),
                                 self.config.storage.clone(),
-                                self.tool_state.clone(),
+                                self.state.clone(),
                             )
                             .with_transcript(self.transcript_path())
                             // 工具名 → `ToolBody::fit` 的落盘前缀（`ctx.name`）
@@ -911,12 +954,15 @@ impl Session {
             let finished = outcome
                 .clone()
                 .unwrap_or_else(|| ToolOutput::text(CANCEL_TEXT));
-            bus.emit(Event::Turn(TurnEvent::ToolResult {
-                name: calls[index].function.name.clone(),
-                content: finished.to_text().clone(),
-                arguments: calls[index].function.arguments.clone(),
-                images: finished.canvas_images(),
-            }));
+            bus.send(
+                Event::Turn(TurnEvent::ToolResult {
+                    name: calls[index].function.name.clone(),
+                    content: finished.to_text().clone(),
+                    arguments: calls[index].function.arguments.clone(),
+                    images: finished.canvas_images(),
+                }),
+                None,
+            );
             outcomes[index] = outcome;
         }
         outcomes
@@ -1389,10 +1435,13 @@ impl Session {
             context::compact_session(&mut self.messages, &session_config, &self.config.storage)?
         {
             self.compaction_events.push(event);
-            self.bus.emit(Event::Session(SessionEvent::Cleared {
-                archived: path.clone(),
-                count: before,
-            }));
+            self.bus.send(
+                Event::Session(SessionEvent::Cleared {
+                    archived: path.clone(),
+                    count: before,
+                }),
+                None,
+            );
             self.windows.push(path);
         }
         // `/clear` 的特性（兜底没有）：system prompt 顺便重建一次（记忆变化要反映进来；
@@ -1484,13 +1533,13 @@ impl Session {
         parts.join("\n")
     }
 
-    fn at(path: PathBuf, config: &Config, llm: LlmClient, tools: ToolRegistry) -> Self {
+    fn at(path: PathBuf, config: &Config, llm: LlmClient, registry: Registry) -> Self {
         Self {
             path,
             config: config.clone(),
             llm,
-            tools,
-            tool_state: std::sync::Arc::new(crate::tools::SessionState::default()),
+            registry,
+            state: std::sync::Arc::new(SessionState::default()),
             compaction_events: Vec::new(),
             messages: vec![Message::system(config::build_system_prompt(
                 config,
@@ -1685,13 +1734,13 @@ mod tests {
         LlmClient::new(&Config::default()).expect("client")
     }
 
-    fn tools() -> ToolRegistry {
-        ToolRegistry::new(Default::default())
+    fn registry() -> Registry {
+        Registry::new(Default::default())
     }
 
     /// 跑一批工具的会话（不落盘、不碰 `~/.pie`）：`tool_call` 只需要一个 `&Session`。
     fn session() -> Session {
-        Session::ephemeral(&Config::default(), llm(), tools())
+        Session::ephemeral(&Config::default(), llm(), registry())
     }
 
     // ---------------------------------------------------------------- 一批工具的并发/串行
@@ -1728,6 +1777,32 @@ mod tests {
                 _ => "other",
             })
             .collect()
+    }
+
+    /// `Session::tool(name)` 给的句柄能真把工具调起来（扩展「包一层」就靠它）；
+    /// 未注册的名字给 `None`。
+    #[test]
+    fn tool_handle_calls_the_registered_tool() {
+        let dir = std::env::temp_dir().join(format!("pie-tool-handle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "hi there\n").expect("写临时文件");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let s = session();
+            let read = s.tool("read").expect("read 已注册");
+            assert_eq!(read.name, "read");
+            assert!(!read.description.is_empty());
+            let out = read
+                .call(json!({"path": file.to_str().unwrap()}))
+                .await
+                .expect("调用得到结果");
+            assert!(out.to_text().contains("hi there"), "{}", out.to_text());
+
+            assert!(s.tool("没这个工具").is_none(), "未注册的名字给 None");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 收本会话的**回合事件**（会话生命周期事件忽略）：事件现在走 `Session.bus`，
@@ -1849,7 +1924,7 @@ mod tests {
     fn clear_window_archives_and_expands_back() {
         let _g = env_lock();
         let dir = pie_dir_tmp("clear");
-        let mut s = Session::at(dir.join("s.jsonl"), &Config::default(), llm(), tools());
+        let mut s = Session::at(dir.join("s.jsonl"), &Config::default(), llm(), registry());
         s.push_user("第一问");
         s.messages.push(Message {
             role: "assistant".into(),
@@ -1919,7 +1994,8 @@ mod tests {
         let meta = saved.lines().next().unwrap_or_default();
         assert!(meta.contains("\"kind\":\"session\""), "{meta}");
         assert!(!meta.contains("\"level\""), "{meta}");
-        let back = Session::load(&s.path, &s.config, s.llm.clone(), s.tools.clone()).expect("load");
+        let back =
+            Session::load(&s.path, &s.config, s.llm.clone(), s.registry.clone()).expect("load");
         assert_eq!(back.compaction_events.len(), s.compaction_events.len());
         assert_eq!(back.compaction_events[0].raw_path(), events[0].raw_path());
 
@@ -2010,7 +2086,7 @@ mod tests {
     fn downgrade_replaces_file_blocks_and_invalidates() {
         let config = Config::default();
         let path = tmp("downgrade.jsonl");
-        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), registry());
         // 历史里两条消息各带一个 file 块 + 一个普通 text 块
         s.messages.push(Message {
             role: "user".into(),
@@ -2117,7 +2193,7 @@ mod tests {
             storage: config::Storage::at(&dir),
             ..Default::default()
         };
-        let mut s = Session::new(&config, Some("s.jsonl"), llm(), tools());
+        let mut s = Session::new(&config, Some("s.jsonl"), llm(), registry());
         // `repl.rs` 转存后的持久副本（`files/img-<hash>.png`）
         let image = config
             .storage
@@ -2188,7 +2264,7 @@ mod tests {
             files_api: false,
             ..Default::default()
         };
-        let mut s = Session::ephemeral(&config, llm(), tools());
+        let mut s = Session::ephemeral(&config, llm(), registry());
         s.messages.push(Message::tool_result(
             "call_1",
             "read",
@@ -2227,7 +2303,7 @@ mod tests {
             &config,
             Some(dir.join("s.jsonl").to_str().unwrap()),
             llm(),
-            tools(),
+            registry(),
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
         assert!(
@@ -2271,7 +2347,7 @@ mod tests {
         )
         .unwrap();
 
-        let s = Session::load(&path, &Config::default(), llm(), tools()).expect("load");
+        let s = Session::load(&path, &Config::default(), llm(), registry()).expect("load");
         assert_eq!(s.messages.len(), 3, "system prompt + 窗口摘要 + 真实消息");
         assert_eq!(s.messages[0].role, "system");
         assert!(s.messages[0].compaction.is_none(), "第一条是当前提示词");
@@ -2294,7 +2370,7 @@ mod tests {
         let dir = pie_dir_tmp("full-history");
         std::fs::create_dir_all(storage().context()).unwrap();
         let config = Config::default();
-        let mut s = Session::ephemeral(&config, llm(), tools());
+        let mut s = Session::ephemeral(&config, llm(), registry());
 
         // 工具级：落盘的是被截断的那份输出全文（纯文本，不是消息）
         let full_text = "line1\nline2\nline3\n";
@@ -2360,7 +2436,7 @@ mod tests {
         let dir = pie_dir_tmp("full-history-gone");
         std::fs::create_dir_all(storage().context()).unwrap();
         let config = Config::default();
-        let mut s = Session::ephemeral(&config, llm(), tools());
+        let mut s = Session::ephemeral(&config, llm(), registry());
 
         let turn = raw("[]", "turn");
         let mut summary =
@@ -2383,7 +2459,7 @@ mod tests {
     /// 为什么不能让它读会话文件：那个文件只在退出 / `/save` 时落盘，会话进行中根本不存在。
     #[test]
     fn transcript_snapshot_is_rewritten_for_each_turn() {
-        let mut s = Session::new(&Config::default(), Some("s.jsonl"), llm(), tools());
+        let mut s = Session::new(&Config::default(), Some("s.jsonl"), llm(), registry());
         s.push_user("第一问");
         s.write_transcript();
         let snap = s.transcript_path();
@@ -2422,7 +2498,7 @@ mod tests {
                 arguments: json!({"code": code}).to_string(),
             },
         };
-        let mut s = Session::new(&config, Some("blocks.jsonl"), llm(), tools());
+        let mut s = Session::new(&config, Some("blocks.jsonl"), llm(), registry());
         s.messages.push(Message {
             role: "assistant".into(),
             tool_calls: Some(vec![
@@ -2466,7 +2542,7 @@ mod tests {
 
         // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建
         s.save().unwrap();
-        let mut loaded = Session::load(&s.path, &config, llm(), tools()).unwrap();
+        let mut loaded = Session::load(&s.path, &config, llm(), registry()).unwrap();
         assert_eq!(loaded.repl_blocks.len(), 2, "{:?}", loaded.repl_blocks);
         loaded.refresh_runtime_state();
         assert!(
@@ -2479,7 +2555,7 @@ mod tests {
     /// 日志有上限：超出丢最老的（不能让它变成第二份无限长的历史）。
     #[test]
     fn repl_blocks_are_capped_and_drop_the_oldest() {
-        let mut s = Session::new(&Config::default(), Some("cap.jsonl"), llm(), tools());
+        let mut s = Session::new(&Config::default(), Some("cap.jsonl"), llm(), registry());
         for i in 0..(REPL_BLOCKS_MAX + 3) {
             s.messages.push(Message {
                 role: "assistant".into(),
@@ -2516,7 +2592,7 @@ mod tests {
             storage: crate::config::Storage::at(&dir),
             ..Config::default()
         };
-        let mut s = Session::ephemeral(&config, llm(), tools());
+        let mut s = Session::ephemeral(&config, llm(), registry());
 
         let before = s.messages[0].content_text();
         let heading = config::RUNTIME_STATE_HEADING;
@@ -2587,7 +2663,7 @@ mod tests {
             &config,
             Some(dir.join("s.jsonl").to_str().unwrap()),
             llm(),
-            tools(),
+            registry(),
         );
         assert_eq!(s.set_model("deepseek-v4-pro"), "已写入配置");
         assert_eq!(s.config.model, "deepseek-v4-pro");
@@ -2611,7 +2687,7 @@ mod tests {
             reserved_tokens: Some(4_000),
             ..Default::default()
         };
-        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), registry());
         s.push_user("hi");
         s.usage.record(&Usage {
             prompt_tokens: Some(1_234),
@@ -2629,7 +2705,7 @@ mod tests {
     fn round_trips_through_jsonl() {
         let config = Config::default();
         let path = tmp("rt.jsonl");
-        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), tools());
+        let mut s = Session::new(&config, Some(path.to_str().unwrap()), llm(), registry());
         assert_eq!(s.path, path);
         s.push_user("第一轮：读一下 Cargo.toml");
         s.messages.push(Message {
@@ -2640,7 +2716,7 @@ mod tests {
         s.usage.record(&usage(10));
         s.save().expect("save");
 
-        let back = Session::load(&path, &config, llm(), tools()).expect("load");
+        let back = Session::load(&path, &config, llm(), registry()).expect("load");
         assert_eq!(back.turn_count, 1);
         assert_eq!(back.title.as_deref(), Some("第一轮：读一下 Cargo.toml"));
         assert_eq!(back.usage.calls, 1);
@@ -2674,7 +2750,7 @@ mod tests {
         });
         std::fs::write(&path, format!("{meta}\n")).expect("write");
 
-        let s = Session::load(&path, &config, llm(), tools()).expect("load");
+        let s = Session::load(&path, &config, llm(), registry()).expect("load");
         assert_eq!(
             s.compaction_events.len(),
             3,
@@ -2705,7 +2781,7 @@ mod tests {
     fn save_escapes_control_chars_that_break_line_readers() {
         let config = Config::default();
         let path = tmp("c1.jsonl");
-        let mut s = Session::at(path.clone(), &config, llm(), tools());
+        let mut s = Session::at(path.clone(), &config, llm(), registry());
         let payload = "a\u{85}b\u{2028}c\u{9f}d";
         s.messages
             .push(Message::tool_result("call_1", "bash", payload));
@@ -2727,7 +2803,7 @@ mod tests {
             serde_json::from_str::<Value>(line).expect("每行都是合法 JSON");
         }
         // 转义对语义透明：读回来还是原来的字符
-        let back = Session::load(&path, &config, llm(), tools()).expect("load");
+        let back = Session::load(&path, &config, llm(), registry()).expect("load");
         let Some(Content::Text(back_text)) = back.messages.last().unwrap().content.as_ref() else {
             panic!("最后一条该是 tool 文本消息");
         };
@@ -2746,8 +2822,11 @@ mod tests {
                 max_retries: 0,
                 ..Config::default()
             };
-            let mut s =
-                Session::ephemeral(&config, LlmClient::new(&config).expect("client"), tools());
+            let mut s = Session::ephemeral(
+                &config,
+                LlmClient::new(&config).expect("client"),
+                registry(),
+            );
             let err = s
                 .aturn(
                     "看一下这个 bug",
@@ -2782,8 +2861,11 @@ mod tests {
                 max_retries: 0,
                 ..Config::default()
             };
-            let mut s =
-                Session::ephemeral(&config, LlmClient::new(&config).expect("client"), tools());
+            let mut s = Session::ephemeral(
+                &config,
+                LlmClient::new(&config).expect("client"),
+                registry(),
+            );
             // 会话生命周期事件也在这里收（这轮要断言的就是它们），所以不用 `collect_turn_events`
             let events: std::sync::Arc<std::sync::Mutex<Vec<Event>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2846,7 +2928,7 @@ mod tests {
         .join("\n");
         std::fs::write(&path, format!("{jsonl}\n")).unwrap();
 
-        let s = Session::load(&path, &config, llm(), tools()).expect("load");
+        let s = Session::load(&path, &config, llm(), registry()).expect("load");
         assert_eq!(s.title.as_deref(), Some("旧会话"));
         assert_eq!(s.usage.calls, 3);
         assert_eq!(s.usage.prompt_tokens, Some(123));
@@ -2885,11 +2967,11 @@ mod tests {
         let other_cwd = write("b.jsonl", "/elsewhere", "other-cwd");
 
         // cwd 匹配优先（哪怕它更旧）
-        let s = Session::resume_in(&dir, Some("/work/dir"), &config, llm(), tools()).unwrap();
+        let s = Session::resume_in(&dir, Some("/work/dir"), &config, llm(), registry()).unwrap();
         assert_eq!(s.title.as_deref(), Some("same-cwd"));
         assert_eq!(s.path, same_cwd);
         // 都不匹配 → 取 mtime 最新
-        let s = Session::resume_in(&dir, Some("/nope"), &config, llm(), tools()).unwrap();
+        let s = Session::resume_in(&dir, Some("/nope"), &config, llm(), registry()).unwrap();
         assert_eq!(s.title.as_deref(), Some("other-cwd"));
         assert_eq!(s.path, other_cwd);
         // 空目录 → 报错不 panic
@@ -2897,7 +2979,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         assert!(
-            Session::resume_in(&empty, None, &config, llm(), tools())
+            Session::resume_in(&empty, None, &config, llm(), registry())
                 .unwrap_err()
                 .contains("没有历史会话")
         );

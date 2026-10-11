@@ -134,7 +134,7 @@ tools = ["~/.pie/tools"]                     # 文件或目录（目录取其下
 - **`[tools.<名字>]` 里其它 `_` 开头的键会注入给 handler**（和内置工具走同一条 `inject_defaults`，按注册名查表）：
   签名里声明同名的 `_参数` 就收得到，**显式传参优先**。例：`[tools.web_search] _max_characters = 3000`
   （注：`[tools.repl] _python` 这类内置工具键只对内置工具有意义）。
-- **整个绑定都能用**：工具里 `import pie` 拿到的就是真包（`pie.llm(...)` / `pie.Config` / `pie.ToolRegistry` / …）。
+- **整个绑定都能用**：工具里 `import pie` 拿到的就是真包（`pie.llm(...)` / `pie.Config` / `pie.Registry` / …）。
   想顺手问一句就用 `pie.llm("…")` —— 它按环境变量（`PIE_DIR` / `PIE_CONFIG_FILE`）自己读配置，所以多数情况下
   与本次 `pie` 同一份；⚠ 命令行里的 `-c` / `-m` 这类**按次覆盖看不到**。
 - 与 `repl` 的关系：**共用解释器（同一个 venv），不共用进程**——工具里 `import` 得到的包，repl 里也 import 得到；
@@ -187,7 +187,7 @@ tail = 5
 ```python
 import pie
 cfg = pie.Config.load()                          # ~/.pie/config.toml（只改内存，不写盘）
-session = pie.Session.ephemeral(cfg, pie.LlmClient(cfg), pie.ToolRegistry.builtins(cfg))
+session = pie.Session.ephemeral(cfg, pie.LlmClient(cfg), pie.Registry.builtins(cfg))
 answer = session.aturn("看看当前目录", on_event=lambda ev: print(ev["type"]))
 
 pie.llm("顺手问一句", config=cfg)                 # 一次性问一句（内部就是 LlmClient.complete）

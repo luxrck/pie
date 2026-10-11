@@ -4,7 +4,7 @@
 //!
 //! 词汇表 —— 从 `session` / `llm` / `context` 三处搬来的三类事件：
 //!   - [`TurnEvent`]    语义：回合 → 消费者（TUI / CLI / 绑定）
-//!   - [`StreamChunk`]  传输增量：模型层内部（`stream()` 的增量，被翻成 `TurnEvent`）
+//!   - [`ChunkEvent`]  传输增量：模型层内部（`stream()` 的增量，被翻成 `TurnEvent`）
 //!   - [`CompactEvent`] 压缩记账：随会话落盘（`__meta__.compaction_events`）
 //!
 //! **故意不在这里的东西**：
@@ -14,11 +14,11 @@
 //!   - `log::Kind` / `log::Notice` —— 带外诊断，是**进程内**的告警出口，不走事件总线。
 //!
 //! 各原模块用 `pub use crate::event::…` 再导出，所以调用点（`pie::session::TurnEvent`、
-//! `crate::llm::StreamChunk` …）路径不变。
+//! `crate::llm::ChunkEvent` …）路径不变。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +56,7 @@ pub enum TurnEvent {
 
 /// 流式增量。`done` 不在这里——最终结果由 `stream()` 直接返回。
 #[derive(Clone, Debug)]
-pub enum StreamChunk {
+pub enum ChunkEvent {
     Reasoning(String),
     Content(String),
     ToolCall {
@@ -233,10 +233,12 @@ impl From<SessionEvent> for Event {
 
 // ---------------------------------------------------------------- 事件出口（发射器）
 
-/// 事件出口：**发射器 + 订阅**。`Session` 全程持有它，任何位置（含 `aturn` 之外）都能 `emit`。
+/// 事件出口：**发射器 + 订阅**。`Session` 全程持有它，任何位置（含 `aturn` 之外）都能 `send`。
 ///
-/// `emit` 是**同步、内联**的（按注册顺序逐个调用监听者）——所以：
-///   - 要异步 / 跨线程的消费者，**自己在监听者里往 channel 一丢**（TUI 与绑定就是这么干的）；
+/// **默认同步**（`non_blocking` 为 `None` / `Some(false)`）：就在调用方那条线程上按注册顺序逐个调监听者
+/// ——所以：
+///   - 要异步 / 跨线程的消费者，**自己在监听者里往 channel 一丢**（TUI 与绑定就是这么干的），
+///     或直接把 `non_blocking` 给 `Some(true)`（那就走后台派发线程）；
 ///   - ⚠ 监听者**不该阻塞**（它跑在回合的那条线程上，阻塞会把回合拖慢）；
 ///   - ⚠ 监听者**不该碰同一个 `Session`**（`aturn` 正持有 `&mut Session`，重入要么借用冲突要么死锁）。
 ///
@@ -246,13 +248,16 @@ pub struct EventBus {
     inner: Arc<BusInner>,
 }
 
-/// 一个监听者：`(id, 回调)`——id 供退订，回调按**注册顺序**被同步调用（见 [`EventBus::emit`]）。
+/// 一个监听者：`(id, 回调)`——id 供退订，回调按**注册顺序**被调用（见 [`EventBus::send`]）。
 type Listener = (u64, Arc<dyn Fn(&Event) + Send + Sync>);
 
 #[derive(Default)]
 struct BusInner {
     next_id: AtomicU64,
+    /// 监听者表（同步派发时先快照再调，见 [`EventBus::dispatch`]）。
     listeners: RwLock<Vec<Listener>>,
+    /// 异步派发的入口：**第一次 `send(.., Some(false))` 才起线程**（没人用异步就不起）。
+    queue: Mutex<Option<std::sync::mpsc::Sender<Event>>>,
 }
 
 impl std::fmt::Debug for EventBus {
@@ -307,11 +312,26 @@ impl EventBus {
         }
     }
 
-    /// 扇出给所有监听者。**不阻塞、无返回**（要结果就不该走事件）。
+    /// 扇出给所有监听者。**无返回**（要结果就不该走事件）。
+    ///
+    /// `non_blocking`：`None` / `Some(false)` = **同步**（默认：就在调用方这条线程上、按注册顺序
+    /// 逐个调完才返回）；`Some(true)` = 丢进后台派发线程、立刻返回（观察者慢也拖不住回合）。
+    ///
+    /// ⚠ 两种模式混用时，同一个监听者**可能被并发调用**（同步那条在调用方线程、异步那条在派发
+    /// 线程上），跨路径的相对顺序也不保证（各自路径内才是 FIFO）——监听者该自己保证可重入。
+    pub fn send(&self, event: Event, non_blocking: Option<bool>) {
+        if non_blocking.unwrap_or(false) {
+            self.enqueue(event);
+        } else {
+            self.dispatch(&event);
+        }
+    }
+
+    /// 同步派发（`send` 的默认路径；派发线程也走它）。
     ///
     /// 先**快照**监听者表再调用：监听者在自己里面 `on` / drop 订阅时不会和这里抢锁
     /// （同线程持读锁再取写锁就是死锁）。
-    pub fn emit(&self, event: Event) {
+    fn dispatch(&self, event: &Event) {
         let listeners: Vec<_> = self
             .inner
             .listeners
@@ -321,8 +341,33 @@ impl EventBus {
             .map(|(_, listener)| Arc::clone(listener))
             .collect();
         for listener in listeners {
-            listener(&event);
+            listener(event);
         }
+    }
+
+    /// 异步派发：把事件交给后台线程（懒起、一个总线一个），**立刻返回**。
+    ///
+    /// 队列是**无界** `mpsc`：观察者慢只会让事件积压，既拖不住回合、也**不吃背压**。
+    /// 「有界 + 满则丢 + 丢弃计数」等真接上远端观察者（`docs/extension.md` 的观察轴）再加。
+    fn enqueue(&self, event: Event) {
+        let mut slot = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = slot.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Event>();
+            // 线程里只持 `Weak`：总线没人要了 → `Sender`（住在 `BusInner` 里）随之 drop
+            // → `recv` 断开 → 线程自己退出，不会把 `BusInner` 吊着不死。
+            let inner = Arc::downgrade(&self.inner);
+            let _ = std::thread::Builder::new()
+                .name("pie-events".to_string())
+                .spawn(move || {
+                    while let Ok(event) = rx.recv() {
+                        let Some(inner) = inner.upgrade() else { break };
+                        EventBus { inner }.dispatch(&event);
+                    }
+                });
+            tx
+        });
+        // 线程起不来 / 通道已断 → 直接丢：观察者少收一条不该影响回合。
+        let _ = sender.send(event);
     }
 
     /// 当前监听者数量（测试 / 诊断）。
@@ -358,17 +403,21 @@ mod tests {
         }
         assert_eq!(bus.listener_count(), 2);
 
-        bus.emit(Event::Session(SessionEvent::TurnStart {
-            input: "hi".into(),
-        }));
+        bus.send(
+            Event::Session(SessionEvent::TurnStart { input: "hi".into() }),
+            None,
+        );
         // 按**注册顺序**收到
         assert_eq!(got.lock().unwrap().as_slice(), ["a:hi", "b:hi"]);
 
         drop(subs.pop()); // 退订 b
         assert_eq!(bus.listener_count(), 1);
-        bus.emit(Event::Session(SessionEvent::TurnStart {
-            input: "again".into(),
-        }));
+        bus.send(
+            Event::Session(SessionEvent::TurnStart {
+                input: "again".into(),
+            }),
+            None,
+        );
         assert_eq!(got.lock().unwrap().len(), 3, "{:?}", got.lock().unwrap());
     }
 
@@ -393,7 +442,7 @@ mod tests {
         assert_eq!(cleared["count"], 3);
     }
 
-    /// 监听者在自己里面 `on(..)` 不该死锁（`emit` 先快照再调用，不持读锁去调）。
+    /// 监听者在自己里面 `on(..)` 不该死锁（`send` 先快照再调用，不持读锁去调）。
     #[test]
     fn subscribing_from_inside_a_listener_does_not_deadlock() {
         let bus = EventBus::new();
@@ -406,11 +455,45 @@ mod tests {
                 kept.lock().unwrap().push(inside.on(|_| {}));
             }
         });
-        bus.emit(Event::Session(SessionEvent::Start {
-            id: "x".into(),
-            resume: false,
-        }));
+        bus.send(
+            Event::Session(SessionEvent::Start {
+                id: "x".into(),
+                resume: false,
+            }),
+            None,
+        );
         assert_eq!(bus.listener_count(), 2);
         assert_eq!(kept.lock().unwrap().len(), 1);
+    }
+
+    /// `Some(true)`：`send` 立刻返回，事件随后仍**按序**到达（后台派发线程里叫监听者）。
+    #[test]
+    fn non_blocking_send_delivers_off_thread_and_in_order() {
+        let bus = EventBus::new();
+        let got: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let _sub = bus.on({
+            let got = Arc::clone(&got);
+            move |e: &Event| {
+                if let Event::Session(SessionEvent::Cleared { count, .. }) = e {
+                    got.lock().unwrap().push(*count);
+                }
+            }
+        });
+        for n in 0..64usize {
+            bus.send(
+                Event::Session(SessionEvent::Cleared {
+                    archived: PathBuf::from("/tmp/w"),
+                    count: n,
+                }),
+                Some(true),
+            );
+        }
+        // 等后台线程追平（有上限，免得坏了就挂住）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.lock().unwrap().len() < 64 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got, (0..64usize).collect::<Vec<_>>(), "少了或乱了：{got:?}");
     }
 }

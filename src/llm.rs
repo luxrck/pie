@@ -312,8 +312,8 @@ pub struct LlmResult {
     pub reasoning_content: Option<String>,
 }
 
-/// 流式增量（定义已搬去 [`crate::event`]；这里再导出，`crate::llm::StreamChunk` 路径不变）。
-pub use crate::event::StreamChunk;
+/// 流式增量（定义已搬去 [`crate::event`]；这里再导出，`crate::llm::ChunkEvent` 路径不变）。
+pub use crate::event::ChunkEvent;
 
 // ---------------------------------------------------------------- 错误
 
@@ -700,7 +700,7 @@ impl LlmClient {
         on_chunk: F,
     ) -> Result<LlmResult, LlmError>
     where
-        F: FnMut(StreamChunk) + Send,
+        F: FnMut(ChunkEvent) + Send,
     {
         if request_options.stream() {
             self.stream_once(messages, tools, request_options, on_chunk)
@@ -764,7 +764,7 @@ impl LlmClient {
         on_chunk: F,
     ) -> Result<LlmResult, LlmError>
     where
-        F: FnMut(StreamChunk) + Send,
+        F: FnMut(ChunkEvent) + Send,
     {
         // 请求闭包与判定闭包都要读写这两个开关；`on_chunk` 还要跨多次尝试复用。
         //
@@ -1101,7 +1101,7 @@ struct StreamState {
 impl StreamState {
     fn absorb<F>(&mut self, chunk: StreamChunkWire, on_chunk: &mut F, emitted: &AtomicBool)
     where
-        F: FnMut(StreamChunk),
+        F: FnMut(ChunkEvent),
     {
         if let Some(u) = chunk.usage {
             self.usage = u;
@@ -1113,12 +1113,12 @@ impl StreamState {
         if let Some(r) = delta.reasoning_content.filter(|s| !s.is_empty()) {
             self.reasoning.push_str(&r);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(StreamChunk::Reasoning(r));
+            on_chunk(ChunkEvent::Reasoning(r));
         }
         if let Some(c) = delta.content.filter(|s| !s.is_empty()) {
             self.content.push_str(&c);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(StreamChunk::Content(c));
+            on_chunk(ChunkEvent::Content(c));
         }
         for tc in delta.tool_calls.unwrap_or_default() {
             let index = tc.index.unwrap_or(0) as usize;
@@ -1135,7 +1135,7 @@ impl StreamState {
             }
             slot.function.arguments.push_str(&arguments);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(StreamChunk::ToolCall {
+            on_chunk(ChunkEvent::ToolCall {
                 index,
                 id: slot.id.clone(),
                 name: slot.function.name.clone(),

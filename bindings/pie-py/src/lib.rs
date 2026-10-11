@@ -27,7 +27,7 @@ use serde_json::Value;
 pub use config::PyConfig;
 pub use llm::PyLlmClient;
 pub use session::{PyCancel, PySession, PySubscription};
-pub use tools::PyToolRegistry;
+pub use tools::PyRegistry;
 
 // ---------------------------------------------------------------- 异常层级
 
@@ -207,11 +207,11 @@ fn resolve_runtime(
     py: Python<'_>,
     config: Option<&crate::config::PyConfig>,
     llm: Option<&crate::llm::PyLlmClient>,
-    tools: Option<&crate::tools::PyToolRegistry>,
+    tools: Option<&crate::tools::PyRegistry>,
 ) -> PyResult<(
     pie::config::Config,
     pie::llm::LlmClient,
-    pie::tools::ToolRegistry,
+    pie::tools::Registry,
 )> {
     let core_config = match config {
         Some(c) => c.inner.clone(),
@@ -223,7 +223,7 @@ fn resolve_runtime(
     };
     let registry = match tools {
         Some(t) => t.inner.clone(),
-        None => pie::tools::ToolRegistry::new(core_config.tool_defaults()),
+        None => pie::tools::Registry::new(core_config.tool_defaults()),
     };
     Ok((core_config, client, registry))
 }
@@ -245,7 +245,7 @@ fn run(
     task: String,
     config: Option<&crate::config::PyConfig>,
     llm: Option<&crate::llm::PyLlmClient>,
-    tools: Option<&crate::tools::PyToolRegistry>,
+    tools: Option<&crate::tools::PyRegistry>,
     max_steps: Option<usize>,
     stream: Option<bool>,
     parallel_tools: Option<bool>,
@@ -285,7 +285,7 @@ fn arun(
     task: String,
     config: Option<&crate::config::PyConfig>,
     llm: Option<&crate::llm::PyLlmClient>,
-    tools: Option<&crate::tools::PyToolRegistry>,
+    tools: Option<&crate::tools::PyRegistry>,
     max_steps: Option<usize>,
     stream: Option<bool>,
     parallel_tools: Option<bool>,
@@ -355,7 +355,7 @@ fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyConfig>()?;
     m.add_class::<PyLlmClient>()?;
-    m.add_class::<PyToolRegistry>()?;
+    m.add_class::<PyRegistry>()?;
     m.add_class::<PySession>()?;
     m.add_class::<PyCancel>()?;
     m.add_class::<PySubscription>()?;

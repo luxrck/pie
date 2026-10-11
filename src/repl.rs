@@ -462,7 +462,7 @@ mod tests {
     use super::*;
     use crate::cancel::Cancel;
     use crate::config::Storage;
-    use crate::tools::ToolRegistry;
+    use crate::tools::Registry;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -539,8 +539,8 @@ while True:
         p
     }
 
-    fn registry() -> ToolRegistry {
-        ToolRegistry::empty(HashMap::new()).with_tool::<Repl>("repl")
+    fn registry() -> Registry {
+        Registry::empty(HashMap::new()).with_tool::<Repl>("repl")
     }
 
     fn ctx_at(tmp: &Path) -> ToolCtx {
@@ -553,7 +553,7 @@ while True:
         }
     }
 
-    async fn run_code(reg: &ToolRegistry, ctx: &ToolCtx, py: &str, code: &str) -> ToolOutput {
+    async fn run_code(reg: &Registry, ctx: &ToolCtx, py: &str, code: &str) -> ToolOutput {
         let args = json!({"code": code, "_python": py, "_driver": FAKE});
         reg.dispatch("repl", &args, ctx.clone()).await.unwrap()
     }
@@ -659,7 +659,7 @@ while True:
     }
 
     /// 跑**真驱动**（不传 `_driver`）——`history()` 那条路只有真解释器才有。
-    async fn run_code_real(reg: &ToolRegistry, ctx: &ToolCtx, py: &str, code: &str) -> ToolOutput {
+    async fn run_code_real(reg: &Registry, ctx: &ToolCtx, py: &str, code: &str) -> ToolOutput {
         let args = json!({"code": code, "_python": py});
         reg.dispatch("repl", &args, ctx.clone()).await.unwrap()
     }
@@ -839,7 +839,7 @@ while True:
     /// 对模型暴露的 schema：只有 `code`（必填）+ `timeout`，私有参数不进。
     #[test]
     fn schema_exposes_code_and_hides_private_params() {
-        let spec = registry().specs().remove(0);
+        let spec = registry().tool_specs().remove(0);
         assert_eq!(spec["function"]["name"], "repl");
         assert!(
             spec["function"]["description"]

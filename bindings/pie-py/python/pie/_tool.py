@@ -6,7 +6,7 @@
 三种写法都行：`@tool`（裸用）/ `@tool()` / `@tool(name="…", description="…")`。
 
 `async def` 也**能**装饰：`pytool` 宿主有后台 loop，会跑协程（同步 handler 仍走线程池）。
-**绑定**跑不了协程，所以它那边的 `ToolRegistry.register(...)` 会在注册那一步拦。
+**绑定**跑不了协程，所以它那边的 `Registry.register(...)` 会在注册那一步拦。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ __all__ = ["Tool", "tool"]
 
 @dataclass
 class Tool:
-    """一个可注册的工具（`@pie.tool` 的产物；`ToolRegistry.register(tool)` 消费它）。"""
+    """一个可注册的工具（`@pie.tool` 的产物；`Registry.register(tool)` 消费它）。"""
 
     name: str
     description: str
@@ -29,7 +29,7 @@ class Tool:
     handler: Callable[..., str]
 
     def definition(self) -> dict[str, Any]:
-        """OpenAI 线上形状的工具定义（与 `ToolRegistry.specs()` 里那条同形）。"""
+        """OpenAI 线上形状的工具定义（与 `Registry.tool_specs()` 里那条同形）。"""
         return {
             "type": "function",
             "function": {

@@ -226,7 +226,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_llm):
     cfg.api_key = "test-key"
     cfg.model = "test-model"
     llm = pie.LlmClient(cfg)
-    tools = pie.ToolRegistry.builtins(cfg)
+    tools = pie.Registry.builtins(cfg)
     return cfg, llm, tools, fake_llm
 
 
@@ -521,9 +521,9 @@ def test_llm_error_carries_status(env):
 
 def test_tool_registry_specs_and_tool_defaults():
     cfg = pie.Config()
-    names = pie.ToolRegistry.builtins(cfg).names()
+    names = pie.Registry.builtins(cfg).names()
     assert names == ["read", "edit", "writ", "bash", "repl"]
-    limited = pie.ToolRegistry.from_spec("read,ls", cfg)
+    limited = pie.Registry.from_spec("read,ls", cfg)
     assert limited.names() == ["read", "bash"]  # 非内置名 → 受限 bash
 
 
@@ -761,7 +761,7 @@ def test_stub_declares_every_public_attribute():
                 declared.add(item.target.id)
             elif isinstance(item, ast.FunctionDef):
                 declared.add(item.name)
-        # `__init__` 不看：有的类只能走 staticmethod 造（Session / ToolRegistry），存根里本来就不写构造器
+        # `__init__` 不看：有的类只能走 staticmethod 造（Session / Registry），存根里本来就不写构造器
         real = {attr for attr, _ in inspect.getmembers(cls) if not attr.startswith("_")}
         missing = real - declared
         assert not missing, f"{name} 存根缺: {sorted(missing)}"
@@ -903,7 +903,7 @@ def test_register_python_tool_end_to_end(env):
 
     tools.register(fetch)
     assert "fetch" in tools.names()
-    assert any(t["function"]["name"] == "fetch" for t in tools.specs())
+    assert any(t["function"]["name"] == "fetch" for t in tools.tool_specs())
 
     server.tool_name = "fetch"
     server.tool_arguments = '{"url": "https://example.com", "retries": 2}'
