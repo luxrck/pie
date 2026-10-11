@@ -243,6 +243,7 @@ impl App {
                     crate::event::Event::Session(s) => UiEvent::Session(s.clone()),
                 };
                 let _ = tx.send(ui);
+                Ok(())
             }
         });
         // 取消句柄也先留一份（同理：回合期间拿不到 `&Session`）

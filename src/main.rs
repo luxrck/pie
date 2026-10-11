@@ -378,8 +378,14 @@ async fn run(cli: Cli) -> i32 {
             };
         }
         // 事件出口：只订两类（`print_event` 只写 stdout，不阻塞回合）
-        let _deltas = session.on("content_delta", move |ev| print_event(ev, mode));
-        let _answers = session.on("answer", move |ev| print_event(ev, mode));
+        let _deltas = session.on("content_delta", move |ev| {
+            print_event(ev, mode);
+            Ok(())
+        });
+        let _answers = session.on("answer", move |ev| {
+            print_event(ev, mode);
+            Ok(())
+        });
         let answer = match session
             // `parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）；`stream` 是**请求的属性**
             //（思考深度用客户端/配置的、`response_format` = text，其余走默认）
@@ -413,8 +419,14 @@ async fn run(cli: Cli) -> i32 {
     // 回合循环现在就在 `Session::aturn` 里（原 loop.rs 已并入）；
     // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 config
     let mut session = Session::ephemeral(&config, client, registry);
-    let _deltas = session.on("content_delta", move |ev| print_event(ev, mode));
-    let _answers = session.on("answer", move |ev| print_event(ev, mode));
+    let _deltas = session.on("content_delta", move |ev| {
+        print_event(ev, mode);
+        Ok(())
+    });
+    let _answers = session.on("answer", move |ev| {
+        print_event(ev, mode);
+        Ok(())
+    });
     match session
         .aturn(
             &task,

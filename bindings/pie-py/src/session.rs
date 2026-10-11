@@ -338,6 +338,10 @@ impl PySession {
     /// `model_changed` / `cwd_changed` / `start`），`"*"` = 全部。
     /// 只要某几类就分别订 —— Rust 侧**根本不会为没订的事件建 dict**（尤其那两个增量）。
     ///
+    /// **回调可以否决**：返回 `None`（或什么都不返回）= 通过；返回一个字符串 = 否决，
+    /// 那个字符串就是理由（**只对 `tool_call` 有含义**：那次调用不执行，模型收到
+    /// `[策略拒绝] <理由>`）。回调抛异常 / 返回别的东西 = 当通过（打 traceback）。
+    ///
     /// 与 `turn(on_event=…)` 的区别：那个只在**这一次回合**有效；`on` 一直有效，直到你把返回的
     /// [`Subscription`] 丢掉（或 `.close()`）—— 所以 `set_model(..)` / `clear_window()` 这些
     /// **回合之外**的动作也能收到。
@@ -351,18 +355,34 @@ impl PySession {
     fn on(&self, kind: &str, callback: Py<PyAny>) -> PySubscription {
         let sub = self.bus.on(kind, move |event: &Event| {
             // 监听者是「发事件方」调用的，所以得现取 GIL（回到 Python 才能调回调）。
-            let outcome = Python::attach(|py| -> PyResult<()> {
+            let outcome = Python::attach(|py| -> PyResult<Option<String>> {
                 let dict = event_to_py(py, event)?;
-                callback.call1(py, (dict,))?;
-                Ok(())
+                let reply = callback.call1(py, (dict,))?;
+                // 回话：`None` = 通过；`str` = 否决（只对「动作前」的事件有含义，即 `tool_call`）。
+                // 别的返回值算写错了（当成异常报出来，仍然当通过）。
+                if reply.is_none(py) {
+                    return Ok(None);
+                }
+                match reply.extract::<String>(py) {
+                    Ok(reason) => Ok(Some(reason)),
+                    Err(_) => Err(pyo3::exceptions::PyTypeError::new_err(
+                        "on(...) 的回调只能返回 None（通过）或 str（否决理由）",
+                    )),
+                }
             });
-            if let Err(e) = outcome {
-                // 没人能接住这个异常（`send` 无返回值）—— 打到 stderr，别把回合带崩。
-                Python::attach(|py| {
-                    let _ = py
-                        .import("traceback")
-                        .and_then(|tb| tb.call_method1("print_exception", (e,)));
-                });
+            match outcome {
+                Ok(None) => Ok(()),
+                Ok(Some(reason)) => Err(reason),
+                Err(e) => {
+                    // 回调抛异常 / 返回了不认识的东西：打到 stderr，**当通过**（fail-open，
+                    // 与「宿主挂了 → 放行」同口径）。
+                    Python::attach(|py| {
+                        let _ = py
+                            .import("traceback")
+                            .and_then(|tb| tb.call_method1("print_exception", (e,)));
+                    });
+                    Ok(())
+                }
             }
         });
         PySubscription {
@@ -418,6 +438,7 @@ impl PySession {
         // 调用线程那侧的 `rx.recv()` 才会断开（否则这里会一直挂着等事件）。
         let subscription = guard.on("*", move |event: &Event| {
             let _ = tx.send(event.clone());
+            Ok(()) // `turn(on_event=…)` 这一路只观察，不参与否决
         });
         let handle = crate::runtime().spawn(async move {
             let mut session = guard;
@@ -520,6 +541,7 @@ impl PySession {
                 sink_for_events.bind(py).call1((obj,))?;
                 Ok(())
             });
+            Ok(()) // 这一路（`aturn` 的事件队列）只观察，不参与否决
         });
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = guard;

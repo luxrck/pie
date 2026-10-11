@@ -317,7 +317,14 @@ pub struct EventBus {
 
 /// 一个监听者：`(id, 事件名过滤, 回调)`——id 供退订；过滤 `None` = 全部；
 /// 回调按**注册顺序**被调用（见 [`EventBus::send`]）。
-type Listener = (u64, Option<String>, Arc<dyn Fn(&Event) + Send + Sync>);
+///
+/// 回调返回 `Result<(), String>`：`Ok(())` = 通过；`Err(理由)` = **否决**——
+/// 只对「动作前」的事件（现在只有 `tool_call`）有含义，见 [`EventBus::ask`]。
+type Listener = (
+    u64,
+    Option<String>,
+    Arc<dyn Fn(&Event) -> Result<(), String> + Send + Sync>,
+);
 
 #[derive(Default)]
 struct BusInner {
@@ -370,10 +377,13 @@ impl EventBus {
     ///
     /// `name`：`"*"` = 全部；其余 = 只要这一类（值就是 [`Event::name`] / 线上 `type`）。
     /// 拼错了（不在 [`Event::NAMES`] 里）会告警——那一类永远不会有事件，多半是手误。
+    ///
+    /// `listener` 返回 `Ok(())` 通过 / `Err(理由)` 否决（只对「动作前」的事件有含义，见 [`EventBus::ask`]）；
+    /// 纯观察者写 `Ok(())` 就行。
     pub fn on(
         &self,
         name: &str,
-        listener: impl Fn(&Event) + Send + Sync + 'static,
+        listener: impl Fn(&Event) -> Result<(), String> + Send + Sync + 'static,
     ) -> Subscription {
         let filter = if name == "*" {
             None
@@ -396,7 +406,7 @@ impl EventBus {
         }
     }
 
-    /// 扇出给所有监听者。**无返回**（要结果就不该走事件）。
+    /// 扇出给所有监听者（**不等回话**）。要回话用 [`EventBus::ask`]。
     ///
     /// `non_blocking`：`None` / `Some(false)` = **同步**（默认：就在调用方这条线程上、按注册顺序
     /// 逐个调完才返回）；`Some(true)` = 丢进后台派发线程、立刻返回（观察者慢也拖不住回合）。
@@ -406,16 +416,33 @@ impl EventBus {
     pub fn send(&self, event: Event, non_blocking: Option<bool>) {
         if non_blocking.unwrap_or(false) {
             self.enqueue(event);
-        } else {
-            self.dispatch(&event);
+            return;
+        }
+        let denials = self.dispatch(&event);
+        if !denials.is_empty() {
+            // `send` 这条路是「陈述句」（回合边界、正文增量…），没有「动作前」的语义 ——
+            // 监听者在这儿返回的理由没人能用，说一声，别让人以为拦住了什么。
+            crate::log::warn(format!(
+                "{} 事件上有订阅者给了否决理由，但这类事件没有「动作前」语义，已忽略：{}",
+                event.name(),
+                denials.join("；")
+            ));
         }
     }
 
-    /// 同步派发（`send` 的默认路径；派发线程也走它）。
+    /// 派发**并收集回话**：返回所有否决理由（空 = 通过），按**注册顺序**。
+    ///
+    /// 只有「动作前」的事件该走这条（现在只有 `tool_call`）——调用方拿理由去决定做不做。
+    /// **不走异步派发**（要回话就不能丢后台），也不短路（理由要全，见 `docs/extension.md`）。
+    pub fn ask(&self, event: &Event) -> Vec<String> {
+        self.dispatch(event)
+    }
+
+    /// 同步派发（`send` 的默认路径；派发线程也走它）。返回所有否决理由。
     ///
     /// 先**快照**监听者表再调用：监听者在自己里面 `on` / drop 订阅时不会和这里抢锁
     /// （同线程持读锁再取写锁就是死锁）。
-    fn dispatch(&self, event: &Event) {
+    fn dispatch(&self, event: &Event) -> Vec<String> {
         let name = event.name();
         let listeners: Vec<_> = self
             .inner
@@ -426,9 +453,13 @@ impl EventBus {
             .filter(|(_, filter, _)| filter.as_deref().is_none_or(|want| want == name))
             .map(|(_, _, listener)| Arc::clone(listener))
             .collect();
+        let mut denials = Vec::new();
         for listener in listeners {
-            listener(event);
+            if let Err(reason) = listener(event) {
+                denials.push(reason);
+            }
         }
+        denials
     }
 
     /// 异步派发：把事件交给后台线程（懒起、一个总线一个），**立刻返回**。
@@ -447,6 +478,7 @@ impl EventBus {
                 .spawn(move || {
                     while let Ok(event) = rx.recv() {
                         let Some(inner) = inner.upgrade() else { break };
+                        // 后台派发不问回话（没人等）→ 理由丢掉
                         EventBus { inner }.dispatch(&event);
                     }
                 });
@@ -484,6 +516,7 @@ mod tests {
                     if let Event::Session(SessionEvent::TurnStart { input }) = e {
                         got.lock().unwrap().push(format!("{tag}:{input}"));
                     }
+                    Ok(())
                 }
             }));
         }
@@ -538,7 +571,8 @@ mod tests {
         let _outer = bus.on("*", {
             let kept = Arc::clone(&kept);
             move |_| {
-                kept.lock().unwrap().push(inside.on("*", |_| {}));
+                kept.lock().unwrap().push(inside.on("*", |_| Ok(())));
+                Ok(())
             }
         });
         bus.send(
@@ -563,6 +597,7 @@ mod tests {
                 if let Event::Session(SessionEvent::Cleared { count, .. }) = e {
                     got.lock().unwrap().push(*count);
                 }
+                Ok(())
             }
         });
         for n in 0..64usize {
@@ -590,7 +625,10 @@ mod tests {
         let got: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let _sub = bus.on("tool_call", {
             let got = Arc::clone(&got);
-            move |e: &Event| got.lock().unwrap().push(e.name())
+            move |e: &Event| {
+                got.lock().unwrap().push(e.name());
+                Ok(())
+            }
         });
         bus.send(
             Event::Turn(TurnEvent::ContentDelta { text: "x".into() }),

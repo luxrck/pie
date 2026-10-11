@@ -325,6 +325,35 @@ def test_turn_runs_tool_and_streams_events(env):
     assert "1 轮历史" in session.summary()
 
 
+def test_on_can_veto_a_tool_call(env):
+    """回调返回一个字符串 = **否决**：那次工具调用不执行，模型收到 `[策略拒绝] <理由>`。
+
+    只有 `tool_call` 有这档语义（「动作前」）；返回 `None`（或不返回）= 通过。
+    """
+    cfg, llm, tools, server = env
+    # 让假端点回一个真的 rm 命令（默认那条是 `echo hi`，策略不会拦）
+    server.tool_arguments = '{"command": "rm -f /tmp/pie-veto-demo"}'
+    session = pie.Session.ephemeral(cfg, llm, tools)
+
+    def no_rm(ev: dict) -> str | None:
+        return "策略拒绝：检测到 rm" if "rm " in ev["arguments"]["command"] else None
+
+    sub = session.on("tool_call", no_rm)
+    assert sub.closed is False
+
+    events = []
+    session.turn("跑个命令", on_event=events.append)
+
+    # 工具没执行：结果是一条**合法**的 tool 消息（配对不破），正文是拒绝理由
+    result = next(e for e in events if e["type"] == "tool_result")
+    assert result["text"].startswith("[策略拒绝]"), result
+    assert "检测到 rm" in result["text"]
+
+    # 历史形状不变：user → assistant(tool_calls) → tool → assistant
+    assert [m["role"] for m in session.messages] == ["system", "user", "assistant", "tool", "assistant"]
+    assert session.messages[3]["content"].startswith("[策略拒绝]")
+
+
 def test_ephemeral_session_never_touches_disk(env, tmp_path):
     cfg, llm, tools, _ = env
     session = pie.Session.ephemeral(cfg, llm, tools)

@@ -388,12 +388,15 @@ impl Session {
     /// 订阅本会话的事件（`name`：`"*"` = 全部，其余 = 只要这一类，见 [`Event::name`]）。
     /// 返回的凭据 **drop 即退订**。
     ///
+    /// 回调返回 `Ok(())` = 通过、`Err(理由)` = **否决**；后者只对「动作前」的事件有含义
+    /// （现在只有 `tool_call`，见 [`Event`] 与 `Session::tool_call`）——纯观察者写 `Ok(())` 就行。
+    ///
     /// ⚠ 监听者跑在**发事件的那条线程**上，`aturn` 期间 Session 还正被 `&mut` 借用 ——
     /// 所以监听者里别阻塞、更别碰同一个 `Session`（要异步就自己往 channel 里丢）。
     pub fn on(
         &self,
         name: &str,
-        listener: impl Fn(&Event) + Send + Sync + 'static,
+        listener: impl Fn(&Event) -> Result<(), String> + Send + Sync + 'static,
     ) -> Subscription {
         self.bus.on(name, listener)
     }
@@ -875,14 +878,19 @@ impl Session {
         // 进不去，所以事件只能在「完成的当下」由外面推）。
         let bus = self.bus.clone();
         let cancel = self.cancel.clone();
+        // **推事件 + 收表态**：`ask` 这一下就同时是「把 `tool_call` 告诉订阅者」与「问他们要不要拦」
+        // （同步、按注册顺序；没人订阅就是空集，零开销）。
+        //
+        // 被否决的**不执行**，但仍然要有一条配对的 tool 消息（否则下一轮请求 400）——
+        // 下面按原顺序回填时落成 `[策略拒绝] …`。
+        let mut denied: Vec<Option<String>> = Vec::with_capacity(calls.len());
         for call in calls {
-            bus.send(
-                Event::Turn(TurnEvent::ToolCall {
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                }),
-                None,
-            );
+            let event = Event::Turn(TurnEvent::ToolCall {
+                name: call.function.name.clone(),
+                arguments: call.function.arguments.clone(),
+            });
+            let reasons = bus.ask(&event);
+            denied.push((!reasons.is_empty()).then(|| reasons.join("；")));
         }
         // 事件在下面这个循环里「完成的当下」推（顺序 = 真实完成顺序）。
         //
@@ -894,8 +902,12 @@ impl Session {
         for (index, call) in calls.iter().enumerate() {
             // 每个 future 各拿一份（`Cancel` 内部是 `Arc`，克隆即共享）
             let cancel = cancel.clone();
+            let denial = denied[index].clone();
             futures.push(async move {
-                let outcome = if cancel.is_cancelled() {
+                let outcome = if let Some(reason) = denial {
+                    // 策略否决（`docs/extension.md`：只有「动作前」的事件有这档）
+                    Some(ToolOutput::text(format!("[策略拒绝] {reason}")))
+                } else if cancel.is_cancelled() {
                     None // 还没轮到就取消了
                 } else {
                     match serde_json::from_str::<Value>(&call.function.arguments) {
@@ -1828,6 +1840,7 @@ mod tests {
                 if let Event::Turn(t) = e {
                     got.lock().unwrap().push(t.clone());
                 }
+                Ok(())
             }
         });
         (got, sub)
@@ -2603,6 +2616,85 @@ mod tests {
         assert!(leftovers.is_empty(), "残留临时件：{leftovers:?}");
     }
 
+    /// 同步订阅者可以**否决**一次工具调用：`Err(理由)` → 那次调用**不执行**，
+    /// 但仍然落一条配对的 tool 消息（`[策略拒绝] …`）—— `tool_call` ↔ `tool` 配对不能破。
+    #[test]
+    fn a_sync_subscriber_can_veto_a_tool_call() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let marker = std::env::temp_dir().join(format!("pie-veto-{}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let s = session();
+            // 只拦「命令里含 rm 」的 bash
+            let _sub = s.on("tool_call", |ev| match ev {
+                Event::Turn(TurnEvent::ToolCall { name, arguments })
+                    if name == "bash" && arguments.contains("rm ") =>
+                {
+                    Err("检测到 rm".to_string())
+                }
+                _ => Ok(()),
+            });
+            // 跑得起来就会创建 marker
+            let command = format!("rm -f /definitely/not/here && touch {}", marker.display());
+            let outcomes = s.tool_call(&[shell_call("c1", &command)], true).await;
+            let text = texts(&outcomes);
+            assert!(text[0].starts_with("[策略拒绝]"), "{text:?}");
+            assert!(text[0].contains("检测到 rm"), "{text:?}");
+            assert!(!marker.exists(), "被否决的调用不该真的执行：{text:?}");
+            let _ = std::fs::remove_file(&marker);
+        });
+    }
+
+    /// 多个同步订阅者：**任一个 `Err` 就否决**，理由全收集（不短路）；没人否决 → 照常执行。
+    #[test]
+    fn any_denial_blocks_and_reasons_are_joined() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let s = session();
+            let _a = s.on("tool_call", |_| Err("甲：危险命令".to_string()));
+            let _b = s.on("tool_call", |_| Ok(()));
+            let _c = s.on("tool_call", |_| Err("丙：不在白名单".to_string()));
+            let outcomes = s.tool_call(&[shell_call("c1", "echo hi")], true).await;
+            let text = texts(&outcomes);
+            assert!(text[0].contains("甲：危险命令"), "{text:?}");
+            assert!(
+                text[0].contains("丙：不在白名单"),
+                "理由要全（不短路）：{text:?}"
+            );
+            assert!(!text[0].contains("hi"), "没执行就不该有输出：{text:?}");
+
+            // 退订之后（把前三个订阅都丢掉）就恢复了
+            drop((_a, _b, _c));
+            let outcomes = s.tool_call(&[shell_call("c1", "echo hi")], true).await;
+            assert!(
+                texts(&outcomes)[0].contains("hi"),
+                "没人否决就该照常跑：{:?}",
+                texts(&outcomes)
+            );
+        });
+    }
+
+    /// 事件没在 `Session::NAMES` 里？—— 无关键；这里钉的是：观察者返回 `Ok(())` 不影响任何东西，
+    /// 而 `ask` 在任何事件上都能收理由（只有 `tool_call` 拿它去做事）。
+    #[test]
+    fn ask_collects_reasons_for_any_event_but_only_tool_call_acts() {
+        let s = session();
+        let _sub = s.on("turn_done", |_| Err("不喜欢的答复".to_string()));
+        let reasons = s
+            .bus_handle()
+            .ask(&Event::Session(crate::event::SessionEvent::TurnDone {
+                answer: "x".into(),
+                error: None,
+                elapsed_ms: 1,
+            }));
+        assert_eq!(reasons, ["不喜欢的答复"]);
+        assert!(
+            s.bus_handle()
+                .ask(&Event::Turn(TurnEvent::Answer { text: "x".into() }))
+                .is_empty()
+        );
+    }
+
     /// 日志有上限：超出丢最老的（不能让它变成第二份无限长的历史）。
     #[test]
     fn repl_blocks_are_capped_and_drop_the_oldest() {
@@ -2923,7 +3015,10 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let _sub = s.on("*", {
                 let events = std::sync::Arc::clone(&events);
-                move |e: &Event| events.lock().unwrap().push(e.clone())
+                move |e: &Event| {
+                    events.lock().unwrap().push(e.clone());
+                    Ok(())
+                }
             });
             let _ = s
                 .aturn(
