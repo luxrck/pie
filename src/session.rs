@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use futures_util::stream::{self, StreamExt};
 
+use crate::action::{Actions, MethodCall};
 use crate::cancel::{CANCEL_TEXT, Cancel};
 use crate::config::{self, Config};
 use crate::context;
@@ -85,6 +86,11 @@ pub struct Session {
     /// 当前回合的取消信号。**私有**：对外只经 [`Session::cancel`]（就地取消）与
     /// [`Session::cancel_handle`]（回合外先留个句柄）。`aturn` 开头会 `reset()`。
     cancel: Cancel,
+    /// 扩展「改实例」的动作入口（宿主帧落到这里；见 [`crate::action`]）。
+    ///
+    /// 宿主发帧的时刻不受我们控制（一批工具并发跑时 `Session` 只有 `&self`），所以立即档当场办、
+    /// 排队档攒着，等回合循环手里有 `&mut self` 的那一刻执行（[`Session::drain_actions`]）。
+    actions: Actions,
 }
 
 /// 「思考」计时：实时视图里那行 `• Thought for 3.4s` 的来源。
@@ -570,6 +576,10 @@ impl Session {
                 cancelled = true;
                 break;
             }
+            // **apply point**：执行扩展排下的动作（宿主发来的方法调用，见 [`crate::action`]）。
+            // 选在「每步开头」：上一批工具已回填完，历史里没有悬挂的 `tool_call`，
+            // 此刻改配置 / 压缩都不会把发给 API 的序列弄乱。
+            self.drain_actions();
             if let Some(max) = max_steps
                 && steps >= max
             {
@@ -1557,6 +1567,8 @@ impl Session {
     }
 
     fn at(path: PathBuf, config: &Config, llm: LlmClient, registry: Registry) -> Self {
+        // 取消信号与动作入口共享同一个 `Cancel`（立即档的 `cancel()` 与 TUI 的 Esc 一个语义）
+        let cancel = Cancel::new();
         let mut session = Self {
             path,
             config: config.clone(),
@@ -1576,7 +1588,8 @@ impl Session {
             turn_count: 0,
             available_models: None,
             bus: EventBus::new(),
-            cancel: Cancel::new(),
+            actions: Actions::new(cancel.clone()),
+            cancel,
             extensions: Vec::new(),
         };
         session.attach_extensions();
@@ -1588,12 +1601,17 @@ impl Session {
     /// 为什么不在 `Registry` 里就把回调挂上：宿主是**进程级**的（多个会话复用），订阅是
     /// **会话级**的 —— 只有会话建好了才知道「现在是谁」。凭据存进 [`Session::extensions`] 保活。
     fn attach_extensions(&mut self) {
+        // 会话身份：宿主帧（事件与动作）都带它 —— 宿主是进程级共享的，得让它知道这是哪个会话。
+        let session_id = config::name_of(&self.path);
+        // 动作入口登记进进程级路由：宿主发来的方法调用靠 `session_id` 找到本会话。
+        // （即便没有插件订阅也要登记：动作与订阅是两条通道。）
+        self.registry
+            .route_actions(&session_id, self.actions.clone());
         if self.registry.extensions().is_empty() {
             return;
         }
-        // 帧里那个 `ctx`：会话身份。宿主是进程级共享的，得让它知道这是哪个会话。
         let ctx = json!({
-            "session_id": config::name_of(&self.path),
+            "session_id": session_id,
             "session_path": self.path.display().to_string(),
             "cwd": std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -1606,6 +1624,55 @@ impl Session {
                 let ctx = ctx.clone();
                 self.extensions
                     .push(self.bus.on(kind, move |event| (hook.on_event)(event, &ctx)));
+            }
+        }
+    }
+
+    /// **apply point**：把扩展排下的动作执行掉（宿主发来的方法调用，见 [`crate::action`]）。
+    ///
+    /// 只有拿到 `&mut self` 的地方能调 —— 现在就 `aturn` 的「每步开头」一处（那里上一批工具已回填完，
+    /// 改配置 / 压缩都不会把序列弄乱）。立即档（`cancel`）走不到这儿：它在 [`crate::action::Actions`]
+    /// 里当场就办了。
+    fn drain_actions(&mut self) {
+        for MethodCall { method, args } in self.actions.take() {
+            match method.as_str() {
+                "set_model" => match args.get("name").and_then(Value::as_str) {
+                    Some(name) => {
+                        let note = self.set_model(name);
+                        crate::log::warn(format!("[扩展] {note}"));
+                    }
+                    None => crate::log::warn("[扩展] set_model 缺 name 参数"),
+                },
+                "set_reasoning_effort" => match args.get("level").and_then(Value::as_str) {
+                    Some(level) => {
+                        let note = self.set_reasoning_effort(level);
+                        crate::log::warn(format!("[扩展] {note}"));
+                    }
+                    None => crate::log::warn("[扩展] set_reasoning_effort 缺 level 参数"),
+                },
+                "compact" => {
+                    let mode = match args.get("mode").and_then(Value::as_str) {
+                        Some("tools") => context::CompactMode::Tools,
+                        Some("turns") => context::CompactMode::Turns,
+                        _ => context::CompactMode::Auto,
+                    };
+                    let stats = self.compact(mode);
+                    crate::log::warn(format!(
+                        "[扩展] 已压缩（工具级 {} / 轮次级 {}）",
+                        stats.tools, stats.turns
+                    ));
+                }
+                "clear_window" => match self.clear_window() {
+                    Ok(count) => {
+                        crate::log::warn(format!("[扩展] 已归档当前窗口（累计 {count} 块）"))
+                    }
+                    Err(e) => crate::log::warn(format!("[扩展] 归档窗口失败: {e}")),
+                },
+                "reset" => {
+                    self.reset();
+                    crate::log::warn("[扩展] 已清空历史（只留 system prompt）");
+                }
+                other => crate::log::warn(format!("[扩展] 未知动作: {other}")),
             }
         }
     }
@@ -2647,6 +2714,38 @@ mod tests {
             .filter(|name| name.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "残留临时件：{leftovers:?}");
+    }
+
+    /// 扩展排的队：**排队档**在 `submit` 时**不生效**（回执只说「已受理」），到 apply point 才落地；
+    /// **立即档**（`cancel`）当场生效（不碰 `&mut self`）。
+    #[test]
+    fn queued_actions_land_at_the_apply_point_and_immediate_ones_do_not_wait() {
+        let mut s = session();
+        s.push_user("hi");
+        assert_eq!(s.messages.len(), 2, "system + user");
+
+        let receipt = s.actions.submit("reset", json!({}));
+        assert_eq!(receipt["effective"], "next_step");
+        assert_eq!(s.messages.len(), 2, "排队档不该在 submit 时就生效");
+
+        s.drain_actions();
+        assert_eq!(s.messages.len(), 1, "apply point 之后只留 system prompt");
+
+        let receipt = s.actions.submit("cancel", json!({}));
+        assert_eq!(receipt["effective"], "now");
+        assert!(s.cancel_handle().is_cancelled(), "cancel 是立即档");
+    }
+
+    /// 白名单外的动作当场拒绝，并把可用方法列出来（插件写错了要能自己看出来）。
+    #[test]
+    fn unknown_actions_are_rejected_with_the_whitelist() {
+        let s = session();
+        let receipt = s.actions.submit("rm_rf", json!({}));
+        assert_eq!(receipt["ok"], false);
+        assert!(
+            receipt["error"].as_str().unwrap().contains("reset"),
+            "报错要列出可用方法：{receipt}"
+        );
     }
 
     /// 同步订阅者可以**否决**一次工具调用：`Err(理由)` → 那次调用**不执行**，

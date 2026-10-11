@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -1173,6 +1173,11 @@ pub struct Registry {
     /// 进程级插件声明的**事件订阅**（`pytool::load` 从清单里读出来）——
     /// `Session` 建好后把它们挂到自己的事件总线上。
     extensions: Vec<ExtensionHook>,
+    /// **会话动作路由**：`session_id` → 那个会话的动作入口（`Session::attach_extensions` 登记）。
+    ///
+    /// 与 `extensions` 同一条理由：宿主是**进程级**的（一个进程一个宿主、多个会话共用），
+    /// 而动作是**会话级**的 —— 宿主帧里带 `session_id`，靠这张表找到该改哪个会话。
+    actions: Arc<Mutex<HashMap<String, crate::action::Actions>>>,
 }
 
 /// 一个插件对会话事件的订阅（宿主声明，`Session` 挂载）。
@@ -1210,6 +1215,7 @@ impl Registry {
             plugins: Vec::new(),
             defaults,
             extensions: Vec::new(),
+            actions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1222,6 +1228,28 @@ impl Registry {
     /// 本注册表带的插件订阅（`Session` 建构造时读它，见 `Session::attach_extensions`）。
     pub fn extensions(&self) -> &[ExtensionHook] {
         &self.extensions
+    }
+
+    /// 登记一个会话的**动作入口**（`Session` 建好后调；宿主帧按 `session_id` 找到它）。
+    pub fn route_actions(&self, session_id: &str, actions: crate::action::Actions) {
+        self.actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), actions);
+    }
+
+    /// 按会话 id 取动作入口（`None` = 没有这个会话）。
+    pub fn actions_of(&self, session_id: &str) -> Option<crate::action::Actions> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
+    /// 路由表的**共享句柄**（宿主桥捕获它，按帧里的 `session_id` 路由）。
+    pub fn actions_handle(&self) -> Arc<Mutex<HashMap<String, crate::action::Actions>>> {
+        Arc::clone(&self.actions)
     }
 
     /// **注册一个工具**：`.with_tool::<Read>("read")`。

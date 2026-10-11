@@ -81,6 +81,31 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     for warning in &handshake.warnings {
         crate::log::warn(format!("[pytool] {warning}"));
     }
+    // 宿主**主动发起**的调用（插件里 `S.set_model(…)` 那种）→ 按帧里的 `session_id` 路由到会话。
+    // 会话建好时会把自己的动作入口登记进 `Registry`（见 `Session::attach_extensions`）；
+    // 宿主是进程级共享的，所以路由表也住 `Registry`（`Arc` → 会话侧登记、这里读）。
+    {
+        let routes = registry.actions_handle();
+        host.set_call_handler(Arc::new(move |frame: &Value| {
+            let session = frame
+                .get("session")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(actions) = routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session)
+                .cloned()
+            else {
+                return json!({"ok": false, "error": format!("没有这个会话: {session}")});
+            };
+            let method = frame
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            actions.submit(method, frame.get("args").cloned().unwrap_or(Value::Null))
+        }));
+    }
     // 插件报的事件订阅：每个会话建好后会把它挂到自己的事件总线上（见 `Session::attach_extensions`）。
     let hook = (!handshake.extensions.subscribe.is_empty()).then(|| ExtensionHook {
         subscribe: handshake.extensions.subscribe.clone(),
@@ -407,6 +432,9 @@ session.on("tool_call", no_rm)
                     plugins: vec![self.dir.to_string_lossy().into_owned()],
                 },
                 storage: crate::config::Storage::at(self.dir.join("storage")),
+                // 插件能让会话写配置（`S.set_model(…)` → `persist_config`）——
+                // 指到临时目录，别碰用户真实的 `~/.pie/config.toml`
+                config_file: Some(self.dir.join("config.toml")),
                 ..Default::default()
             }
         }
@@ -500,6 +528,39 @@ def loud() -> str:
         assert!(
             session.bus_handle().ask(&call("echo hi")).is_empty(),
             "没否决就该是空集"
+        );
+    }
+
+    /// **插件能改当前实例**：`S.cancel()` 走的是 **host → rust** 的动作帧（与事件、工具调用反向），
+    /// 落到会话自己的取消信号上。
+    ///
+    /// 这同时证明三件事都通：动作帧发出来了、Rust 侧受理了、回执回来了（没回来 Python 侧会超时，
+    /// 而超时发生在 `S.cancel()` 里 → 取消根本不会生效）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_can_act_on_the_session() {
+        const ACTOR: &str = r#"
+def stop(ev, S):
+    S.cancel()          # 立即档：不碰 &mut Session → 当场生效
+    return None
+
+session.on("tool_call", stop)
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("act", ACTOR);
+        let config = fixture.config(python);
+        let registry = load(Registry::empty(HashMap::new()), &config).await;
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
+        let session = Session::new(&config, Some("act.jsonl"), llm, registry);
+
+        let call = crate::event::Event::Turn(crate::session::TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: json!({"command": "echo hi"}).to_string(),
+        });
+        let denials = session.bus_handle().ask(&call);
+        assert!(denials.is_empty(), "插件没否决、只是取消：{denials:?}");
+        assert!(
+            session.cancel_handle().is_cancelled(),
+            "插件调的 S.cancel() 该落到会话的取消信号上"
         );
     }
 

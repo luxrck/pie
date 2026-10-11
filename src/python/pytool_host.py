@@ -9,6 +9,10 @@
 #   stdout 之后    ← {"id":N,"text":"…"} / {"id":N,"error":"…"}
 #                   事件回话：{"id":N,"deny":"理由"|null}      （null = 通过）
 #
+# **反方向**（插件要改当前实例，`S.set_model(…)` 那种）——两个方向各用各的键，不撞车：
+#   stdin  每行    → 动作    ：{"call":N,"session":"…","method":"…","args":{…}}
+#   stdout 之后    ← 动作回执：{"call_reply":N,"result":{"ok":true,"effective":"now"|"next_step"}}
+#
 # 插件（一个文件可以只写 @tool、只写 session.on(…)，或者都写）：
 #   def no_rm(ev, S):            # ev = 事件 dict（形状与 Python 绑定那套完全一致）
 #       if ev["tool"] == "bash" and "rm " in ev["arguments"]["command"]:
@@ -16,7 +20,8 @@
 #       return None                       # None = 通过
 #   session.on("tool_call", no_rm)
 # `S` 是「当前会话」的代理：属性 = 事实（`session_id` / `path` / `model` / `cwd`），
-# 方法（改实例）以后加 —— 现在只能看，不能改。
+# 方法 = 动作（`S.set_model(…)` / `S.cancel()` …）—— 一次远程调用，回执里的 `effective` 说清是
+# 当场生效（`cancel`）还是排到下一个 apply point（其余）。
 #
 # **用真绑定，不嵌副本**：`tool` / `Tool` 直接 `from pie import …`，所以**那个解释器里得装着
 # Python 绑定 `pie`**（工具文件里的 `@tool` 就是它提供的）；装不上整个宿主起不来（这里打印原因，
@@ -38,6 +43,7 @@ import asyncio
 import concurrent.futures
 import importlib.util
 import inspect
+import itertools
 import json
 import os
 import sys
@@ -71,13 +77,43 @@ threading.Thread(target=_LOOP.run_forever, daemon=True, name="pie-pytool-loop").
 
 
 class _Proxy:
-    """插件看到的「当前会话」：属性 = **事实**（Rust 侧发的那份 `ctx`）。
+    """插件看到的「当前会话」：属性 = **事实**（Rust 侧发的那份 `ctx`），方法 = **动作**。
 
-    方法（改实例的动作）以后加 —— 现在只有读。
+    动作 = 一次远程调用（Rust 侧执行）。立即档（`cancel`）当场生效；其余排到回合的下一个
+    apply point —— 回执里的 `effective` 说清是哪档，插件别拿 `"next_step"` 当「已生效」。
+    方法白名单就是会话自己那批公开操作（不另造 API）。
     """
 
     def __init__(self, ctx):
         self.__dict__.update(ctx or {})
+        self.__dict__["_session"] = (ctx or {}).get("session_id", "")
+
+    def _act(self, method, **args):
+        return _call(self._session, method, args)
+
+    def cancel(self):
+        """停掉当前回合（立即生效）。"""
+        return self._act("cancel")
+
+    def set_model(self, name):
+        """换模型（下一个 apply point 生效，即下一步请求起）。"""
+        return self._act("set_model", name=name)
+
+    def set_reasoning_effort(self, level):
+        """换思考档位（下一个 apply point 生效）。"""
+        return self._act("set_reasoning_effort", level=level)
+
+    def compact(self, mode="auto"):
+        """手动压缩；`mode` = `auto` | `tools` | `turns`。"""
+        return self._act("compact", mode=mode)
+
+    def clear_window(self):
+        """归档当前窗口（等于 `/clear`）。"""
+        return self._act("clear_window")
+
+    def reset(self):
+        """清空历史（只留 system prompt）。"""
+        return self._act("reset")
 
 
 class _Session:
@@ -98,14 +134,36 @@ class _Session:
 SESSION = _Session()
 
 
+# 写协议通道的锁：worker 线程 / 后台 loop / `_call` 都可能同时写（一条一条，别交错成半行）。
+_EMIT_LOCK = threading.Lock()
+
+
+# 动作（插件改当前实例）的往返：`{"call":N,…}` → `{"call_reply":N,"result":{…}}`。
+_CALL_ID = itertools.count(1)
+_CALL_LOCK = threading.Lock()
+_CALLS = {}  # id → {"event": Event, "result": …}
+CALL_TIMEOUT = 10.0
+
+
 def _emit(obj, lock=None):
-    """往协议通道写一行；worker 线程里要拿锁（一次调用一条，别交错成半行）。"""
+    """往协议通道写一行（默认用模块级那把锁）。"""
     line = json.dumps(obj, ensure_ascii=False) + "\n"
-    if lock is None:
+    with (lock or _EMIT_LOCK):
         _PROTOCOL.write(line)
-    else:
-        with lock:
-            _PROTOCOL.write(line)
+
+
+def _call(session, method, args):
+    """发一次动作给 Rust 侧，等回执（worker 线程里阻塞等；主线程负责把回执塞回来）。"""
+    cid = next(_CALL_ID)
+    slot = {"event": threading.Event(), "result": None}
+    with _CALL_LOCK:
+        _CALLS[cid] = slot
+    _emit({"call": cid, "session": session, "method": method, "args": args or {}})
+    if not slot["event"].wait(CALL_TIMEOUT):
+        with _CALL_LOCK:
+            _CALLS.pop(cid, None)
+        raise TimeoutError("动作 %s 没有回执（%.0fs 超时）" % (method, CALL_TIMEOUT))
+    return slot["result"]
 
 
 def _load(path, index):
@@ -196,7 +254,7 @@ def _main():
     )
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS)
-    lock = threading.Lock()
+    lock = _EMIT_LOCK  # 全局一把：`_call` 发的动作帧也别与别的行交错
     while True:
         # 用 `readline()` 而不是 `for line in sys.stdin`：后者带读前缓冲，一半请求可能被捂在缓冲区里
         line = sys.stdin.readline()
@@ -208,6 +266,13 @@ def _main():
             continue
         try:
             request = json.loads(line)
+            if "call_reply" in request:  # 动作回执 → 交还给等着的 worker
+                with _CALL_LOCK:
+                    slot = _CALLS.pop(request["call_reply"], None)
+                if slot is not None:
+                    slot["result"] = request.get("result")
+                    slot["event"].set()
+                continue
             if "event" in request:  # 事件（工具与扩展共用一条通道、共用一套 id）
                 pool.submit(
                     _run_event,

@@ -16,12 +16,14 @@
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + gc
 //!   - [`event`] —— 事件词汇表（`TurnEvent` / `ChunkEvent` / `CompactEvent` / `SessionEvent`）+ 观察信封 `Event`
+//!   - [`action`]  —— 扩展「改实例」的动作通道（宿主发意图 → 落到 `Session` 已有的方法上）
 //!   - [`cancel`]  —— 取消信号（TUI 的 Esc）
 //!   - [`log`]     —— 告警出口（TUI 期间不能直接写 stderr）
 //!
 //! ⚠ 目前是**全 pub**（M0 阶段）：先把模块边界立起来、让 CLI 与绑定都能用，真实 API 面等
 //! 绑定稳定后再收紧。TUI 与 CLI 参数结构**不属于**对外 API（`pie` 对外就是那个可执行文件）。
 
+pub mod action;
 pub mod cancel;
 pub mod cli;
 pub mod config;

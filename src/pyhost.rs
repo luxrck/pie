@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -101,11 +101,25 @@ pub enum Outcome {
 /// `id` →（**进程代**，应答通道）。见模块头「应答路由带进程代」。
 type Pending = Arc<Mutex<HashMap<u64, (u64, oneshot::Sender<Value>)>>>;
 
+/// 宿主**主动发起**的方法调用（`{"call":M,"method":…}`）的处理器：给回执那个值。
+///
+/// 为什么需要它：扩展要能「改当前实例」（`S.set_model(…)` 之类），而那些方法调用是 **host → rust**
+/// 方向 —— 与工具调用（rust → host）反向。两个方向的 `id` 各用各的键（`call` / `id`），不撞车。
+pub type CallHandler = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
 /// 一个长活 Python 宿主：有进程就写、没有就起、死了下次调用懒重启。
 pub struct PyHost {
     spec: Spec,
     /// 写通道（`None` = 还没起 / 已死）。
-    stdin: AsyncMutex<Option<ChildStdin>>,
+    ///
+    /// `Arc` 是为了让**读线程**也能写 —— 宿主发来的 `call` 帧由读线程接、回执也得由它写
+    /// （那两个方向共用这根管道）。
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
+    /// 宿主主动发起的调用交给它（`pytool` 在 `load` 时挂；`repl` 没有 → 回一条错误）。
+    ///
+    /// `OnceLock` 而不是 `Option`：挂的时候 `start` 已经跑过了（首行清单读完才知道要不要挂），
+    /// 读线程拿的是 `Arc` clone → 后挂也生效。
+    on_call: Arc<OnceLock<CallHandler>>,
     /// 当前进程的 pid（0 = 没有）——信号路径**只读它，不碰锁**（取消要能立刻发出去）。
     pid: AtomicU32,
     /// 当前进程还活着吗（读线程 EOF / 被杀时置 false）→ 下次请求懒重启。
@@ -122,7 +136,8 @@ impl PyHost {
     pub async fn start(spec: &Spec) -> Result<(Arc<Self>, Value), String> {
         let host = Arc::new(Self {
             spec: spec.clone(),
-            stdin: AsyncMutex::new(None),
+            stdin: Arc::new(AsyncMutex::new(None)),
+            on_call: Arc::new(OnceLock::new()),
             pid: AtomicU32::new(0),
             alive: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -138,6 +153,11 @@ impl PyHost {
     /// 标签（错误消息里那个名字）。
     pub fn label(&self) -> &str {
         &self.spec.label
+    }
+
+    /// 挂上「宿主主动发起的调用」的处理器（`pytool` 用；不挂 → 那种帧回一条错误）。
+    pub fn set_call_handler(&self, handler: CallHandler) {
+        let _ = self.on_call.set(handler);
     }
 
     /// 起子进程 + 读首行清单，把剩下的 stdout 交给读线程；返回 `stdin` 让调用方自己存
@@ -216,8 +236,10 @@ impl PyHost {
         tokio::spawn(reader_loop(
             reader,
             child,
+            Arc::clone(&self.stdin),
             Arc::clone(&self.pending),
             Arc::clone(&self.alive),
+            Arc::clone(&self.on_call),
             generation,
             spec.label.clone(),
         ));
@@ -406,36 +428,66 @@ impl PyHost {
     }
 }
 
-/// 读线程：按 `id` 把应答交还对应的调用；EOF（进程死了 / 被杀了）→ 丢掉**本代**在飞的调用。
+/// 读线程：按 `id` 把应答交还对应的调用；`call` 帧（**宿主主动发起**）交给 `on_call` 并写回执；
+/// EOF（进程死了 / 被杀了）→ 丢掉**本代**在飞的调用。
+///
+/// ⚠ 两个方向的 `id` 各用各的键：rust → host 是 `id`，host → rust 是 `call`；回执用 `call_reply`
+/// （**不**复用 `id`：两边各自从 1 开始数，同一个键会撞）。
+#[allow(clippy::too_many_arguments)] // 都是长活任务的必要句柄，包成结构体只是换个地方列
 async fn reader_loop(
     reader: BufReader<ChildStdout>,
     child: Child,
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     pending: Pending,
     alive: Arc<AtomicBool>,
+    on_call: Arc<OnceLock<CallHandler>>,
     generation: u64,
     label: String,
 ) {
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) => match value.get("id").and_then(Value::as_u64) {
-                Some(id) => {
-                    if let Some((_, tx)) = pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id)
-                    {
-                        let _ = tx.send(value);
-                    }
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(e) => {
+                crate::log::warn(format!("[{label}] 应答不是合法 JSON: {e}（{line}）"));
+                continue;
+            }
+        };
+        // 宿主主动发起的调用：当场算回执，再写回去（不等下一轮）
+        if let Some(call_id) = value.get("call").and_then(Value::as_u64) {
+            let result = match on_call.get() {
+                Some(handler) => handler(&value),
+                None => json!({"ok": false, "error": "这个宿主没有配动作处理器"}),
+            };
+            let reply = json!({"call_reply": call_id, "result": result}).to_string() + "\n";
+            let mut guard = stdin.lock().await;
+            let Some(child_stdin) = guard.as_mut() else {
+                continue;
+            };
+            if let Err(e) = child_stdin.write_all(reply.as_bytes()).await {
+                crate::log::warn(format!("[{label}] 写动作回执失败: {e}"));
+                alive.store(false, Ordering::SeqCst);
+            } else {
+                let _ = child_stdin.flush().await;
+            }
+            continue;
+        }
+        match value.get("id").and_then(Value::as_u64) {
+            Some(id) => {
+                if let Some((_, tx)) = pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id)
+                {
+                    let _ = tx.send(value);
                 }
-                // 没有 id 的行 = 宿主连请求都认不出来（协议外的东西）→ 当告警
-                None => {
-                    if let Some(err) = value.get("error").and_then(Value::as_str) {
-                        crate::log::warn(format!("[{label}] {err}"));
-                    }
+            }
+            // 没有 id 的行 = 宿主连请求都认不出来（协议外的东西）→ 当告警
+            None => {
+                if let Some(err) = value.get("error").and_then(Value::as_str) {
+                    crate::log::warn(format!("[{label}] {err}"));
                 }
-            },
-            Err(e) => crate::log::warn(format!("[{label}] 应答不是合法 JSON: {e}（{line}）")),
+            }
         }
     }
     // 进程没了：把自己这一代还挂着的应答通道丢掉（丢弃 = 调用方拿到「没有应答」）。
