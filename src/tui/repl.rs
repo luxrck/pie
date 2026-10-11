@@ -86,15 +86,12 @@ struct Cached {
 }
 
 impl Cached {
-    /// 解码 + 按区域大小编码。有点阻塞，所以只在新图 / 区域变化时做。
+    /// 解码 + 按区域大小编码（`Fit` 只缩不放）。有点阻塞，所以只在新图 / 区域变化时做。
     fn build(picker: &Picker, path: &Path, cells: Size) -> Result<Self, String> {
         let image = image::ImageReader::open(path)
             .map_err(|e| e.to_string())?
             .decode()
             .map_err(|e| e.to_string())?;
-        // 先自己归一尺寸（见 `fit_to_cells`）：`Resize::Fit` **只缩不放**，图比浮层小时会原样
-        // 贴右下角 —— 用户看到的就是「滚到 100% 也没占满」。
-        let image = fit_to_cells(picker, image, cells);
         let protocol = picker
             .new_protocol(image, cells, Resize::Fit(None))
             .map_err(|e| e.to_string())?;
@@ -104,24 +101,6 @@ impl Cached {
             protocol,
         })
     }
-}
-
-/// 把图按比例缩放到**恰好装进** `cells`（浮层的字符格区域）—— 补上 `Resize::Fit` 缺的「放大」那半。
-///
-/// 目标像素 = `cells × 终端字格`，就是浮层真实占的那块像素。`DynamicImage::resize` 保持宽高比、
-/// 缩到「装得下」为止 → 缩小 / 放大都覆盖；之后 `new_protocol` 的 `Fit` 基本不会再动它。
-/// ⚠ 保持比例意味着**只有一个方向能被填满**（比例不匹配的那边照样留白）—— 要让两个方向都满，
-/// 只能裁切（丢边缘）或拉伸（变形），那不该是默认行为。
-fn fit_to_cells(picker: &Picker, image: image::DynamicImage, cells: Size) -> image::DynamicImage {
-    let font = picker.font_size();
-    let (w, h) = (
-        u32::from(cells.width) * u32::from(font.width),
-        u32::from(cells.height) * u32::from(font.height),
-    );
-    if w == 0 || h == 0 {
-        return image;
-    }
-    image.resize(w, h, image::imageops::FilterType::Triangle)
 }
 
 /// REPL 画布：记录 + 滚动偏移 + 最近一张图。
@@ -311,7 +290,7 @@ impl Repl {
     /// 缩放图浮层：`delta` **正 = 放大**（一次滚轮 = ±3 → ±15%）。
     ///
     /// 只改比例：下一帧 `split` 就用新尺寸，而 [`Cached`] 的缓存键里带着 `cells` → **自动重编**，
-    /// 不需要额外的失效逻辑。图被缩/放到**刚好装进**浮层（见 `fit_to_cells`），比例一变它就重新铺满那块。
+    /// 不需要额外的失效逻辑。⚠ `Resize::Fit` 只缩不放 —— 图本来就比浮层小时，浮层再大图也不会变大。
     pub fn zoom(&mut self, delta: i32) {
         let next = i32::from(self.image_ratio) + delta * ZOOM_STEP;
         self.image_ratio =
@@ -430,8 +409,7 @@ impl Repl {
     /// 切分画布：文本永远拿到**整块画布**；有图时额外在**右下角浮**一块固定 Rect。
     ///
     /// 图是**浮层**——压在文本上（不是把文本挤上去）。浮层取画布的 4/5 宽 × 4/5 高、右对齐/底对齐，
-    /// 好让图尽量大。图会被缩/放到**铺满其中一个方向**（`fit_to_cells` 补了 `Fit` 缺的放大那半），
-    /// 比例不符的那边露出底下的文本，像浮在字上。
+    /// 好让图尽量大。图比浮层小时（`Fit` 只缩不放）贴到浮层右下角，左上露出底下的文本，像浮在字上。
     fn split(&self, area: Rect) -> (Rect, Option<Rect>) {
         if !self.any_image() || area.height < IMAGE_MIN_CANVAS_ROWS {
             return (area, None);
@@ -454,8 +432,8 @@ impl Repl {
 
     /// 画图：`Protocol` 按区域尺寸编码一次，之后每帧只渲染（便宜）。
     ///
-    /// 编码拿**整个 `area`** 当上限（`Cached::build` 里先把图按比例缩放到装进 `area`，所以编出来的
-    /// 就是「能塞进 area 的最大尺寸」），再把它贴到 area 的**右下角**。
+    /// 编码拿**整个 `area`** 当上限（`Fit` 只缩不放 → 编出来的就是「能塞进 area 的最大尺寸」），
+    /// 再把它贴到 area 的**右下角**：图比区域小时靠右下沉，不孤零零挂在左上。
     fn render_image(&mut self, frame: &mut Frame, area: Rect, palette: &Palette) {
         let Some(path) = self.image.clone() else {
             return;
@@ -1045,42 +1023,22 @@ mod tests {
         let size = view.cached.as_ref().unwrap().protocol.size();
         assert_eq!(
             (size.width, size.height),
-            (103, 13),
-            "图比浮层小时该被**放大**：1210×440 按比例铺满浮层宽（103 格 × 20px），高 440×2060/1210 = 749px → 13 行"
+            (61, 8),
+            "1210×440 ÷ 20×58 = 61×8 格"
         );
 
         let seq = screen.lines().find(|l| l.contains("1337;File")).unwrap();
         let head = &seq[seq.find("1337;File").unwrap()..];
         let head = &head[..head.find(':').unwrap_or(head.len())];
         assert!(
-            head.contains("width=2060px;height=749px"),
-            "发出去的是缩放后的图：103 格 × 20px = 2060，高 440×2060/1210 = 749：{head:?}"
+            head.contains("width=1220px;height=464px"),
+            "发出去的必须是 61×8 格 × 20×58 像素：{head:?}"
         );
 
-        // 而且贴着图区的**右下角**（不是左上角）
+        // 而且贴在图区的**右下角**（不是左上角）
         let (_, Some(area)) = view.split(Rect::new(0, 0, 129, 27)) else {
             panic!("有图就该留出图区")
         };
-        assert_eq!((area.right() - 103, area.bottom() - 13), (26, 14));
-    }
-
-    /// 大图反过来：不会被放大出浮层（按比例铺满一个方向，另一个方向留白）。
-    #[test]
-    fn a_big_image_is_shrunk_to_fit_the_layer() {
-        #[allow(deprecated)]
-        let mut picker = Picker::from_fontsize(FontSize::new(20, 58));
-        picker.set_protocol_type(ProtocolType::Iterm2);
-        let mut view = Repl::new().with_picker(picker);
-        let png = temp_png("big.png", 4000, 3000); // 比例 1.33：比浮层（103×21）宽高都大
-        view.on_tool_call("repl", r#"{"code":"plt.show()"}"#);
-        view.on_tool_result("repl", "", Status::Ok, &[png]);
-
-        render_text(&mut view, 129, 27);
-        let size = view.cached.as_ref().unwrap().protocol.size();
-        assert!(
-            size.width <= 103 && size.height <= 21,
-            "绝不能溢出浮层：{size:?}"
-        );
-        assert_eq!(size.height, 21, "按高适配 → 铺满浮层高：{size:?}");
+        assert_eq!((area.right() - 61, area.bottom() - 8), (68, 19));
     }
 }
