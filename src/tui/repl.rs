@@ -37,8 +37,8 @@ const IMAGE_MAX_ROWS: u16 = 60;
 const IMAGE_MIN_ROWS: u16 = 4;
 /// 画布矮于这个高度就不贴图了（太小没意思）。
 const IMAGE_MIN_CANVAS_ROWS: u16 = 8;
-/// 图像浮层占画布的百分比（默认 80 = 老的 `4/5`）；滚轮悬在图上时可调（[`Repl::zoom`]）。
-const IMAGE_RATIO_DEFAULT: u16 = 80;
+/// 图像浮层占画布的百分比（默认 40）；滚轮悬在图上时可调（[`Repl::zoom`]）。
+const IMAGE_RATIO_DEFAULT: u16 = 40;
 /// 缩放下限 / 上限（百分比）。
 const IMAGE_RATIO_MIN: u16 = 20;
 const IMAGE_RATIO_MAX: u16 = 100;
@@ -1045,23 +1045,23 @@ mod tests {
         let size = view.cached.as_ref().unwrap().protocol.size();
         assert_eq!(
             (size.width, size.height),
-            (103, 13),
-            "图比浮层小时该被**放大**：1210×440 按比例铺满浮层宽（103 格 × 20px），高 440×2060/1210 = 749px → 13 行"
+            (51, 7),
+            "图比浮层小时该被**放大**：浮层 40% = 51×10 格 → 1210×440 按比例铺满宽（51 格 × 20px），高 440×1020/1210 = 371px → 7 行"
         );
 
         let seq = screen.lines().find(|l| l.contains("1337;File")).unwrap();
         let head = &seq[seq.find("1337;File").unwrap()..];
         let head = &head[..head.find(':').unwrap_or(head.len())];
         assert!(
-            head.contains("width=2060px;height=749px"),
-            "发出去的是缩放后的图：103 格 × 20px = 2060，高 440×2060/1210 = 749：{head:?}"
+            head.contains("width=1020px;height=371px"),
+            "发出去的是缩放后的图：51 格 × 20px = 1020，高 440×1020/1210 = 371：{head:?}"
         );
 
         // 而且贴着图区的**右下角**（不是左上角）
         let (_, Some(area)) = view.split(Rect::new(0, 0, 129, 27)) else {
             panic!("有图就该留出图区")
         };
-        assert_eq!((area.right() - 103, area.bottom() - 13), (26, 14));
+        assert_eq!((area.right() - 51, area.bottom() - 7), (78, 20));
     }
 
     /// 大图反过来：不会被放大出浮层（按比例铺满一个方向，另一个方向留白）。
@@ -1071,16 +1071,16 @@ mod tests {
         let mut picker = Picker::from_fontsize(FontSize::new(20, 58));
         picker.set_protocol_type(ProtocolType::Iterm2);
         let mut view = Repl::new().with_picker(picker);
-        let png = temp_png("big.png", 4000, 3000); // 比例 1.33：比浮层（103×21）宽高都大
+        let png = temp_png("big.png", 4000, 3000); // 比例 1.33：比浮层（51×10）宽高都大
         view.on_tool_call("repl", r#"{"code":"plt.show()"}"#);
         view.on_tool_result("repl", "", Status::Ok, &[png]);
 
         render_text(&mut view, 129, 27);
         let size = view.cached.as_ref().unwrap().protocol.size();
         assert!(
-            size.width <= 103 && size.height <= 21,
+            size.width <= 51 && size.height <= 10,
             "绝不能溢出浮层：{size:?}"
         );
-        assert_eq!(size.height, 21, "按高适配 → 铺满浮层高：{size:?}");
+        assert_eq!(size.height, 10, "按高适配 → 铺满浮层高：{size:?}");
     }
 }
