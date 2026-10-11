@@ -511,7 +511,7 @@ mod tests {
             ToolCtx::with_cancel(
                 cancel,
                 crate::config::Storage::at(self.dir.join("storage")),
-                Arc::new(crate::tools::SessionState::default()),
+                Arc::new(crate::state::SessionState::default()),
             )
             .named("pytool")
         }

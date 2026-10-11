@@ -15,6 +15,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::state::SessionState;
+
 /// 输出上限：工具的私有参数 `_max_lines` / `_max_bytes` 的形状。
 ///
 /// 包一层是因为 `bash` / `repl` / `pytool` 都成对持有它，而 `fit(full, a, b)` 里两个
@@ -171,34 +173,6 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 
 //
 // ---------------------------------------------------------------- 工具上下文
-
-/// 会话级工具状态槽：**同一 `Session` 的所有工具调用共享一份**，不同 `Session` 各一份。
-///
-/// 用途：给「有状态的工具」存长活对象（如 `repl` 的 IPython 子进程）。按类型分区
-/// （`TypeId → Arc<T>`）——`ToolCtx` 因此不必认识任何具体工具。
-#[derive(Default)]
-pub struct SessionState {
-    slots: std::sync::Mutex<HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>>,
-}
-
-impl SessionState {
-    /// 取本会话里类型 `T` 的共享状态；没有就用 `init` 建一个（**仅第一次**）。
-    pub fn get_or_init<T: Send + Sync + 'static>(&self, init: impl FnOnce() -> T) -> Arc<T> {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        slots
-            .entry(std::any::TypeId::of::<T>())
-            .or_insert_with(|| Box::new(Arc::new(init())))
-            .downcast_ref::<Arc<T>>()
-            .expect("会话状态槽的类型不一致")
-            .clone()
-    }
-}
-
-impl std::fmt::Debug for SessionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionState").finish_non_exhaustive()
-    }
-}
 
 /// 一次（或几次）read 留下的痕迹：整文件内容 hash + **读过的行区间**（1 起、闭区间）。
 #[derive(Clone)]

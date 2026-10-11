@@ -8,10 +8,11 @@
 //!   - [`config`]  —— 配置加载/保存 + 分层 system prompt + 全局记忆种子
 //!   - [`llm`]     —— OpenAI 兼容客户端（reqwest + 手写 SSE，无 SDK）+ 重试 + Files API
 //!   - [`tools`]   —— read / edit / writ / bash（结构体即参数：一个工具 = 一个结构体）
-//!   - [`repl`]    —— `repl`：会话内持久的 IPython（长活子进程，状态挂 `tools::SessionState`）
+//!   - [`repl`]    —— `repl`：会话内持久的 IPython（长活子进程，状态挂 `state::SessionState`）
 //!   - [`pyhost`]  —— 长活 Python 宿主的传输与进程生命周期（`repl` / `pytool` 共用）
 //!   - [`pytool`]  —— 用 Python 写的工具：长活宿主子进程 + 同一张 `Registry`（无 CPython 嵌入）
 //!   - [`cli`] —— 会话/图片文件的列表与维护（`pie sessions` / `files list|gc` 的数据源）
+//!   - [`state`]   —— 会话级状态（工具的长活对象 + 会话自己派生数据；`repl_blocks` 落盘那一条也住这儿）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
 //!   - [`context`] —— 三级压缩 + 落盘指针 + gc
 //!   - [`event`] —— 事件词汇表（`TurnEvent` / `ChunkEvent` / `CompactEvent` / `SessionEvent`）+ 观察信封 `Event`
@@ -32,6 +33,7 @@ pub mod pyhost;
 pub mod pytool;
 pub mod repl;
 pub mod session;
+pub mod state;
 pub mod tools;
 
 /// TUI（ratatui + crossterm）。**不进绑定**：`default-features = false` 时整个模块不参与编译，

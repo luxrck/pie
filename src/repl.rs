@@ -2,7 +2,7 @@
 //! 变量 / import / 定义跨调用保留。
 //!
 //! 与其它内置工具的唯一区别是有**会话级状态**（那个 Python 子进程）：状态挂在 `Session` 上的
-//! `tools::SessionState` 槽里，本模块只管「取槽 → 懒启动 → 通信」。
+//! `state::SessionState` 槽里，本模块只管「取槽 → 懒启动 → 通信」。
 //!
 //! 进程 / 并发模型：
 //!   - 一个**会话内持久**的 IPython 子进程，传输与进程生命周期全交给 [`crate::pyhost`]
@@ -367,7 +367,7 @@ while True:
             cancel: None,
             storage: Storage::at(tmp.to_path_buf()),
             transcript: None,
-            state: Arc::new(crate::tools::SessionState::default()),
+            state: Arc::new(crate::state::SessionState::default()),
             name: "repl".to_string(),
         }
     }

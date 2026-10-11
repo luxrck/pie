@@ -18,7 +18,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use futures_util::stream::{self, StreamExt};
@@ -30,7 +29,8 @@ use crate::llm::{
     self, ChunkEvent, Compaction, Content, LlmClient, LlmError, LlmResult, Message, RequestOptions,
     ToolCall, UsageTracker,
 };
-use crate::tools::{self, Attachment, Registry, SessionState, ToolCtx, ToolHandle, ToolOutput};
+use crate::state::{REPL_BLOCK_MAX_CHARS, ReplBlock, SessionState};
+use crate::tools::{self, Attachment, Registry, ToolCtx, ToolHandle, ToolOutput};
 
 /// 回合事件（定义已搬去 [`crate::event`]；这里再导出，`pie::session::TurnEvent` 路径不变）。
 pub use crate::event::TurnEvent;
@@ -39,20 +39,6 @@ use crate::event::{Event, EventBus, SessionEvent, Subscription};
 /// 模型请求失败时补进历史的那条 assistant 消息的前缀（与 `cancel::CANCEL_TEXT` 同款用途：
 /// 让「回合没产出」这件事在历史里留下一条**能认出来**的 assistant 消息，而不是留个悬空提问）。
 pub(crate) const ERROR_TURN_PREFIX: &str = "[请求失败] ";
-
-/// 解释器跑过的单个代码块（写进 `__meta__.repl_blocks`）。
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ReplBlock {
-    /// 工具调用的 id（判「它还在不在当前对话里」就靠它）。
-    pub id: String,
-    /// 那次 `repl` 的 `code` 参数（逐字；过长的按字符截断并标一句）。
-    pub code: String,
-}
-
-/// `repl_blocks` 最多留这么多个（超出丢最老的）——它同时限住 `__meta__` 与那节 system prompt。
-const REPL_BLOCKS_MAX: usize = 24;
-/// 单个 cell 存进日志/显示的字符上限（超了截断 + 提示看原文）。
-const REPL_BLOCK_MAX_CHARS: usize = 2000;
 
 #[derive(Debug)]
 pub struct Session {
@@ -77,14 +63,6 @@ pub struct Session {
     /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
     /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
     pub compaction_events: Vec<context::CompactEvent>,
-    /// 解释器跑过的代码块（写进 `__meta__.repl_blocks`）。
-    ///
-    /// 为什么得单独存一份：压缩会把 `tool_calls` 从消息里删掉（轮次级把整段 span 换成摘要、
-    /// 会话级把整窗口归档）—— 等要把代码摆进 system prompt 那节时，消息里已经查不到了。
-    /// 所以它**独立于压缩**维护（每轮开头扫一遍消息里新增的 `repl` 调用、按 call id 去重）。
-    /// 而 system prompt 那节的内容是由它派生的：**只列 id 已不在 `messages` 里的那些** ——
-    /// 两次压缩之间逐字不变（缓存照旧命中），只有真被压走东西的那一刻才变。
-    pub repl_blocks: Vec<ReplBlock>,
     /// 完整历史（`messages[0]` 是当前 system prompt）。
     pub messages: Vec<Message>,
     /// 用量：token 是最近一次上报值，`calls` 累计（见 `UsageTracker`）。
@@ -273,8 +251,8 @@ impl Session {
                     .and_then(Value::as_object)
                     .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default();
-                // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）
-                session.repl_blocks = value
+                // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）——它住在会话状态槽里
+                let blocks: Vec<ReplBlock> = value
                     .get("repl_blocks")
                     .and_then(Value::as_array)
                     .map(|a| {
@@ -283,6 +261,7 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default();
+                session.state.repl_blocks().load(blocks);
                 continue;
             }
             // 旧 system（提示词 / 窗口摘要）丢掉：按当前提示词重建
@@ -1166,9 +1145,10 @@ impl Session {
         if !self.compaction_events.is_empty() {
             meta["compaction_events"] = json!(self.compaction_events);
         }
-        if !self.repl_blocks.is_empty() {
+        let blocks = self.state.repl_blocks().snapshot();
+        if !blocks.is_empty() {
             // 空表不写：没跑过 repl 的会话不该多一个键
-            meta["repl_blocks"] = json!(self.repl_blocks);
+            meta["repl_blocks"] = json!(blocks);
         }
         let mut out = String::new();
         out.push_str(&json_line(&meta)?);
@@ -1289,11 +1269,14 @@ impl Session {
     /// 幂等（按 call id 去重，重复扫不会重复记）。当前这轮不在压缩的受害范围里
     /// （轮次级只压「已完成」的轮，会话级只由用户手动 `/clear`）→ 下一轮再收也来得及。
     fn collect_repl_blocks(&mut self) {
-        let seen: HashSet<&str> = self.repl_blocks.iter().map(|b| b.id.as_str()).collect();
+        // 日志住在会话状态槽里（`state::ReplBlocks`）：它比消息活得久，压缩把 `tool_calls` 删掉
+        // 之后还得靠它把那几个 cell 摆回 system prompt。
+        let log = self.state.repl_blocks();
+        let seen: HashSet<String> = log.snapshot().into_iter().map(|b| b.id).collect();
         let mut fresh: Vec<ReplBlock> = Vec::new();
         for m in &self.messages {
             for call in m.tool_calls.iter().flatten() {
-                if call.function.name != "repl" || seen.contains(call.id.as_str()) {
+                if call.function.name != "repl" || seen.contains(&call.id) {
                     continue;
                 }
                 let Some(code) = serde_json::from_str::<Value>(&call.function.arguments)
@@ -1313,13 +1296,8 @@ impl Session {
                 });
             }
         }
-        if fresh.is_empty() {
-            return;
-        }
-        self.repl_blocks.extend(fresh);
-        if self.repl_blocks.len() > REPL_BLOCKS_MAX {
-            let cut = self.repl_blocks.len() - REPL_BLOCKS_MAX;
-            self.repl_blocks.drain(..cut); // 丢最老的
+        if !fresh.is_empty() {
+            log.record(fresh); // 去重 + 上限都在里面
         }
     }
 
@@ -1328,14 +1306,15 @@ impl Session {
     /// 于是它有两条白拿的性质：两次压缩之间消息没变 → 返回值**逐字相同**（缓存不受影响）；
     /// 刚被压走东西的那一刻才变 —— 而那正是缓存已经全废的时刻。
     fn repl_section(&self) -> String {
+        // 日志住在会话状态槽里（见 `state::ReplBlocks`）：只列**已被压缩带走**的 cell。
+        let blocks = self.state.repl_blocks().snapshot();
         let live: HashSet<&str> = self
             .messages
             .iter()
             .flat_map(|m| m.tool_calls.iter().flatten())
             .map(|c| c.id.as_str())
             .collect();
-        let gone: Vec<&str> = self
-            .repl_blocks
+        let gone: Vec<&str> = blocks
             .iter()
             .filter(|b| !live.contains(b.id.as_str()))
             .map(|b| b.code.as_str())
@@ -1548,7 +1527,6 @@ impl Session {
             ))],
             usage: UsageTracker::default(),
             windows: Vec::new(),
-            repl_blocks: Vec::new(),
             files: HashMap::new(),
             title: None,
             turn_count: 0,
@@ -1681,6 +1659,7 @@ fn first_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::llm::{FunctionCall, Usage};
+    use crate::state::REPL_BLOCKS_MAX;
 
     /// 测试用数据目录：跟随进程级 `PIE_DIR`（`pie_dir_tmp` + `env_lock` 那套）。
     fn storage() -> config::Storage {
@@ -2511,8 +2490,9 @@ mod tests {
         // 1) 采集：独立于压缩，只按 call id 去重（重复扫不重复记）
         s.collect_repl_blocks();
         s.collect_repl_blocks();
-        assert_eq!(s.repl_blocks.len(), 2, "{:?}", s.repl_blocks);
-        assert_eq!(s.repl_blocks[0].code, "df = 1");
+        let blocks = s.state.repl_blocks().snapshot();
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].code, "df = 1");
 
         // 2) 还在对话里 → 那节不该列它（避重复）
         s.refresh_runtime_state();
@@ -2540,10 +2520,11 @@ mod tests {
             "标题前面那段不该变（缓存前缀照旧）：{after}"
         );
 
-        // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建
+        // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建（它是会话状态槽里的一个条目）
         s.save().unwrap();
         let mut loaded = Session::load(&s.path, &config, llm(), registry()).unwrap();
-        assert_eq!(loaded.repl_blocks.len(), 2, "{:?}", loaded.repl_blocks);
+        let reloaded = loaded.state.repl_blocks().snapshot();
+        assert_eq!(reloaded.len(), 2, "{reloaded:?}");
         loaded.refresh_runtime_state();
         assert!(
             loaded.messages[0].content_text().contains("df.head()"),
@@ -2571,9 +2552,10 @@ mod tests {
             });
         }
         s.collect_repl_blocks();
-        assert_eq!(s.repl_blocks.len(), REPL_BLOCKS_MAX);
-        assert_eq!(s.repl_blocks[0].code, "x = 3", "丢最老的三个");
-        assert_eq!(s.repl_blocks[REPL_BLOCKS_MAX - 1].code, "x = 26");
+        let blocks = s.state.repl_blocks().snapshot();
+        assert_eq!(blocks.len(), REPL_BLOCKS_MAX);
+        assert_eq!(blocks[0].code, "x = 3", "丢最老的三个");
+        assert_eq!(blocks[REPL_BLOCKS_MAX - 1].code, "x = 26");
     }
 
     /// 「运行时状态」节活在 `messages[0]` 末尾：每轮重拼、**幂等**（cwd 没变就逐字相同 →
