@@ -4,16 +4,18 @@
 //! 为什么是子进程而不是嵌 CPython：不内嵌 → **零新依赖、默认构建行为不变**（没配
 //! `[python] tools` 就什么都不发生），也不必为一个可选功能把 libpython 拉进每一次构建。
 //!
-//! 形状（协议见 `pytool_host.py`）：
+//! 形状（**传输与进程生命周期全交给 [`crate::pyhost`]**：一行一条 JSON、`id` 配对、首行清单、
+//! 懒重启、按进程组杀 —— 本模块只管「清单 → 注册」与「调用 → 工具结果」）：
 //!   - 一个宿主进程装**所有** `[python] tools` 里列的文件（不是一文件一进程）；
-//!   - 启动（`load`）时 spawn + 读第一行清单 → 逐个 `with_dynamic`；
+//!   - 启动（`load`）时 start + 读首行清单 → 逐个 `with_dynamic`；
 //!   - 调用 = 写一行请求、等一行应答，靠 `id` 配对 → **一批 tool_calls 可以真并发**
 //!     （并发度由 `Session` 那侧决定：`parallel_tools` 关掉时就只会有一个在飞）；
 //!   - **同步 / 异步 handler 都能装**：同步的跑在宿主的线程池里，`async def` 跑在宿主那个
 //!     后台 loop 上（跨调用共享连接池）；本侧只管「写一行等一行」，两种都一样；
 //!   - **宿主用真绑定**（`from pie import tool`）：那个解释器里得装着 `pie`（工具里的 `@tool` 就是它
 //!     提供的）。不内嵌副本 → 实现只有一处、不会与绑定分叉；代价是 pytool 不再「零安装」。
-//!   - 取消（Esc）= `killpg` 杀进程组 → 所有在飞的调用一起失败 → **下次调用懒重启**；
+//!   - 取消（Esc）= 按进程组 `SIGKILL`（`pyhost` 的 `Interrupt::Kill`）→ 在飞的调用一起失败
+//!     → **下次调用懒重启**；
 //!   - 任何失败（起不来 / 导入错 / 重名 / 名字非法）都只告警、不阻断会话。
 //!
 //! 与 `repl` 的关系：**共用解释器（同一个 venv）但各是各的进程**——`repl` 的 `_python` 默认
@@ -26,20 +28,14 @@
 //!     而内置工具会跟着变）——要跟 cwd 走的工具请自己用绝对路径；
 //!   - 用户在**会话中途改工具文件**不会生效（schema 与 handler 都在启动时装好了），重启 `pie` 才行。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::cancel::CANCEL_TEXT;
+use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
     CallFn, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
 };
@@ -49,15 +45,6 @@ use crate::tools::{
 /// ⚠ 宿主**依赖真绑定**（`from pie import tool`）—— 不再内嵌 `_tool.py` / `_llm.py` 的副本：
 /// 实现只有绑定那一处，不会分叉（用户拍板：宁可装真包，也不要两份代码）。
 const HOST: &str = include_str!("python/pytool_host.py");
-
-/// 默认解释器：Unix `python3`，其它 `python`（与 `repl` 同口径）。
-#[cfg(unix)]
-const DEFAULT_PYTHON: &str = "python3";
-#[cfg(not(unix))]
-const DEFAULT_PYTHON: &str = "python";
-
-/// 启动期等清单的上限：工具文件在 import 期卡死时别把 `pie` 也拖住（超时就放弃这些工具）。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 装载 Python 工具：起宿主、读清单、逐个注册。**任何失败都只告警**，原样返回 `registry`。
 ///
@@ -71,19 +58,31 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     let python = config
         .python_interpreter()
         .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
-    let host = match Host::start(&python, files).await {
-        Ok(host) => Arc::new(host),
+    let mut spec = Spec::new("pytool", &python, HOST);
+    spec.files = files;
+    // 子进程 stderr（工具里的 print / traceback）→ 逐行告警；尾巴也会附在出错的消息里
+    spec.stderr_prefix = Some("pytool".to_string());
+    let (host, manifest) = match PyHost::start(&spec).await {
+        Ok(ok) => ok,
         Err(e) => {
-            crate::log::warn(format!("[pytool] {e}"));
+            // `PyHost` 的消息已经带 `[pytool]` 前缀
+            crate::log::warn(e);
             return registry;
         }
     };
-    for warning in &host.warnings {
+    let handshake: Handshake = match serde_json::from_value(manifest) {
+        Ok(handshake) => handshake,
+        Err(e) => {
+            crate::log::warn(format!("[pytool] 清单不是预期的形状: {e}"));
+            return registry;
+        }
+    };
+    for warning in &handshake.warnings {
         crate::log::warn(format!("[pytool] {warning}"));
     }
 
     let mut registry = registry;
-    for spec in host.tools.clone() {
+    for spec in handshake.tools {
         if !valid_tool_name(&spec.name) {
             crate::log::warn(format!(
                 "[pytool] 跳过非法工具名 {:?}：只能用 [A-Za-z0-9_-]、长度 1..=64（API 的 function.name 要求）",
@@ -105,7 +104,7 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
             Arc::new(move |args, ctx| {
                 let host = Arc::clone(&host);
                 let name = name.clone();
-                Box::pin(async move { host.call(&name, args, ctx).await })
+                Box::pin(async move { call(&host, &name, args, ctx).await })
             })
         };
         registry = registry.with_dynamic(
@@ -118,6 +117,39 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
         );
     }
     registry
+}
+
+/// 一次工具调用：把参数转给宿主，把应答转成工具结果。
+///
+/// 截断阈值走与内置工具同一条路：`[tools.<名字>] _max_lines = N` 注入。
+/// ⚠ 这两个是**宿主**的旋钮（与 `bash` 的 `_max_lines` 同义）→ 从 args 里摘掉再转发，
+/// 否则没声明它们的 handler 会拿到一个多余的 kwarg 直接 TypeError。其余 `_` 开头的参数照旧
+/// 转发给 handler（与 Python 绑定同款：用户在 handler 签名里声明 `_foo` 就收得到）。
+async fn call(host: &PyHost, tool: &str, args: Value, ctx: ToolCtx) -> ToolResult {
+    let mut args = args;
+    let (max_lines, max_bytes) = match args.as_object_mut() {
+        Some(map) => (
+            map.remove("_max_lines").and_then(|v| v.as_i64()),
+            map.remove("_max_bytes").and_then(|v| v.as_i64()),
+        ),
+        None => (None, None),
+    };
+    let payload = json!({"tool": tool, "arguments": args});
+    match host
+        .request(payload, ctx.cancel.as_ref(), None, Interrupt::Kill)
+        .await
+    {
+        Ok(Outcome::Reply(value)) => match serde_json::from_value::<Reply>(value) {
+            Ok(reply) => reply.into_result(&ctx, max_lines, max_bytes),
+            Err(e) => Err(ToolError(format!("[pytool] 应答不是预期的形状: {e}"))),
+        },
+        // 取消 = 杀掉整个进程组（在飞的含本次一起失败，下次调用懒重启）——
+        // 不做「中断单次调用但保住状态」，那要把中断协议搬进 Python，不值。
+        Ok(Outcome::Cancelled) => Ok(ToolOutput::text(CANCEL_TEXT)),
+        // pytool 没设超时，这条路上不该出现
+        Ok(Outcome::TimedOut) => Err(ToolError("[pytool] 宿主超时".to_string())),
+        Err(e) => Err(ToolError(e)),
+    }
 }
 
 /// 展开路径：`~` → `$HOME`；目录取其下 `*.py`（不递归、排过序）；不存在 → 告警。
@@ -160,35 +192,6 @@ fn valid_tool_name(name: &str) -> bool {
 
 // ---------------------------------------------------------------- 宿主
 
-/// 应答路由表：`id` →（**进程代**，应答通道）。见 [`Host::pending`]。
-type Pending = Arc<Mutex<HashMap<u64, (u64, oneshot::Sender<Reply>)>>>;
-
-/// 一个长活 Python 宿主进程 + 「本会话所有在飞调用」的应答路由表。
-struct Host {
-    python: String,
-    files: Vec<PathBuf>,
-    /// 启动时拿到的清单与告警（重启不再重取：schema 已经注册进 registry 了）。
-    tools: Vec<ToolSpec>,
-    warnings: Vec<String>,
-    /// 子进程：`None` = 还没起或已死（下次调用懒重启）。锁**只护「起进程 + 写一行」**，不等应答。
-    proc: AsyncMutex<Option<Proc>>,
-    /// `id` →（**进程代**，应答通道）：写请求前挂上、收到应答或出错时摘掉。
-    /// 代是用来防串台的：读线程 EOF 时只清自己那一代（重启后新进程的调用可能已经挂在表里了）。
-    pending: Pending,
-    next_id: AtomicU64,
-    /// 子进程代：每重启一次 +1。
-    generation: AtomicU64,
-}
-
-struct Proc {
-    stdin: ChildStdin,
-    pid: u32,
-    /// 本进程的代（应答路由用；见 `Host::pending`）。
-    generation: u64,
-    /// 读线程（stdout EOF / 被杀）置 false → 下次调用重启。
-    alive: Arc<AtomicBool>,
-}
-
 /// 清单里的一条工具（宿主给的字段名与 OpenAI 线上形状对齐）。
 #[derive(Clone, Deserialize)]
 struct ToolSpec {
@@ -199,195 +202,24 @@ struct ToolSpec {
     parameters: Option<Value>,
 }
 
+/// 宿主首行清单（`pytool_host.py` 给的形状）。
+#[derive(Default, Deserialize)]
+struct Handshake {
+    #[serde(default)]
+    tools: Vec<ToolSpec>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
 /// 宿主的一行应答。
+///
+/// ⚠ `id` 不在这里：它由 [`crate::pyhost`] 用来配对（`serde` 会忽略多出来的键）。
 #[derive(Deserialize)]
 struct Reply {
-    #[serde(default)]
-    id: Option<u64>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     error: Option<String>,
-}
-
-impl Host {
-    /// 起进程 + 读清单（第一行）+ 交给读线程。失败 → `Err(说明)`。
-    async fn start(python: &str, files: Vec<PathBuf>) -> Result<Self, String> {
-        let host = Self {
-            python: python.to_string(),
-            files,
-            tools: Vec::new(),
-            warnings: Vec::new(),
-            proc: AsyncMutex::new(None),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
-            generation: AtomicU64::new(0),
-        };
-        let (proc, tools, warnings) = host.spawn().await?;
-        Ok(Self {
-            tools,
-            warnings,
-            proc: AsyncMutex::new(Some(proc)),
-            ..host
-        })
-    }
-
-    /// spawn 一个宿主进程，读第一行清单，把剩余的 stdout 交给读线程。
-    async fn spawn(&self) -> Result<(Proc, Vec<ToolSpec>, Vec<String>), String> {
-        let program = HOST;
-        let mut cmd = tokio::process::Command::new(&self.python);
-        // `-X utf8`：中文经 stdin/stdout 进出不能靠 locale；`-u`：别让 stdout 缓冲住一行应答
-        cmd.arg("-X").arg("utf8").arg("-u").arg("-c").arg(program);
-        cmd.args(&self.files);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.kill_on_drop(true); // 谁都不管它时别留孤儿（配合下面的读线程）
-        #[cfg(unix)]
-        cmd.process_group(0); // 独立进程组：取消时按组杀
-        let mut child = cmd.spawn().map_err(|e| {
-            format!(
-                "启动解释器失败（{}）: {e}（可用 [python] interpreter 指到别的解释器）",
-                self.python
-            )
-        })?;
-
-        let stdin = child.stdin.take().expect("piped");
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let pid = child.id().unwrap_or(0);
-
-        // stderr 是用户工具自己的输出（print / traceback）→ 走告警通道
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    crate::log::warn(format!("[pytool] {line}"));
-                }
-            }
-        });
-
-        let mut reader = BufReader::new(stdout);
-        let mut first = String::new();
-        let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_line(&mut first)).await;
-        match handshake {
-            Err(_) => {
-                return Err(format!(
-                    "宿主 {}s 内没有给出工具清单（工具文件是不是在 import 期卡住了？）",
-                    HANDSHAKE_TIMEOUT.as_secs()
-                ));
-            }
-            Ok(Err(e)) => return Err(format!("读清单失败: {e}")),
-            Ok(Ok(0)) => {
-                return Err("宿主没有给出工具清单就退出了（看上面的 [pytool] 告警）".to_string());
-            }
-            Ok(Ok(_)) => {}
-        }
-        #[derive(Deserialize)]
-        struct Handshake {
-            #[serde(default)]
-            tools: Vec<ToolSpec>,
-            #[serde(default)]
-            warnings: Vec<String>,
-        }
-        let handshake: Handshake = serde_json::from_str(&first)
-            .map_err(|e| format!("清单不是合法 JSON: {e}（原文: {}）", first.trim()))?;
-
-        let alive = Arc::new(AtomicBool::new(true));
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        tokio::spawn(reader_loop(
-            reader,
-            child,
-            Arc::clone(&self.pending),
-            Arc::clone(&alive),
-            generation,
-        ));
-        Ok((
-            Proc {
-                stdin,
-                pid,
-                generation,
-                alive,
-            },
-            handshake.tools,
-            handshake.warnings,
-        ))
-    }
-
-    /// 一次调用：写一行请求 → 等这一 `id` 的应答（race 取消）。
-    async fn call(&self, tool: &str, args: Value, ctx: ToolCtx) -> ToolResult {
-        // 截断阈值走与内置工具同一条路：`[tools.<名字>] _max_lines = N` 注入。
-        // ⚠ 这两个是**宿主**的旋钮（与 `bash` 的 `_max_lines` 同义）→ 从 args 里摘掉再转发，
-        // 否则没声明它们的 handler 会拿到一个多余的 kwarg 直接 TypeError。其余 `_` 开头的参数照旧
-        // 转发给 handler（与 Python 绑定同款：用户在 handler 签名里声明 `_foo` 就收得到）。
-        let mut args = args;
-        let (max_lines, max_bytes) = match args.as_object_mut() {
-            Some(map) => (
-                map.remove("_max_lines").and_then(|v| v.as_i64()),
-                map.remove("_max_bytes").and_then(|v| v.as_i64()),
-            ),
-            None => (None, None),
-        };
-
-        let mut guard = self.proc.lock().await;
-        let dead = guard
-            .as_ref()
-            .map(|p| !p.alive.load(Ordering::SeqCst))
-            .unwrap_or(true);
-        if dead {
-            *guard = None; // 先把死进程扔掉（读线程已经把它收走了）
-            match self.spawn().await {
-                Ok((proc, _, _)) => *guard = Some(proc),
-                Err(e) => return Err(ToolError(format!("[pytool] {e}"))),
-            }
-        }
-        let proc = guard.as_mut().expect("刚确保过");
-        let pid = proc.pid;
-        let generation = proc.generation;
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, (generation, tx));
-        let line = json!({"id": id, "tool": tool, "arguments": args}).to_string() + "\n";
-        let written = async {
-            proc.stdin.write_all(line.as_bytes()).await?;
-            proc.stdin.flush().await
-        }
-        .await;
-        if let Err(e) = written {
-            // 写不进去 = 管道断了（进程刚死）→ 标记待重启，本次调用算失败
-            proc.alive.store(false, Ordering::SeqCst);
-            self.pending.lock().unwrap().remove(&id);
-            return Err(ToolError(format!("[pytool] 写请求失败: {e}")));
-        }
-        drop(guard); // 应答可以乱序回来，锁不用捂到应答
-
-        let cancel_wait = async {
-            match ctx.cancel.clone() {
-                Some(cancel) => cancel.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(cancel_wait);
-        tokio::select! {
-            reply = rx => match reply {
-                Ok(reply) => reply.into_result(&ctx, max_lines, max_bytes),
-                Err(_) => Err(ToolError(
-                    "[pytool] 宿主没有应答（进程已退出，下次调用会自动重启）".to_string()
-                )),
-            },
-            _ = &mut cancel_wait => {
-                // 杀掉整个进程组：在飞的（含本次）一起失败，下次调用懒重启。
-                // 不做「中断单次调用但保住状态」——那要把中断协议搬进 Python，不值。
-                self.pending.lock().unwrap().remove(&id);
-                crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
-                if let Some(p) = self.proc.lock().await.as_ref() {
-                    p.alive.store(false, Ordering::SeqCst);
-                }
-                Ok(ToolOutput::text(CANCEL_TEXT))
-            }
-        }
-    }
 }
 
 impl Reply {
@@ -419,47 +251,12 @@ impl Reply {
     }
 }
 
-/// 读线程：按 `id` 把应答交还给对应的调用；EOF（进程死了 / 被杀了）→ 丢掉**本代**在飞的调用。
-async fn reader_loop(
-    reader: BufReader<ChildStdout>,
-    child: Child,
-    pending: Pending,
-    alive: Arc<AtomicBool>,
-    generation: u64,
-) {
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        match serde_json::from_str::<Reply>(&line) {
-            Ok(reply) => match reply.id {
-                Some(id) => {
-                    if let Some((_, tx)) = pending.lock().unwrap().remove(&id) {
-                        let _ = tx.send(reply);
-                    }
-                }
-                None => {
-                    // 宿主连请求的 id 都没认出来（非法 JSON 之类）——只可能是告警
-                    if let Some(error) = reply.error {
-                        crate::log::warn(format!("[pytool] {error}"));
-                    }
-                }
-            },
-            Err(e) => crate::log::warn(format!("[pytool] 应答不是合法 JSON: {e}（{line}）")),
-        }
-    }
-    // 进程没了：把**自己这一代**还挂着的应答通道丢掉（丢弃 = 调用方拿到「没有应答」）。
-    // 只动自己这一代：重启出来的新进程可能已经把新调用挂进同一张表了。
-    alive.store(false, Ordering::SeqCst);
-    pending
-        .lock()
-        .unwrap()
-        .retain(|_, (gen_of, _)| *gen_of != generation);
-    drop(child); // 回收（kill_on_drop 也在这里兜底杀掉）
-}
-
-/// 测试用真解释器 + 临时工具文件跑（没找到能用的就跳过，与 `repl` 的测试同款）。
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::process::Stdio;
+    use std::time::Duration;
 
     /// 宿主**依赖真绑定**（工具里 `from pie import tool`），所以测试解释器得能 `import pie`：
     /// 先试绑定自己的 venv（本仓开发态就是它），再退 `python3`（用户自己往里装过）。
