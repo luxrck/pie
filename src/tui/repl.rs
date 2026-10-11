@@ -37,6 +37,13 @@ const IMAGE_MAX_ROWS: u16 = 60;
 const IMAGE_MIN_ROWS: u16 = 4;
 /// 画布矮于这个高度就不贴图了（太小没意思）。
 const IMAGE_MIN_CANVAS_ROWS: u16 = 8;
+/// 图像浮层占画布的百分比（默认 80 = 老的 `4/5`）；滚轮悬在图上时可调（[`Repl::zoom`]）。
+const IMAGE_RATIO_DEFAULT: u16 = 80;
+/// 缩放下限 / 上限（百分比）。
+const IMAGE_RATIO_MIN: u16 = 20;
+const IMAGE_RATIO_MAX: u16 = 100;
+/// 滚轮一格（`delta` = ±3）换算出的缩放步长（百分比）。
+const ZOOM_STEP: i32 = 5;
 
 /// 顶层视图（tab）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +122,12 @@ pub struct Repl {
     image: Option<PathBuf>,
     /// 已编码的图（路径或尺寸变了就重编）。
     cached: Option<Cached>,
+    /// 图浮层占画布的百分比（默认 [`IMAGE_RATIO_DEFAULT`]）。滚轮悬在图上时调它。
+    image_ratio: u16,
+    /// **上一帧**图浮层的矩形（**零矩形** = 没图 / 画布太矮没贴）。
+    ///
+    /// `render` 里记账；`App::wheel` 拿它判「滚轮是不是悬在图上」（图上滚 = 缩放，别处滚 = 滚动）。
+    image_area: Rect,
 }
 
 impl Default for Repl {
@@ -128,6 +141,8 @@ impl Default for Repl {
             picker: Picker::halfblocks(),
             image: None,
             cached: None,
+            image_ratio: IMAGE_RATIO_DEFAULT,
+            image_area: Rect::default(),
         }
     }
 }
@@ -272,6 +287,21 @@ impl Repl {
         self.scroll_from_bottom = (self.scroll_from_bottom as i32 + delta).max(0) as u16;
     }
 
+    /// 缩放图浮层：`delta` **正 = 放大**（一次滚轮 = ±3 → ±15%）。
+    ///
+    /// 只改比例：下一帧 `split` 就用新尺寸，而 [`Cached`] 的缓存键里带着 `cells` → **自动重编**，
+    /// 不需要额外的失效逻辑。⚠ `Resize::Fit` 只缩不放 —— 图本来就比浮层小时，浮层再大图也不会变大。
+    pub fn zoom(&mut self, delta: i32) {
+        let next = i32::from(self.image_ratio) + delta * ZOOM_STEP;
+        self.image_ratio =
+            next.clamp(i32::from(IMAGE_RATIO_MIN), i32::from(IMAGE_RATIO_MAX)) as u16;
+    }
+
+    /// 上一帧图浮层的矩形（**零矩形** = 没图）——`App::wheel` 用它判鼠标在不在图上。
+    pub fn image_area(&self) -> Rect {
+        self.image_area
+    }
+
     /// 上一帧折行后的**总行数**（空画布 = 0）——滚动条要用。
     pub fn total(&self) -> usize {
         self.total
@@ -304,6 +334,8 @@ impl Repl {
         }
         // 文本**铺满整块画布**；有图时再在**右下角浮**一块**固定** Rect（固定 = 不随滚动重传）。
         let (text_area, image_area) = self.split(area);
+        // 记账给鼠标命用（`App::wheel` 判「滚轮是不是在图上」）；没图时是零矩形
+        self.image_area = image_area.unwrap_or_default();
         self.viewport = text_area.height;
         if self.entries.is_empty() {
             self.scroll_from_bottom = 0;
@@ -382,8 +414,13 @@ impl Repl {
         if !self.any_image() || area.height < IMAGE_MIN_CANVAS_ROWS {
             return (area, None);
         }
-        let h = (area.height * 4 / 5).clamp(IMAGE_MIN_ROWS, IMAGE_MAX_ROWS);
-        let w = (area.width * 4 / 5).max(1).min(area.width);
+        // 比例可调（滚轮悬在图上缩放）→ 用 u32 算，免得 u16 × u16 溢出
+        let pct = u32::from(self.image_ratio.clamp(IMAGE_RATIO_MIN, IMAGE_RATIO_MAX));
+        let h = (u32::from(area.height) * pct / 100)
+            .clamp(u32::from(IMAGE_MIN_ROWS), u32::from(IMAGE_MAX_ROWS)) as u16;
+        let w = (u32::from(area.width) * pct / 100)
+            .max(1)
+            .min(u32::from(area.width)) as u16;
         let image = Rect {
             x: area.right() - w,
             y: area.bottom() - h,
@@ -573,6 +610,38 @@ mod tests {
         assert!(view.is_empty());
         assert!(view.on_tool_call("repl", r#"{"code":"1+1"}"#));
         assert!(!view.is_empty());
+    }
+
+    /// 缩放只在 `[IMAGE_RATIO_MIN, IMAGE_RATIO_MAX]` 里走，且真的改变浮层尺寸（没有图就不给浮层）。
+    #[test]
+    fn zoom_moves_the_image_layer_within_bounds() {
+        let mut view = Repl::new();
+        assert!(
+            view.split(Rect::new(0, 0, 40, 20)).1.is_none(),
+            "没图不给浮层"
+        );
+        view.on_tool_call("repl", r#"{"code":"1"}"#);
+        view.on_tool_result(
+            "repl",
+            "1",
+            Status::Ok,
+            &[PathBuf::from("/nonexistent.png")],
+        );
+        let area = Rect::new(0, 0, 40, 20);
+        let h = |v: &Repl| v.split(area).1.expect("有图该给浮层").height;
+        let base = h(&view);
+
+        view.zoom(3); // 一格
+        assert!(h(&view) > base, "放大该让浮层变高：{base} → {}", h(&view));
+        for _ in 0..20 {
+            view.zoom(3);
+        }
+        assert_eq!(view.image_ratio, IMAGE_RATIO_MAX, "顶到上限就停住");
+        for _ in 0..50 {
+            view.zoom(-3);
+        }
+        assert_eq!(view.image_ratio, IMAGE_RATIO_MIN, "缩到下限就停住");
+        assert!(h(&view) < base, "缩到最小该比默认小");
     }
 
     #[test]

@@ -1342,6 +1342,12 @@ impl App {
     /// 写「没什么可滚的就给消息流」是因为光标很容易停在输入框上：那时滚轮应该照旧翻对话，
     /// 否则输入框会变成一块“死区”。
     fn wheel(&mut self, mouse: MouseEvent, delta: i32) {
+        // 滚轮悬在画布的**图上** → 缩放那张图（不是滚画布）。图浮层是压在文本上的浮层，
+        // 命中靠 `Repl` 上一帧记下的矩形（零矩形 = 没图 → 不会误命中）；其余地方照旧滚。
+        if self.tab == Tab::Repl && inside(self.repl.image_area(), mouse.column, mouse.row) {
+            self.repl.zoom(-delta); // `ScrollUp`（-3）= 放大
+            return;
+        }
         if self.surface_at(mouse.column, mouse.row) == Some(Surface::Input)
             && self.input.overflows()
         {
@@ -3545,6 +3551,49 @@ mod tests {
         assert!(app.toast.is_none(), "滚动条不该弹复制提示");
         assert_eq!(app.input.rect(), input_before, "输入框位置/尺寸不受影响");
         assert_eq!(app.input.text(), "草稿", "输入框内容不受影响");
+    }
+
+    /// 滚轮悬在画布右下角那张图上 = **缩放**它（不滚画布）；离开图区照旧滚画布。
+    #[test]
+    fn wheel_over_the_canvas_image_zooms_it_instead_of_scrolling() {
+        let mut app = test_app();
+        app.tab = Tab::Repl;
+        for i in 0..40 {
+            let args = format!(r#"{{"code":"print({i})"}}"#);
+            app.on_turn_event(UiEvent::Turn(TurnEvent::ToolCall {
+                name: "repl".into(),
+                arguments: args.clone(),
+            }));
+            app.on_turn_event(UiEvent::Turn(TurnEvent::ToolResult {
+                name: "repl".into(),
+                text: "x".into(),
+                arguments: args,
+                // 路径不存在也无妨：命中只看浮层矩形（渲染会退化成一行「图读不出来」）
+                images: if i == 39 {
+                    vec![std::path::PathBuf::from("/nonexistent.png")]
+                } else {
+                    Vec::new()
+                },
+            }));
+        }
+        render_buffer(&mut app, 60, 24);
+        let area = app.repl.image_area();
+        assert!(area.width > 0 && area.height > 0, "有图该浮一块矩形");
+        let top = app.repl.top();
+
+        // 在图上滚 → 浮层变大（`ScrollUp` 对应 `zoom(+1 格)`），画布偏移不动
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, area.x + 2, area.y + 2));
+        render_buffer(&mut app, 60, 24);
+        assert!(
+            app.repl.image_area().height >= area.height,
+            "在图上滚该放大（至少不缩）"
+        );
+        assert_eq!(app.repl.top(), top, "滚轮在图上时画布不该被滚");
+
+        // 图区之外（画布左上角）滚 → 照旧滚画布
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        render_buffer(&mut app, 60, 24);
+        assert_ne!(app.repl.top(), top, "图区以外照旧滚画布");
     }
 
     /// REPL 画布也有自己的滚动条：在画布右缘、点它只滚画布（消息流那份偏移一个数不动）。
