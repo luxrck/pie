@@ -235,7 +235,7 @@ impl App {
         let (tx, rx) = unbounded_channel();
         // 把会话事件接进 UI 主循环：监听者只往 channel 一丢（不阻塞回合）。
         // 订阅凭据挂在 `App` 上 —— 它一 drop 就退订，所以和 App 同寿。
-        let session_events = session.on({
+        let session_events = session.on("*", {
             let tx = tx.clone();
             move |event: &crate::event::Event| {
                 let ui = match event {
@@ -736,12 +736,12 @@ impl App {
             UiEvent::RetryDone { key } => self.clear_retry(&key),
             // 会话生命周期事件：TUI 暂不消费（回合结束仍走自己的 `TurnDone`）
             UiEvent::Session(_) => {}
-            UiEvent::Turn(TurnEvent::Reasoning(_)) => {
+            UiEvent::Turn(TurnEvent::ReasoningDelta { text: _ }) => {
                 self.settle_retry(); // 模型有响应了 = 重试成功
                 let since = *self.thought_started.get_or_insert_with(Instant::now);
                 self.activity = Activity::Thinking { since };
             }
-            UiEvent::Turn(TurnEvent::AssistantText(delta)) => {
+            UiEvent::Turn(TurnEvent::ContentDelta { text: delta }) => {
                 self.settle_retry(); // 模型开始出字 = 重试成功了
                 self.settle_thought();
                 // 首个正文增量：开一段「Responding」计时（⚠ 不能每个增量都重设，否则永远是 0.0s）
@@ -752,7 +752,7 @@ impl App {
                 }
                 Cell::push_assistant_text(&mut self.cells, &delta);
             }
-            UiEvent::Turn(TurnEvent::Answer(text)) => {
+            UiEvent::Turn(TurnEvent::Answer { text }) => {
                 self.settle_retry();
                 self.settle_thought();
                 Cell::push_assistant_text(&mut self.cells, &text);
@@ -774,15 +774,12 @@ impl App {
                 });
             }
             UiEvent::Turn(TurnEvent::ToolResult {
-                name,
-                content,
-                images,
-                ..
+                name, text, images, ..
             }) => {
                 // 被取消的工具回的是哨兵文本（不是 `[exit=]` 头）→ 标 ⏹ 而不是 ✓
-                let status = pane::tool_status(&content);
-                self.repl.on_tool_result(&name, &content, status, &images);
-                Cell::finish_tool(&mut self.cells, &name, status, &content);
+                let status = pane::tool_status(&text);
+                self.repl.on_tool_result(&name, &text, status, &images);
+                Cell::finish_tool(&mut self.cells, &name, status, &text);
                 self.activity = Activity::Tool {
                     since: Instant::now(),
                 };
@@ -1844,7 +1841,7 @@ mod tests {
         app.on_turn_event(call("repl", r#"{"code":"print(42)"}"#));
         app.on_turn_event(UiEvent::Turn(TurnEvent::ToolResult {
             name: "repl".into(),
-            content: "42".into(),
+            text: "42".into(),
             arguments: r#"{"code":"print(42)"}"#.into(),
             images: Vec::new(),
         }));
@@ -2570,7 +2567,9 @@ mod tests {
         assert!(flat.contains("模型列表请求失败"), "别人的块不动：{flat}");
 
         // 模型开始出字 = 重试成功 → 所有临时进度块都撤掉
-        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("好了".into())));
+        app.on_turn_event(UiEvent::Turn(TurnEvent::ContentDelta {
+            text: "好了".into(),
+        }));
         let flat = squash(&app.render_to_string(80, 24));
         assert!(!flat.contains('⟳'), "恢复后不留重试块：{flat}");
         assert!(flat.contains("好了"), "正文照常：{flat}");
@@ -3082,10 +3081,14 @@ mod tests {
         app.activity = Activity::Thinking {
             since: Instant::now(),
         };
-        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("第一".into())));
+        app.on_turn_event(UiEvent::Turn(TurnEvent::ContentDelta {
+            text: "第一".into(),
+        }));
         let started = since_of(&app).expect("第一个增量开表");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        app.on_turn_event(UiEvent::Turn(TurnEvent::AssistantText("第二".into())));
+        app.on_turn_event(UiEvent::Turn(TurnEvent::ContentDelta {
+            text: "第二".into(),
+        }));
         assert_eq!(since_of(&app), Some(started), "第二个增量不能把起点往后挪");
     }
 
@@ -3353,9 +3356,13 @@ mod tests {
     fn queued_turn_events_all_land_in_one_pass() {
         let (mut app, mut rx) = app_with_rx();
         for ev in [
-            TurnEvent::Reasoning("…".into()),
-            TurnEvent::AssistantText("正在".into()),
-            TurnEvent::AssistantText("改文件".into()),
+            TurnEvent::ReasoningDelta { text: "…".into() },
+            TurnEvent::ContentDelta {
+                text: "正在".into(),
+            },
+            TurnEvent::ContentDelta {
+                text: "改文件".into(),
+            },
             TurnEvent::ToolCall {
                 name: "edit".into(),
                 arguments: r#"{"path":"a.rs"}"#.into(),
@@ -3552,7 +3559,7 @@ mod tests {
             }));
             app.on_turn_event(UiEvent::Turn(TurnEvent::ToolResult {
                 name: "repl".into(),
-                content: "x".into(),
+                text: "x".into(),
                 arguments: args,
                 images: Vec::new(),
             }));

@@ -42,8 +42,10 @@
     （含压缩元数据），与 CLI 写下的会话可互读。
   - **一个 Session 同一时刻只跑一个回合**：回合进行中再调 ``aturn`` / 读属性会抛
     ``RuntimeError("session 正忙")``；**事件回调里不要碰同一个 Session**。
-  - **订阅事件有两种**：``turn(on_event=cb)`` 只管这一次回合；``session.on(cb)`` **跨回合**
-    （返回的 ``Subscription`` 要留着 —— 丢掉或 ``.close()`` 就退订），于是 ``set_model()`` /
+  - **订阅事件有两种**：``turn(on_event=cb)`` 只管这一次回合（收全部）；``session.on(kind, cb)``
+    **跨回合**、且**按事件名订**（``kind`` 就是 dict 里的 ``type``，``"*"`` = 全部）——
+    Rust 侧**不会为没订的事件建 dict**，所以只要某一两类时就分开订（尤其两个增量）。
+    返回的 ``Subscription`` 要留着 —— 丢掉或 ``.close()`` 就退订），于是 ``set_model()`` /
     ``clear_window()`` 这些回合之外的动作也收得到。两种的回调都跑在**发事件那条线程**上
     （回合期间是 Rust 侧的 worker），所以**别阻塞、别碰同一个 Session**。
 """

@@ -366,7 +366,7 @@ class Session:
     def stop(self) -> bool:
         """停住正在跑的回合；返回是否确实发过信号。"""
 
-    def on(self, callback: Callable[[dict[str, Any]], None]) -> Subscription:
+    def on(self, kind: str, callback: Callable[[dict[str, Any]], None]) -> Subscription:
         """**跨回合订阅**本会话的事件：`callback(event: dict)`，形状与 `turn(on_event=…)` 同一套。
 
         与 `turn(on_event=…)` 的区别：那个只管**这一次**回合；`on` 一直有效，直到丢掉返回的

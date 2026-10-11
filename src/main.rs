@@ -324,29 +324,23 @@ async fn run(cli: Cli) -> i32 {
     // `stream` 只影响到达时间）。
     let mode = cli.mode;
 
-    /// 一次性 / 会话模式的 stdout 打印（`--mode text` 时 stdout = 答案本身，shell 能直接接住；
-    /// `stream` 只影响到达时间）。注册到会话的事件总线上，见下面各分支里的 `session.on(..)`。
+    /// 一次性 / 会话模式的 stdout 打印（`--mode text` 时 stdout = 答案本身）。
+    ///
+    /// 只**订两类**事件（见下面各分支的 `session.on(..)`）：`content_delta`（流式正文增量）
+    /// 与 `answer`（非流式的最终答复）—— 工具活动与会话生命周期都不进 stdout，
+    /// 所以它们**压根不会到这儿**（曾经的 `[tNsM]` 日志已随 `Config.verbose` 删掉）。
     fn print_event(ev: &Event, mode: Mode) {
+        if mode != Mode::Text {
+            return; // `json` / `transcript` 由调用方最后一次性输出
+        }
         match ev {
-            Event::Turn(TurnEvent::AssistantText(delta)) => {
-                if mode == Mode::Text {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                }
+            Event::Turn(TurnEvent::ContentDelta { text: delta }) => {
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
             }
-            Event::Turn(TurnEvent::Reasoning(_)) => {}
-            // 非流式（`--no-stream`）时的最终答复：流式下走 AssistantText 增量，这里不会来
-            Event::Turn(TurnEvent::Answer(text)) => {
-                if mode == Mode::Text {
-                    println!("{text}");
-                }
-            }
-            // 工具活动不打印（stdout 只放结果；曾经的 `[tNsM]` / `[tool] …←…` 日志是 verbose 门控的，
-            // 已随 `Config.verbose` 一起删除）
-            Event::Turn(TurnEvent::ToolCall { .. }) | Event::Turn(TurnEvent::ToolResult { .. }) => {
-            }
-            // 会话生命周期（TurnStart/TurnDone/Compacted…）：一次性模式的 stdout 只放结果，不打印
-            Event::Session(_) => {}
+            // 非流式（`--no-stream`）时的最终答复：流式下走 ContentDelta 增量，这里不会来
+            Event::Turn(TurnEvent::Answer { text }) => println!("{text}"),
+            _ => {}
         }
     }
 
@@ -383,8 +377,9 @@ async fn run(cli: Cli) -> i32 {
                 }
             };
         }
-        // 事件出口：订阅本会话（`print_event` 只写 stdout，不阻塞回合）
-        let _printer = session.on(move |ev| print_event(ev, mode));
+        // 事件出口：只订两类（`print_event` 只写 stdout，不阻塞回合）
+        let _deltas = session.on("content_delta", move |ev| print_event(ev, mode));
+        let _answers = session.on("answer", move |ev| print_event(ev, mode));
         let answer = match session
             // `parallel_tools` 跟随配置（CLI 没有覆盖它的旗标）；`stream` 是**请求的属性**
             //（思考深度用客户端/配置的、`response_format` = text，其余走默认）
@@ -418,7 +413,8 @@ async fn run(cli: Cli) -> i32 {
     // 回合循环现在就在 `Session::aturn` 里（原 loop.rs 已并入）；
     // `--system-prompt` / `--append-system-prompt` 已通过 `apply_overrides` 进了 config
     let mut session = Session::ephemeral(&config, client, registry);
-    let _printer = session.on(move |ev| print_event(ev, mode));
+    let _deltas = session.on("content_delta", move |ev| print_event(ev, mode));
+    let _answers = session.on("answer", move |ev| print_event(ev, mode));
     match session
         .aturn(
             &task,

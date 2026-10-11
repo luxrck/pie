@@ -99,10 +99,10 @@ struct ThoughtClock {
 impl ThoughtClock {
     fn on(&mut self, ev: &TurnEvent) {
         match ev {
-            TurnEvent::Reasoning(_) => {
+            TurnEvent::ReasoningDelta { .. } => {
                 self.started.get_or_insert_with(std::time::Instant::now);
             }
-            TurnEvent::AssistantText(_) => {
+            TurnEvent::ContentDelta { .. } => {
                 if let Some(start) = self.started.take() {
                     self.ms = Some(start.elapsed().as_millis() as u64);
                 }
@@ -385,12 +385,17 @@ impl Session {
             .push(Message::assistant(format!("{ERROR_TURN_PREFIX}{err}")));
     }
 
-    /// 订阅本会话的事件（按注册顺序回调）。返回的凭据 **drop 即退订**。
+    /// 订阅本会话的事件（`name`：`"*"` = 全部，其余 = 只要这一类，见 [`Event::name`]）。
+    /// 返回的凭据 **drop 即退订**。
     ///
     /// ⚠ 监听者跑在**发事件的那条线程**上，`aturn` 期间 Session 还正被 `&mut` 借用 ——
     /// 所以监听者里别阻塞、更别碰同一个 `Session`（要异步就自己往 channel 里丢）。
-    pub fn on(&self, listener: impl Fn(&Event) + Send + Sync + 'static) -> Subscription {
-        self.bus.on(listener)
+    pub fn on(
+        &self,
+        name: &str,
+        listener: impl Fn(&Event) + Send + Sync + 'static,
+    ) -> Subscription {
+        self.bus.on(name, listener)
     }
 
     /// 请求取消当前回合（`Esc` 就是它）。
@@ -571,7 +576,9 @@ impl Session {
                 });
                 if !use_stream {
                     bus.send(
-                        Event::Turn(TurnEvent::Answer(answer.clone().unwrap_or_default())),
+                        Event::Turn(TurnEvent::Answer {
+                            text: answer.clone().unwrap_or_default(),
+                        }),
                         None,
                     );
                 }
@@ -671,7 +678,9 @@ impl Session {
                 if !use_stream {
                     // 非流式：正文从没被推过 → 用 answer 事件交出去（流式下已增量推过）
                     bus.send(
-                        Event::Turn(TurnEvent::Answer(answer.clone().unwrap_or_default())),
+                        Event::Turn(TurnEvent::Answer {
+                            text: answer.clone().unwrap_or_default(),
+                        }),
                         None,
                     );
                 }
@@ -741,7 +750,9 @@ impl Session {
             self.messages.push(Message::assistant(CANCEL_TEXT));
             if !use_stream {
                 bus.send(
-                    Event::Turn(TurnEvent::Answer(CANCEL_TEXT.to_string())),
+                    Event::Turn(TurnEvent::Answer {
+                        text: CANCEL_TEXT.to_string(),
+                    }),
                     None,
                 );
             }
@@ -773,17 +784,17 @@ impl Session {
             request_options,
             |chunk| match chunk {
                 // 先喂计时器（它是 `thought_ms` 的唯一来源），再交给调用方
-                ChunkEvent::Content(d) => {
-                    let ev = TurnEvent::AssistantText(d);
+                ChunkEvent::ContentDelta(d) => {
+                    let ev = TurnEvent::ContentDelta { text: d };
                     clock.on(&ev);
                     bus.send(ev.into(), None);
                 }
-                ChunkEvent::Reasoning(d) => {
-                    let ev = TurnEvent::Reasoning(d);
+                ChunkEvent::ReasoningDelta(d) => {
+                    let ev = TurnEvent::ReasoningDelta { text: d };
                     clock.on(&ev);
                     bus.send(ev.into(), None);
                 }
-                ChunkEvent::ToolCall { .. } => {}
+                ChunkEvent::ToolCallDelta { .. } => {}
             },
         );
         tokio::select! {
@@ -936,7 +947,7 @@ impl Session {
             bus.send(
                 Event::Turn(TurnEvent::ToolResult {
                     name: calls[index].function.name.clone(),
-                    content: finished.to_text().clone(),
+                    text: finished.to_text().clone(),
                     arguments: calls[index].function.arguments.clone(),
                     images: finished.canvas_images(),
                 }),
@@ -1811,7 +1822,7 @@ mod tests {
         Subscription,
     ) {
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sub = session.on({
+        let sub = session.on("*", {
             let got = std::sync::Arc::clone(&got);
             move |e: &Event| {
                 if let Event::Turn(t) = e {
@@ -1856,8 +1867,8 @@ mod tests {
             );
             // 完成顺序：最快的（three）先出结果 —— 证明真的并发，而不是串行跑完再补事件
             match &events[3] {
-                TurnEvent::ToolResult { content, .. } => {
-                    assert!(content.contains("three"), "{content}")
+                TurnEvent::ToolResult { text, .. } => {
+                    assert!(text.contains("three"), "{text}")
                 }
                 other => panic!("第 4 个事件该是结果：{other:?}"),
             }
@@ -1883,8 +1894,8 @@ mod tests {
             let events = events.lock().unwrap();
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
             match &events[2] {
-                TurnEvent::ToolResult { content, .. } => {
-                    assert!(content.contains("one"), "{content}")
+                TurnEvent::ToolResult { text, .. } => {
+                    assert!(text.contains("one"), "{text}")
                 }
                 other => panic!("第 3 个事件该是结果：{other:?}"),
             }
@@ -2018,16 +2029,16 @@ mod tests {
             let s = session();
             let (events, _sub) = collect_turn_events(&s);
             let outcomes = s.tool_call(&calls, true).await;
-            let text = outcomes[0].clone().expect("跑成功了");
+            let outcome = outcomes[0].clone().expect("跑成功了");
             assert!(
-                text.to_text().len() > 500,
+                outcome.to_text().len() > 500,
                 "工具输出本来就很长：{} 字",
-                text.to_text().len()
+                outcome.to_text().len()
             );
             let events = events.lock().unwrap();
             match &events[1] {
-                TurnEvent::ToolResult { content, .. } => {
-                    assert_eq!(content, &text.to_text(), "事件里的文本要原样（不截断）")
+                TurnEvent::ToolResult { text, .. } => {
+                    assert_eq!(text, &outcome.to_text(), "事件里的文本要原样（不截断）")
                 }
                 other => panic!("第 2 个事件该是结果：{other:?}"),
             }
@@ -2069,8 +2080,8 @@ mod tests {
             assert_eq!(event_kinds(&events), ["call", "call", "result", "result"]);
             for event in &events[2..] {
                 match event {
-                    TurnEvent::ToolResult { content, .. } => {
-                        assert_eq!(content.as_str(), CANCEL_TEXT)
+                    TurnEvent::ToolResult { text, .. } => {
+                        assert_eq!(text.as_str(), CANCEL_TEXT)
                     }
                     other => panic!("第 3/4 个事件该是结果：{other:?}"),
                 }
@@ -2910,7 +2921,7 @@ mod tests {
             // 会话生命周期事件也在这里收（这轮要断言的就是它们），所以不用 `collect_turn_events`
             let events: std::sync::Arc<std::sync::Mutex<Vec<Event>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let _sub = s.on({
+            let _sub = s.on("*", {
                 let events = std::sync::Arc::clone(&events);
                 move |e: &Event| events.lock().unwrap().push(e.clone())
             });

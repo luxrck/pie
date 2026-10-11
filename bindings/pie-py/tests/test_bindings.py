@@ -463,7 +463,7 @@ def test_stop_from_another_thread_aborts_the_turn(env):
 
 
 def test_on_subscribes_across_turns(env, tmp_path):
-    """`session.on(cb)` 是**跨回合**订阅：`set_model` / `clear_window` 这些回合**之外**的动作也收得到。
+    """`session.on(kind, cb)` 是**跨回合**订阅：`set_model` / `clear_window` 这些回合**之外**的动作也收得到。
 
     对比 `turn(on_event=…)`：那个只在这一次回合有效（监听者随回合结束一起注销）。
     """
@@ -472,7 +472,7 @@ def test_on_subscribes_across_turns(env, tmp_path):
     session = pie.Session.ephemeral(cfg, llm, tools)
 
     seen: list[dict] = []
-    sub = session.on(seen.append)
+    sub = session.on("*", seen.append)
     assert sub.closed is False
 
     # ① 回合**之外**的动作 —— `on_event=` 收不到，`on` 收得到
@@ -500,7 +500,7 @@ def test_on_subscribes_across_turns(env, tmp_path):
     assert len(seen) == before, "close() 之后不该再有事件"
 
     # ④ **丢掉引用**也等于退订（CPython 引用计数即时回收 → Rust 侧 Subscription drop）
-    keep = session.on(seen.append)
+    keep = session.on("*", seen.append)
     session.set_model("m3")
     assert len(seen) == before + 1
     del keep

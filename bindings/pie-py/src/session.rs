@@ -29,7 +29,7 @@ use tokio::sync::Mutex as TokioMutex;
 use pie::cancel::Cancel;
 use pie::context::CompactMode;
 use pie::event::{Event, EventBus, Subscription};
-use pie::session::{Session as CoreSession, TurnEvent};
+use pie::session::Session as CoreSession;
 
 use crate::config::PyConfig;
 use crate::llm::PyLlmClient;
@@ -331,7 +331,12 @@ impl PySession {
         true
     }
 
-    /// **跨回合订阅本会话的事件**：`on(callback)`，回调收到 dict（形状与 `turn(on_event=…)` 同一套）。
+    /// **跨回合订阅本会话的事件**：`on(kind, callback)`，回调收到 dict（形状与 `turn(on_event=…)` 同一套）。
+    ///
+    /// `kind` = **事件名**（就是 dict 里的 `type`：`content_delta` / `reasoning_delta` / `tool_call` /
+    /// `tool_result` / `answer` / `turn_start` / `turn_done` / `compacted` / `cleared` /
+    /// `model_changed` / `cwd_changed` / `start`），`"*"` = 全部。
+    /// 只要某几类就分别订 —— Rust 侧**根本不会为没订的事件建 dict**（尤其那两个增量）。
     ///
     /// 与 `turn(on_event=…)` 的区别：那个只在**这一次回合**有效；`on` 一直有效，直到你把返回的
     /// [`Subscription`] 丢掉（或 `.close()`）—— 所以 `set_model(..)` / `clear_window()` 这些
@@ -343,8 +348,8 @@ impl PySession {
     /// ⚠ 回调跑在**发事件那条线程**上（回合期间是 Rust 侧的 worker 线程）⇒
     /// ① 回调里**别阻塞**（会拖慢回合）；② 回调里**别碰同一个 Session**（回合正占着它）；
     /// ③ 回调抛异常**不会**传回调用方（`send` 无返回值），会打到 stderr——事件是旁路，不该带崩回合。
-    fn on(&self, callback: Py<PyAny>) -> PySubscription {
-        let sub = self.bus.on(move |event: &Event| {
+    fn on(&self, kind: &str, callback: Py<PyAny>) -> PySubscription {
+        let sub = self.bus.on(kind, move |event: &Event| {
             // 监听者是「发事件方」调用的，所以得现取 GIL（回到 Python 才能调回调）。
             let outcome = Python::attach(|py| -> PyResult<()> {
                 let dict = event_to_py(py, event)?;
@@ -411,7 +416,7 @@ impl PySession {
         // 订阅本会话的事件：监听者只往 std channel 一丢（`std::sync::mpsc::Sender::send` 是同步的，
         // 不会阻塞回合）。⚠ 凭据交给下面那个任务持有 —— 回合一结束它就 drop → `tx` 随之 drop →
         // 调用线程那侧的 `rx.recv()` 才会断开（否则这里会一直挂着等事件）。
-        let subscription = guard.on(move |event: &Event| {
+        let subscription = guard.on("*", move |event: &Event| {
             let _ = tx.send(event.clone());
         });
         let handle = crate::runtime().spawn(async move {
@@ -508,7 +513,7 @@ impl PySession {
         let sink_for_events = sink.clone_ref(py);
         let sink_end = sink;
         // 订阅本会话的事件（凭据随回合一起 drop）
-        let subscription = guard.on(move |event: &Event| {
+        let subscription = guard.on("*", move |event: &Event| {
             // 事件：只会「往 asyncio 队列里丢」，失败就当没发生（别把回合弄崩）
             let _ = Python::attach(|py| -> PyResult<()> {
                 let obj = event_to_py(py, event)?;
@@ -629,57 +634,28 @@ fn busy_error_or(msg: &str) -> PyErr {
 ///
 /// 回合事件手写映射（`content_delta` / `reasoning_delta` / `tool_call` / `tool_result` / `answer`）；
 /// 会话事件直接走 serde（`SessionEvent` 自带 `#[serde(tag = "type")]`，同一套扁平词表）。
+/// 事件 → Python dict：**规范形状由 serde 给**（`src/event.rs` 的 `#[serde(tag = "type")]`
+/// 是唯一事实来源——改那儿不会跟这儿漂）。只补两处 Python 侧更顺手的：
+/// `tool_call` / `tool_result` 的 `arguments` 给**解析后的 dict**，`tool_call` 另附 `arguments_raw` 原文。
 fn event_to_py(py: Python<'_>, event: &Event) -> PyResult<Py<PyAny>> {
-    let turn = match event {
-        Event::Turn(turn) => turn,
-        Event::Session(session) => {
-            let value = serde_json::to_value(session)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-            return crate::json_to_py(py, &value);
-        }
-    };
-    let dict = PyDict::new(py);
-    match turn {
-        TurnEvent::AssistantText(text) => {
-            dict.set_item("type", "content_delta")?;
-            dict.set_item("text", text)?;
-        }
-        TurnEvent::Reasoning(text) => {
-            dict.set_item("type", "reasoning_delta")?;
-            dict.set_item("text", text)?;
-        }
-        TurnEvent::ToolCall { name, arguments } => {
-            dict.set_item("type", "tool_call")?;
-            dict.set_item("name", name)?;
-            // `arguments` 给解析后的 dict，另附原文备查
-            dict.set_item("arguments", crate::json_to_py(py, &args_value(arguments))?)?;
-            dict.set_item("arguments_raw", arguments)?;
-        }
-        TurnEvent::ToolResult {
-            name,
-            content,
-            arguments,
-            images,
-        } => {
-            dict.set_item("type", "tool_result")?;
-            dict.set_item("name", name)?;
-            dict.set_item("text", content)?;
-            dict.set_item("arguments", crate::json_to_py(py, &args_value(arguments))?)?;
-            // 工具产出的图（本地路径；现在只有 `repl` 给）——留在后端看的，模型看不到
-            dict.set_item(
-                "images",
-                images
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>(),
-            )?;
-        }
-        TurnEvent::Answer(text) => {
-            dict.set_item("type", "answer")?;
-            dict.set_item("text", text)?;
+    let mut value = serde_json::to_value(event)
+        .map_err(|e| PyValueError::new_err(format!("事件序列化失败: {e}")))?;
+    if let Some(map) = value.as_object_mut() {
+        let kind = map
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let wants_args = kind == "tool_call" || kind == "tool_result";
+        if wants_args && let Some(raw) = map.get("arguments").and_then(Value::as_str) {
+            let raw = raw.to_string();
+            map.insert("arguments".into(), args_value(&raw));
+            if kind == "tool_call" {
+                map.insert("arguments_raw".into(), Value::String(raw));
+            }
         }
     }
-    Ok(dict.into_any().unbind())
+    crate::json_to_py(py, &value)
 }
 
 /// 工具参数是模型给的 JSON 字符串：能解析就用解析结果，否则退回 `{"raw": ...}`。

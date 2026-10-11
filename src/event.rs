@@ -24,42 +24,64 @@ use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------- 语义（回合 → 消费者）
 
-/// 回合过程中推给调用方的事件（TUI / CLI 边跑边渲染用）。
+/// 回合过程中推给调用方的事件（TUI / CLI / 绑定 / 扩展宿主边跑边消费）。
 ///
-/// 事件形状与绑定的 `on_event` dict 一一对应（`{"type": …}`）；`arguments` 传**原始 JSON 字符串**，
-/// 由消费者自己解析出「这次调的是哪个文件 / 命令」的摘要。
-#[derive(Debug, Clone)]
+/// **一份线上词汇表**：`#[serde(tag = "type", rename_all = "snake_case")]` 让变体名逐字变成
+/// 线上名（`ContentDelta` → `content_delta`）—— 所以**没有** per-variant rename，
+/// `Event::name()` 与 serde 的 `type` 自然一致（契约测试钉住）。
+/// 订阅时用的那个名字就是 `type` 的值。`arguments` 是**原始 JSON 字符串**，由消费者自己解析摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnEvent {
     /// 正文增量
-    AssistantText(String),
+    ContentDelta { text: String },
     /// 思考增量
-    Reasoning(String),
+    ReasoningDelta { text: String },
     /// 即将执行某个工具
     ToolCall { name: String, arguments: String },
     /// 工具执行完毕（按真实完成顺序推；`content` 是**原样**文本，不再截断——
     /// 少显示是展示层的事，见 `Session::tool_call`）
     ToolResult {
         name: String,
-        content: String,
+        /// 工具的输出正文（**原样**，不截断）——线上键名就是 `text`（与绑定那套 dict 一致）。
+        text: String,
         arguments: String,
         /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
         images: Vec<PathBuf>,
     },
     /// 最终答复。
     ///
-    /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `AssistantText` 增量
+    /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `ContentDelta` 增量
     /// 推过了，再推一次消费者会重复显示。
-    Answer(String),
+    Answer { text: String },
+}
+
+impl TurnEvent {
+    /// 线上名（= `type` 的值）。
+    pub fn name(&self) -> &'static str {
+        match self {
+            TurnEvent::ContentDelta { .. } => "content_delta",
+            TurnEvent::ReasoningDelta { .. } => "reasoning_delta",
+            TurnEvent::ToolCall { .. } => "tool_call",
+            TurnEvent::ToolResult { .. } => "tool_result",
+            TurnEvent::Answer { .. } => "answer",
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 传输增量（模型层内）
 
 /// 流式增量。`done` 不在这里——最终结果由 `stream()` 直接返回。
+///
+/// ⚠ 变体名一律带 `Delta`：这里的每一条都是**片段**，不是成品。
+/// 尤其是 `ToolCallDelta.arguments` 是「**本次收到的片段**」（要拼接），
+/// 而 [`TurnEvent::ToolCall`] 的 `arguments` 是**完整 JSON 串**（直接能 `from_str`）——
+/// 两个同名反义的字段曾经是个坑，靠名字分开。
 #[derive(Clone, Debug)]
 pub enum ChunkEvent {
-    Reasoning(String),
-    Content(String),
-    ToolCall {
+    ReasoningDelta(String),
+    ContentDelta(String),
+    ToolCallDelta {
         index: usize,
         id: String,
         name: String,
@@ -208,15 +230,60 @@ pub enum SessionEvent {
     Start { id: String, resume: bool },
 }
 
+impl SessionEvent {
+    /// 线上名（= `type` 的值）。
+    pub fn name(&self) -> &'static str {
+        match self {
+            SessionEvent::TurnStart { .. } => "turn_start",
+            SessionEvent::TurnDone { .. } => "turn_done",
+            SessionEvent::Compacted { .. } => "compacted",
+            SessionEvent::Cleared { .. } => "cleared",
+            SessionEvent::ModelChanged { .. } => "model_changed",
+            SessionEvent::CwdChanged { .. } => "cwd_changed",
+            SessionEvent::Start { .. } => "start",
+        }
+    }
+}
+
 /// **对外观察的统一信封**：所有事件都从这一个出口出去。
 ///
-/// 现在只有 `Turn` / `Session` 两支；将来拆 `ToolEvent` 时加一支、把工具搬出 `TurnEvent`。
-#[derive(Debug, Clone)]
+/// `#[serde(untagged)]`：序列化时**摊平**成内层（`{"type":"tool_call",…}`）—— 与绑定那套 dict、
+/// 与宿主协议同形（不会多一层 `{"type":"turn",…}`）。
+/// 订阅时按 [`Event::name`] 过滤。
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum Event {
     /// 回合内的事件（模型说话、工具活动）。
     Turn(TurnEvent),
     /// 会话生命周期。
     Session(SessionEvent),
+}
+
+impl Event {
+    /// 所有事件名（= 线上 `type` = 订阅用的 kind）。唯一事实来源是下面 `name()` 里那些字面量
+    /// —— 这里再列一遍是给**校验**用（订阅时拼错了就告警），契约测试钉住两者一致。
+    pub const NAMES: [&'static str; 12] = [
+        "content_delta",
+        "reasoning_delta",
+        "tool_call",
+        "tool_result",
+        "answer",
+        "turn_start",
+        "turn_done",
+        "compacted",
+        "cleared",
+        "model_changed",
+        "cwd_changed",
+        "start",
+    ];
+
+    /// 事件名（= 序列化出来的 `type` = 订阅时用的那个 kind）。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Event::Turn(event) => event.name(),
+            Event::Session(event) => event.name(),
+        }
+    }
 }
 
 impl From<TurnEvent> for Event {
@@ -248,8 +315,9 @@ pub struct EventBus {
     inner: Arc<BusInner>,
 }
 
-/// 一个监听者：`(id, 回调)`——id 供退订，回调按**注册顺序**被调用（见 [`EventBus::send`]）。
-type Listener = (u64, Arc<dyn Fn(&Event) + Send + Sync>);
+/// 一个监听者：`(id, 事件名过滤, 回调)`——id 供退订；过滤 `None` = 全部；
+/// 回调按**注册顺序**被调用（见 [`EventBus::send`]）。
+type Listener = (u64, Option<String>, Arc<dyn Fn(&Event) + Send + Sync>);
 
 #[derive(Default)]
 struct BusInner {
@@ -288,7 +356,7 @@ impl Drop for Subscription {
             return; // 总线已经没人持有了，本来就该一起没
         };
         let mut listeners = bus.listeners.write().unwrap_or_else(|e| e.into_inner());
-        listeners.retain(|(id, _)| *id != self.id);
+        listeners.retain(|(id, _, _)| *id != self.id);
     }
 }
 
@@ -298,14 +366,30 @@ impl EventBus {
     }
 
     /// 注册一个监听者（可以有多个，按**注册顺序**收到事件）。返回的凭据 drop 即退订。
-    pub fn on(&self, listener: impl Fn(&Event) + Send + Sync + 'static) -> Subscription {
+    /// 注册一个监听者（按**注册顺序**收到事件）。返回的凭据 drop 即退订。
+    ///
+    /// `name`：`"*"` = 全部；其余 = 只要这一类（值就是 [`Event::name`] / 线上 `type`）。
+    /// 拼错了（不在 [`Event::NAMES`] 里）会告警——那一类永远不会有事件，多半是手误。
+    pub fn on(
+        &self,
+        name: &str,
+        listener: impl Fn(&Event) + Send + Sync + 'static,
+    ) -> Subscription {
+        let filter = if name == "*" {
+            None
+        } else {
+            if !Event::NAMES.contains(&name) {
+                crate::log::warn(format!("事件名拼错了？订阅了一个不存在的事件：{name}"));
+            }
+            Some(name.to_string())
+        };
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut listeners = self
             .inner
             .listeners
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        listeners.push((id, Arc::new(listener)));
+        listeners.push((id, filter, Arc::new(listener)));
         Subscription {
             bus: Arc::downgrade(&self.inner),
             id,
@@ -332,13 +416,15 @@ impl EventBus {
     /// 先**快照**监听者表再调用：监听者在自己里面 `on` / drop 订阅时不会和这里抢锁
     /// （同线程持读锁再取写锁就是死锁）。
     fn dispatch(&self, event: &Event) {
+        let name = event.name();
         let listeners: Vec<_> = self
             .inner
             .listeners
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(_, listener)| Arc::clone(listener))
+            .filter(|(_, filter, _)| filter.as_deref().is_none_or(|want| want == name))
+            .map(|(_, _, listener)| Arc::clone(listener))
             .collect();
         for listener in listeners {
             listener(event);
@@ -392,7 +478,7 @@ mod tests {
         let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let mut subs = Vec::new();
         for tag in ["a", "b"] {
-            subs.push(bus.on({
+            subs.push(bus.on("*", {
                 let got = Arc::clone(&got);
                 move |e: &Event| {
                     if let Event::Session(SessionEvent::TurnStart { input }) = e {
@@ -449,10 +535,10 @@ mod tests {
         let inside = bus.clone();
         // 新订阅得**留下来**（否则 `on` 的返回值一 drop 就退订了）
         let kept: Arc<Mutex<Vec<Subscription>>> = Arc::new(Mutex::new(Vec::new()));
-        let _outer = bus.on({
+        let _outer = bus.on("*", {
             let kept = Arc::clone(&kept);
             move |_| {
-                kept.lock().unwrap().push(inside.on(|_| {}));
+                kept.lock().unwrap().push(inside.on("*", |_| {}));
             }
         });
         bus.send(
@@ -471,7 +557,7 @@ mod tests {
     fn non_blocking_send_delivers_off_thread_and_in_order() {
         let bus = EventBus::new();
         let got: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-        let _sub = bus.on({
+        let _sub = bus.on("*", {
             let got = Arc::clone(&got);
             move |e: &Event| {
                 if let Event::Session(SessionEvent::Cleared { count, .. }) = e {
@@ -495,5 +581,87 @@ mod tests {
         }
         let got = got.lock().unwrap().clone();
         assert_eq!(got, (0..64usize).collect::<Vec<_>>(), "少了或乱了：{got:?}");
+    }
+
+    /// 只订一个事件名：别的名字不进来（宿主 / 绑定靠这个关掉不需要的流量）。
+    #[test]
+    fn subscription_filters_by_name() {
+        let bus = EventBus::new();
+        let got: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let _sub = bus.on("tool_call", {
+            let got = Arc::clone(&got);
+            move |e: &Event| got.lock().unwrap().push(e.name())
+        });
+        bus.send(
+            Event::Turn(TurnEvent::ContentDelta { text: "x".into() }),
+            None,
+        );
+        bus.send(
+            Event::Turn(TurnEvent::ToolCall {
+                name: "read".into(),
+                arguments: "{}".into(),
+            }),
+            None,
+        );
+        assert_eq!(got.lock().unwrap().as_slice(), ["tool_call"]);
+    }
+
+    /// 契约：[`Event::name`] 必须与 serde 出来的 `type` **逐字一致**，且恰好覆盖 [`Event::NAMES`]。
+    ///
+    /// 词表只有一处定义（`name()` 里那些字面量）；这条是那张网——改名 / 加变体时忘了同步就会红。
+    #[test]
+    fn event_names_match_the_wire() {
+        let samples = vec![
+            Event::Turn(TurnEvent::ContentDelta { text: "x".into() }),
+            Event::Turn(TurnEvent::ReasoningDelta { text: "x".into() }),
+            Event::Turn(TurnEvent::ToolCall {
+                name: "read".into(),
+                arguments: "{}".into(),
+            }),
+            Event::Turn(TurnEvent::ToolResult {
+                name: "read".into(),
+                text: "ok".into(),
+                arguments: "{}".into(),
+                images: Vec::new(),
+            }),
+            Event::Turn(TurnEvent::Answer { text: "x".into() }),
+            Event::Session(SessionEvent::TurnStart { input: "x".into() }),
+            Event::Session(SessionEvent::TurnDone {
+                answer: "x".into(),
+                error: None,
+                elapsed_ms: 1,
+            }),
+            Event::Session(SessionEvent::Compacted {
+                level: 1,
+                path: PathBuf::from("/tmp/c"),
+                hash: "h".into(),
+            }),
+            Event::Session(SessionEvent::Cleared {
+                archived: PathBuf::from("/tmp/w"),
+                count: 1,
+            }),
+            Event::Session(SessionEvent::ModelChanged {
+                previous: "a".into(),
+                current: "b".into(),
+            }),
+            Event::Session(SessionEvent::CwdChanged {
+                to: PathBuf::from("/tmp"),
+            }),
+            Event::Session(SessionEvent::Start {
+                id: "s".into(),
+                resume: false,
+            }),
+        ];
+        let mut names: Vec<&str> = Vec::new();
+        for ev in &samples {
+            let wire = serde_json::to_value(ev).expect("序列化");
+            assert_eq!(wire["type"], ev.name(), "{ev:?}");
+            names.push(ev.name());
+        }
+        names.sort_unstable();
+        names.dedup();
+        let mut known = Event::NAMES.to_vec();
+        known.sort_unstable();
+        assert_eq!(names, known, "name() 与 Event::NAMES 要对得上，且一个不漏");
     }
 }

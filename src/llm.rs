@@ -1113,12 +1113,12 @@ impl StreamState {
         if let Some(r) = delta.reasoning_content.filter(|s| !s.is_empty()) {
             self.reasoning.push_str(&r);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(ChunkEvent::Reasoning(r));
+            on_chunk(ChunkEvent::ReasoningDelta(r));
         }
         if let Some(c) = delta.content.filter(|s| !s.is_empty()) {
             self.content.push_str(&c);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(ChunkEvent::Content(c));
+            on_chunk(ChunkEvent::ContentDelta(c));
         }
         for tc in delta.tool_calls.unwrap_or_default() {
             let index = tc.index.unwrap_or(0) as usize;
@@ -1135,7 +1135,7 @@ impl StreamState {
             }
             slot.function.arguments.push_str(&arguments);
             emitted.store(true, Ordering::Relaxed);
-            on_chunk(ChunkEvent::ToolCall {
+            on_chunk(ChunkEvent::ToolCallDelta {
                 index,
                 id: slot.id.clone(),
                 name: slot.function.name.clone(),
