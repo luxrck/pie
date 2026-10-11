@@ -902,7 +902,7 @@ def test_tool_schema_shape_is_stable():
     assert list(pie.tool()(hidden).parameters["properties"]) == ["x"]
 
     # `@tool` **裸用**（不带括号）= 直接当装饰器用：以前会把函数当 `name` → 返回 `decorate`
-    # 而不是 `Tool` → 调用方（pytool 宿主 / 绑定）只挑 `Tool` 实例，工具**静默消失**
+    # 而不是 `Tool` → 调用方（pyplugin 宿主 / 绑定）只挑 `Tool` 实例，工具**静默消失**
     def bare(q: str) -> str:
         """裸用的工具"""
         return q
@@ -915,7 +915,7 @@ def test_tool_schema_shape_is_stable():
     async def a(x: str) -> str:
         return x
 
-    # async 现在**能**装饰（pytool 宿主有后台 loop，会跑协程）；**绑定跑不了** → 在
+    # async 现在**能**装饰（pyplugin 宿主有后台 loop，会跑协程）；**绑定跑不了** → 在
     # `register(...)` 那一步拦（见 test_register_validates_name_duplicate_and_async）
     assert pie.tool(a).handler is a
 
@@ -979,7 +979,7 @@ def test_register_validates_name_duplicate_and_async(env):
 
     with pytest.raises(ValueError, match="async"):
         tools.register(name="a", handler=a)
-    # 装饰器现在**收** async（pytool 宿主有后台 loop 能跑协程）；绑定跑不了 → 注册那一步拦
+    # 装饰器现在**收** async（pyplugin 宿主有后台 loop 能跑协程）；绑定跑不了 → 注册那一步拦
     decorated = pie.tool(a)
     with pytest.raises(ValueError, match="async"):
         tools.register(decorated)

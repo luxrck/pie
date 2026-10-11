@@ -1,9 +1,9 @@
-//! 长活 Python 宿主的**传输 + 进程生命周期**（`repl` 与 `pytool` 共用；将来的扩展宿主也走它）。
+//! 长活 Python 宿主的**传输 + 进程生命周期**（`repl` 与 `pyplugin` 共用；将来的扩展宿主也走它）。
 //!
 //! 形状：一个子进程 + **一行一条 JSON**（一问一答、靠 `id` 配对、**应答可乱序**）：
 //!
 //! ```text
-//! stdout 第一行  ← 清单（驱动自己给：`repl` 给 `{}`，`pytool` 给 {"tools":[…]}
+//! stdout 第一行  ← 清单（驱动自己给：`repl` 给 `{}`，`pyplugin` 给 {"tools":[…]}
 //! stdin  每行    → {"id":N, …}
 //! stdout 之后    ← {"id":N, …}
 //! ```
@@ -40,7 +40,7 @@ use crate::cancel::{self, Cancel};
 /// 启动期等清单的上限：驱动卡在 import 时别把 `pie` 也拖住。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 默认解释器：Unix `python3`，其它 `python`（`repl` / `pytool` 共用同一份）。
+/// 默认解释器：Unix `python3`，其它 `python`（`repl` / `pyplugin` 共用同一份）。
 #[cfg(unix)]
 pub const DEFAULT_PYTHON: &str = "python3";
 #[cfg(not(unix))]
@@ -58,7 +58,7 @@ pub struct Spec {
     pub python: String,
     /// 驱动正文（`-c` 传进去；官方的用 `include_str!` 嵌，测试传假驱动）。
     pub driver: String,
-    /// 交给驱动的文件（`pytool` 的工具文件；`repl` 空）。
+    /// 交给驱动的文件（`pyplugin` 的工具文件；`repl` 空）。
     pub files: Vec<PathBuf>,
     /// 额外环境变量（`PIE_TRANSCRIPT` 之类）。
     pub env: Vec<(String, String)>,
@@ -115,7 +115,7 @@ pub struct PyHost {
     /// `Arc` 是为了让**读线程**也能写 —— 宿主发来的 `call` 帧由读线程接、回执也得由它写
     /// （那两个方向共用这根管道）。
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
-    /// 宿主主动发起的调用交给它（`pytool` 在 `load` 时挂；`repl` 没有 → 回一条错误）。
+    /// 宿主主动发起的调用交给它（`pyplugin` 在 `load` 时挂；`repl` 没有 → 回一条错误）。
     ///
     /// `OnceLock` 而不是 `Option`：挂的时候 `start` 已经跑过了（首行清单读完才知道要不要挂），
     /// 读线程拿的是 `Arc` clone → 后挂也生效。
@@ -155,7 +155,7 @@ impl PyHost {
         &self.spec.label
     }
 
-    /// 挂上「宿主主动发起的调用」的处理器（`pytool` 用；不挂 → 那种帧回一条错误）。
+    /// 挂上「宿主主动发起的调用」的处理器（`pyplugin` 用；不挂 → 那种帧回一条错误）。
     pub fn set_call_handler(&self, handler: CallHandler) {
         let _ = self.on_call.set(handler);
     }

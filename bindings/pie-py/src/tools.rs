@@ -89,7 +89,7 @@ impl PyRegistry {
     /// 不打断整个回合。
     ///
     /// ⚠ 三条纪律：
-    ///   1. handler 得是**同步**函数（绑定这条链是同步调用它；`async def` 只有 pytool 宿主能跑）；
+    ///   1. handler 得是**同步**函数（绑定这条链是同步调用它；`async def` 只有 pyplugin 宿主能跑）；
     ///   2. 它跑在 runtime 的 worker 线程上、期间持有 GIL —— 别在里面等别的线程；
     ///   3. **别在 handler 里碰同一个 Session**（会拿到「session 正忙」，那是防死锁）。
     #[pyo3(signature = (tool=None, *, name=None, description=None, parameters=None, handler=None))]
@@ -139,7 +139,7 @@ impl PyRegistry {
             return Err(PyValueError::new_err(
                 format!(
                     "工具 {name:?} 是 async 函数：绑定是同步调用 handler 的（拿到的会是个没 await 的协程）"
-                ) + "——写成同步函数，或把工具文件交给 `pie` 二进制的 pytool（`~/.pie/plugins/`）跑",
+                ) + "——写成同步函数，或把工具文件交给 `pie` 二进制的 pyplugin（`~/.pie/plugins/`）跑",
             ));
         }
         let parameters_json = crate::py_to_json(&parameters)?;

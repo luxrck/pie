@@ -5,7 +5,7 @@
 下划线开头的参数（注入项）不进 schema；描述取 `description` → docstring 首行 → 函数名。
 三种写法都行：`@tool`（裸用）/ `@tool()` / `@tool(name="…", description="…")`。
 
-`async def` 也**能**装饰：`pytool` 宿主有后台 loop，会跑协程（同步 handler 仍走线程池）。
+`async def` 也**能**装饰：`pyplugin` 宿主有后台 loop，会跑协程（同步 handler 仍走线程池）。
 **绑定**跑不了协程，所以它那边的 `Registry.register(...)` 会在注册那一步拦。
 """
 
@@ -89,7 +89,7 @@ def tool(
     """
 
     # `@tool` 裸用（不带括号）时 Python 把被装饰的函数当**第一个位置参数**递进来。
-    # 不认这一种会返回 `decorate` 而不是 `Tool`：调用方（pytool 宿主 / 绑定）只挑 `Tool` 实例，
+    # 不认这一种会返回 `decorate` 而不是 `Tool`：调用方（pyplugin 宿主 / 绑定）只挑 `Tool` 实例，
     # 于是那个工具**静默消失**（连一条告警都没有），而且裸用还顺带跳过了下面那道 async 检查。
     # 真踩过 —— 所以裸用必须认。
     direct = name if name is not None and not isinstance(name, str) else None

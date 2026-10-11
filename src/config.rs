@@ -577,7 +577,7 @@ impl Default for CompactionConfig {
 }
 
 /// `[python]` 段：Python 相关的东西放一处 —— `interpreter` 给 `repl`（`_python` 的默认值）
-/// 与 Python 工具宿主（`pytool`）**共用**：指向同一个 venv，工具里装了的包 repl 里也就有。
+/// 与 Python 工具宿主（`pyplugin`）**共用**：指向同一个 venv，工具里装了的包 repl 里也就有。
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct PythonConfig {
@@ -625,7 +625,7 @@ pub struct Config {
     pub theme: String,
     /// 按工具名设默认私有参数（下划线开头，不进 schema）。
     pub tools: HashMap<String, toml::Value>,
-    /// `[python]`：解释器 + 用 Python 写的工具（见 `crate::pytool`）。
+    /// `[python]`：解释器 + 用 Python 写的工具（见 `crate::pyplugin`）。
     pub python: PythonConfig,
     pub tui: TuiConfig,
     pub files_api: bool,
@@ -747,7 +747,7 @@ impl Config {
             .entry("_max_image_bytes".to_string())
             .or_insert(toml::Value::Integer(image_cap));
         // `[python] interpreter`（没显式写就用 `envs/base`）→ `repl` 的 `_python` 默认值：
-        // 一处配置，两处消费（repl 与 pytool 宿主）。用户在 `[tools.repl] _python` 里显式写了就听用户的。
+        // 一处配置，两处消费（repl 与 pyplugin 宿主）。用户在 `[tools.repl] _python` 里显式写了就听用户的。
         if let Some(interpreter) = self.python_interpreter() {
             out.entry("repl".to_string())
                 .or_default()
@@ -765,7 +765,7 @@ impl Config {
     /// 解释器解析顺序：显式 `[python] interpreter` → `envs/base`（**存在才算**，`pie setup` 建的）
     /// → `None`（= 各消费者自己的默认：`python3` / Windows `python`）。
     ///
-    /// `repl` 的 `_python` 与 Python 工具宿主都取它（见 [`Self::tool_defaults`] 与 `crate::pytool`）
+    /// `repl` 的 `_python` 与 Python 工具宿主都取它（见 [`Self::tool_defaults`] 与 `crate::pyplugin`）
     /// —— 一处配置、两处消费，也是「工具里 import 得到的包 repl 里也 import 得到」的实现。
     pub fn python_interpreter(&self) -> Option<String> {
         if let Some(explicit) = &self.python.interpreter {

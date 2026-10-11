@@ -19,7 +19,7 @@ use crate::state::SessionState;
 
 /// 输出上限：工具的私有参数 `_max_lines` / `_max_bytes` 的形状。
 ///
-/// 包一层是因为 `bash` / `repl` / `pytool` 都成对持有它，而 `fit(full, a, b)` 里两个
+/// 包一层是因为 `bash` / `repl` / `pyplugin` 都成对持有它，而 `fit(full, a, b)` 里两个
 /// `Option<i64>` 传反了编译器不会报错。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Limits {
@@ -1170,7 +1170,7 @@ impl std::fmt::Debug for Plugin {
 pub struct Registry {
     plugins: Vec<Plugin>,
     defaults: HashMap<String, toml::Table>,
-    /// 进程级插件声明的**事件订阅**（`pytool::load` 从清单里读出来）——
+    /// 进程级插件声明的**事件订阅**（`pyplugin::load` 从清单里读出来）——
     /// `Session` 建好后把它们挂到自己的事件总线上。
     extensions: Vec<ExtensionHook>,
     /// **会话动作路由**：`session_id` → 那个会话的动作入口（`Session::attach_extensions` 登记）。
@@ -1219,7 +1219,7 @@ impl Registry {
         }
     }
 
-    /// 带上插件的**事件订阅**（`pytool::load` 装完工具后调）。
+    /// 带上插件的**事件订阅**（`pyplugin::load` 装完工具后调）。
     pub fn with_extensions(mut self, extensions: Vec<ExtensionHook>) -> Self {
         self.extensions = extensions;
         self
@@ -1421,7 +1421,7 @@ impl std::fmt::Debug for ToolHandle {
 ///
 /// 解析优先级：内置工具名 > Python 工具名 > shell 子命令。
 ///   - 名字 ∈ 内置（read/edit/writ/bash/repl）→ 启用该工具；
-///   - 名字 ∈ `registry` 里动态注册的 Python 工具（`pytool::load` 装进来的）→ 启用它；
+///   - 名字 ∈ `registry` 里动态注册的 Python 工具（`pyplugin::load` 装进来的）→ 启用它；
 ///   - 其他名字 → 收集成 shell 允许的子命令白名单，并隐式启用**受限 shell**；
 ///   - 未显式列 shell 且没有任何非内置名 → shell 工具禁用。
 ///
@@ -1429,12 +1429,12 @@ impl std::fmt::Debug for ToolHandle {
 /// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash（当 `ls`/`grep` 不是已注册的
 /// Python 工具时）；`"ls,grep"` → 仅受限 bash。
 ///
-/// 传进来的 `registry` 是**全量**（内置 + Python 工具，见 `pytool::load`）：
+/// 传进来的 `registry` 是**全量**（内置 + Python 工具，见 `pyplugin::load`）：
 /// 「一个非内置名字是 Python 工具还是 shell 子命令」得先知道 Python 工具都叫什么。
 pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
     const BUILTINS: [&str; 5] = ["read", "edit", "writ", "bash", "repl"];
 
-    let pytools: Vec<&str> = registry
+    let pyplugins: Vec<&str> = registry
         .names()
         .into_iter()
         .filter(|n| !BUILTINS.contains(n))
@@ -1450,7 +1450,7 @@ pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
             if !enabled.contains(&name) {
                 enabled.push(name);
             }
-        } else if pytools.contains(&token) {
+        } else if pyplugins.contains(&token) {
             if !enabled_py.iter().any(|n| n == token) {
                 enabled_py.push(token.to_string());
             }

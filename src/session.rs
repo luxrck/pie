@@ -723,7 +723,7 @@ impl Session {
                     }
                 };
                 let name = call.function.name.as_str();
-                // 工具自带落盘（bash / repl / pytool 超限）→ 消息**进历史前**就带上原文指针（工具级），
+                // 工具自带落盘（bash / repl / pyplugin 超限）→ 消息**进历史前**就带上原文指针（工具级），
                 // 并同步一条压缩流水（gc 靠它保住那份落盘原文）。
                 // ⚠ 只有真落了盘才设：`compact_tools` 靠 `compaction.is_some()` 跳过「已压过」的
                 // 消息，没落盘却设一段元数据会让工具级压缩永远压不动（曾经就是无条件标）。
@@ -1596,7 +1596,7 @@ impl Session {
         session
     }
 
-    /// 把 `Registry` 里带的插件订阅挂到本会话的事件总线上（`pytool::load` 装进来的）。
+    /// 把 `Registry` 里带的插件订阅挂到本会话的事件总线上（`pyplugin::load` 装进来的）。
     ///
     /// 为什么不在 `Registry` 里就把回调挂上：宿主是**进程级**的（多个会话复用），订阅是
     /// **会话级**的 —— 只有会话建好了才知道「现在是谁」。凭据存进 [`Session::extensions`] 保活。
@@ -1634,7 +1634,7 @@ impl Session {
     /// 改配置 / 压缩都不会把序列弄乱）。立即档（`cancel`）走不到这儿：它在 [`crate::action::Actions`]
     /// 里当场就办了。
     ///
-    /// `pub(crate)`：`pytool` 的集成测试靠它把「真插件排的队」推到 apply point（那一端不许走
+    /// `pub(crate)`：`pyplugin` 的集成测试靠它把「真插件排的队」推到 apply point（那一端不许走
     /// `aturn` —— 测试里不能真发模型请求）。
     pub(crate) fn drain_actions(&mut self) {
         for MethodCall { method, args } in self.actions.take() {

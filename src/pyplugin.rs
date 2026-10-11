@@ -1,4 +1,4 @@
-//! `pytool` —— **用 Python 写的工具**：起一个长活的 Python 宿主子进程，把它的工具注册进
+//! `pyplugin` —— **用 Python 写的工具**：起一个长活的 Python 宿主子进程，把它的工具注册进
 //! [`Registry`]（与内置工具、Python 绑定注册的工具共用同一条分发链）。
 //!
 //! 为什么是子进程而不是嵌 CPython：不内嵌 → **零新依赖、默认构建行为不变**（没配
@@ -13,7 +13,7 @@
 //!   - **同步 / 异步 handler 都能装**：同步的跑在宿主的线程池里，`async def` 跑在宿主那个
 //!     后台 loop 上（跨调用共享连接池）；本侧只管「写一行等一行」，两种都一样；
 //!   - **宿主用真绑定**（`from pie import tool`）：那个解释器里得装着 `pie`（工具里的 `@tool` 就是它
-//!     提供的）。不内嵌副本 → 实现只有一处、不会与绑定分叉；代价是 pytool 不再「零安装」。
+//!     提供的）。不内嵌副本 → 实现只有一处、不会与绑定分叉；代价是 pyplugin 不再「零安装」。
 //!   - 取消（Esc）= 按进程组 `SIGKILL`（`pyhost` 的 `Interrupt::Kill`）→ 在飞的调用一起失败
 //!     → **下次调用懒重启**；
 //!   - 任何失败（起不来 / 导入错 / 重名 / 名字非法）都只告警、不阻断会话。
@@ -45,7 +45,7 @@ use crate::tools::{
 ///
 /// ⚠ 宿主**依赖真绑定**（`from pie import tool`）—— 不再内嵌 `_tool.py` / `_llm.py` 的副本：
 /// 实现只有绑定那一处，不会分叉（用户拍板：宁可装真包，也不要两份代码）。
-const HOST: &str = include_str!("python/pytool_host.py");
+const HOST: &str = include_str!("python/pyplugin_host.py");
 
 /// 装载 Python 工具：起宿主、读清单、逐个注册。**任何失败都只告警**，原样返回 `registry`。
 ///
@@ -59,14 +59,14 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     let python = config
         .python_interpreter()
         .unwrap_or_else(|| DEFAULT_PYTHON.to_string());
-    let mut spec = Spec::new("pytool", &python, HOST);
+    let mut spec = Spec::new("pyplugin", &python, HOST);
     spec.files = files;
     // 子进程 stderr（工具里的 print / traceback）→ 逐行告警；尾巴也会附在出错的消息里
-    spec.stderr_prefix = Some("pytool".to_string());
+    spec.stderr_prefix = Some("pyplugin".to_string());
     let (host, manifest) = match PyHost::start(&spec).await {
         Ok(ok) => ok,
         Err(e) => {
-            // `PyHost` 的消息已经带 `[pytool]` 前缀
+            // `PyHost` 的消息已经带 `[pyplugin]` 前缀
             crate::log::warn(e);
             return registry;
         }
@@ -74,12 +74,12 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     let handshake: Handshake = match serde_json::from_value(manifest) {
         Ok(handshake) => handshake,
         Err(e) => {
-            crate::log::warn(format!("[pytool] 清单不是预期的形状: {e}"));
+            crate::log::warn(format!("[pyplugin] 清单不是预期的形状: {e}"));
             return registry;
         }
     };
     for warning in &handshake.warnings {
-        crate::log::warn(format!("[pytool] {warning}"));
+        crate::log::warn(format!("[pyplugin] {warning}"));
     }
     // 宿主**主动发起**的调用（插件里 `S.set_model(…)` 那种）→ 按帧里的 `session_id` 路由到会话。
     // 会话建好时会把自己的动作入口登记进 `Registry`（见 `Session::attach_extensions`）；
@@ -118,7 +118,7 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     for spec in handshake.tools {
         if !valid_tool_name(&spec.name) {
             crate::log::warn(format!(
-                "[pytool] 跳过非法工具名 {:?}：只能用 [A-Za-z0-9_-]、长度 1..=64（API 的 function.name 要求）",
+                "[pyplugin] 跳过非法工具名 {:?}：只能用 [A-Za-z0-9_-]、长度 1..=64（API 的 function.name 要求）",
                 spec.name
             ));
             continue;
@@ -126,7 +126,7 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
         // `with_dynamic` 撞重名会 panic（那是 Rust 侧注册的编程错误）——外部来的名字必须自己挡
         if registry.names().contains(&spec.name.as_str()) {
             crate::log::warn(format!(
-                "[pytool] 跳过重名工具 {}（与已有工具同名）",
+                "[pyplugin] 跳过重名工具 {}（与已有工具同名）",
                 spec.name
             ));
             continue;
@@ -164,7 +164,7 @@ fn deliver(host: &PyHost, event: &crate::event::Event, ctx: &Value) -> Result<()
     let value = match crate::event::to_wire(event) {
         Ok(value) => value,
         Err(e) => {
-            crate::log::warn(format!("[pytool] 事件序列化失败: {e}"));
+            crate::log::warn(format!("[pyplugin] 事件序列化失败: {e}"));
             return Ok(());
         }
     };
@@ -174,14 +174,14 @@ fn deliver(host: &PyHost, event: &crate::event::Event, ctx: &Value) -> Result<()
     // 多线程（`Runtime::new()` / `new_multi_thread()`），单线程 runtime 下只能放弃投递（放行 + 告警）。
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         crate::log::warn(format!(
-            "[pytool] 没有 runtime，{} 事件没发给插件",
+            "[pyplugin] 没有 runtime，{} 事件没发给插件",
             event.name()
         ));
         return Ok(());
     };
     if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
         crate::log::warn(format!(
-            "[pytool] 单线程 runtime 下不投递事件（{}），这次当通过",
+            "[pyplugin] 单线程 runtime 下不投递事件（{}），这次当通过",
             event.name()
         ));
         return Ok(());
@@ -242,13 +242,13 @@ async fn call(host: &PyHost, tool: &str, args: Value, ctx: ToolCtx) -> ToolResul
     {
         Ok(Outcome::Reply(value)) => match serde_json::from_value::<Reply>(value) {
             Ok(reply) => reply.into_result(&ctx, max_lines, max_bytes),
-            Err(e) => Err(ToolError(format!("[pytool] 应答不是预期的形状: {e}"))),
+            Err(e) => Err(ToolError(format!("[pyplugin] 应答不是预期的形状: {e}"))),
         },
         // 取消 = 杀掉整个进程组（在飞的含本次一起失败，下次调用懒重启）——
         // 不做「中断单次调用但保住状态」，那要把中断协议搬进 Python，不值。
         Ok(Outcome::Cancelled) => Ok(ToolOutput::text(CANCEL_TEXT)),
-        // pytool 没设超时，这条路上不该出现
-        Ok(Outcome::TimedOut) => Err(ToolError("[pytool] 宿主超时".to_string())),
+        // pyplugin 没设超时，这条路上不该出现
+        Ok(Outcome::TimedOut) => Err(ToolError("[pyplugin] 宿主超时".to_string())),
         Err(e) => Err(ToolError(e)),
     }
 }
@@ -268,14 +268,16 @@ fn files_of(entries: &[String]) -> Vec<PathBuf> {
                         .collect();
                     found.sort();
                     if found.is_empty() {
-                        crate::log::warn(format!("[pytool] 目录里没有 *.py：{}", path.display()));
+                        crate::log::warn(format!("[pyplugin] 目录里没有 *.py：{}", path.display()));
                     }
                     out.append(&mut found);
                 }
-                Err(e) => crate::log::warn(format!("[pytool] 读不了目录 {}: {e}", path.display())),
+                Err(e) => {
+                    crate::log::warn(format!("[pyplugin] 读不了目录 {}: {e}", path.display()))
+                }
             },
             Ok(_) => out.push(path),
-            Err(e) => crate::log::warn(format!("[pytool] 找不到 {}: {e}", path.display())),
+            Err(e) => crate::log::warn(format!("[pyplugin] 找不到 {}: {e}", path.display())),
         }
     }
     out
@@ -303,7 +305,7 @@ struct ToolSpec {
     parameters: Option<Value>,
 }
 
-/// 宿主首行清单（`pytool_host.py` 给的形状）。
+/// 宿主首行清单（`pyplugin_host.py` 给的形状）。
 #[derive(Default, Deserialize)]
 struct Handshake {
     #[serde(default)]
@@ -416,8 +418,8 @@ session.on("tool_call", no_rm)
 
     impl Fixture {
         fn new(name: &str, body: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("pie-pytool-test-{}-{name}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("pie-pyplugin-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("tools.py"), body).unwrap();
@@ -445,7 +447,7 @@ session.on("tool_call", no_rm)
                 crate::config::Storage::at(self.dir.join("storage")),
                 Arc::new(crate::state::SessionState::default()),
             )
-            .named("pytool")
+            .named("pyplugin")
         }
     }
 
@@ -1021,7 +1023,7 @@ def fine() -> str:
     /// 目录展开：只取 `*.py`、不递归、排过序；`~` 会展开。
     #[test]
     fn files_of_expands_directories_and_tilde() {
-        let dir = std::env::temp_dir().join(format!("pie-pytool-files-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pie-pyplugin-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("b.py"), "").unwrap();

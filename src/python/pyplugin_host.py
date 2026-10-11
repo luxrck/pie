@@ -1,5 +1,5 @@
 # pie 的 Python 工具宿主：由二进制以 `python -X utf8 -u -c "<本文件正文>" <工具文件…>` 启动
-# （`rust` 侧见 `pytool.rs`）。
+# （`rust` 侧见 `pyplugin.rs`）。
 #
 # 协议：一行一个 JSON，一问一答；**应答可乱序**（并发跑在线程池里），靠 `id` 配对。
 #   stdout 第一行  ← {"tools":[…], "extensions":{"subscribe":["tool_call",…]}, "warnings":[…]}
@@ -58,7 +58,7 @@ try:
     from pie import Tool, tool
 except ImportError:
     print(
-        "pytool 需要 Python 绑定 `pie`（工具里的 @tool 就是它提供的）：请把它装进 %s"
+        "pyplugin 需要 Python 绑定 `pie`（工具里的 @tool 就是它提供的）：请把它装进 %s"
         % sys.executable,
         file=sys.stderr,
     )
@@ -73,7 +73,7 @@ _MAX_WORKERS = 8
 # `run_coroutine_threadsafe` 把协程递过去。共享一份 loop = 跨调用复用 client / 连接池。
 # ⚠ async handler 里别干重的 CPU 活（那是单线程，会把别的 async 调用一起卡住）。
 _LOOP = asyncio.new_event_loop()
-threading.Thread(target=_LOOP.run_forever, daemon=True, name="pie-pytool-loop").start()
+threading.Thread(target=_LOOP.run_forever, daemon=True, name="pie-pyplugin-loop").start()
 
 
 class _Proxy:
