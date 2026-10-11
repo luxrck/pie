@@ -380,7 +380,7 @@ impl Host {
                 // 杀掉整个进程组：在飞的（含本次）一起失败，下次调用懒重启。
                 // 不做「中断单次调用但保住状态」——那要把中断协议搬进 Python，不值。
                 self.pending.lock().unwrap().remove(&id);
-                kill_group(pid);
+                crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
                 if let Some(p) = self.proc.lock().await.as_ref() {
                     p.alive.store(false, Ordering::SeqCst);
                 }
@@ -454,16 +454,6 @@ async fn reader_loop(
         .unwrap()
         .retain(|_, (gen_of, _)| *gen_of != generation);
     drop(child); // 回收（kill_on_drop 也在这里兜底杀掉）
-}
-
-/// 给子进程**组**发 SIGKILL（非 Unix 上是空操作）——与 `bash` / `repl` 同款：
-/// 只杀宿主会让它启动的孙进程变成孤儿并继续持有管道。
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    if pid != 0 {
-        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-    }
-    let _ = pid;
 }
 
 /// 测试用真解释器 + 临时工具文件跑（没找到能用的就跳过，与 `repl` 的测试同款）。

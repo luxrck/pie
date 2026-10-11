@@ -1,8 +1,11 @@
-//! 回合取消信号（TUI 的 `Esc`；`aturn` 的 `cancel` 形参也能外部触发）。
+//! 回合取消信号（TUI 的 `Esc`；`aturn` 的 `cancel` 形参也能外部触发）+ 杀**进程组**的原语。
 //!
-//! 一个很薄的东西：`AtomicBool`（随时可问「取消了没」）+ `Notify`（取消时唤醒正在等的人）。
+//! 取消信号本身是一个很薄的东西：`AtomicBool`（随时可问「取消了没」）+ `Notify`（取消时唤醒正在等的人）。
 //! 放在模块顶层是因为**三层都要用**：`session`（回合循环）、`llm`（请求 race）、`tools`（shell 杀进程组）；
 //! 塞进任何一层都会让另外两层反向依赖它。
+//!
+//! `kill_group` / 两个信号常量就挨着它放：三个起子进程的地方（`bash` / `repl` / `pytool`）**都要**
+//! 「独立进程组 + 按组杀」，而且都踩过同一个坑（见下）—— 字面量散在三处只会漂。
 //!
 //! `Clone` 是共享语义（内部 `Arc`），所以能随手发给工具、传给等待点。
 
@@ -13,6 +16,30 @@ use tokio::sync::Notify;
 
 /// 取消后写入历史 / 返回给调用方的固定文本。
 pub const CANCEL_TEXT: &str = "用户手动终止";
+
+/// 中断（`Ctrl-C` 语义；`repl` 用它保住解释器状态）。
+#[cfg(unix)]
+pub const SIGINT: i32 = libc::SIGINT;
+#[cfg(not(unix))]
+pub const SIGINT: i32 = 2;
+
+/// 强杀（保不住状态的那条路）。
+#[cfg(unix)]
+pub const SIGKILL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+pub const SIGKILL: i32 = 9;
+
+/// 给一个**进程组**发信号（非 Unix 上是空操作）。
+///
+/// 为什么必须按组：只杀直接子进程，它启动的孙进程（shell 命令 / 插件起的服务）会变孤儿
+/// 并继续持有管道写端 → 等待被卡到子孙自然退出。所以起进程时都 `process_group(0)`，杀时按组。
+pub fn kill_group(pid: u32, sig: i32) {
+    #[cfg(unix)]
+    if pid != 0 {
+        unsafe { libc::killpg(pid as libc::pid_t, sig) };
+    }
+    let _ = (pid, sig);
+}
 
 #[derive(Clone, Default)]
 pub struct Cancel {

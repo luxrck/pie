@@ -1090,12 +1090,8 @@ impl Tool for Bash {
             }
         };
         tokio::pin!(cancel_waiter);
-        let kill_group = || {
-            #[cfg(unix)]
-            if pid != 0 {
-                unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-            }
-        };
+        // 杀进程组：只杀 `bash` 会让它启动的孙进程变孤儿并继续持有管道写端（原语在 `cancel`）。
+        let kill_group = || crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
 
         let status = match timeout {
             Some(t) if t > 0 => {

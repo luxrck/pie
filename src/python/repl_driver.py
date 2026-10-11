@@ -1,9 +1,12 @@
-"""pie `repl` 工具的驱动：一个**长活**的 IPython，用「定长前缀 + JSON」跟 Rust 侧说话。
+"""pie `repl` 工具的驱动：一个**长活**的 IPython，用「一行一条 JSON」跟 Rust 侧说话。
 
-由 `src/repl.rs` 以 `python -u -c <本文件内容>` 启动；协议（与 `repl.rs` 对齐）：
+由 `src/pyhost.rs` 以 `python -X utf8 -u -c <本文件内容>` 启动；协议（与 `pyhost.rs` 对齐）：
 
-    收： u32 大端长度 ++ utf-8 源码
-    发： u32 大端长度 ++ utf-8 JSON {"stdout":…, "stderr":…, "error":…}
+    发（首行）: {"ready": true}                       ← 清单（告诉对端「驱动起来了」，还能顺便报版本）
+    收      : {"id": N, "code": "…"}
+    发      : {"id": N, "stdout":…, "stderr":…, "error":…, "images":[…], "state":{…}}
+
+**帧里的 `id` 原样回写**（对端靠它对上请求）；JSON 自己会把换行转义掉，所以「一行一帧」安全。
 
 parent 一死，stdin 就 EOF → 本进程自杀（孤儿进程防护）。
 """
@@ -13,7 +16,6 @@ import hashlib
 import io
 import json
 import os
-import struct
 import sys
 import tempfile
 import time
@@ -21,8 +23,8 @@ import traceback
 
 # 协议走真 stdin/stdout 的 **fd 副本**；把 sys.stdin 换成空的，让用户代码里的 input()
 # 得到 EOF，而不是把协议字节吃掉。
-proto_in = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
-proto_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+proto_in = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8", buffering=1)
+proto_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
 sys.stdin = io.StringIO("")
 
 
@@ -208,19 +210,15 @@ shell.user_ns["history"] = history
 shell.user_ns_hidden["history"] = history
 
 
-def _read_exact(n):
-    buf = b""
-    while len(buf) < n:
-        chunk = proto_in.read(n - len(buf))
-        if not chunk:
-            raise EOFError
-        buf += chunk
-    return buf
-
-
 def _send(payload):
-    body = json.dumps(payload).encode("utf-8")
-    proto_out.write(struct.pack(">I", len(body)) + body)
+    proto_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    proto_out.flush()
+
+
+# 首行清单放在**准备工作全做完之后**：对端在启动期等它，等不到就把「驱动起不来」
+# （缺 IPython / import 报错）当成启动失败 —— 比「起来了但一调就死」清楚得多
+# （所以这一行不能摆在文件开头）。
+_send({"ready": True})
 
 
 def _format_exc(exc):
@@ -228,11 +226,20 @@ def _format_exc(exc):
 
 
 while True:
-    try:
-        (length,) = struct.unpack(">I", _read_exact(4))
-        code = _read_exact(length).decode("utf-8")
-    except EOFError:
+    line = proto_in.readline()
+    if not line:
         break  # 父进程没了 → 退出
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue  # 不是给我们的行（理论上不会发生）
+    rid = request.get("id")
+    code = request.get("code", "")
+    if not isinstance(code, str):
+        code = str(code)
 
     _images.clear()
     before = set(_namespace())
@@ -259,6 +266,7 @@ while True:
         }
     except BaseException as exc:  # KeyboardInterrupt / 驱动自身异常：也要回一帧，别让 Rust 卡住
         payload = {"stdout": "", "stderr": "", "error": _format_exc(exc), "images": []}
+    payload["id"] = rid  # 回写请求的 id：对端靠它对上（**必须在 `_send` 之前**）
     # 解释器状态随每一帧回去（异常帧也要）：模型看不到解释器内部，压缩之后它连代码块都没了
     # —— 有这一行，它才不会按记忆里的变量名瞎写。Rust 侧拼成输出**头区**那行 `[解释器] …`。
     names = _namespace()

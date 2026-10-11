@@ -5,27 +5,24 @@
 //! `tools::SessionState` 槽里，本模块只管「取槽 → 懒启动 → 通信」。
 //!
 //! 进程 / 并发模型：
-//!   - 子进程归一个 **owner task** 独占（`stdin` / `stdout` 都在它手里），本工具只经 `mpsc`
-//!     请求 + `oneshot` 应答跟它说话——这样读帧**永远不会被 `select!` 取消**（`read_exact`
-//!     不是 cancel-safe，被丢掉会留半帧、把后续帧全部错位）。
-//!   - 同一会话内的 `repl` 调用用 `tokio::sync::Mutex` 串行化（状态共享，不能并发跑）。
-//!   - 取消 / 超时：给**子进程组**发信号（`SIGINT` 保状态；停不住再 `SIGKILL`）。
+//!   - 一个**会话内持久**的 IPython 子进程，传输与进程生命周期全交给 [`crate::pyhost`]
+//!     （一行一条 JSON、`id` 配对、读线程不受取消影响）；
+//!   - 同一会话内的 `repl` 调用用 `tokio::sync::Mutex` 串行化（状态共享，不能并发跑）；
+//!   - 取消 / 超时：给**子进程组**发 `SIGINT`（保状态），超时路径再等 [`INTERRUPT_GRACE`]
+//!     看它能不能自己停下来，停不住才 `SIGKILL`（丢状态，下次调用重启）。
 //!
-//! 协议见 `repl_driver.py`（「4 字节大端长度 + UTF-8」），本模块是它的对端。
+//! 协议见 `repl_driver.py`（一行一条 JSON，**首行是清单** `{}`；见 `pyhost` 的模块头）。
 
-use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, oneshot};
+use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::cancel::CANCEL_TEXT;
+use crate::cancel::{CANCEL_TEXT, SIGINT};
+use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
     Attachment, Limits, Tool, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
 };
@@ -33,24 +30,8 @@ use crate::tools::{
 /// 驱动脚本正文（编译期嵌入；它自己用 IPython 的 `InteractiveShell`）。
 const DRIVER: &str = include_str!("python/repl_driver.py");
 
-/// 默认解释器：Unix `python3`，其它 `python`。
-#[cfg(unix)]
-const DEFAULT_PYTHON: &str = "python3";
-#[cfg(not(unix))]
-const DEFAULT_PYTHON: &str = "python";
-
 /// 中断后等驱动回帧的宽限（超时路径用：及时停了就保住状态，停不住才杀）。
 const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
-
-/// 信号：Unix 用 libc 的常量；其它平台只是占位（`signal` 在非 Unix 上是空操作）。
-#[cfg(unix)]
-const SIGINT: i32 = libc::SIGINT;
-#[cfg(not(unix))]
-const SIGINT: i32 = 2;
-#[cfg(unix)]
-const SIGKILL: i32 = libc::SIGKILL;
-#[cfg(not(unix))]
-const SIGKILL: i32 = 9;
 
 // 会话内持久的 IPython：状态活在本会话的进程里；`pie -r` 恢复会话**不会**带回解释器内存
 // （重新起一个干净的）——活进程没法跨进程重启携带。
@@ -81,22 +62,12 @@ pub struct Repl {
 }
 
 /// 本会话的 REPL 状态（挂在 `SessionState` 槽里，一会话一份）。
+///
+/// 传输/进程生命周期全交给 [`crate::pyhost`]；这里只留「本会话那个宿主句柄」
+/// + 一把串行锁（解释器状态共享，同一会话的 `repl` 调用不能并发跑）。
 #[derive(Default)]
 struct ReplSession {
-    proc: tokio::sync::Mutex<Option<ReplProc>>,
-}
-
-/// 一个活着的解释器：pid（发信号用）+ 请求通道（owner task 收）+ 存活标志。
-struct ReplProc {
-    pid: u32,
-    tx: mpsc::Sender<Request>,
-    alive: Arc<AtomicBool>,
-}
-
-/// 一次执行请求（owner task 按序处理）。
-struct Request {
-    code: String,
-    reply: oneshot::Sender<Result<Reply, String>>,
+    host: AsyncMutex<Option<Arc<PyHost>>>,
 }
 
 /// 驱动回的一帧。
@@ -131,13 +102,6 @@ struct Namespace {
     defined: Vec<String>,
 }
 
-/// 一次执行的结果分类。
-enum Outcome {
-    Reply(Reply),
-    Cancelled,
-    TimedOut,
-}
-
 impl Tool for Repl {
     async fn call(self, ctx: ToolCtx) -> ToolResult {
         let Self {
@@ -155,220 +119,73 @@ impl Tool for Repl {
         }
         let python =
             crate::config::expand_tilde(&_python.unwrap_or_else(|| DEFAULT_PYTHON.to_string()));
-        let driver = _driver.unwrap_or_else(|| DRIVER.to_string());
+        let mut spec = Spec::new(
+            "repl",
+            &python,
+            &_driver.unwrap_or_else(|| DRIVER.to_string()),
+        );
+        if let Some(path) = &ctx.transcript {
+            // 解释器的 `history()` 读这份转录快照（每轮开头由 `Session` 重写）
+            spec.env
+                .push(("PIE_TRANSCRIPT".to_string(), path.display().to_string()));
+        }
+        let payload = json!({"code": code});
+        // 超时按秒给；`0` / 负数 = 不限时（与旧行为一致）
+        let deadline = timeout
+            .filter(|t| *t > 0)
+            .map(|t| Duration::from_secs(t as u64));
+        // 取消/超时都先 `SIGINT`：解释器能把 `KeyboardInterrupt` 变成一帧回执，状态保住。
+        let interrupt = Interrupt::Signal {
+            sig: SIGINT,
+            grace: INTERRUPT_GRACE,
+        };
 
         // 取本会话的 REPL 槽；锁住整段交互（同一会话的 repl 调用串行）。
         let session = ctx.state.get_or_init(ReplSession::default);
-        let mut guard = session.proc.lock().await;
+        let mut guard = session.host.lock().await;
 
         // 启动 / 断线重启；最多试两次（第一次失败多半是子进程刚自己退了）。
         let mut last: Option<String> = None;
         for attempt in 0..2 {
-            let dead = guard
-                .as_ref()
-                .map(|p| !p.alive.load(Ordering::SeqCst))
-                .unwrap_or(true);
-            if dead {
-                *guard = None;
-                *guard = Some(ReplProc::spawn(&python, &driver, ctx.transcript.as_deref()).await?);
-            }
-            let proc = guard.as_mut().expect("刚确保过");
-            match proc.run(code.clone(), &ctx, timeout).await {
-                Ok(Outcome::Reply(reply)) => {
-                    return Ok(format_reply(reply, &ctx, _max_lines, _max_bytes));
-                }
+            let host = match guard.clone() {
+                Some(host) => host,
+                None => match PyHost::start(&spec).await {
+                    Ok((host, _manifest)) => {
+                        *guard = Some(Arc::clone(&host));
+                        host
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        if attempt == 0 {
+                            continue;
+                        }
+                        break;
+                    }
+                },
+            };
+            match host
+                .request(payload.clone(), ctx.cancel.as_ref(), deadline, interrupt)
+                .await
+            {
+                Ok(Outcome::Reply(value)) => match serde_json::from_value::<Reply>(value) {
+                    Ok(reply) => return Ok(format_reply(reply, &ctx, _max_lines, _max_bytes)),
+                    Err(e) => last = Some(format!("[repl] 解释器返回了非法 JSON: {e}")),
+                },
                 Ok(Outcome::Cancelled) => return Ok(ToolOutput::text(CANCEL_TEXT)),
                 Ok(Outcome::TimedOut) => {
-                    // 超时且宽限期内没停住 → 已 kill；下次调用会重启（状态丢失）。
+                    // 宽限期内没停住 → 已杀进程组；下次调用会重启（状态丢失）。
                     return Ok(ToolOutput::text(format!(
                         "[repl] 执行超过 {}s 仍未停下，解释器已重启（之前的变量丢失）",
                         timeout.unwrap_or(0)
                     )));
                 }
-                Err(e) => {
-                    last = Some(e);
-                    *guard = None; // 下一轮重起
-                    if attempt == 1 {
-                        break;
-                    }
-                }
+                Err(e) => last = Some(e),
             }
+            *guard = None; // 下一轮重起
         }
-        Err(ToolError(format!(
-            "[repl] {}",
-            last.unwrap_or_else(|| "解释器不可用".to_string())
-        )))
-    }
-}
-
-impl ReplProc {
-    /// 起一个解释器进程，把 `stdin` / `stdout` / `stderr` 交给 owner task。
-    async fn spawn(
-        python: &str,
-        driver: &str,
-        transcript: Option<&Path>,
-    ) -> Result<ReplProc, ToolError> {
-        let mut cmd = tokio::process::Command::new(python);
-        cmd.arg("-u").arg("-c").arg(driver);
-        // 解释器据此读转录（`history()`）——一份**每轮重写**的快照，不是会话文件本身
-        if let Some(path) = transcript {
-            cmd.env("PIE_TRANSCRIPT", path);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.kill_on_drop(true); // owner task 被丢弃（会话没了 / 回合中断）→ 别留孤儿
-        #[cfg(unix)]
-        cmd.process_group(0); // 独立进程组：中断/超时按组发信号
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError(format!("[repl] 启动解释器失败（{python}）: {e}")))?;
-        let stdin = child.stdin.take().expect("piped");
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let pid = child.id().unwrap_or(0);
-        let (tx, rx) = mpsc::channel::<Request>(1);
-        let alive = Arc::new(AtomicBool::new(true));
-        tokio::spawn(owner_loop(stdin, stdout, stderr, rx, alive.clone(), child));
-        Ok(ReplProc { pid, tx, alive })
-    }
-
-    /// 发一次请求 + 等应答（race 取消 / 超时）。
-    async fn run(
-        &mut self,
-        code: String,
-        ctx: &ToolCtx,
-        timeout: Option<i64>,
-    ) -> Result<Outcome, String> {
-        let (tx, mut rx) = oneshot::channel();
-        if self.tx.send(Request { code, reply: tx }).await.is_err() {
-            return Err("解释器进程已退出".to_string());
-        }
-
-        let cancel_wait = async {
-            match ctx.cancel.clone() {
-                Some(cancel) => cancel.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(cancel_wait);
-        let timeout_wait = async {
-            match timeout {
-                Some(t) if t > 0 => tokio::time::sleep(Duration::from_secs(t as u64)).await,
-                _ => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(timeout_wait);
-
-        tokio::select! {
-            res = &mut rx => match res {
-                Ok(Ok(reply)) => Ok(Outcome::Reply(reply)),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("解释器没有应答（进程可能已退出）".to_string()),
-            },
-            _ = &mut cancel_wait => {
-                self.interrupt(); // SIGINT：解释器保住状态，下次还能接着用
-                Ok(Outcome::Cancelled)
-            }
-            _ = &mut timeout_wait => {
-                self.interrupt();
-                match tokio::time::timeout(INTERRUPT_GRACE, &mut rx).await {
-                    Ok(Ok(Ok(reply))) => Ok(Outcome::Reply(reply)), // 及时停了：状态还在
-                    _ => {
-                        self.kill(); // 停不住 → 杀（丢状态，下次重启）
-                        Ok(Outcome::TimedOut)
-                    }
-                }
-            }
-        }
-    }
-
-    /// 给子进程**组**发信号（非 Unix 上是空操作）。
-    fn signal(&self, sig: i32) {
-        #[cfg(unix)]
-        if self.pid != 0 {
-            unsafe { libc::killpg(self.pid as libc::pid_t, sig) };
-        }
-        let _ = sig;
-    }
-
-    fn interrupt(&self) {
-        self.signal(SIGINT);
-    }
-
-    fn kill(&self) {
-        self.alive.store(false, Ordering::SeqCst);
-        self.signal(SIGKILL);
-    }
-}
-
-/// owner task：独占子进程的管道，按序「读请求 → 写帧 → 读帧 → 回答」。
-///
-/// 它**永不进 `select!`**，所以读写永远完整；协商取消靠外面给进程组发信号。
-async fn owner_loop(
-    mut stdin: ChildStdin,
-    mut stdout: ChildStdout,
-    mut stderr: ChildStderr,
-    mut rx: mpsc::Receiver<Request>,
-    alive: Arc<AtomicBool>,
-    mut child: Child,
-) {
-    while let Some(req) = rx.recv().await {
-        // 正常路径：写帧 → 读帧 → 回答；任何一步失败都带上子进程 stderr 再回。
-        if let Err(e) = write_frame(&mut stdin, &req.code).await {
-            let msg = with_stderr(format!("向解释器写入失败: {e}"), &mut stderr).await;
-            let _ = req.reply.send(Err(msg));
-            break;
-        }
-        match read_frame(&mut stdout).await {
-            Ok(body) => {
-                let reply = serde_json::from_slice::<Reply>(&body)
-                    .map_err(|e| format!("解释器返回了非法 JSON: {e}"));
-                let _ = req.reply.send(reply);
-                continue; // 成功：处理下一个请求（别走到下面的失败分支）
-            }
-            Err(e) => {
-                let msg = with_stderr(format!("读取解释器输出失败: {e}"), &mut stderr).await;
-                let _ = req.reply.send(Err(msg));
-                break;
-            }
-        }
-    }
-    alive.store(false, Ordering::SeqCst);
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-async fn write_frame(stdin: &mut ChildStdin, code: &str) -> std::io::Result<()> {
-    let bytes = code.as_bytes();
-    stdin.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    stdin.write_all(bytes).await?;
-    stdin.flush().await
-}
-
-async fn read_frame(stdout: &mut ChildStdout) -> std::io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    stdout.read_exact(&mut len).await?;
-    let n = u32::from_be_bytes(len) as usize;
-    let mut buf = vec![0u8; n];
-    stdout.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-/// 子进程退出后把 stderr 读干净（给个 1s 上限，免得万一还活着卡住）。
-async fn drain_stderr(stderr: &mut ChildStderr) -> String {
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(1), stderr.read_to_end(&mut buf)).await;
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// 失败信息补上子进程的 stderr（比如 `ModuleNotFoundError: IPython`），没有就不加。
-async fn with_stderr(msg: String, stderr: &mut ChildStderr) -> String {
-    let detail = drain_stderr(stderr).await;
-    if detail.trim().is_empty() {
-        msg
-    } else {
-        format!("{msg}；解释器 stderr：{}", detail.trim())
+        Err(ToolError(
+            last.unwrap_or_else(|| "[repl] 解释器不可用".to_string()),
+        ))
     }
 }
 
@@ -469,16 +286,18 @@ mod tests {
 
     /// 假驱动：不依赖 IPython，只按协议回帧。`call#N` 里的 N 证明**进程被复用**。
     const FAKE: &str = r#"
-import json, os, struct, sys, time
-inp = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
-out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+import json, os, sys, time
+inp = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8", buffering=1)
+out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
+out.write(json.dumps({"ready": True}) + "\n"); out.flush()
 count = 0
 while True:
-    head = inp.read(4)
-    if len(head) < 4:
+    line = inp.readline()
+    if not line:
         break
-    (size,) = struct.unpack(">I", head)
-    code = inp.read(size).decode("utf-8")
+    request = json.loads(line)
+    rid = request.get("id")
+    code = request.get("code", "")
     count += 1
     if code == "stall":
         time.sleep(10)
@@ -493,8 +312,8 @@ while True:
                    "state": {"names": ["df", "f", "math"], "total": 3, "defined": ["df"]}}
     else:
         payload = {"stdout": "call#%d: %s\n" % (count, code), "stderr": "", "error": None}
-    body = json.dumps(payload).encode("utf-8")
-    out.write(struct.pack(">I", len(body)) + body); out.flush()
+    payload["id"] = rid
+    out.write(json.dumps(payload) + "\n"); out.flush()
 "#;
 
     /// 一启动就报错退出的假驱动（模拟「解释器里没装 IPython」）。
@@ -507,19 +326,19 @@ sys.exit(3)
     /// 把「输入 code」当成一个文件路径回帧的假驱动：用它验证**图从临时目录转存进 `files/`**
     /// （不依赖 IPython / matplotlib）。
     const FAKE_IMAGES: &str = r#"
-import json, os, struct, sys
-inp = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
-out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+import json, os, sys
+inp = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8", buffering=1)
+out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
+out.write(json.dumps({"ready": True}) + "\n"); out.flush()
 while True:
-    head = inp.read(4)
-    if len(head) < 4:
+    line = inp.readline()
+    if not line:
         break
-    (size,) = struct.unpack(">I", head)
-    path = inp.read(size).decode("utf-8").strip()
+    request = json.loads(line)
+    path = str(request.get("code", "")).strip()
     images = [path] if os.path.isfile(path) else []
-    payload = {"stdout": "", "stderr": "", "error": None, "images": images}
-    body = json.dumps(payload).encode("utf-8")
-    out.write(struct.pack(">I", len(body)) + body); out.flush()
+    payload = {"id": request.get("id"), "stdout": "", "stderr": "", "error": None, "images": images}
+    out.write(json.dumps(payload) + "\n"); out.flush()
 "#;
 
     /// 有 python3 才跑（本工具本来就要解释器；没有就跳过）。
