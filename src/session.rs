@@ -1157,7 +1157,25 @@ impl Session {
             out.push_str(&json_line(m)?);
             out.push('\n');
         }
-        fs::write(&self.path, out).map_err(|e| format!("写入会话失败 {}: {e}", self.path.display()))
+        // **原子落盘**：先写同目录的临时件，再 `rename`（同一文件系统上 rename 是原子的）。
+        //
+        // 为什么非这么干不可：会话是**用户数据的唯一副本**（压缩原文 / 图片副本都有 gc 保护窗，
+        // 会话没了就是没了），而直接 `fs::write` 到目标上——写到一半崩/断电/盘满——留下的是一份
+        // **截断的**会话。目录里其它落盘（`Storage::store`）早就是 temp + rename 了，只有它例外。
+        let name = self
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let tmp = self
+            .path
+            .with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+        fs::write(&tmp, out).map_err(|e| format!("写入会话失败 {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = fs::remove_file(&tmp); // 换不过去就把临时件收走，别在目录里留垃圾
+            format!("落盘会话失败 {}: {e}", self.path.display())
+        })
     }
 
     /// 恢复 / 新建后的概览（CLI 提示用）。
@@ -2531,6 +2549,47 @@ mod tests {
             "载入后那节要能重建：{}",
             loaded.messages[0].content_text()
         );
+    }
+
+    /// 落盘是**原子**的（写同目录临时件再 `rename`）：内容整份替换、目录里不留临时件。
+    ///
+    /// 为什么钉它：会话是**用户数据的唯一副本**，直接 `fs::write` 到目标上、写到一半崩就是
+    /// 一份截断的会话（目录里其它落盘早就是 temp + rename 了）。
+    #[test]
+    fn save_replaces_the_session_file_atomically() {
+        let dir = std::env::temp_dir().join(format!("pie-save-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            storage: crate::config::Storage::at(&dir),
+            ..Config::default()
+        };
+        let mut s = Session::new(&config, Some("atomic.jsonl"), llm(), registry());
+        s.push_user("第一轮");
+        s.save().unwrap();
+        assert!(std::fs::read_to_string(&s.path).unwrap().contains("第一轮"));
+
+        // 再存一次：**整份替换**（不是追加）——先手工往文件尾塞一行垃圾
+        {
+            use std::io::Write;
+            let mut fh = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&s.path)
+                .unwrap();
+            fh.write_all("{\"role\":\"user\",\"content\":\"垃圾行\"}\n".as_bytes())
+                .unwrap();
+        }
+        s.save().unwrap();
+        let after = std::fs::read_to_string(&s.path).unwrap();
+        assert!(!after.contains("垃圾行"), "旧内容要整份消失：{after}");
+
+        // 目录里不留临时件（`.<名字>.tmp-<pid>`）
+        let leftovers: Vec<String> = std::fs::read_dir(config.storage.sessions())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时件：{leftovers:?}");
     }
 
     /// 日志有上限：超出丢最老的（不能让它变成第二份无限长的历史）。

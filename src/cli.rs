@@ -9,6 +9,7 @@
 //! TUI（同一个二进制）与 Python 绑定（`pie.list_sessions`）也都用它。
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -119,14 +120,24 @@ pub fn iter_session_files(sessions_dir: &Path) -> Vec<(PathBuf, String, Value)> 
         .collect();
     files.sort();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        // ⚠ **只读首行**：会话文件可能几十 MB（历史上把图内联成 base64 的那批），
+        // `read_to_string` 会把整份读进内存 —— 而列表只需要 `__meta__` 那一行。
+        let Ok(fh) = std::fs::File::open(&file) else {
             continue;
         };
-        // meta 是第一行，读完就够
-        let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
+        let mut reader = BufReader::new(fh);
+        let mut first = String::new();
+        while first.trim().is_empty() {
+            first.clear();
+            match reader.read_line(&mut first) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        if first.trim().is_empty() {
             continue;
-        };
-        let Ok(meta) = serde_json::from_str::<Value>(first) else {
+        }
+        let Ok(meta) = serde_json::from_str::<Value>(&first) else {
             continue;
         };
         if !meta
@@ -292,6 +303,29 @@ pub fn collect_context_garbage(storage: &config::Storage) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::Storage;
+
+    /// 列表**只读首行**：文件尾损坏（非 UTF-8 / 半截行）也不该让这个会话从列表里消失。
+    ///
+    /// 以前是 `read_to_string` 整份读 → 尾部坏一字节就 `Err` → 整个会话漏掉；
+    /// 而它可能几十 MB（历史上把图内联成 base64 的那批），读进来还白占内存。
+    #[test]
+    fn listing_reads_only_the_first_line_so_a_broken_tail_is_harmless() {
+        let dir = std::env::temp_dir().join(format!("pie-cli-first-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::at(&dir);
+        std::fs::create_dir_all(storage.sessions()).unwrap();
+        let meta = serde_json::json!({
+            "__meta__": true,
+            "files": {"img-x": {"file_id": "f1", "local": "/tmp/x.png"}}
+        });
+        let mut bytes = format!("{meta}\n").into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, b'\n']); // 尾部：不是合法 UTF-8
+        std::fs::write(storage.sessions().join("s.jsonl"), bytes).unwrap();
+
+        let rows = iter_session_files(&storage.sessions());
+        assert_eq!(rows.len(), 1, "首行有效就够：{rows:?}");
+        assert_eq!(rows[0].1, "img-x");
+    }
 
     /// `files gc` 的判据：**既没人引用、又过了保护窗**才回收。
     ///
