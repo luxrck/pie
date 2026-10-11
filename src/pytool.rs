@@ -30,6 +30,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,7 +38,7 @@ use serde_json::{Value, json};
 use crate::cancel::CANCEL_TEXT;
 use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
-    CallFn, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
+    CallFn, ExtensionHook, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
@@ -80,8 +81,15 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
     for warning in &handshake.warnings {
         crate::log::warn(format!("[pytool] {warning}"));
     }
-
-    let mut registry = registry;
+    // 插件报的事件订阅：每个会话建好后会把它挂到自己的事件总线上（见 `Session::attach_extensions`）。
+    let hook = (!handshake.extensions.subscribe.is_empty()).then(|| ExtensionHook {
+        subscribe: handshake.extensions.subscribe.clone(),
+        on_event: {
+            let host = Arc::clone(&host);
+            Arc::new(move |event: &crate::event::Event, ctx: &Value| deliver(&host, event, ctx))
+        },
+    });
+    let mut registry = registry.with_extensions(hook.into_iter().collect());
     for spec in handshake.tools {
         if !valid_tool_name(&spec.name) {
             crate::log::warn(format!(
@@ -117,6 +125,74 @@ pub async fn load(registry: Registry, config: &crate::config::Config) -> Registr
         );
     }
     registry
+}
+
+/// 一个事件交给宿主：
+///
+/// - **可否决的 kind**（`tool_call`）：带上 `id` 并**等回话** → 宿主回的 `deny` 就是否决理由；
+/// - 其余 kind：只写一行就走（不等，返回值没人用）。
+///
+/// ⚠ 它是**同步**回调（`EventBus::ask` / `send` 在调用方线程上跑），所以要 `block_in_place`
+/// 把当前 worker 让出去再 `block_on`（多线程 runtime 才行；当前线程 runtime 用了会 panic）。
+/// 起不起 runtime 的场合（纯同步调用）→ 直接放行 + 告警，别把调用方带崩。
+fn deliver(host: &PyHost, event: &crate::event::Event, ctx: &Value) -> Result<(), String> {
+    let value = match crate::event::to_wire(event) {
+        Ok(value) => value,
+        Err(e) => {
+            crate::log::warn(format!("[pytool] 事件序列化失败: {e}"));
+            return Ok(());
+        }
+    };
+    let veto = VETO_KINDS.contains(&event.name());
+    // 同步回调里等异步请求：得 `block_in_place` 把当前 worker 让出去（`Handle::block_on` 自己
+    // 在 runtime 里用会 panic）。⚠ 它只在**多线程 runtime** 上可用 —— `pie` 的 CLI/TUI 与绑定都是
+    // 多线程（`Runtime::new()` / `new_multi_thread()`），单线程 runtime 下只能放弃投递（放行 + 告警）。
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        crate::log::warn(format!(
+            "[pytool] 没有 runtime，{} 事件没发给插件",
+            event.name()
+        ));
+        return Ok(());
+    };
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        crate::log::warn(format!(
+            "[pytool] 单线程 runtime 下不投递事件（{}），这次当通过",
+            event.name()
+        ));
+        return Ok(());
+    }
+    let payload = json!({"event": value, "ctx": ctx});
+    let outcome = tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            if veto {
+                host.request(payload, None, Some(VETO_TIMEOUT), Interrupt::Kill)
+                    .await
+            } else {
+                host.notify(payload)
+                    .await
+                    .map(|()| Outcome::Reply(Value::Null))
+            }
+        })
+    });
+    match outcome {
+        Ok(Outcome::Reply(reply)) => {
+            let deny = reply
+                .get("deny")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if veto && !deny.is_empty() {
+                return Err(deny);
+            }
+            Ok(())
+        }
+        // 取消 / 超时 → 放行（fail-open）；宿主没了 → 告警 + 放行
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::log::warn(e);
+            Ok(())
+        }
+    }
 }
 
 /// 一次工具调用：把参数转给宿主，把应答转成工具结果。
@@ -207,9 +283,27 @@ struct ToolSpec {
 struct Handshake {
     #[serde(default)]
     tools: Vec<ToolSpec>,
+    /// 插件声明的事件订阅（`{"subscribe": ["tool_call", …]}`；没写 = 不订阅）。
+    #[serde(default)]
+    extensions: Extensions,
     #[serde(default)]
     warnings: Vec<String>,
 }
+
+/// 清单里的 `extensions` 段。
+#[derive(Default, Deserialize)]
+struct Extensions {
+    #[serde(default)]
+    subscribe: Vec<String>,
+}
+
+/// 可否决的 kind（「动作前」的事件）——只有它要等回话；其余只发一行就走。
+const VETO_KINDS: [&str; 1] = ["tool_call"];
+
+/// 等宿主表态的上限：超时就**放行 + 告警**。
+///
+/// 一个卡住的插件不该把工具全卡死（fail-open）；真要 fail-closed 得另说（见 `docs/extension.md`）。
+const VETO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 宿主的一行应答。
 ///
@@ -256,7 +350,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::process::Stdio;
+
+    use crate::session::Session;
     use std::time::Duration;
+
+    /// 一个**插件**（不是工具）：只订阅 `tool_call`，含 `rm ` 就否决。
+    /// 理由里带上 `S.session_id` —— 证明帧里的 `ctx`（会话身份）也到位了。
+    const PLUGIN: &str = r#"
+def no_rm(ev, S):
+    if ev["name"] == "bash" and "rm " in ev["arguments"]["command"]:
+        return "策略拒绝：检测到 rm（来自插件 %s）" % S.session_id
+    return None
+
+session.on("tool_call", no_rm)
+"#;
 
     /// 宿主**依赖真绑定**（工具里 `from pie import tool`），所以测试解释器得能 `import pie`：
     /// 先试绑定自己的 venv（本仓开发态就是它），再退 `python3`（用户自己往里装过）。
@@ -355,6 +462,46 @@ def loud() -> str:
     print("工具里的 print")
     return "ok"
 "#;
+
+    /// **插件（独立进程）能拦下工具**：清单报 `extensions.subscribe` → `Session` 把订阅挂到自己
+    /// 的事件总线上 → `tool_call` 前那一下 `ask` 把事件发给插件、拿回否决理由。
+    ///
+    /// `#[tokio::test(flavor = "multi_thread")]`：宿主桥在同步回调里要 `block_in_place` 等回话，
+    /// 单线程 runtime 上用不了（生产里 CLI/TUI 与绑定都是多线程）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_can_veto_a_tool_call() {
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("veto", PLUGIN);
+        let config = fixture.config(python);
+        let registry = load(Registry::empty(HashMap::new()), &config).await;
+
+        // ① 清单里的订阅被读到
+        assert_eq!(registry.extensions().len(), 1, "该有一个订阅声明");
+        assert_eq!(registry.extensions()[0].subscribe, ["tool_call"]);
+
+        // ② 会话建好 → 订阅挂上 → `ask`（= 工具执行前那一下）拿到插件的否决理由
+        let llm = crate::llm::LlmClient::new(&config).expect("client");
+        let session = Session::new(&config, Some("veto.jsonl"), llm, registry);
+        let call = |command: &str| {
+            crate::event::Event::Turn(crate::session::TurnEvent::ToolCall {
+                name: "bash".into(),
+                arguments: json!({"command": command}).to_string(),
+            })
+        };
+        let denials = session.bus_handle().ask(&call("rm -rf /tmp/x"));
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        assert!(denials[0].contains("检测到 rm"), "{denials:?}");
+        assert!(
+            denials[0].contains("来自插件"),
+            "理由里该带会话身份（S.session_id）：{denials:?}"
+        );
+
+        // ③ 不危险的命令 → 插件返回 None → 放行
+        assert!(
+            session.bus_handle().ask(&call("echo hi")).is_empty(),
+            "没否决就该是空集"
+        );
+    }
 
     #[tokio::test]
     async fn registers_python_tools_and_parses_schema() {

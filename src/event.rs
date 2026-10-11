@@ -286,6 +286,48 @@ impl Event {
     }
 }
 
+/// 事件的**线上形状**——唯一出口。
+///
+/// serde 给规范形状（`#[serde(tag = "type", rename_all = "snake_case")]`），这里只补一处
+/// Python 侧顺手的：`tool_call` / `tool_result` 的 `arguments` 给**解析后的对象**
+/// （`tool_call` 另附 `arguments_raw` 原文）。**绑定的 dict 与宿主协议的事件帧都吃它** ——
+/// 两个 Python 面因此逐字同形（插件里写的 `ev["arguments"]["command"]` 在绑定里也一样）。
+pub fn to_wire(event: &Event) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(event)?;
+    if let Some(map) = value.as_object_mut() {
+        let kind = map
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let parsed = kind == "tool_call" || kind == "tool_result";
+        if parsed
+            && let Some(raw) = map
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        {
+            map.insert("arguments".into(), arguments_value(&raw));
+            if kind == "tool_call" {
+                map.insert("arguments_raw".into(), serde_json::Value::String(raw));
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// 工具参数是模型给的 JSON 字符串：能解析就用解析结果，否则退回 `{"raw": …}`（前 200 字）。
+fn arguments_value(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "raw".to_string(),
+            serde_json::Value::String(raw.chars().take(200).collect()),
+        );
+        serde_json::Value::Object(map)
+    })
+}
+
 impl From<TurnEvent> for Event {
     fn from(e: TurnEvent) -> Self {
         Self::Turn(e)

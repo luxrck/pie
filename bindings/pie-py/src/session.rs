@@ -656,38 +656,10 @@ fn busy_error_or(msg: &str) -> PyErr {
 ///
 /// 回合事件手写映射（`content_delta` / `reasoning_delta` / `tool_call` / `tool_result` / `answer`）；
 /// 会话事件直接走 serde（`SessionEvent` 自带 `#[serde(tag = "type")]`，同一套扁平词表）。
-/// 事件 → Python dict：**规范形状由 serde 给**（`src/event.rs` 的 `#[serde(tag = "type")]`
-/// 是唯一事实来源——改那儿不会跟这儿漂）。只补两处 Python 侧更顺手的：
-/// `tool_call` / `tool_result` 的 `arguments` 给**解析后的 dict**，`tool_call` 另附 `arguments_raw` 原文。
+/// 事件 → Python dict：**线上形状由核心给**（[`pie::event::to_wire`] 是唯一出口——
+/// 规范形状 + `arguments` 解析成 dict + `arguments_raw`），这里只做 Value → PyObject。
 fn event_to_py(py: Python<'_>, event: &Event) -> PyResult<Py<PyAny>> {
-    let mut value = serde_json::to_value(event)
+    let value = pie::event::to_wire(event)
         .map_err(|e| PyValueError::new_err(format!("事件序列化失败: {e}")))?;
-    if let Some(map) = value.as_object_mut() {
-        let kind = map
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let wants_args = kind == "tool_call" || kind == "tool_result";
-        if wants_args && let Some(raw) = map.get("arguments").and_then(Value::as_str) {
-            let raw = raw.to_string();
-            map.insert("arguments".into(), args_value(&raw));
-            if kind == "tool_call" {
-                map.insert("arguments_raw".into(), Value::String(raw));
-            }
-        }
-    }
     crate::json_to_py(py, &value)
-}
-
-/// 工具参数是模型给的 JSON 字符串：能解析就用解析结果，否则退回 `{"raw": ...}`。
-fn args_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "raw".to_string(),
-            Value::String(raw.chars().take(200).collect()),
-        );
-        Value::Object(map)
-    })
 }

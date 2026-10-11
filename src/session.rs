@@ -63,6 +63,9 @@ pub struct Session {
     /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
     /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
     pub compaction_events: Vec<context::CompactEvent>,
+    /// 插件的**事件订阅**凭据（`Registry` 带进来的）——留着它们只是**保活**：
+    /// `Subscription` 一 drop 就退订，随会话一起走正好。
+    extensions: Vec<Subscription>,
     /// 完整历史（`messages[0]` 是当前 system prompt）。
     pub messages: Vec<Message>,
     /// 用量：token 是最近一次上报值，`calls` 累计（见 `UsageTracker`）。
@@ -1554,7 +1557,7 @@ impl Session {
     }
 
     fn at(path: PathBuf, config: &Config, llm: LlmClient, registry: Registry) -> Self {
-        Self {
+        let mut session = Self {
             path,
             config: config.clone(),
             llm,
@@ -1574,6 +1577,36 @@ impl Session {
             available_models: None,
             bus: EventBus::new(),
             cancel: Cancel::new(),
+            extensions: Vec::new(),
+        };
+        session.attach_extensions();
+        session
+    }
+
+    /// 把 `Registry` 里带的插件订阅挂到本会话的事件总线上（`pytool::load` 装进来的）。
+    ///
+    /// 为什么不在 `Registry` 里就把回调挂上：宿主是**进程级**的（多个会话复用），订阅是
+    /// **会话级**的 —— 只有会话建好了才知道「现在是谁」。凭据存进 [`Session::extensions`] 保活。
+    fn attach_extensions(&mut self) {
+        if self.registry.extensions().is_empty() {
+            return;
+        }
+        // 帧里那个 `ctx`：会话身份。宿主是进程级共享的，得让它知道这是哪个会话。
+        let ctx = json!({
+            "session_id": config::name_of(&self.path),
+            "session_path": self.path.display().to_string(),
+            "cwd": std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            "model": self.config.model,
+        });
+        for hook in self.registry.extensions().to_vec() {
+            for kind in &hook.subscribe {
+                let hook = hook.clone();
+                let ctx = ctx.clone();
+                self.extensions
+                    .push(self.bus.on(kind, move |event| (hook.on_event)(event, &ctx)));
+            }
         }
     }
 }

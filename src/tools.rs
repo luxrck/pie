@@ -1170,6 +1170,37 @@ impl std::fmt::Debug for Plugin {
 pub struct Registry {
     plugins: Vec<Plugin>,
     defaults: HashMap<String, toml::Table>,
+    /// 进程级插件声明的**事件订阅**（`pytool::load` 从清单里读出来）——
+    /// `Session` 建好后把它们挂到自己的事件总线上。
+    extensions: Vec<ExtensionHook>,
+}
+
+/// 一个插件对会话事件的订阅（宿主声明，`Session` 挂载）。
+///
+/// 为什么要绕 `Registry` 一手：宿主是**进程级**的（挂在这儿、被多个会话复用），而订阅是
+/// **会话级**的（挂 `EventBus`）—— `Session` 建好后照这张表把自己挂上去。
+#[derive(Clone)]
+pub struct ExtensionHook {
+    /// 要订的事件名（[`crate::event::Event::name`] 的取值）。要几类就写几类；
+    /// 可否决的只有 `tool_call`（`docs/extension.md`）。
+    pub subscribe: Vec<String>,
+    /// 事件 → 表态：`Ok(())` 通过 / `Err(理由)` 否决。`ctx` 是会话身份（帧里那个 `ctx`）。
+    ///
+    /// ⚠ 它是**同步**回调（跑在发事件的那条线程上）：要等远端回话就自己 `block_in_place`，
+    /// 别把它做成阻塞很久的事 —— 那是把回合拖住。
+    pub on_event: EventHookFn,
+}
+
+/// 插件的事件回调（类型别名只是为了不撞 clippy 的 `type_complexity`）。
+pub type EventHookFn =
+    Arc<dyn Fn(&crate::event::Event, &Value) -> Result<(), String> + Send + Sync>;
+
+impl std::fmt::Debug for ExtensionHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtensionHook")
+            .field("subscribe", &self.subscribe)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Registry {
@@ -1178,7 +1209,19 @@ impl Registry {
         Self {
             plugins: Vec::new(),
             defaults,
+            extensions: Vec::new(),
         }
+    }
+
+    /// 带上插件的**事件订阅**（`pytool::load` 装完工具后调）。
+    pub fn with_extensions(mut self, extensions: Vec<ExtensionHook>) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// 本注册表带的插件订阅（`Session` 建构造时读它，见 `Session::attach_extensions`）。
+    pub fn extensions(&self) -> &[ExtensionHook] {
+        &self.extensions
     }
 
     /// **注册一个工具**：`.with_tool::<Read>("read")`。
@@ -1199,7 +1242,6 @@ impl Registry {
         });
         self
     }
-
     /// **动态注册**（Python 工具走这条）：名字 / 描述 / schema 都是运行时给的，
     /// 调用体由调用方提供（绑定里就是「往 Python 里叫一次」那段）。
     ///

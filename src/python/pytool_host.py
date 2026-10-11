@@ -1,10 +1,22 @@
 # pie 的 Python 工具宿主：由二进制以 `python -X utf8 -u -c "<本文件正文>" <工具文件…>` 启动
 # （`rust` 侧见 `pytool.rs`）。
 #
-# 协议：一行一个 JSON，一问一答；**应答可乱序**（调用并发跑在线程池里），靠 `id` 配对。
-#   stdout 第一行  ← {"tools":[{name,description,parameters}…], "warnings":[…]}
-#   stdin  每行    → {"id":N,"tool":"名字","arguments":{…}}
-#   stdout 之后    ← {"id":N,"text":"…"} 或 {"id":N,"error":"…"}
+# 协议：一行一个 JSON，一问一答；**应答可乱序**（并发跑在线程池里），靠 `id` 配对。
+#   stdout 第一行  ← {"tools":[…], "extensions":{"subscribe":["tool_call",…]}, "warnings":[…]}
+#   stdin  每行    → 工具调用：{"id":N,"tool":"名字","arguments":{…}}
+#                   事件    ：{"event":{…},"ctx":{…}}          （只发一行：观察，不等回话）
+#                             {"id":N,"event":{…},"ctx":{…}}   （要回话：可否决的 kind，如 tool_call）
+#   stdout 之后    ← {"id":N,"text":"…"} / {"id":N,"error":"…"}
+#                   事件回话：{"id":N,"deny":"理由"|null}      （null = 通过）
+#
+# 插件（一个文件可以只写 @tool、只写 session.on(…)，或者都写）：
+#   def no_rm(ev, S):            # ev = 事件 dict（形状与 Python 绑定那套完全一致）
+#       if ev["tool"] == "bash" and "rm " in ev["arguments"]["command"]:
+#           return "策略拒绝：检测到 rm"     # 返回一句理由 = **否决**（只有 tool_call 有这档语义）
+#       return None                       # None = 通过
+#   session.on("tool_call", no_rm)
+# `S` 是「当前会话」的代理：属性 = 事实（`session_id` / `path` / `model` / `cwd`），
+# 方法（改实例）以后加 —— 现在只能看，不能改。
 #
 # **用真绑定，不嵌副本**：`tool` / `Tool` 直接 `from pie import …`，所以**那个解释器里得装着
 # Python 绑定 `pie`**（工具文件里的 `@tool` 就是它提供的）；装不上整个宿主起不来（这里打印原因，
@@ -58,6 +70,34 @@ _LOOP = asyncio.new_event_loop()
 threading.Thread(target=_LOOP.run_forever, daemon=True, name="pie-pytool-loop").start()
 
 
+class _Proxy:
+    """插件看到的「当前会话」：属性 = **事实**（Rust 侧发的那份 `ctx`）。
+
+    方法（改实例的动作）以后加 —— 现在只有读。
+    """
+
+    def __init__(self, ctx):
+        self.__dict__.update(ctx or {})
+
+
+class _Session:
+    """插件注册事件订阅的地方（`session.on(kind, fn)`）。
+
+    装载期就被注进每个插件文件的 globals（和 `tool` / `Tool` 一样），
+    所以插件文件里直接写 `session.on(...)` 就行。
+    """
+
+    def __init__(self):
+        self.handlers = {}  # kind → [fn]
+
+    def on(self, kind, fn):
+        self.handlers.setdefault(kind, []).append(fn)
+        return fn
+
+
+SESSION = _Session()
+
+
 def _emit(obj, lock=None):
     """往协议通道写一行；worker 线程里要拿锁（一次调用一条，别交错成半行）。"""
     line = json.dumps(obj, ensure_ascii=False) + "\n"
@@ -71,13 +111,14 @@ def _emit(obj, lock=None):
 def _load(path, index):
     """按文件路径导入用户工具文件（同一路径的文件共用同一模块名，import 只跑一次）。
 
-    执行前把 `tool` / `Tool` 注进这个模块的 globals → 工具文件不写 `from pie import tool`
-    也能用 `@tool()`；写了的走真绑定，是同一个类。
+    执行前把 `tool` / `Tool` / `session` 注进这个模块的 globals → 工具文件不写
+    `from pie import tool` 也能用 `@tool()`；写了的走真绑定，是同一个类。
     """
     name = "_pie_user_tools_%d" % index
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     module.__dict__["tool"] = tool
+    module.__dict__["session"] = SESSION
     module.__dict__["Tool"] = Tool
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -105,6 +146,25 @@ def _run(tool_obj, rid, kwargs, lock):
     _emit({"id": rid, "text": out}, lock)
 
 
+def _run_event(event, ctx, rid, lock):
+    """处理一个事件：跑订了这一类的插件函数；有一个返回非空字符串就是**否决理由**（取第一个）。
+
+    `rid` 不是 None = 对方在等回话（可否决的 kind），那就必须回一行；否则只跑不答。
+    """
+    reason = None
+    kind = event.get("type") if isinstance(event, dict) else None
+    for fn in SESSION.handlers.get(kind, []):
+        try:
+            out = fn(event, _Proxy(ctx))
+        except BaseException as e:  # 插件自己出错：告警 + 当通过（fail-open）
+            print("插件处理 %s 时抛异常: %s: %s" % (kind, type(e).__name__, e), file=sys.stderr)
+            continue
+        if isinstance(out, str) and out and reason is None:
+            reason = out
+    if rid is not None:
+        _emit({"id": rid, "deny": reason}, lock)
+
+
 def _main():
     found = {}
     warnings = []
@@ -130,6 +190,7 @@ def _main():
                 {"name": t.name, "description": t.description, "parameters": t.parameters}
                 for t in found.values()
             ],
+            "extensions": {"subscribe": sorted(SESSION.handlers)},
             "warnings": warnings,
         }
     )
@@ -147,6 +208,15 @@ def _main():
             continue
         try:
             request = json.loads(line)
+            if "event" in request:  # 事件（工具与扩展共用一条通道、共用一套 id）
+                pool.submit(
+                    _run_event,
+                    request["event"],
+                    request.get("ctx"),
+                    request.get("id"),  # 没有 id = 不用回话（观察类）
+                    lock,
+                )
+                continue
             rid = request["id"]
             tool_obj = found[request["tool"]]
             kwargs = request.get("arguments") or {}

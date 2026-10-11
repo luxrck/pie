@@ -235,6 +235,34 @@ impl PyHost {
         Ok(())
     }
 
+    /// 写一行就走（**不等应答**）：给「观察类」的事件用 —— 没人要回话，宿主那边卡住也不影响回合。
+    ///
+    /// 不带 `id`：宿主按「没有 `id`」判定这次不用回。
+    pub async fn notify(&self, payload: Value) -> Result<(), String> {
+        self.ensure().await?;
+        let mut line = serde_json::to_string(&payload)
+            .map_err(|e| format!("[{}] 请求序列化失败: {e}", self.spec.label))?;
+        line.push('\n');
+        let mut guard = self.stdin.lock().await;
+        let Some(stdin) = guard.as_mut() else {
+            return Err(format!("[{}] 宿主没起来", self.spec.label));
+        };
+        let written = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        }
+        .await;
+        if let Err(e) = written {
+            self.alive.store(false, Ordering::SeqCst);
+            return Err(format!(
+                "[{}] 写事件失败: {e}{}",
+                self.spec.label,
+                self.stderr_suffix()
+            ));
+        }
+        Ok(())
+    }
+
     /// 发一次请求 + 等这一 `id` 的应答（race 取消 / 超时）。
     ///
     /// `payload` 必须是 JSON 对象：本模块会往里加 `id`。
