@@ -139,7 +139,7 @@ impl PyRegistry {
             return Err(PyValueError::new_err(
                 format!(
                     "工具 {name:?} 是 async 函数：绑定是同步调用 handler 的（拿到的会是个没 await 的协程）"
-                ) + "——写成同步函数，或把工具文件交给 `pie` 二进制的 pytool（`~/.pie/tools/`）跑",
+                ) + "——写成同步函数，或把工具文件交给 `pie` 二进制的 pytool（`~/.pie/plugins/`）跑",
             ));
         }
         let parameters_json = crate::py_to_json(&parameters)?;

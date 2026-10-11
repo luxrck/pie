@@ -2,11 +2,11 @@
 //! [`Registry`]（与内置工具、Python 绑定注册的工具共用同一条分发链）。
 //!
 //! 为什么是子进程而不是嵌 CPython：不内嵌 → **零新依赖、默认构建行为不变**（没配
-//! `[python] tools` 就什么都不发生），也不必为一个可选功能把 libpython 拉进每一次构建。
+//! `[python] plugins` 就什么都不发生），也不必为一个可选功能把 libpython 拉进每一次构建。
 //!
 //! 形状（**传输与进程生命周期全交给 [`crate::pyhost`]**：一行一条 JSON、`id` 配对、首行清单、
 //! 懒重启、按进程组杀 —— 本模块只管「清单 → 注册」与「调用 → 工具结果」）：
-//!   - 一个宿主进程装**所有** `[python] tools` 里列的文件（不是一文件一进程）；
+//!   - 一个宿主进程装**所有** `[python] plugins` 里列的文件（不是一文件一进程）；
 //!   - 启动（`load`）时 start + 读首行清单 → 逐个 `with_dynamic`；
 //!   - 调用 = 写一行请求、等一行应答，靠 `id` 配对 → **一批 tool_calls 可以真并发**
 //!     （并发度由 `Session` 那侧决定：`parallel_tools` 关掉时就只会有一个在飞）；
@@ -49,9 +49,9 @@ const HOST: &str = include_str!("python/pytool_host.py");
 /// 装载 Python 工具：起宿主、读清单、逐个注册。**任何失败都只告警**，原样返回 `registry`。
 ///
 /// 解释器与工具文件都从 `config` 取（`[python] interpreter` → `envs/base` → `python3`；
-/// `[python] tools` + 约定目录 `<root>/tools`）。文件列表为空 → 直接返回（零开销，不 spawn）。
+/// `[python] plugins` + 约定目录 `<root>/plugins`）。文件列表为空 → 直接返回（零开销，不 spawn）。
 pub async fn load(registry: Registry, config: &crate::config::Config) -> Registry {
-    let files = files_of(&config.python_tool_entries());
+    let files = files_of(&config.python_plugin_entries());
     if files.is_empty() {
         return registry;
     }
@@ -297,7 +297,7 @@ mod tests {
             crate::config::Config {
                 python: crate::config::PythonConfig {
                     interpreter: Some(python.to_string()),
-                    tools: vec![self.dir.to_string_lossy().into_owned()],
+                    plugins: vec![self.dir.to_string_lossy().into_owned()],
                 },
                 storage: crate::config::Storage::at(self.dir.join("storage")),
                 ..Default::default()
@@ -726,7 +726,7 @@ def ping(text: str) -> str:
 
         // 路径不存在
         let mut nowhere = fixture.config(python);
-        nowhere.python.tools = vec!["/definitely/not/here".to_string()];
+        nowhere.python.plugins = vec!["/definitely/not/here".to_string()];
         let before = Registry::new(HashMap::new());
         let after = load(before.clone(), &nowhere).await;
         assert_eq!(after.names(), before.names());

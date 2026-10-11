@@ -263,7 +263,7 @@ async fn run(cli: Cli) -> i32 {
     // 工具集：先装出**全量**（内置 + 用 Python 写的工具），再按 `--tools` 裁剪。
     // ⚠ 顺序要紧：`--tools` 里非内置的名字要先跟 Python 工具对（对上 = 放行该工具，
     // 对不上 = shell 子命令白名单），所以 Python 工具得先装、名字先知道。
-    // Python 工具走一个长活宿主子进程（`[python] tools`）；没配就是零开销，起不来 / 报错只告警。
+    // 插件（工具 / 扩展）走一个长活宿主子进程（`[python] plugins`）；没配就是零开销，起不来 / 报错只告警。
     // 解释器 / 工具文件 / 给宿主的 `PIE_*` 快照都从 `config` 取（一处解析，见 `pytool.rs`）。
     let registry = pie::pytool::load(Registry::new(config.tool_defaults()), &config).await;
     let registry = tools_from_spec(cli.tools.as_deref(), registry);

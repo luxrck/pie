@@ -99,7 +99,7 @@ cd bindings/pie-py && VIRTUAL_ENV=~/.pie/envs/base .venv/bin/maturin develop   #
 ⚠ 它是**没开 abi3** 的扩展（按解释器版本编的）：base 是 3.13 就只要 `cp313` 那份，以后改了 Rust 要重跑同一条命令刷新。
 
 ```python
-# ~/.pie/tools/word_count.py
+# ~/.pie/plugins/word_count.py
 from pie import tool
 
 @tool(description="统计文本字符数")      # 描述可省（退到 docstring 首行 → 函数名）
@@ -113,13 +113,15 @@ def word_count(text: str) -> str:
 # ~/.pie/config.toml
 [python]
 interpreter = "~/.pie/envs/base/bin/python"   # 缺省就是这样（`pie setup` 建的环境，存在即用）
-tools = ["~/.pie/tools"]                     # 文件或目录（目录取其下 *.py，不递归；`~` 会展开）
+plugins = ["~/.pie/plugins"]                   # 文件或目录（目录取其下 *.py，不递归；`~` 会展开）
+                                         # 旧名 `tools` 也认（那时只有工具，没有扩展）
 ```
 
 不用写 `interpreter` —— **只要 `envs/base` 存在就用它**（`pie setup` 给你建），`repl` 与 Python 工具共用同一个环境，
 所以要装依赖只装一处：`uv pip install --python ~/.pie/envs/base/bin/python pandas`。
 
-工具文件放 `[python] tools` 列出的路径，或直接丢进约定目录 `~/.pie/tools/`（存在即自动加载，不必写配置）。
+**插件文件**放 `[python] plugins` 列出的路径，或直接丢进约定目录 `~/.pie/plugins/`（存在即自动加载，
+不必写配置）——一个文件就是一个插件：可以只写 `@tool`（给模型一个工具）、只写 `session.on(…)`（挂一个扩展），或者两者都写。
 
 - **并发**：同一批的多个 `tool_calls` 一起进宿主、并发跑（`parallel_tools = false` 时按顺序），应答靠 `id` 配对。
 - **取消**：`Esc` 杀掉宿主进程组（在飞的调用一起失败），**下次调用自动重启**。

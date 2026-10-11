@@ -75,7 +75,7 @@ pub fn home_dir() -> PathBuf {
 
 /// 展开路径开头的 `~` / `~/…` → `$HOME`（其余原样）。
 ///
-/// `Command::new` / `PathBuf` 都不认 `~`，而配置里写 `~/.pie/tools` 是最自然的写法 ——
+/// `Command::new` / `PathBuf` 都不认 `~`，而配置里写 `~/.pie/plugins` 是最自然的写法 ——
 /// `repl` 的解释器路径与 `[python]` 段都走这里（**不是 shell，不做变量展开**）。
 pub fn expand_tilde(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
@@ -183,12 +183,12 @@ impl Storage {
         self.envs().join("base")
     }
 
-    /// Python 工具文件目录：`<root>/tools/`。
+    /// **插件目录**：`<root>/plugins/`（工具与扩展的代码都往这儿丢）。
     ///
     /// **约定目录、存在即用**（与 `envs/base` 同一条风格）：往这儿丢 `*.py` 就生效，不用写
-    /// `[python] tools`（两者可共存；见 `Config::python_tool_entries`）。
-    pub fn python_tools(&self) -> PathBuf {
-        self.root.join("tools")
+    /// `[python] plugins`（两者可共存；见 `Config::python_plugin_entries`）。
+    pub fn python_plugins(&self) -> PathBuf {
+        self.root.join("plugins")
     }
 
     /// 上面那个环境的解释器（Windows 是 `Scripts/python.exe`）。
@@ -583,8 +583,12 @@ impl Default for CompactionConfig {
 pub struct PythonConfig {
     /// 解释器路径/命令（缺省：各消费者自己的默认 —— `python3`，Windows `python`）。
     pub interpreter: Option<String>,
-    /// Python 工具文件（或目录；目录取其下 `*.py`，不递归）；`~` 会展开。
-    pub tools: Vec<String>,
+    /// **插件文件**（或目录；目录取其下 `*.py`，不递归）；`~` 会展开。
+    ///
+    /// 一个文件 = 一个插件：可以只写 `@tool`（给模型一个工具）、只写 `session.on(…)`（挂一个扩展）、
+    /// 或者两者都写。旧配置里的 `tools` 键靠 alias 照读（那时只有工具，没有扩展）。
+    #[serde(alias = "tools")]
+    pub plugins: Vec<String>,
 }
 
 /// `[tui]` 段（TUI 还没移植，先把配置形状收着，保证老配置文件能读进来）。
@@ -771,12 +775,11 @@ impl Config {
         base.exists().then(|| base.to_string_lossy().into_owned())
     }
 
-    /// Python 工具文件：`[python] tools` 里写的，加上约定目录 `<root>/tools/`（**存在才算**、
-    /// 排在后头）—— 于是「往 `~/.pie/tools/` 丢个 `.py`」就生效，不必写配置。
-    ///
-    pub fn python_tool_entries(&self) -> Vec<String> {
-        let mut out = self.python.tools.clone();
-        let dir = self.storage.python_tools();
+    /// 插件文件：`[python] plugins` 里写的，加上约定目录 `<root>/plugins/`（**存在才算**、
+    /// 排在后头）—— 于是「往 `~/.pie/plugins/` 丢个 `.py`」就生效，不必写配置。
+    pub fn python_plugin_entries(&self) -> Vec<String> {
+        let mut out = self.python.plugins.clone();
+        let dir = self.storage.python_plugins();
         if dir.is_dir() {
             out.push(dir.to_string_lossy().into_owned());
         }
@@ -950,10 +953,10 @@ impl Config {
         if let Some(interpreter) = &self.python.interpreter {
             python.insert("interpreter".to_string(), V::String(interpreter.clone()));
         }
-        if !self.python.tools.is_empty() {
+        if !self.python.plugins.is_empty() {
             python.insert(
-                "tools".to_string(),
-                V::Array(self.python.tools.iter().cloned().map(V::String).collect()),
+                "plugins".to_string(),
+                V::Array(self.python.plugins.iter().cloned().map(V::String).collect()),
             );
         }
         put("python", V::Table(python));
@@ -1319,6 +1322,44 @@ lean = true
 
     /// 解释器解析：显式 `[python] interpreter` > `envs/base`（**存在才算**）> `None`。
     /// 后者是「`pie setup` 建了环境，`repl` 与 Python 工具自动就用它」的那条线。
+    #[test]
+    fn python_plugin_entries_accepts_the_old_tools_key() {
+        // 旧配置写的是 `[python] tools`（那时只有工具，没有扩展）——**照样读得进来**
+        let old: Config = toml::from_str("[python]\ntools = [\"a.py\", \"/b\"]").unwrap();
+        assert_eq!(old.python.plugins, ["a.py", "/b"]);
+
+        // 新名字；两边一起写时以新名为准（与 serde 的 alias 语义一致）
+        let new: Config = toml::from_str("[python]\nplugins = [\"p.py\"]").unwrap();
+        assert_eq!(new.python.plugins, ["p.py"]);
+
+        // 约定目录是 `<root>/plugins/`（**存在才算**），排在显式列表后头
+        let dir = std::env::temp_dir().join(format!("pie-plugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::at(&dir);
+        let config = Config {
+            storage: storage.clone(),
+            python: PythonConfig {
+                interpreter: None,
+                plugins: vec!["x.py".to_string()],
+            },
+            ..Config::default()
+        };
+        assert_eq!(config.python_plugin_entries(), ["x.py"], "目录不存在就不列");
+        std::fs::create_dir_all(storage.python_plugins()).unwrap();
+        assert_eq!(
+            config.python_plugin_entries().len(),
+            2,
+            "约定目录存在就算一份：{:?}",
+            config.python_plugin_entries()
+        );
+        assert!(
+            config.python_plugin_entries()[1].ends_with("plugins"),
+            "{:?}",
+            config.python_plugin_entries()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn python_interpreter_prefers_explicit_then_base_env() {
         let dir = std::env::temp_dir().join(format!("pie-pyenv-{}", std::process::id()));
