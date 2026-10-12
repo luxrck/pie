@@ -32,9 +32,9 @@
     ⚠ 语义在 2026-10-04 调过：``aturn`` 过去是**同步**的那个 —— 旧代码 ``session.aturn("…")``
     现在会拿到一个没被 await 的 coroutine（同步版改名成了 ``turn``；旧的 ``aturn_async`` 已删）。
   - **事件是 dict**：键名见 ``docs/python-bindings.md``
-    （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``answer``
-    + 会话生命周期的 ``turn_start`` / ``turn_done`` / ``compacted`` / ``cleared`` /
-    ``model_changed`` / ``cwd_changed`` / ``start``）。
+    （``content_delta`` / ``reasoning_delta`` / ``tool_call`` / ``tool_result`` / ``message`` /
+    ``answer`` + 会话生命周期的 ``turn_start`` / ``turn_done`` / ``compacted`` / ``cleared`` /
+    ``model_changed`` / ``cwd_changed`` / ``start`` / ``close``）。
     ⚠ ``tool_result.text`` **不截断**——
     要少显示自己截；同理，一批多个 tool_call 时事件顺序是「先全部 tool_call、再按完成顺序
     tool_result」（``parallel_tools`` 只在并发度上有区别）。

@@ -51,6 +51,11 @@ class ToolResultEvent(TypedDict):
     # 工具产出的图像（本地文件路径）——模型看不到，只有界面用（现在只有 `repl` 给）
     images: list[str]
 
+class MessageEvent(TypedDict):
+    type: Literal["message"]
+    # 刚组装好、写进历史的那条消息（形状与 `session.messages` 里那条一致）
+    message: Message
+
 class AnswerEvent(TypedDict):
     type: Literal["answer"]
     text: str
@@ -94,7 +99,11 @@ class StartEvent(TypedDict):
     # `True` = 从磁盘恢复的会话（`Session.load`），`False` = 新建的
     resume: bool
 
-TurnEvent = ContentDelta | ReasoningDelta | ToolCallEvent | ToolResultEvent | AnswerEvent
+class CloseEvent(TypedDict):
+    type: Literal["close"]
+    id: str
+
+TurnEvent = ContentDelta | ReasoningDelta | ToolCallEvent | ToolResultEvent | MessageEvent | AnswerEvent
 """回合内事件（模型说话 / 工具活动）。"""
 
 SessionEvent = (
@@ -105,6 +114,7 @@ SessionEvent = (
     | ModelChangedEvent
     | CwdChangedEvent
     | StartEvent
+    | CloseEvent
 )
 """会话生命周期事件。"""
 

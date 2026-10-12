@@ -162,8 +162,9 @@ session.on("tool_call", no_rm)
 ```
 
 - **订阅按名字**（`kind` 就是事件 dict 里的 `type`，`"*"` = 全部）：回合事件 `tool_call` / `tool_result` /
-  `answer` / `content_delta` / `reasoning_delta`，会话事件 `turn_start` / `turn_done` / `compacted` /
-  `cleared` / `model_changed` / `cwd_changed` / `start`。**没订的不发**（逐字增量默认不订，别把它灌进来）。
+  `message`（一条完整消息组装好了：user / assistant / tool 结果各推一次）/ `answer` / `content_delta` /
+  `reasoning_delta`，会话事件 `turn_start` / `turn_done` / `compacted` /
+  `cleared` / `model_changed` / `cwd_changed` / `start` / `close`。**没订的不发**（逐字增量默认不订，别把它灌进来）。
 - **只有 `tool_call` 能拦**：回调返回字符串 = 否决 —— 那次调用不执行，模型收到 `[策略拒绝] <理由>`
   （历史里仍是一对配好的消息）；返回 `None` = 通过。别的 kind 返回字符串只当写错（忽略），
   回调抛异常一律**当通过**（fail-open）。

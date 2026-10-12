@@ -334,8 +334,8 @@ impl PySession {
     /// **跨回合订阅本会话的事件**：`on(kind, callback)`，回调收到 dict（形状与 `turn(on_event=…)` 同一套）。
     ///
     /// `kind` = **事件名**（就是 dict 里的 `type`：`content_delta` / `reasoning_delta` / `tool_call` /
-    /// `tool_result` / `answer` / `turn_start` / `turn_done` / `compacted` / `cleared` /
-    /// `model_changed` / `cwd_changed` / `start`），`"*"` = 全部。
+    /// `tool_result` / `message` / `answer` / `turn_start` / `turn_done` / `compacted` / `cleared` /
+    /// `model_changed` / `cwd_changed` / `start` / `close`），`"*"` = 全部。
     /// 只要某几类就分别订 —— Rust 侧**根本不会为没订的事件建 dict**（尤其那两个增量）。
     ///
     /// **回调可以否决**：返回 `None`（或什么都不返回）= 通过；返回一个字符串 = 否决，
@@ -395,7 +395,7 @@ impl PySession {
     /// 这是**同步**版（名字不带 `a`）；要 `await` 用 [`PySession::aturn`]。
     ///
     /// `on_event(event: dict)` 边跑边收事件（`content_delta` / `reasoning_delta` / `tool_call` /
-    /// `tool_result` / `answer`，形状见 `docs/python-bindings.md`）；
+    /// `tool_result` / `message` / `answer`，形状见 `docs/python-bindings.md`）；
     /// 事件在**调用线程**上回调（所以回调里能安全地 print / 更新自己的状态）。
     ///
     /// `max_steps=None` = 不限步数；`stream=None` = 默认流式（`False` 则一次性 complete，
@@ -654,7 +654,8 @@ fn busy_error_or(msg: &str) -> PyErr {
 
 /// `Event` → dict（键名与 JSONL / 事件形状对齐）。
 ///
-/// 回合事件手写映射（`content_delta` / `reasoning_delta` / `tool_call` / `tool_result` / `answer`）；
+/// 回合事件手写映射（`content_delta` / `reasoning_delta` / `tool_call` / `tool_result` / `message` /
+/// `answer`）；
 /// 会话事件直接走 serde（`SessionEvent` 自带 `#[serde(tag = "type")]`，同一套扁平词表）。
 /// 事件 → Python dict：**线上形状由核心给**（[`pie::event::to_wire`] 是唯一出口——
 /// 规范形状 + `arguments` 解析成 dict + `arguments_raw`），这里只做 Value → PyObject。

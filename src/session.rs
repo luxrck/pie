@@ -93,6 +93,20 @@ pub struct Session {
     actions: Actions,
 }
 
+impl Drop for Session {
+    /// 会话结束（与 [`SessionEvent::Start`] 对应）：广播 [`SessionEvent::Close`]。
+    ///
+    /// ⚠ 发事件的是 drop 的那条线程（TUI 主线程 / 绑定回收对象那条）—— 监听者里同样别阻塞。
+    fn drop(&mut self) {
+        self.bus.send(
+            Event::Session(SessionEvent::Close {
+                id: config::name_of(&self.path),
+            }),
+            None,
+        );
+    }
+}
+
 /// 「思考」计时：实时视图里那行 `• Thought for 3.4s` 的来源。
 ///
 /// 口径与 TUI 的 `settle_thought` **一致**：**首个 reasoning 增量**起算、**首个正文增量**停下
@@ -133,12 +147,16 @@ impl Session {
     /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
     pub fn new(config: &Config, id: Option<&str>, llm: LlmClient, registry: Registry) -> Self {
-        Self::at(
-            resolve_path(&config.storage.sessions(), id),
-            config,
-            llm,
-            registry,
-        )
+        Self::at(Self::path_for(config, id), config, llm, registry)
+    }
+
+    /// `id` 解析出来的会话文件路径：纯名字 → `<sessions>/<name>.jsonl`；带目录 / 绝对路径 → 原样；
+    /// `None` → 时间戳新文件。
+    ///
+    /// [`Session::new`] 用它；CLI 的「已存在就载入」也得先算出同一个路径
+    /// —— `Session` 现在带 `Drop`，不能再生一个壳再把字段拆出来复用。
+    pub fn path_for(config: &Config, id: Option<&str>) -> PathBuf {
+        resolve_path(&config.storage.sessions(), id)
     }
 
     /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`，压缩事件也就不会落盘），其余完全一样。
@@ -370,7 +388,7 @@ impl Session {
         if self.title.is_none() {
             self.title = first_line(text);
         }
-        self.messages.push(Message::user(text));
+        self.push_message(Message::user(text));
         self.turn_count += 1;
     }
 
@@ -379,7 +397,7 @@ impl Session {
     /// 典型场景（synthetic 那套）：模型这一轮什么也没改，就在历史里补一条 assistant 再补一条
     /// user 提醒，然后**接着跑**下一个 `aturn`。计 `turn_count` 只数用户消息，这里不动它。
     pub fn push_assistant(&mut self, text: &str) {
-        self.messages.push(Message::assistant(text));
+        self.push_message(Message::assistant(text));
     }
 
     /// 模型请求失败（外部因素：网络 / 服务端错 / 协议错）→ 往历史里补一条 assistant 消息
@@ -390,8 +408,19 @@ impl Session {
     /// 取消补 `CANCEL_TEXT`，失败补 `[请求失败] <错误>`；调用方仍然拿到 `Err`（界面照旧报错），
     /// 只是历史里这对 user/assistant 始终成对。
     fn push_error_turn(&mut self, err: &LlmError) {
-        self.messages
-            .push(Message::assistant(format!("{ERROR_TURN_PREFIX}{err}")));
+        self.push_message(Message::assistant(format!("{ERROR_TURN_PREFIX}{err}")));
+    }
+
+    /// 把一条消息写进历史，并广播 [`TurnEvent::Message`]（**这条消息组装完了**）。
+    ///
+    /// 所有写入口都走这里（user / assistant / tool 结果 / 取消与失败的收尾回执）：`message` 事件
+    /// 因此与 `messages` 里那条**一一对应、同序** —— 消费者拿它就能重建对话，不必自己拼增量。
+    fn push_message(&mut self, message: Message) {
+        let event = TurnEvent::Message {
+            message: message.clone(),
+        };
+        self.messages.push(message);
+        self.bus.send(Event::Turn(event), None);
     }
 
     /// 订阅本会话的事件（`name`：`"*"` = 全部，其余 = 只要这一类，见 [`Event::name`]）。
@@ -677,7 +706,7 @@ impl Session {
             send_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
-            self.messages.push(Message {
+            self.push_message(Message {
                 role: "assistant".into(),
                 content: result
                     .content
@@ -733,7 +762,7 @@ impl Session {
                     msg.compaction = Some(Compaction::tool(path));
                 }
                 let msg_index = self.messages.len();
-                self.messages.push(msg);
+                self.push_message(msg);
                 // 要送给模型的图（`Attachment::Model`）——先记下标，循环外挂（见 `attach_read_images`）
                 if let Some(att) = out
                     .attachments
@@ -763,7 +792,7 @@ impl Session {
 
         if cancelled {
             // 历史里留一条终止消息，并把它当本轮答复
-            self.messages.push(Message::assistant(CANCEL_TEXT));
+            self.push_message(Message::assistant(CANCEL_TEXT));
             if !use_stream {
                 bus.send(
                     Event::Turn(TurnEvent::Answer {
@@ -3180,6 +3209,79 @@ mod tests {
                 other => panic!("最后一条该是 TurnDone：{other:?}"),
             }
         });
+    }
+
+    /// `message` 事件 = 刚写进历史的那条消息：一轮请求失败也照样各推一次（user → 失败回执），
+    /// 与 `messages` 逐条对得上（`system` 不在本回合的写入里）。
+    #[test]
+    fn message_events_mirror_the_written_history() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let config = Config {
+                base_url: "不是地址".into(),
+                max_retries: 0,
+                ..Config::default()
+            };
+            let mut s = Session::ephemeral(
+                &config,
+                LlmClient::new(&config).expect("client"),
+                registry(),
+            );
+            let seen: std::sync::Arc<std::sync::Mutex<Vec<Message>>> = Default::default();
+            let _sub = s.on("*", {
+                let seen = std::sync::Arc::clone(&seen);
+                move |e: &Event| {
+                    if let Event::Turn(TurnEvent::Message { message }) = e {
+                        seen.lock().unwrap().push(message.clone());
+                    }
+                    Ok(())
+                }
+            });
+            let _ = s
+                .aturn(
+                    "看一下这个 bug",
+                    None,
+                    None,
+                    RequestOptions::default().with_stream(Some(false)),
+                )
+                .await
+                .expect_err("请求必定失败");
+
+            let pairs = |ms: &[Message]| -> Vec<(String, String)> {
+                ms.iter()
+                    .map(|m| (m.role.clone(), m.content_text()))
+                    .collect()
+            };
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                pairs(&seen),
+                pairs(&s.messages[1..]),
+                "事件要与历史逐条对应"
+            );
+            assert_eq!(seen.len(), 2, "user + 失败回执：{seen:?}");
+            assert_eq!(seen[0].role, "user");
+            assert!(seen[1].content_text().starts_with(ERROR_TURN_PREFIX));
+        });
+    }
+
+    /// 会话销毁时推一条 `Close`（与 `Start` 对应）。
+    #[test]
+    fn dropping_a_session_broadcasts_close() {
+        let s = session();
+        let id = config::name_of(&s.path);
+        let got: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let _sub = s.on("close", {
+            let got = std::sync::Arc::clone(&got);
+            move |e: &Event| {
+                if let Event::Session(SessionEvent::Close { id }) = e {
+                    got.lock().unwrap().push(id.clone());
+                }
+                Ok(())
+            }
+        });
+        // 得在订阅凭据还活着的时候显式 drop（它比会话后声明，不显式 drop 就先退订了）
+        drop(s);
+        assert_eq!(got.lock().unwrap().as_slice(), [id.as_str()]);
     }
 
     /// 用量是「最近一次上报值 + calls 累计」（不求和）。

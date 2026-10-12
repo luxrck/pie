@@ -945,19 +945,14 @@ fn open_session(
         let s = Session::resume(config, llm, registry)?;
         return Ok(s);
     }
-    let candidate = Session::new(config, id, llm, registry);
-    if candidate.path.exists() {
-        // 已存在 → 载入它（把客户端 / 工具集从刚建好的壳里取出来再用）
-        let Session {
-            path,
-            llm,
-            registry,
-            ..
-        } = candidate;
+    // 已存在 → 载入它。路径先算出来，同一个 `llm` / `registry` 直接交给 `load`
+    //（`Session` 带 `Drop`，不能再建个壳再把字段拆出来复用）。
+    let path = Session::path_for(config, id);
+    if path.exists() {
         let s = Session::load(&path, config, llm, registry)?;
         Ok(s)
     } else {
-        Ok(candidate)
+        Ok(Session::new(config, id, llm, registry))
     }
 }
 

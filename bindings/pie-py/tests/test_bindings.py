@@ -279,13 +279,18 @@ def test_turn_runs_tool_and_streams_events(env):
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
-    # 会话生命周期事件包在两头：`turn_start`（带原始输入）/ `turn_done`（带答复）
+    # 会话生命周期事件包在两头：`turn_start`（带原始输入）/ `turn_done`（带答复）；
+    # 每条写进历史的消息（user / 两处 assistant / tool）各带一条 `message`
     assert kinds == [
         "turn_start",
+        "message",
+        "message",
         "tool_call",
         "tool_result",
+        "message",
         "content_delta",
         "content_delta",
+        "message",
         "turn_done",
     ]
     assert events[0]["input"] == "打个招呼"
@@ -293,19 +298,27 @@ def test_turn_runs_tool_and_streams_events(env):
     assert events[-1]["error"] is None
     assert isinstance(events[-1]["elapsed_ms"], int)
 
-    call = events[1]
+    # `message` 事件 = 刚写进历史的那条（顺序与 `messages` 一致；system 不在本回合里）
+    assert [e["message"]["role"] for e in events if e["type"] == "message"] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+    call = events[3]
     assert call["name"] == "bash"
     assert call["arguments"] == {"command": "echo hi"}  # 参数已解析成 dict
     assert call["arguments_raw"] == '{"command": "echo hi"}'
 
-    result = events[2]
+    result = events[4]
     assert result["name"] == "bash"
     # 成功**只有正文**（`[exit=N]` 头只在失败时给，2026-09-23 定稿）：正文就是 `echo` 的输出，
     # 说明 shell 真跑了
     assert result["text"] == "hi\n"
     assert "hi" in result["text"]
 
-    assert [e["text"] for e in events[3:5]] == ["搞定", "了"]
+    assert [e["text"] for e in events[6:8]] == ["搞定", "了"]
 
     # 历史：user → assistant(tool_calls) → tool → assistant
     roles = [m["role"] for m in session.messages]
@@ -427,7 +440,17 @@ def test_turn_accepts_per_turn_knobs(env):
 
     assert answer == "搞定了"
     kinds = [e["type"] for e in events]
-    assert kinds == ["turn_start", "tool_call", "tool_result", "answer", "turn_done"], kinds
+    assert kinds == [
+        "turn_start",
+        "message",
+        "message",
+        "tool_call",
+        "tool_result",
+        "message",
+        "message",
+        "answer",
+        "turn_done",
+    ], kinds
     assert events[-2]["text"] == "搞定了"
 
 
@@ -514,10 +537,14 @@ def test_on_subscribes_across_turns(env, tmp_path):
     session.turn("打个招呼")
     assert [e["type"] for e in seen[1:]] == [
         "turn_start",
+        "message",
+        "message",
         "tool_call",
         "tool_result",
+        "message",
         "content_delta",
         "content_delta",
+        "message",
         "turn_done",
     ], seen
 
@@ -818,6 +845,7 @@ def test_stub_event_shapes_match_the_real_events(env):
         "reasoning_delta": "ReasoningDelta",
         "tool_call": "ToolCallEvent",
         "tool_result": "ToolResultEvent",
+        "message": "MessageEvent",
         "answer": "AnswerEvent",
         "turn_start": "TurnStartEvent",
         "turn_done": "TurnDoneEvent",
@@ -826,6 +854,7 @@ def test_stub_event_shapes_match_the_real_events(env):
         "model_changed": "ModelChangedEvent",
         "cwd_changed": "CwdChangedEvent",
         "start": "StartEvent",
+        "close": "CloseEvent",
     }
 
     cfg, llm, tools, _ = env
@@ -1028,10 +1057,14 @@ def test_aturn_streams_events_and_returns_answer(env):
     assert answer == "搞定了"
     assert kinds == [
         "turn_start",
+        "message",
+        "message",
         "tool_call",
         "tool_result",
+        "message",
         "content_delta",
         "content_delta",
+        "message",
         "turn_done",
     ], kinds
 

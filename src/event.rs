@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use crate::llm::Message;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------- 语义（回合 → 消费者）
@@ -49,6 +50,13 @@ pub enum TurnEvent {
         /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
         images: Vec<PathBuf>,
     },
+    /// 一条**完整的消息**组装好了（刚写进历史的那条）。
+    ///
+    /// 与增量事件的分工：正文边涨边看用 `content_delta`，**成品**看这里 —— `message` 的形状就是
+    /// 会话文件里那条（`role` / `content` / `tool_calls` / `reasoning_content` …，含本地字段）。
+    /// 一次回合里**每条写进历史的消息都推一次**（user / assistant / tool 结果 / 取消与失败的收尾
+    /// 回执），所以消费者光靠它就能按序重建这段对话，不必自己拼增量。
+    Message { message: Message },
     /// 最终答复。
     ///
     /// **只在非流式（`aturn(stream = Some(false))`）时推**：流式下正文已经通过 `ContentDelta` 增量
@@ -64,6 +72,7 @@ impl TurnEvent {
             TurnEvent::ReasoningDelta { .. } => "reasoning_delta",
             TurnEvent::ToolCall { .. } => "tool_call",
             TurnEvent::ToolResult { .. } => "tool_result",
+            TurnEvent::Message { .. } => "message",
             TurnEvent::Answer { .. } => "answer",
         }
     }
@@ -228,6 +237,11 @@ pub enum SessionEvent {
     /// 会话开始（构造时就定了）：`resume` = 这是**从磁盘恢复**的会话（`Session::load`），
     /// 而不是新建的。
     Start { id: String, resume: bool },
+    /// 会话结束（`Session` 正在销毁）——与 [`SessionEvent::Start`] 对应。
+    ///
+    /// 发在 `Drop` 里而不是另开一个 `close()`：会话的「结束」没有别的确定时刻 ——
+    /// CLI 跑完、TUI 退出、绑定的对象被回收，都是 drop。
+    Close { id: String },
 }
 
 impl SessionEvent {
@@ -241,6 +255,7 @@ impl SessionEvent {
             SessionEvent::ModelChanged { .. } => "model_changed",
             SessionEvent::CwdChanged { .. } => "cwd_changed",
             SessionEvent::Start { .. } => "start",
+            SessionEvent::Close { .. } => "close",
         }
     }
 }
@@ -262,11 +277,12 @@ pub enum Event {
 impl Event {
     /// 所有事件名（= 线上 `type` = 订阅用的 kind）。唯一事实来源是下面 `name()` 里那些字面量
     /// —— 这里再列一遍是给**校验**用（订阅时拼错了就告警），契约测试钉住两者一致。
-    pub const NAMES: [&'static str; 12] = [
+    pub const NAMES: [&'static str; 14] = [
         "content_delta",
         "reasoning_delta",
         "tool_call",
         "tool_result",
+        "message",
         "answer",
         "turn_start",
         "turn_done",
@@ -275,6 +291,7 @@ impl Event {
         "model_changed",
         "cwd_changed",
         "start",
+        "close",
     ];
 
     /// 事件名（= 序列化出来的 `type` = 订阅时用的那个 kind）。
@@ -704,6 +721,9 @@ mod tests {
                 arguments: "{}".into(),
                 images: Vec::new(),
             }),
+            Event::Turn(TurnEvent::Message {
+                message: Message::assistant("x"),
+            }),
             Event::Turn(TurnEvent::Answer { text: "x".into() }),
             Event::Session(SessionEvent::TurnStart { input: "x".into() }),
             Event::Session(SessionEvent::TurnDone {
@@ -731,6 +751,7 @@ mod tests {
                 id: "s".into(),
                 resume: false,
             }),
+            Event::Session(SessionEvent::Close { id: "s".into() }),
         ];
         let mut names: Vec<&str> = Vec::new();
         for ev in &samples {

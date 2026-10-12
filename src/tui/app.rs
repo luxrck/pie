@@ -785,6 +785,9 @@ impl App {
                     since: Instant::now(),
                 };
             }
+            // 完整消息：消息流是**增量拼**出来的（`ContentDelta` / `ToolCall` / `ToolResult`），
+            // 不再消费这条 —— 否则同一段正文会显示两遍。
+            UiEvent::Turn(TurnEvent::Message { .. }) => {}
             UiEvent::ShellDone(status, body) => {
                 self.busy = false;
                 self.snapshot.busy = false;
