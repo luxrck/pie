@@ -50,7 +50,8 @@ const HOST: &str = include_str!("python/pyplugin_host.py");
 /// 装载 Python 工具：起宿主、读清单、逐个注册。**任何失败都只告警**，原样返回 `registry`。
 ///
 /// 解释器与工具文件都从 `config` 取（`[python] interpreter` → `envs/base` → `python3`；
-/// `[python] plugins` + 约定目录 `<root>/plugins`）。文件列表为空 → 直接返回（零开销，不 spawn）。
+/// `[python] plugins` + 约定目录 `<root>/plugins`）。文件列表为空 → 直接返回（零开销，不 spawn，
+/// 也**不告警**：没装插件是正常状态）。
 pub async fn load(registry: Registry, config: &crate::config::Config) -> Registry {
     let files = files_of(&config.python_plugin_entries());
     if files.is_empty() {
@@ -253,7 +254,11 @@ async fn call(host: &PyHost, tool: &str, args: Value, ctx: ToolCtx) -> ToolResul
     }
 }
 
-/// 展开路径：`~` → `$HOME`；目录取其下 `*.py`（不递归、排过序）；不存在 → 告警。
+/// 展开路径：`~` → `$HOME`；目录取其下 `*.py`（不递归、排过序）。
+///
+/// 目录里没有 `*.py` = **没装插件**（正常状态）→ 静默跳过，不告警：约定目录
+/// `<root>/plugins` 常年空着，每次启动刷一句「没有 *.py」只是噪音。
+/// 真错（路径不存在、目录读不了）照样告警。
 fn files_of(entries: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in entries {
@@ -267,9 +272,6 @@ fn files_of(entries: &[String]) -> Vec<PathBuf> {
                         .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "py"))
                         .collect();
                     found.sort();
-                    if found.is_empty() {
-                        crate::log::warn(format!("[pyplugin] 目录里没有 *.py：{}", path.display()));
-                    }
                     out.append(&mut found);
                 }
                 Err(e) => {
