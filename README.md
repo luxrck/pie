@@ -40,7 +40,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | `--max-steps <N>` | 单回合最多问几次模型 |
 | `--no-stream` | 强制非流式（一次性 `complete`） |
 | `--auto-compact-threshold <N>` | 服务端上报的上下文超过该值即自动压缩 |
-| `--timeout-seconds` / `--max-retries` / `--max-retry-delay-seconds` | HTTP 超时 / 重试次数 / 重试等待上限 |
+| `--timeout-seconds` / `--max-retries` / `--max-retry-delay-seconds` | 「等不到数据」的秒数上限（建连 / 响应头 / 流式数据块间隔，**不是**总时长） / 重试次数 / 重试等待上限 |
 | `--cwd <目录>` | 工具的工作目录（默认当前目录） |
 | `--tools <名单>` | 限制可用工具，如 `read,ls,grep`（内置名 `read/edit/writ/bash/repl` 启用对应工具；其余名字先跟用 Python 写的工具对，对不上当 shell 子命令白名单） |
 | `--system-prompt <文本或路径>` / `--append-system-prompt <…>` | 替换基础提示 / 追加到 system prompt（可重复） |

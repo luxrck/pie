@@ -319,8 +319,17 @@ pub use crate::event::ChunkEvent;
 
 #[derive(Debug)]
 pub enum LlmError {
-    /// 传输层（连接 / 超时 / 读 body 中断）—— 一律可重试。
+    /// 传输层（连接 / 读 body 中断）—— 一律可重试。
+    ///
+    /// ⚠ reqwest 把**读 body 阶段的任何失败**都归成 `Kind::Decode`，Display 只给一句
+    /// 「error decoding response body」——完全看不出是断流还是超时。所以报错时必须带上
+    /// `source()` 链（见 `chain`），否则等于没报。
     Transport(reqwest::Error),
+    /// 等太久没动静：超时点是我们自己的 `timeout_seconds`（不是服务端给的）。
+    ///
+    /// 单独一支的理由：流式请求**不能**用「整个请求的总时限」（长回答必被砍）。所以流式按
+    /// **静默期**判超时（两个数据块之间，见 `stream_once`），只有那种超时走这一支。
+    Timeout { what: &'static str, secs: f64 },
     /// 服务端返回了非 2xx：保留 status + 原文 + `Retry-After`。
     /// 原文必须留着：`is_stale_file_error` 靠它做字符串匹配。
     Api {
@@ -335,7 +344,10 @@ pub enum LlmError {
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmError::Transport(e) => write!(f, "连接失败: {e}"),
+            LlmError::Transport(e) => write!(f, "连接失败: {}", chain(e)),
+            LlmError::Timeout { what, secs } => {
+                write!(f, "超时: 等待{what}超过 {secs:.0} 秒")
+            }
             LlmError::Api { status, body, .. } => {
                 let body = body.trim();
                 let body: String = body.chars().take(500).collect();
@@ -372,7 +384,7 @@ impl LlmError {
     /// 值不值得重试：408/409/429/5xx 与传输层异常；其余 4xx 立刻抛。
     pub fn retryable(&self) -> bool {
         match self {
-            LlmError::Transport(_) => true,
+            LlmError::Transport(_) | LlmError::Timeout { .. } => true,
             LlmError::Api { status, .. } => {
                 *status == 408 || *status == 409 || *status == 429 || *status >= 500
             }
@@ -408,18 +420,7 @@ impl LlmError {
     /// 日志里的一行摘要（`[retry] …（异常摘要）`）。
     fn brief(&self) -> String {
         match self {
-            LlmError::Transport(e) => {
-                let mut cur: &dyn std::error::Error = e;
-                let mut parts = Vec::new();
-                for _ in 0..2 {
-                    parts.push(one_line(&cur.to_string()));
-                    match cur.source() {
-                        Some(s) => cur = s,
-                        None => break,
-                    }
-                }
-                format!("{}: {}", type_prefix(e), parts.join(" ↳ "))
-            }
+            LlmError::Transport(e) => format!("{}: {}", type_prefix(e), chain(e)),
             other => {
                 let mut s = one_line(&other.to_string());
                 s.truncate(240);
@@ -427,6 +428,28 @@ impl LlmError {
             }
         }
     }
+}
+
+/// 错误链：`主消息 ↳ 根因 ↳ 更根的原因`（最多四层 / 300 字）。
+///
+/// reqwest 的 Display 是**按错误大类**给的固定文案（"error decoding response body" /
+/// "error sending request"），真正的原因（连接被对端关掉 / TLS / IO）只在 `source()` 里。
+/// 取四层是因为 reqwest → hyper-util → ConnectError → io 正好是这个深度（最里层才是
+/// "Connection refused (os error 61)" 这种能直接定位的话）。
+fn chain(e: &reqwest::Error) -> String {
+    let mut cur: &dyn std::error::Error = e;
+    let mut parts: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let msg = one_line(&cur.to_string());
+        if parts.last() != Some(&msg) {
+            parts.push(msg);
+        }
+        match cur.source() {
+            Some(s) => cur = s,
+            None => break,
+        }
+    }
+    parts.join(" ↳ ").chars().take(300).collect()
 }
 
 fn type_prefix(e: &reqwest::Error) -> &'static str {
@@ -540,6 +563,10 @@ pub struct LlmClient {
     max_tokens: Option<i64>,
     max_retries: u32,
     max_retry_delay: f64,
+    /// 「等不到数据」的上限：建连 / 等响应头 / 流式两个数据块之间。**不是**整个请求的总时长。
+    timeout: Duration,
+    /// 同一个数的秒值（只用于报错文案）。
+    timeout_secs: f64,
 }
 
 /// 重试等待的上限：再长也不把一个回合卡死。
@@ -570,8 +597,13 @@ impl LlmClient {
         // TLS 的 crypto provider 只用 ring（reqwest 0.13 默认是 aws-lc-rs，要多一套 cmake/NASM 构建）；
         // 装过一次就全局生效，重复装会返回 Err —— 忽略即可。
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let timeout_secs = config.timeout_seconds.max(1.0);
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(config.timeout_seconds.max(1.0)))
+            // ⚠ **不**设 client 级 `.timeout()`：那作用在**整个请求（含 body）**上，流式长回答
+            // （尤其 high 思考 + 大上下文）超过了就被砍，而且 reqwest 会把它归成 Decode，
+            // 报成误导的「error decoding response body」。这里只限建连，其余等待点各自限时：
+            // 非流式 `send_json` 整体限时，流式 `send` 限响应头、`stream_once` 按**静默期**限数据块。
+            .connect_timeout(Duration::from_secs_f64(timeout_secs))
             .user_agent(concat!("pie/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(LlmError::Transport)?;
@@ -584,6 +616,8 @@ impl LlmClient {
             max_tokens: config.reserved_tokens.map(|n| n as i64),
             max_retries: config.max_retries as u32,
             max_retry_delay: config.max_retry_delay_seconds,
+            timeout: Duration::from_secs_f64(timeout_secs),
+            timeout_secs,
         })
     }
 
@@ -597,6 +631,43 @@ impl LlmClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path)
+    }
+
+    /// 超时错误（`what` = 在等什么：响应 / 响应头 / 下一个数据块）。
+    fn timeout_error(&self, what: &'static str) -> LlmError {
+        LlmError::Timeout {
+            what,
+            secs: self.timeout_secs,
+        }
+    }
+
+    /// 发请求 + 检查状态码：**等响应头**（含读错误体）这一段受 `timeout` 限制。
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, LlmError> {
+        let fut = async {
+            let resp = req.send().await.map_err(LlmError::Transport)?;
+            check_status(resp).await
+        };
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(self.timeout_error("响应头")),
+        }
+    }
+
+    /// 非流式的一次完整往返：发请求 → 读完整 JSON。**整体**受 `timeout` 限制
+    ///（非流式本来就该在一次时限内完成，没有「长流」这回事）。
+    async fn send_json<T>(&self, req: reqwest::RequestBuilder) -> Result<T, LlmError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let fut = async {
+            let resp = req.send().await.map_err(LlmError::Transport)?;
+            let resp = check_status(resp).await?;
+            resp.json::<T>().await.map_err(LlmError::Transport)
+        };
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(self.timeout_error("响应")),
+        }
     }
 
     /// 请求体。`request_options` 是**按次**覆盖（见 [`RequestOptions`]）：
@@ -722,16 +793,14 @@ impl LlmClient {
             "请求",
             || async move {
                 let body = self.request_body(messages, tools, false, false, request_options);
-                let resp = self
-                    .http
-                    .post(self.url("chat/completions"))
-                    .bearer_auth(&self.api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(LlmError::Transport)?;
-                let resp = check_status(resp).await?;
-                let parsed: ChatResponse = resp.json().await.map_err(LlmError::Transport)?;
+                let parsed: ChatResponse = self
+                    .send_json(
+                        self.http
+                            .post(self.url("chat/completions"))
+                            .bearer_auth(&self.api_key)
+                            .json(&body),
+                    )
+                    .await?;
                 let choice = parsed
                     .choices
                     .into_iter()
@@ -785,18 +854,24 @@ impl LlmClient {
                     let body =
                         self.request_body(messages, tools, true, with_usage, request_options);
                     let resp = self
-                        .http
-                        .post(self.url("chat/completions"))
-                        .bearer_auth(&self.api_key)
-                        .json(&body)
-                        .send()
-                        .await
-                        .map_err(LlmError::Transport)?;
-                    let resp = check_status(resp).await?;
+                        .send(
+                            self.http
+                                .post(self.url("chat/completions"))
+                                .bearer_auth(&self.api_key)
+                                .json(&body),
+                        )
+                        .await?;
 
                     let mut stream = resp.bytes_stream();
                     let mut buf: Vec<u8> = Vec::new();
-                    while let Some(item) = stream.next().await {
+                    loop {
+                        // **静默期**超时：两个数据块之间（含第一块）太久没动静才断。
+                        // 只要数据还在流，长回答就不会因为「总共花了多久」被砍。
+                        let item = match tokio::time::timeout(self.timeout, stream.next()).await {
+                            Ok(item) => item,
+                            Err(_) => return Err(self.timeout_error("下一个数据块")),
+                        };
+                        let Some(item) = item else { break };
                         let bytes = item.map_err(LlmError::Transport)?;
                         buf.extend_from_slice(&bytes);
                         // 按行切；最后一段可能是不完整的行，留在 buf 里等下一个 chunk
@@ -849,15 +924,9 @@ impl LlmClient {
         self.with_retry(
             "模型列表请求",
             || async move {
-                let resp = self
-                    .http
-                    .get(self.url("models"))
-                    .bearer_auth(&self.api_key)
-                    .send()
-                    .await
-                    .map_err(LlmError::Transport)?;
-                let resp = check_status(resp).await?;
-                let parsed: ModelsResponse = resp.json().await.map_err(LlmError::Transport)?;
+                let parsed: ModelsResponse = self
+                    .send_json(self.http.get(self.url("models")).bearer_auth(&self.api_key))
+                    .await?;
                 let mut ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
                 ids.sort();
                 Ok(ids)
@@ -876,15 +945,12 @@ impl LlmClient {
         self.with_retry(
             "余额查询",
             || async move {
-                let resp = self
-                    .http
-                    .get(self.url("user/balance"))
-                    .bearer_auth(&self.api_key)
-                    .send()
-                    .await
-                    .map_err(LlmError::Transport)?;
-                let resp = check_status(resp).await?;
-                resp.json::<Balance>().await.map_err(LlmError::Transport)
+                self.send_json(
+                    self.http
+                        .get(self.url("user/balance"))
+                        .bearer_auth(&self.api_key),
+                )
+                .await
             },
             |attempt, e| default_retry(self.max_retries, attempt, e),
         )
@@ -1339,6 +1405,23 @@ mod tests {
         // 落盘（会话 JSONL）要保住它，否则回放还原不出「• Thought for …」
         let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.thought_ms, Some(1234));
+    }
+
+    /// 超时错误要**说清楚在等什么、等了多久**。
+    ///
+    /// 以前 reqwest 把「流式响应体阶段超时」归成 `Kind::Decode`，界面上只有一句
+    /// "error decoding response body"（看上去像 JSON 坏了）—— 这是 2026-10-17 那次现场报错的根源。
+    #[test]
+    fn timeout_error_names_what_and_how_long() {
+        let e = LlmError::Timeout {
+            what: "下一个数据块",
+            secs: 60.0,
+        };
+        let s = e.to_string();
+        assert!(s.contains("超时"), "{s}");
+        assert!(s.contains("下一个数据块") && s.contains("60"), "{s}");
+        assert!(e.retryable(), "超时是外部因素，该重试");
+        assert_eq!(e.status(), None);
     }
 
     #[test]

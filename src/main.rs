@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long)]
     auto_compact_threshold: Option<usize>,
 
-    /// HTTP 超时秒数（覆盖配置）
+    /// 「等不到数据」的秒数上限（建连 / 响应头 / 流式数据块间隔；不是总时长）
     #[arg(long)]
     timeout_seconds: Option<f64>,
 

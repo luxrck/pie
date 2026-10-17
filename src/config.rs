@@ -619,6 +619,8 @@ pub struct Config {
     /// `None` = 不做任何上下文压缩。
     #[serde(deserialize_with = "de_compaction")]
     pub compaction: Option<CompactionConfig>,
+    /// 「等不到数据」的上限（秒）：建连 / 等响应头 / 流式两个数据块之间。**不是**整个请求的总时长：
+    /// 非流式请求整体受它限制，流式只要数据还在流就不会被它砍。
     pub timeout_seconds: f64,
     pub max_retries: usize,
     pub max_retry_delay_seconds: f64,
