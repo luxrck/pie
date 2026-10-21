@@ -141,8 +141,17 @@ pub enum StoreType<'a> {
 
 impl Storage {
     /// 从环境解析默认 root：`PIE_DIR` → 当前目录下的 `.pie`（存在即用）→ `~/.pie`。
+    ///
+    /// **顺手把 root 建出来**：`PIE_DIR` 指到还不存在的目录也照用（用户说“用它”就是用它，
+    /// 缺了就建 —— 不然读类子命令会对着一个不存在的路径说“没有东西”）。建不了只当没建成
+    /// （没有结果位可用）：真正要写盘的地方会报带路径的错。
+    ///
+    /// 目录**已经存在就照原样用**（哪怕里面是上一版 pie 的旧配置 / 旧会话）：不迁移、不清空，
+    /// 各写入点只补缺的（`ensure_config_file` / `ensure_global_memory_file` 不覆盖已有文件）。
     pub fn from_env() -> Self {
-        Self { root: pie_dir() }
+        let root = pie_dir();
+        let _ = std::fs::create_dir_all(&root);
+        Self { root }
     }
 
     /// 指定 root（测试注入临时目录用）。
@@ -199,6 +208,17 @@ impl Storage {
             "bin/python"
         };
         self.base_env().join(rel)
+    }
+
+    /// 配置文件：`<root>/config.toml`（`-c` / `PIE_CONFIG_FILE` 能改到别处，见
+    /// [`Storage::resolve_config_file`]）。
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+
+    /// 全局记忆：`<root>/memory.md`（拼进 system prompt 的那份，`pie setup` 只种下骨架）。
+    pub fn global_memory(&self) -> PathBuf {
+        self.root.join("memory.md")
     }
 
     /// 内容寻址落盘：`Blob` 图片副本 / `Raw` 压缩原文 / `Window` 窗口块，见 [`StoreType`]。
@@ -273,6 +293,164 @@ impl Storage {
         let _ = mode;
         std::fs::rename(&tmp, path).map_err(|e| with_path(path, e))
     }
+
+    // ---------------------------------------------------------------- 缺省件（`pie setup`）
+    //
+    // 三样都在这一层：默认配置文件、全局记忆种子、`envs/base`（`repl` 与 Python 工具共用的解释器）。
+    // 落点全由 `self.root` 定（= [`pie_dir`] 的搜索结果：`PIE_DIR` → `<cwd>/.pie` → `~/.pie`），
+    // 只有配置文件还能被 `-c` / `PIE_CONFIG_FILE` 改到别处 —— 打印归 CLI，落点与成败在这儿。
+
+    /// 配置路径：显式 `-c` > `PIE_CONFIG_FILE`（非空）> `<root>/config.toml`。
+    ///
+    /// 两项都跳过**空路径**（`-c ""` / `PIE_CONFIG_FILE=` 跟没给一样）：空路径写下去就是
+    /// 相对当前目录的一个名字，不是用户想要的（与 [`pie_dir`] 那两行同一套口径）。
+    pub fn resolve_config_file(&self, explicit: Option<&Path>) -> PathBuf {
+        if let Some(p) = explicit
+            && !p.as_os_str().is_empty()
+        {
+            return p.to_path_buf();
+        }
+        if let Some(raw) = std::env::var_os("PIE_CONFIG_FILE") {
+            let path = PathBuf::from(raw);
+            if !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty() {
+                return path;
+            }
+        }
+        self.config_file()
+    }
+
+    /// 配置文件不存在就写一份默认的（父目录 `<root>/` 也一起建）。
+    ///
+    /// 已存在**一律不覆盖**（里面可能有用户自己的 key / 注释），所以可以反复跑。
+    /// 默认值只有一个来源：`Config::default()` —— 与「没有配置文件时 `pie` 的行为」逐字一致。
+    /// 返回 `(路径, 是否新建)`。
+    pub fn ensure_config_file(
+        &self,
+        explicit: Option<&Path>,
+    ) -> Result<(PathBuf, bool), ConfigError> {
+        let path = self.resolve_config_file(explicit);
+        if path.exists() {
+            return Ok((path, false));
+        }
+        let config = Config {
+            config_file: Some(path.clone()), // 让 save() 写到解析出来的那个路径
+            ..Config::default()
+        };
+        config.save()?;
+        Ok((path, true))
+    }
+
+    /// 全局记忆种子：不存在就写一份（`prompts/memory.md` 的正文，编译期嵌入），已存在不动。
+    ///
+    /// 写不了就算了（权限 / 只读数据根）：这只是个种子，不值得挡住启动。
+    pub fn ensure_global_memory(&self) {
+        let _ = self.ensure_global_memory_file();
+    }
+
+    /// 同上，但把结果交给调用方（`pie setup` 要报「已创建 / 已存在」）：返回 `(路径, 是否新建)`。
+    pub fn ensure_global_memory_file(&self) -> std::io::Result<(PathBuf, bool)> {
+        let path = self.global_memory();
+        if path.exists() {
+            return Ok((path, false));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, include_str!("../prompts/memory.md"))?;
+        Ok((path, true))
+    }
+
+    /// 确保默认 Python 环境 `envs/base` 可用（`pie setup` 调）：没有 uv 或建不成就**回一句告警文案**
+    /// （`Err`），setup 不该因此失败。
+    ///
+    /// 幂等：venv 已在就不建；`repl` 靠的 IPython 已在就不装（用户自己的依赖自己
+    /// `uv pip install --python <环境>/bin/python …` 装进这个环境 —— `repl` 与 Python 工具都能 import）。
+    pub fn ensure_base_env(&self) -> Result<String, String> {
+        let python = self.base_env_python();
+        let uv_ok = std::process::Command::new("uv")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !uv_ok {
+            return Err(format!(
+                "没找到可用的 uv：装上 uv 后重跑 `pie setup`，或手写 [python] interpreter（想用的解释器路径）\n  （venv 要建在 {}）",
+                self.base_env().display()
+            ));
+        }
+
+        let existed = python.exists();
+        if !existed {
+            let out = std::process::Command::new("uv")
+                .arg("venv")
+                .arg(self.base_env())
+                .output()
+                .map_err(|e| format!("跑 `uv venv` 失败: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "`uv venv {}` 失败: {}",
+                    self.base_env().display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+
+        // IPython 是 `repl` 的运行时依赖（系统 python3 通常没有）——装好它，repl 开箱可用。
+        let has_ipython = std::process::Command::new(&python)
+            .args(["-c", "import IPython"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let label = if existed { "已存在" } else { "已创建" };
+        if has_ipython {
+            return Ok(format!("{label}  {}", self.base_env().display()));
+        }
+        let out = std::process::Command::new("uv")
+            .args(["pip", "install", "--python"])
+            .arg(&python)
+            .arg("ipython")
+            .output()
+            .map_err(|e| format!("跑 `uv pip install` 失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{label} {}，但装 IPython 失败（`repl` 要它）：{}\n  自己补：uv pip install --python {} ipython",
+                self.base_env().display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                python.display()
+            ));
+        }
+        Ok(format!(
+            "{label} + 已装 IPython  {}",
+            self.base_env().display()
+        ))
+    }
+
+    /// `pie setup`：把数据根（[`pie_dir`] 的搜索结果）下缺的默认件补齐 —— 默认配置文件、
+    /// 全局记忆种子、`envs/base`。**非交互**（只写默认值）、已存在一律不覆盖 → 幂等；
+    /// 成败逐项交给调用方打印（见 [`SetupReport`]）。
+    pub fn setup(&self, explicit_config: Option<&Path>) -> SetupReport {
+        SetupReport {
+            config_file: self.ensure_config_file(explicit_config),
+            memory: self.ensure_global_memory_file(),
+            python_env: self.ensure_base_env(),
+        }
+    }
+}
+
+/// `pie setup` 的结果：三样各自成 / 败（落点与成败都在这儿定，打印归 CLI）。
+pub struct SetupReport {
+    /// 默认配置文件 `(路径, 是否新建)`；`-c` / `PIE_CONFIG_FILE` 能把它指到别处。
+    pub config_file: Result<(PathBuf, bool), ConfigError>,
+    /// 全局记忆种子 `(路径, 是否新建)`。
+    pub memory: std::io::Result<(PathBuf, bool)>,
+    /// `envs/base` 的一句话结果（`Err` 只告警：`repl` / Python 工具没得用，不算 setup 失败）。
+    pub python_env: Result<String, String>,
 }
 
 // ---------------------------------------------------------------- 落盘名字（id）
@@ -312,15 +490,22 @@ pub fn hash_of(path: &Path) -> String {
         .to_string()
 }
 
-/// 数据根目录：`PIE_DIR`（非空才算）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造）→ `~/.pie`。
+/// 数据根目录：`PIE_DIR`（给了路径就听它的）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造：
+/// 不能让任何目录一跑就长出一个 `.pie`）→ `~/.pie`。
+///
+/// `PIE_DIR` 那一档只管“变量里有没有值”，**不管那个目录的实际状态**：不存在就建（`Storage::from_env`），
+/// 里面已经有上一版 pie 的旧配置 / 旧会话也照用（不迁移、不清空、不覆盖——只补缺的）。
+/// 空串 / 全空白 = 没给（问的是“变量值里有没有路径”，与“目录里是空的”是两回事）：
+/// 空路径不是个能用的目录（`join` 出来全是相对当前目录的），所以照 `没设` 走。
 ///
 /// 就这三步、都写在这儿：**别为了好测把顺序拆成单独的函数**（要测就改环境变量测能测的那两档，
 /// 见用例；`<cwd>/.pie` 那档得改进程 cwd，代价比收益大）。
 pub fn pie_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PIE_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
+    if let Some(raw) = std::env::var_os("PIE_DIR") {
+        let root = PathBuf::from(raw);
+        if !root.as_os_str().is_empty() && !root.to_string_lossy().trim().is_empty() {
+            return root;
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
         let local = cwd.join(".pie");
@@ -329,10 +514,6 @@ pub fn pie_dir() -> PathBuf {
         }
     }
     home_dir().join(".pie")
-}
-
-pub fn default_config_file() -> PathBuf {
-    pie_dir().join("config.toml")
 }
 
 // ---------------------------------------------------------------- 时间（没日期库，自己换算）
@@ -414,48 +595,6 @@ pub fn thousands(n: i64) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
-pub fn global_memory_file() -> PathBuf {
-    pie_dir().join("memory.md")
-}
-
-/// 首次运行创建全局记忆的种子文件（已存在则跳过，**不覆盖**）：每次启动时检查一次。
-///
-/// 种子正文放在 `prompts/memory.md`、`include_str!` 编进来（与内置 system prompt 同一套做法：
-/// 模板里全是中文与骨架，写成转义串难读也容易碰格式）。
-///
-/// 写不了就算了（权限/只读家目录）：这只是个种子，不值得挡住启动。
-pub fn ensure_global_memory() {
-    let _ = ensure_global_memory_file();
-}
-
-/// 同上，但把结果交给调用方（`pie setup` 要报「已创建 / 已存在」）：返回 `(路径, 是否新建)`。
-pub fn ensure_global_memory_file() -> std::io::Result<(PathBuf, bool)> {
-    let path = global_memory_file();
-    if path.exists() {
-        return Ok((path, false));
-    }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, include_str!("../prompts/memory.md"))?;
-    Ok((path, true))
-}
-
-/// 配置路径：显式 `-c` > `PIE_CONFIG_FILE` 环境变量 > 默认 `~/.pie/config.toml`。
-pub fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
-    if let Some(p) = explicit {
-        return p.to_path_buf();
-    }
-    if let Some(v) = std::env::var_os("PIE_CONFIG_FILE")
-        && !v.is_empty()
-    {
-        return PathBuf::from(v);
-    }
-    default_config_file()
-}
-
 /// 环境变量覆盖：`OPENAI_API_KEY` → `api_key`。空串视为没设（不覆盖配置文件里的值）。
 pub fn env_api_key() -> Option<String> {
     non_empty_var("OPENAI_API_KEY")
@@ -471,24 +610,6 @@ fn non_empty_var(name: &str) -> Option<String> {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => None,
     }
-}
-
-/// `pie setup` 用：配置文件不存在就写一份默认的（父目录 `~/.pie` 也一起建）。
-///
-/// 已存在**一律不覆盖**（里面可能有用户自己的 key / 注释），所以可以反复跑。
-/// 默认值只有一个来源：`Config::default()` —— 与「没有配置文件时 `pie` 的行为」逐字一致。
-/// 返回 `(路径, 是否新建)`。
-pub fn ensure_config_file(explicit: Option<&Path>) -> Result<(PathBuf, bool), ConfigError> {
-    let path = resolve_config_file(explicit);
-    if path.exists() {
-        return Ok((path, false));
-    }
-    let config = Config {
-        config_file: Some(path.clone()), // 让 save() 写到解析出来的那个路径
-        ..Config::default()
-    };
-    config.save()?;
-    Ok((path, true))
 }
 
 // ---------------------------------------------------------------- 压缩配置
@@ -689,7 +810,9 @@ impl Config {
     /// `OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`。
     /// 只改内存、不写回配置文件（`save()` 照旧落盘当前值）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        let path = resolve_config_file(explicit);
+        // 数据根与配置路径用**同一个** `Storage` 算（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`）
+        let storage = Storage::from_env();
+        let path = storage.resolve_config_file(explicit);
         let mut config = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::Io(path.clone(), e.to_string()))?;
@@ -704,6 +827,7 @@ impl Config {
         if let Some(url) = env_base_url() {
             config.base_url = url;
         }
+        config.storage = storage;
         config.config_file = Some(path);
         Ok(config)
     }
@@ -788,75 +912,6 @@ impl Config {
         out
     }
 
-    /// 确保默认 Python 环境 `envs/base` 可用（`pie setup` 调）：没有 uv 或建不成就**回一句告警文案**
-    /// （`Err`），setup 不该因此失败。
-    ///
-    /// 幂等：venv 已在就不建；`repl` 靠的 IPython 已在就不装（用户自己的依赖自己
-    /// `uv pip install --python <环境>/bin/python …` 装进这个环境 —— `repl` 与 Python 工具都能 import）。
-    pub fn ensure_base_env(storage: &Storage) -> Result<String, String> {
-        let python = storage.base_env_python();
-        let uv_ok = std::process::Command::new("uv")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !uv_ok {
-            return Err(format!(
-                "没找到可用的 uv：装上 uv 后重跑 `pie setup`，或手写 [python] interpreter（想用的解释器路径）\n  （venv 要建在 {}）",
-                storage.base_env().display()
-            ));
-        }
-
-        let existed = python.exists();
-        if !existed {
-            let out = std::process::Command::new("uv")
-                .arg("venv")
-                .arg(storage.base_env())
-                .output()
-                .map_err(|e| format!("跑 `uv venv` 失败: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "`uv venv {}` 失败: {}",
-                    storage.base_env().display(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-        }
-
-        // IPython 是 `repl` 的运行时依赖（系统 python3 通常没有）——装好它，repl 开箱可用。
-        let has_ipython = std::process::Command::new(&python)
-            .args(["-c", "import IPython"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        let label = if existed { "已存在" } else { "已创建" };
-        if has_ipython {
-            return Ok(format!("{label}  {}", storage.base_env().display()));
-        }
-        let out = std::process::Command::new("uv")
-            .args(["pip", "install", "--python"])
-            .arg(&python)
-            .arg("ipython")
-            .output()
-            .map_err(|e| format!("跑 `uv pip install` 失败: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "{label} {}，但装 IPython 失败（`repl` 要它）：{}\n  自己补：uv pip install --python {} ipython",
-                storage.base_env().display(),
-                String::from_utf8_lossy(&out.stderr).trim(),
-                python.display()
-            ));
-        }
-        Ok(format!(
-            "{label} + 已装 IPython  {}",
-            storage.base_env().display()
-        ))
-    }
-
     /// 写回配置文件（`config_file`，默认 `~/.pie/config.toml`）——`/model`、`/thinking` 用。
     ///
     /// ⚠ 入口目前只有交互层（与 `Session::set_model` 一起）；一次性 CLI 不写配置。
@@ -866,7 +921,11 @@ impl Config {
     ///
     /// 运行时字段（`config_file`）不写进去。    #[allow(dead_code)]
     pub fn save(&self) -> Result<PathBuf, ConfigError> {
-        let path = self.config_file.clone().unwrap_or_else(default_config_file);
+        // 没指定路径就按「`-c` > `PIE_CONFIG_FILE` > `<root>/config.toml`」现算（与 load 同一条）。
+        let path = self
+            .config_file
+            .clone()
+            .unwrap_or_else(|| self.storage.resolve_config_file(None));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ConfigError::Io(parent.to_path_buf(), e.to_string()))?;
@@ -1098,7 +1157,6 @@ pub fn build_system_prompt(
     system_prompt: Option<&str>,
     append_system_prompt: &[String],
 ) -> String {
-    let _ = config; // 预留：将来这里可拼一行上下文预算说明
     let base = match system_prompt {
         Some(s) => s.to_string(),
         None => read_text(resolve_prompt_file(SYSTEM_FILE)),
@@ -1119,11 +1177,11 @@ pub fn build_system_prompt(
     }
 
     let mut memories: Vec<String> = Vec::new();
-    let global_memory = std::fs::read_to_string(global_memory_file()).unwrap_or_default();
+    let global_memory = std::fs::read_to_string(config.storage.global_memory()).unwrap_or_default();
     if !global_memory.is_empty() {
         memories.push(format!(
             "## 全局记忆（{}）\n{global_memory}",
-            global_memory_file().display()
+            config.storage.global_memory().display()
         ));
     }
     let project_memory = read_text(resolve_prompt_file(MEMORY_FILE));
@@ -1195,14 +1253,20 @@ mod tests {
         set_env("PIE_DIR", "/tmp/pie-from-env");
         assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-from-env"));
 
-        // 2) 空串 = 没设 → 往下走；cwd 没有 `.pie` 时就是 `$HOME/.pie`
-        set_env("PIE_DIR", "");
+        // 2) 空串 / 全空白 = 没设 → 往下走；cwd 没有 `.pie` 时就是 `$HOME/.pie`
         set_env("HOME", "/tmp/pie-home-stub");
         let cwd_has_pie = std::env::current_dir()
             .map(|d| d.join(".pie").is_dir())
             .unwrap_or(false);
-        if !cwd_has_pie {
-            assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-home-stub/.pie"));
+        for blank in ["", "   "] {
+            set_env("PIE_DIR", blank);
+            if !cwd_has_pie {
+                assert_eq!(
+                    pie_dir(),
+                    PathBuf::from("/tmp/pie-home-stub/.pie"),
+                    "`PIE_DIR={blank:?}` 不是个能用的路径 → 当没设"
+                );
+            }
         }
 
         match old_dir {
@@ -1212,6 +1276,89 @@ mod tests {
         match old_home {
             Some(v) => set_env("HOME", v),
             None => unset_env("HOME"),
+        }
+    }
+
+    /// `PIE_DIR` 指到还不存在的目录：照用它（**不回去找 `~/.pie`**），并就地建出来。
+    #[test]
+    fn storage_from_env_creates_a_missing_pie_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_dir = std::env::var_os("PIE_DIR");
+        let parent = std::env::temp_dir().join(format!("pie-root-missing-{}", std::process::id()));
+        let dir = parent.join("nested");
+        let _ = std::fs::remove_dir_all(&parent);
+
+        set_env("PIE_DIR", &dir);
+        let storage = Storage::from_env();
+        assert_eq!(storage.root, dir, "指定了就用它，不猜别的目录");
+        assert!(dir.is_dir(), "不存在就建出来");
+
+        let _ = std::fs::remove_dir_all(&parent);
+        match old_dir {
+            Some(v) => set_env("PIE_DIR", v),
+            None => unset_env("PIE_DIR"),
+        }
+    }
+
+    /// `PIE_DIR` 指到一个**已经存在、里面是上一版 pie 的旧配置**的目录：照样用它，
+    /// 不迁移、不清空、不覆盖 —— `<root>` 下已有的一律原样留着，`ensure_*` 只补缺的。
+    #[test]
+    fn storage_from_env_reuses_an_existing_pie_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_dir = std::env::var_os("PIE_DIR");
+        let old_config = std::env::var_os("PIE_CONFIG_FILE");
+        let root = std::env::temp_dir().join(format!("pie-root-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        // 旧版留下的东西：多一个不认识的表（`[pytool]` 是旧名）、缺一堆新键
+        std::fs::write(
+            root.join("config.toml"),
+            "model = \"legacy-model\"\n[pytool]\nplugins = [\"a.py\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("memory.md"), "旧记忆").unwrap();
+
+        set_env("PIE_DIR", &root);
+        set_env("PIE_CONFIG_FILE", ""); // 空 = 没设（不然这一项会把配置指到别处）
+        let storage = Storage::from_env();
+        assert_eq!(storage.root, root, "指定了就用它（里面有没有东西都一样）");
+
+        // 旧配置读得进来（不认识的键忽略、缺的键走默认），数据根也跟着 `PIE_DIR`
+        let config = Config::load(None).expect("旧配置要能读");
+        assert_eq!(config.model, "legacy-model");
+        assert_eq!(config.storage.root, root);
+        assert_eq!(
+            config.config_file.as_deref(),
+            Some(storage.config_file().as_path())
+        );
+
+        // `pie setup` 那两样只报「已存在」：一个字节都不改
+        assert_eq!(
+            storage.ensure_config_file(None).unwrap(),
+            (storage.config_file(), false)
+        );
+        assert_eq!(
+            storage.ensure_global_memory_file().unwrap(),
+            (storage.global_memory(), false)
+        );
+        assert!(
+            std::fs::read_to_string(storage.config_file())
+                .unwrap()
+                .contains("legacy-model")
+        );
+        assert_eq!(
+            std::fs::read_to_string(storage.global_memory()).unwrap(),
+            "旧记忆"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match old_dir {
+            Some(v) => set_env("PIE_DIR", v),
+            None => unset_env("PIE_DIR"),
+        }
+        match old_config {
+            Some(v) => set_env("PIE_CONFIG_FILE", v),
+            None => unset_env("PIE_CONFIG_FILE"),
         }
     }
 
@@ -1448,13 +1595,12 @@ lean = true
 
     #[test]
     fn ensure_global_memory_seeds_once_and_never_overwrites() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        set_env("PIE_DIR", &dir);
+        let storage = Storage::at(&dir);
 
-        ensure_global_memory();
-        let path = global_memory_file();
+        storage.ensure_global_memory();
+        let path = storage.global_memory();
         let text = std::fs::read_to_string(&path).expect("种子文件已写入");
         assert!(text.starts_with("# 全局记忆"), "{text}");
         assert!(text.contains("## 编码风格／工具链"), "带分类骨架：{text}");
@@ -1462,7 +1608,7 @@ lean = true
 
         // 已有内容绝不能被动（这是用户自己的记忆文件）
         std::fs::write(&path, "我的记忆").unwrap();
-        ensure_global_memory();
+        storage.ensure_global_memory();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "我的记忆");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1470,20 +1616,20 @@ lean = true
 
     #[test]
     fn ensure_global_memory_reports_whether_it_created_the_file() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-report-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        set_env("PIE_DIR", &dir);
+        let storage = Storage::at(&dir);
 
-        // `~/.pie` 不存在：连父目录一起建，并报「已创建」
-        let (path, created) = ensure_global_memory_file().expect("写种子");
+        // 数据根不存在：连父目录一起建，并报「已创建」
+        let (path, created) = storage.ensure_global_memory_file().expect("写种子");
         assert!(created, "第一次要报已创建");
-        assert_eq!(path, global_memory_file());
+        assert_eq!(path, storage.global_memory());
+        assert_eq!(path, dir.join("memory.md"), "落在数据根上，不是 ~/.pie");
         assert!(path.exists());
 
         // 再跑一次：文件已在，报「已存在」且内容不动
         std::fs::write(&path, "我的记忆").unwrap();
-        let (_, created) = ensure_global_memory_file().expect("再跑一次");
+        let (_, created) = storage.ensure_global_memory_file().expect("再跑一次");
         assert!(!created, "已存在就不算新建");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "我的记忆");
 
@@ -1492,12 +1638,36 @@ lean = true
 
     #[test]
     fn ensure_config_file_writes_defaults_once_and_keeps_existing() {
+        // 断言里要比 `env_api_key()` / `env_base_url()`：这两项会被其它用例改，得拿住锁
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-setup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // 父目录故意不存在：`pie setup` 要能把 `~/.pie/` 一起建出来
+        let storage = Storage::at(&dir);
+        // 不给显式路径 → 落在数据根上（`-c` / `PIE_CONFIG_FILE` 才会把它指到别处）；
+        // 空 / 全空白的环境变量与空 `-c` 一律当没给
+        assert_eq!(storage.resolve_config_file(None), dir.join("config.toml"));
+        let old_env = std::env::var_os("PIE_CONFIG_FILE");
+        for blank in ["", "  "] {
+            set_env("PIE_CONFIG_FILE", blank);
+            assert_eq!(
+                storage.resolve_config_file(None),
+                dir.join("config.toml"),
+                "`PIE_CONFIG_FILE={blank:?}` 不是个能用的路径 → 当没设"
+            );
+        }
+        match old_env {
+            Some(v) => set_env("PIE_CONFIG_FILE", v),
+            None => unset_env("PIE_CONFIG_FILE"),
+        }
+        assert_eq!(
+            storage.resolve_config_file(Some(Path::new(""))),
+            dir.join("config.toml"),
+            "`-c \"\"` 同理"
+        );
+        // 父目录故意不存在：`pie setup` 要能把数据根一起建出来
         let path = dir.join("nested").join("config.toml");
 
-        let (written, created) = ensure_config_file(Some(&path)).expect("写默认配置");
+        let (written, created) = storage.ensure_config_file(Some(&path)).expect("写默认配置");
         assert_eq!(written, path);
         assert!(created);
         // 写出来的必须能读回来（默认值往返，不是一份手写样板）
@@ -1519,7 +1689,7 @@ lean = true
 
         // 已存在：原样保留，报「已存在」
         std::fs::write(&path, "model = \"mine\"\n").unwrap();
-        let (_, created) = ensure_config_file(Some(&path)).expect("再跑一次");
+        let (_, created) = storage.ensure_config_file(Some(&path)).expect("再跑一次");
         assert!(!created, "已存在就不算新建");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1574,19 +1744,21 @@ lean = true
 
     #[test]
     fn seeded_global_memory_lands_in_the_system_prompt() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-memory-prompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        set_env("PIE_DIR", &dir);
+        let storage = Storage::at(&dir);
 
-        let config = Config::default();
+        let config = Config {
+            storage: storage.clone(),
+            ..Config::default()
+        };
         // 按**路径**判有无：项目记忆里可能碰巧引用了「## 全局记忆（…）」这个形状
         // （本仓 MEMORY.md 就写过）——拿那串当断言会自打脸。
-        let marker = format!("## 全局记忆（{}）", global_memory_file().display());
+        let marker = format!("## 全局记忆（{}）", storage.global_memory().display());
         let before = build_system_prompt(&config, None, &[]);
         assert!(!before.contains(&marker), "没文件就不拼这块");
 
-        ensure_global_memory();
+        storage.ensure_global_memory();
         let after = build_system_prompt(&config, None, &[]);
         assert!(
             after.contains(&marker),

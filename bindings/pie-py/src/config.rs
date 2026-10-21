@@ -35,14 +35,15 @@ impl PyConfig {
 
     /// 从配置文件加载（`path=None` → `~/.pie/config.toml`；与 CLI 的 `-c` 同一套解析）。
     ///
-    /// 顺带写一次全局记忆种子文件（`~/.pie/memory.md`，已存在则不动）——与 CLI 每次启动同款。
+    /// 顺带写一次全局记忆种子文件（`<数据根>/memory.md`，已存在则不动）——与 CLI 每次启动同款。
     #[staticmethod]
     #[pyo3(signature = (path=None))]
     fn load(path: Option<&str>) -> PyResult<Self> {
-        config::ensure_global_memory();
-        Config::load(path.map(Path::new))
+        let config = Config::load(path.map(Path::new))
             .map(Self::wrap)
-            .map_err(config_error)
+            .map_err(config_error)?;
+        config.inner.storage.ensure_global_memory();
+        Ok(config)
     }
 
     // ------------------------------------------------------------ 常用字段

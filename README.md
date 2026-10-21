@@ -24,7 +24,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 
 | 命令 | 作用 |
 | --- | --- |
-| `pie setup` | 补齐 `~/.pie/` 下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `~/.pie/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
+| `pie setup` | 补齐**数据根**（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`；`PIE_DIR` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
 | `pie context info` / `verify` / `gc [--delete]` | 列出压缩事件 / 校验落盘原文是否还在 / 列出或删除未引用的 `~/.pie/context/` 文件 |
 | `pie files list [--all]` / `gc [--delete] [--all]` | 列出图片记录 / 回收本地副本（`--all` 作用于云端上传件） |
@@ -41,7 +41,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | `--no-stream` | 强制非流式（一次性 `complete`） |
 | `--auto-compact-threshold <N>` | 服务端上报的上下文超过该值即自动压缩 |
 | `--timeout-seconds` / `--max-retries` / `--max-retry-delay-seconds` | 「等不到数据」的秒数上限（建连 / 响应头 / 流式数据块间隔，**不是**总时长） / 重试次数 / 重试等待上限 |
-| `--cwd <目录>` | 工具的工作目录（默认当前目录） |
+| `--cwd <目录>` | 工具的工作目录（默认当前目录）——数据根与配置路径也跟着它算（`setup` 落点同样） |
 | `--tools <名单>` | 限制可用工具，如 `read,ls,grep`（内置名 `read/edit/writ/bash/repl` 启用对应工具；其余名字先跟用 Python 写的工具对，对不上当 shell 子命令白名单） |
 | `--system-prompt <文本或路径>` / `--append-system-prompt <…>` | 替换基础提示 / 追加到 system prompt（可重复） |
 | `--mode <text\|json\|transcript>` | 一次性模式的输出格式（默认 `text`） |

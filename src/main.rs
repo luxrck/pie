@@ -177,6 +177,9 @@ enum ContextAction {
 }
 
 fn main() {
+    // OHOS 的 `getsockopt` 兜底不需要在这里装：`pie::arch::ohos::net` 是**同名符号定义**，
+    // 链接期就把 tokio 那句调用接过去了（见该模块注释），没有初始化步骤、也没有顺序要求。
+
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let code = rt.block_on(run(cli));
@@ -184,15 +187,21 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> i32 {
-    // `pie setup`：只补缺的默认文件，**不读也不改**已有配置（配置缺失/坏掉正是它要处理的情形），
+    // `--cwd`：工具的工作目录（默认当前目录）。**放在一切之前**：数据根（[`config::pie_dir`]：
+    // `PIE_DIR` → **这里**的 `<cwd>/.pie` → `~/.pie`）与配置路径都按当前目录算，`pie setup` 也得落在同一个根上。
+    if let Some(cwd) = &cli.cwd
+        && let Err(e) = std::env::set_current_dir(cwd)
+    {
+        eprintln!("切到工作目录失败 {}: {e}", cwd.display());
+        return 1;
+    }
+
+    // `pie setup`：只补缺的默认件，**不读也不改**已有配置（配置缺失/坏掉正是它要处理的情形），
     // 所以要在 `Config::load` 之前、也在启动时那发记忆种子之前接住它。
     if matches!(cli.command.as_ref(), Some(Cmd::Setup)) {
         return setup_main(&cli);
     }
 
-    // 首次运行写入全局记忆的种子文件（已存在则跳过）：它会被拼进 system prompt，
-    // 没文件就白白少一层记忆。
-    config::ensure_global_memory();
     let mut config = match config::Config::load(cli.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -201,20 +210,14 @@ async fn run(cli: Cli) -> i32 {
         }
     };
 
+    // 首次运行写入全局记忆的种子文件（已存在则跳过）：它会被拼进 system prompt，
+    // 没文件就白白少一层记忆。落点跟数据根走（与 `pie setup` 同一处：`config.storage`）。
+    config.storage.ensure_global_memory();
+
     // 一次性覆盖（`-m` / `-t` / `--reserved-tokens` …）——只改内存里的 config，不写回文件
     if let Err(e) = apply_overrides(&mut config, &cli) {
         eprintln!("{e}");
         return 2;
-    }
-    // `--cwd`：工具的工作目录（默认当前目录）
-    if let Some(cwd) = &cli.cwd {
-        if let Err(e) = std::env::set_current_dir(cwd) {
-            eprintln!("切到工作目录失败 {}: {e}", cwd.display());
-            return 1;
-        }
-        // 数据目录跟着工作目录走：`PIE_DIR` 优先 → 新 cwd 下的 `.pie`（存在才算）→ `~/.pie`。
-        // ⚠ 必须在 `set_current_dir` **之后**重解析——`Storage` 是在 `Config::load` 时定型的。
-        config.storage = config::Storage::from_env();
     }
 
     // 维护类子命令（不需要模型）；files 要 config（建 Files API 客户端）
@@ -447,18 +450,20 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
-/// `pie setup`：把 `~/.pie/` 下缺的默认件补齐 —— 默认配置文件 + 全局记忆种子。
+/// `pie setup`：把数据根（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`）下缺的默认件补齐 ——
+/// 默认配置文件 + 全局记忆种子 + `envs/base`（Python 环境）。
 ///
-/// **非交互**（只写默认值，之后自己改），
-/// 已存在的文件**一律不覆盖**（里面可能有用户自己的 key 与记忆）→ 重复跑安全、幂等。
+/// 落点与成败全交给 [`config::Storage::setup`]（路径跟 `pie_dir` 走，不在这儿拼），
+/// 这里只负责打印。**非交互**（只写默认值，之后自己改），已存在的文件**一律不覆盖**
+/// （里面可能有用户自己的 key 与记忆）→ 重复跑安全、幂等。
 fn setup_main(cli: &Cli) -> i32 {
+    let storage = config::Storage::from_env();
+    let report = storage.setup(cli.config.as_deref());
     let mut code = 0;
-    let mut created_config = false;
 
-    match config::ensure_config_file(cli.config.as_deref()) {
+    match &report.config_file {
         Ok((path, created)) => {
-            created_config = created;
-            let label = if created { "已创建" } else { "已存在" };
+            let label = if *created { "已创建" } else { "已存在" };
             println!("配置文件  {label}  {}", path.display());
         }
         Err(e) => {
@@ -466,22 +471,22 @@ fn setup_main(cli: &Cli) -> i32 {
             code = 1;
         }
     }
-    match config::ensure_global_memory_file() {
+    match &report.memory {
         Ok((path, created)) => {
-            let label = if created { "已创建" } else { "已存在" };
+            let label = if *created { "已创建" } else { "已存在" };
             println!("全局记忆  {label}  {}", path.display());
         }
         Err(e) => {
             eprintln!(
                 "写入全局记忆失败（{}）: {e}",
-                config::global_memory_file().display()
+                storage.global_memory().display()
             );
             code = 1;
         }
     }
     // 默认 Python 环境（`repl` 与 Python 工具共用）：`uv` 建的 `envs/base`。
     // 建不成**不算 setup 失败**——只是 `repl` / Python 工具没得用，说清楚就行（`Err` 只打告警）。
-    match config::Config::ensure_base_env(&config::Storage::from_env()) {
+    match &report.python_env {
         Ok(msg) => println!("Python 环境  {msg}"),
         Err(msg) => eprintln!("Python 环境  跳过  {msg}"),
     }
@@ -489,11 +494,11 @@ fn setup_main(cli: &Cli) -> i32 {
     if code != 0 {
         return code;
     }
-    if created_config {
+    if let Ok((_, true)) = report.config_file {
         println!("接着：按需改上面的 model / base_url / api_key，再跑 `pie \"任务\"`。");
         println!(
             "Python 依赖装进这一处就行（`repl` 与用 Python 写的工具共用同一个环境）：\n  uv pip install --python {} <包>",
-            config::Storage::from_env().base_env_python().display()
+            storage.base_env_python().display()
         );
     } else {
         println!("三样都在，未改动。");

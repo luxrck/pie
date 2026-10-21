@@ -17,3 +17,6 @@ classifiers = [
 # 扩展模块装在 `pie` 包里（`pie/_pie_rs.*.so`）：外壳包负责 re-export 与类型存根。
 python-source = "python"
 module-name = "pie._pie_rs"
+# 开发时跑 pytest / import 会留下 __pycache__（含别的解释器版本的 .pyc），别打进 wheel。
+# 第二条是给新版 maturin 的：它把 exclude 的匹配基准从「归档内路径」改成了「源文件路径」。
+exclude = ["pie/__pycache__/*", "python/pie/__pycache__/*"]
