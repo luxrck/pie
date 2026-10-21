@@ -38,8 +38,9 @@ use crate::session::Session;
 /// `max_steps` / `stream` 是 CLI 传下来的**按次**执行旋钮，原样转给每次 `Session::aturn`
 /// （见它的文档）；`None` = 默认（不限步数 / 流式）。
 ///
-/// 终端初始化/恢复用 ratatui 的 `init()` / `restore()`（它还顺带装了 panic hook，
-/// 崩了也不会把终端留在 raw 模式）；鼠标捕获、**bracketed paste** 与**窗口焦点上报**要自己开，
+/// 终端初始化/恢复走 [`init_terminal`] / [`restore_terminal`]（一般平台 = ratatui 的
+/// `try_init()` / `restore()`，顺带装了 panic hook，崩了也不会把终端留在 raw 模式；
+/// OHOS 得自己来，见 `crate::arch::ohos::tty`）；鼠标捕获、**bracketed paste** 与**窗口焦点上报**要自己开，
 /// 退出前一定关掉。
 ///
 /// ⚠ bracketed paste 不能省：不开的话终端不会用 `\x1b[200~` 包住粘贴内容，多行粘贴会被拆成
@@ -51,7 +52,7 @@ pub async fn run(
 ) -> std::io::Result<()> {
     // 先按环境变量定好终端图像协议（**不读 stdin**，见 [`pick_terminal_protocol`]）。
     let picker = pick_terminal_protocol();
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal()?;
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
@@ -69,7 +70,7 @@ pub async fn run(
         crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableFocusChange
     );
-    ratatui::restore();
+    restore_terminal();
     // 退出时的提示（保存失败…）留到终端恢复后再写
     match outcome {
         Ok(warning) => {
@@ -80,6 +81,29 @@ pub async fn run(
         }
         Err(e) => Err(e),
     }
+}
+
+/// 初始化终端：raw 模式 + 备用屏 + [`ratatui::DefaultTerminal`]。
+///
+/// 一般平台就是 `ratatui::try_init()`（不 panic：失败当 `Err` 往上抛，由 `main` 打印）。
+#[cfg(not(target_env = "ohos"))]
+fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
+    ratatui::try_init()
+}
+
+#[cfg(not(target_env = "ohos"))]
+fn restore_terminal() {
+    ratatui::restore();
+}
+
+#[cfg(target_env = "ohos")]
+fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
+    crate::arch::ohos::tty::init()
+}
+
+#[cfg(target_env = "ohos")]
+fn restore_terminal() {
+    crate::arch::ohos::tty::restore();
 }
 
 /// 定终端图像协议（看环境变量）与**字符格的像素尺寸**（问终端）。

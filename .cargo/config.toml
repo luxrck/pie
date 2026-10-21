@@ -1,0 +1,22 @@
+[target.x86_64-unknown-linux-ohos]
+linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/x86_64-unknown-linux-ohos-clang"
+rustflags = [
+    "-C", "link-arg=--sysroot=/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/sysroot",
+]
+
+[target.aarch64-unknown-linux-ohos]
+linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+rustflags = [
+    "-C", "link-arg=--sysroot=/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/sysroot",
+]
+
+[env]
+CC_aarch64_unknown_linux_ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+AR_aarch64_unknown_linux_ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ar"
+CC_x86_64_unknown_linux_ohos  = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/x86_64-unknown-linux-ohos-clang"
+AR_x86_64_unknown_linux_ohos  = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ar"
+
+[unstable]
+# ohos 是 tier-3 目标，官方不发预编译标准库 → 必须从源码编 std（等价于命令行 `-Z build-std=std,panic_abort`）。
+# 只在「--target 不是宿主」时生效，本机构建不受影响。
+build-std = ["std", "panic_abort"]

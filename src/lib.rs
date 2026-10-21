@@ -19,11 +19,13 @@
 //!   - [`action`]  —— 扩展「改实例」的动作通道（宿主发意图 → 落到 `Session` 已有的方法上）
 //!   - [`cancel`]  —— 取消信号（TUI 的 Esc）
 //!   - [`log`]     —— 告警出口（TUI 期间不能直接写 stderr）
+//!   - [`arch`]    —— 平台专场（目前只有 OHOS：`getsockopt` 与终端开关的兜底）
 //!
 //! ⚠ 目前是**全 pub**（M0 阶段）：先把模块边界立起来、让 CLI 与绑定都能用，真实 API 面等
 //! 绑定稳定后再收紧。TUI 与 CLI 参数结构**不属于**对外 API（`pie` 对外就是那个可执行文件）。
 
 pub mod action;
+pub mod arch;
 pub mod cancel;
 pub mod cli;
 pub mod config;
