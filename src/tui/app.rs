@@ -18,7 +18,6 @@
 //! 治法与实测数据见 `docs/CHANGELOG.md` 2026-09-28 那条「每帧全量重排」。
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1607,38 +1606,12 @@ impl App {
 
 /// 跑一条手动 `!cmd`，返回（状态，结果正文）。
 ///
-/// 与工具层的 bash 同款：独立进程组 + 取消时 killpg（只杀 shell 本体的话，持有 stdout
-/// 管道写端的子孙会让读端不 EOF、等不到结束）；stderr 合进 stdout 保证顺序。
+/// 起进程一律走 [`crate::tools::spawn_shell`]（与工具层的 bash 同一个出口：候选 shell、独立进程组、
+/// stderr 合进 stdout 都在那儿）——只杀 shell 本体的话，持有 stdout 管道写端的子孙会让读端不 EOF。
 /// 正文格式：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]` + 一行 `[用户手动终止]`）。
 async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
-    #[cfg(unix)]
-    let mut command = {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    };
-    #[cfg(not(unix))]
-    let mut command = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    };
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        command.process_group(0); // 独立进程组：取消时 killpg 连子孙一起杀
-        unsafe {
-            command.pre_exec(|| {
-                if libc::dup2(1, 2) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
+    let mut child = match crate::tools::spawn_shell(cmd) {
+        Ok((_, child)) => child,
         Err(e) => return (Status::Fail, format!("[exit=error]\n\n启动失败: {e}")),
     };
     let stdout = child.stdout.take().expect("piped");

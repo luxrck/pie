@@ -967,19 +967,76 @@ pub struct Bash {
 }
 
 impl Bash {
-    /// 本工具实际用的 shell：Unix 是 `bash -c`，Windows 是 `cmd /C`。
+    /// 起 shell 的**候选**（按优先级）：Unix 先 `bash`（模型写的多半是 bash 语法），起不来再退 `sh`。
     ///
-    /// ⚠ **单一事实来源**：`call` 里起进程用它——不再各写一份字面量（写岔了就会对不上）。
+    /// 为什么要有退路：OHOS / busybox / alpine 这类系统**根本没有 bash**，而 `execvp` 找 `bash`
+    /// 时会把 PATH 里那些不可读目录下的同名文件算成 **EACCES 而不是 ENOENT**（OHOS 实测：
+    /// `PATH=/usr/local/bin:/bin:/usr/bin`，`/usr/bin/bash` 所在目录不可读 → `Os { code: 13 }`），
+    /// 所以两种错都得换下一个候选。
+    ///
+    /// ⚠ **单一事实来源**：起进程一律走 [`spawn_shell`]（`bash` 工具与 TUI 的 `!cmd` 共用），
+    /// 别在别处再写 `bash` / `sh` / `-c` 的字面量。
     #[cfg(unix)]
-    const SHELL: &'static str = "bash";
+    const SHELLS: [&'static str; 2] = ["bash", "sh"];
     #[cfg(not(unix))]
-    const SHELL: &'static str = "cmd";
+    const SHELLS: [&'static str; 1] = ["cmd"];
 
-    /// 运行 shell 时传的选项：`bash -c <cmd>` / `cmd /C <cmd>`。
+    /// 运行 shell 时传的选项：`bash -c <cmd>` / `sh -c <cmd>` / `cmd /C <cmd>`。
     #[cfg(unix)]
     const SHELL_FLAG: &'static str = "-c";
     #[cfg(not(unix))]
     const SHELL_FLAG: &'static str = "/C";
+}
+
+/// 起一个跑 `command` 的 shell 进程（stdout / stderr 合并到同一条管道）。
+///
+/// 返回**实际**用上的 shell 名（失败码那行头区要写它）+ 子进程。候选与选项见 [`Bash::SHELLS`] /
+/// [`Bash::SHELL_FLAG`]：逐个试，`ENOENT`（没这个件）与 `EACCES`（PATH 里那个目录不可读）都算
+/// 「这个候选不行」，换下一个；其余错（以及全部候选都起不来）带上 shell 名直接抛出去。
+///
+/// 独立进程组与「stderr 进 stdout」也在这儿：**只杀 shell 本体**会让它起的子孙变孤儿、
+/// 一直抱着管道写端，取消/超时就会卡到子孙自然退出（`cancel::kill_group` 靠的就是这个进程组）。
+pub fn spawn_shell(command: &str) -> std::io::Result<(&'static str, tokio::process::Child)> {
+    let mut last: Option<(&'static str, std::io::Error)> = None;
+    for shell in Bash::SHELLS {
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.arg(Bash::SHELL_FLAG).arg(command);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+            // stderr 合并进 stdout，保证输出顺序稳定
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::dup2(1, 2) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        match cmd.spawn() {
+            Ok(child) => return Ok((shell, child)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                last = Some((shell, e));
+            }
+            Err(e) => return Err(with_shell(e, shell)),
+        }
+    }
+    // 所有候选都起不来：报**最后一个**的错（带上它的名字——不然一句 “Permission denied”
+    // 看不出是哪个 shell）
+    let (shell, e) = last.expect("SHELLS 非空");
+    Err(with_shell(e, shell))
+}
+
+/// 给错误带上 shell 名（`启动失败: sh: Permission denied (os error 13)`）——kind 保留，方便调用方判。
+fn with_shell(e: std::io::Error, shell: &str) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{shell}: {e}"))
 }
 
 impl Tool for Bash {
@@ -1006,30 +1063,10 @@ impl Tool for Bash {
                 ));
             }
         }
-        // 命令交给 `bash -c`（Windows 是 `cmd /C`）——名字与选项只住在上面的两个常量里，
-        // 所以两个平台共用这一段（不再各写一份字面量）。
-        let mut cmd = {
-            let mut c = tokio::process::Command::new(Self::SHELL);
-            c.arg(Self::SHELL_FLAG).arg(&command);
-            c
-        };
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            cmd.process_group(0); // 独立进程组：取消/超时时 killpg 连子孙一起杀
-            // stderr 合并进 stdout，保证输出顺序稳定
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::dup2(1, 2) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // 命令交给 shell（`bash -c`，没有 bash 就 `sh -c`；Windows 是 `cmd /C`）——候选、选项、
+        // 进程组与管道只在 [`spawn_shell`] 一处。
+        let (shell, mut child) = match spawn_shell(&command) {
+            Ok(started) => started,
             Err(e) => return err(format!("启动失败: {e}")),
         };
         let stdout = child.stdout.take().expect("piped");
@@ -1114,7 +1151,7 @@ impl Tool for Bash {
             headers.push(format!(
                 "[exit={code}, os={}, shell={}]",
                 std::env::consts::OS,
-                Self::SHELL
+                shell
             ));
         }
 
@@ -1547,7 +1584,7 @@ mod tests {
         format!(
             "[exit={code}, os={}, shell={}]",
             std::env::consts::OS,
-            Bash::SHELL
+            Bash::SHELLS[0]
         )
     }
 
