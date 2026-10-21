@@ -320,7 +320,7 @@ fn arun(
 fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {
     use pyo3::types::PyList;
     let list = PyList::empty(py);
-    // 与 CLI 同口径：走默认数据根（`PIE_DIR` → `./.pie` → `~/.pie`）
+    // 与 CLI 同口径：走默认数据根（`PIE_HOME` → `./.pie` → `~/.pie`）
     let storage = pie::config::Storage::default();
     for r in pie::cli::list_sessions(&storage, limit) {
         let d = PyDict::new(py);

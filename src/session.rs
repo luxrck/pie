@@ -1834,7 +1834,7 @@ mod tests {
     use crate::llm::{FunctionCall, Usage};
     use crate::state::REPL_BLOCKS_MAX;
 
-    /// 测试用数据目录：跟随进程级 `PIE_DIR`（`pie_dir_tmp` + `env_lock` 那套）。
+    /// 测试用数据目录：跟随进程级 `PIE_HOME`（`pie_dir_tmp` + `env_lock` 那套）。
     fn storage() -> config::Storage {
         config::Storage::default()
     }
@@ -1853,7 +1853,7 @@ mod tests {
             .unwrap()
     }
 
-    /// 改进程级 `PIE_DIR` 的用例共用 `config::ENV_LOCK`（跟 `context` 的测试串行化）。
+    /// 改进程级 `PIE_HOME` 的用例共用 `config::ENV_LOCK`（跟 `context` 的测试串行化）。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::ENV_LOCK
             .lock()
@@ -1863,7 +1863,7 @@ mod tests {
     fn pie_dir_tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pie-img-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        crate::config::set_env("PIE_DIR", &dir);
+        crate::config::set_env("PIE_HOME", &dir);
         dir
     }
 

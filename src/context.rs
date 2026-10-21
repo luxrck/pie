@@ -506,7 +506,7 @@ mod tests {
     use crate::llm::{FunctionCall, ToolCall};
     use serde_json::json;
 
-    /// 测试用数据目录：跟随进程级 `PIE_DIR`（`pie_dir_tmp` + `env_lock` 那套）。
+    /// 测试用数据目录：跟随进程级 `PIE_HOME`（`pie_dir_tmp` + `env_lock` 那套）。
     fn storage() -> Storage {
         Storage::default()
     }
@@ -536,7 +536,7 @@ mod tests {
         storage().store(StoreType::Raw { prefix, body }).unwrap()
     }
 
-    /// 测试会改进程级 `PIE_DIR` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
+    /// 测试会改进程级 `PIE_HOME` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
     /// 某个测试 panic 后锁会中毒（这不是错误，只是个测试挂了）→ 继续拿锁，别连锁失败。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::ENV_LOCK
@@ -548,7 +548,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-ctx-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::config::set_env("PIE_DIR", &dir);
+        crate::config::set_env("PIE_HOME", &dir);
         dir
     }
 

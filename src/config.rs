@@ -84,7 +84,7 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// 测试专用：把进程级 `PIE_DIR` 改来改去的用例共用这一把锁（跨模块串行化，
+/// 测试专用：把进程级 `PIE_HOME` 改来改去的用例共用这一把锁（跨模块串行化，
 /// 否则 `context` / `llm` 两边的测试并行跑会互相覆盖环境变量）。
 #[cfg(test)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -93,7 +93,7 @@ pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// 2024 edition 起 `std::env::set_var` 是 `unsafe`（多线程下 `setenv` 本身不是线程安全的）——
 /// 本仓改 env 的用例都持 [`ENV_LOCK`]，所以把那一层 unsafe 收在这里一处，调用点只写
-/// `set_env("PIE_DIR", &dir)`。
+/// `set_env("PIE_HOME", &dir)`。
 #[cfg(test)]
 pub fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: 调用点都持有 `ENV_LOCK`（见上）
@@ -110,8 +110,8 @@ pub fn unset_env(key: &str) {
 /// 数据存储：一个 root + 四个子目录 + 内容寻址落盘（[`Storage::store`]）。
 ///
 /// **唯一职责是「用户数据放哪儿、怎么落盘」**（`config` 是底层，谁都能拿来用）。默认 root 来自
-/// [`Storage::from_env`]（`PIE_DIR` → 当前目录下的 `.pie` → `~/.pie`）；测试用 [`Storage::at`]
-/// 注入临时 root —— 不必再动进程级 `PIE_DIR`。
+/// [`Storage::from_env`]（`PIE_HOME` → 当前目录下的 `.pie` → `~/.pie`）；测试用 [`Storage::at`]
+/// 注入临时 root —— 不必再动进程级 `PIE_HOME`。
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub root: PathBuf,
@@ -140,9 +140,9 @@ pub enum StoreType<'a> {
 }
 
 impl Storage {
-    /// 从环境解析默认 root：`PIE_DIR` → 当前目录下的 `.pie`（存在即用）→ `~/.pie`。
+    /// 从环境解析默认 root：`PIE_HOME` → 当前目录下的 `.pie`（存在即用）→ `~/.pie`。
     ///
-    /// **顺手把 root 建出来**：`PIE_DIR` 指到还不存在的目录也照用（用户说“用它”就是用它，
+    /// **顺手把 root 建出来**：`PIE_HOME` 指到还不存在的目录也照用（用户说“用它”就是用它，
     /// 缺了就建 —— 不然读类子命令会对着一个不存在的路径说“没有东西”）。建不了只当没建成
     /// （没有结果位可用）：真正要写盘的地方会报带路径的错。
     ///
@@ -297,7 +297,7 @@ impl Storage {
     // ---------------------------------------------------------------- 缺省件（`pie setup`）
     //
     // 三样都在这一层：默认配置文件、全局记忆种子、`envs/base`（`repl` 与 Python 工具共用的解释器）。
-    // 落点全由 `self.root` 定（= [`pie_dir`] 的搜索结果：`PIE_DIR` → `<cwd>/.pie` → `~/.pie`），
+    // 落点全由 `self.root` 定（= [`pie_dir`] 的搜索结果：`PIE_HOME` → `<cwd>/.pie` → `~/.pie`），
     // 只有配置文件还能被 `-c` / `PIE_CONFIG_FILE` 改到别处 —— 打印归 CLI，落点与成败在这儿。
 
     /// 配置路径：显式 `-c` > `PIE_CONFIG_FILE`（非空）> `<root>/config.toml`。
@@ -490,10 +490,10 @@ pub fn hash_of(path: &Path) -> String {
         .to_string()
 }
 
-/// 数据根目录：`PIE_DIR`（给了路径就听它的）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造：
+/// 数据根目录：`PIE_HOME`（给了路径就听它的）→ 当前目录下的 `.pie`（**真的存在**才算，不凭空造：
 /// 不能让任何目录一跑就长出一个 `.pie`）→ `~/.pie`。
 ///
-/// `PIE_DIR` 那一档只管“变量里有没有值”，**不管那个目录的实际状态**：不存在就建（`Storage::from_env`），
+/// `PIE_HOME` 那一档只管“变量里有没有值”，**不管那个目录的实际状态**：不存在就建（`Storage::from_env`），
 /// 里面已经有上一版 pie 的旧配置 / 旧会话也照用（不迁移、不清空、不覆盖——只补缺的）。
 /// 空串 / 全空白 = 没给（问的是“变量值里有没有路径”，与“目录里是空的”是两回事）：
 /// 空路径不是个能用的目录（`join` 出来全是相对当前目录的），所以照 `没设` 走。
@@ -501,7 +501,7 @@ pub fn hash_of(path: &Path) -> String {
 /// 就这三步、都写在这儿：**别为了好测把顺序拆成单独的函数**（要测就改环境变量测能测的那两档，
 /// 见用例；`<cwd>/.pie` 那档得改进程 cwd，代价比收益大）。
 pub fn pie_dir() -> PathBuf {
-    if let Some(raw) = std::env::var_os("PIE_DIR") {
+    if let Some(raw) = std::env::var_os("PIE_HOME") {
         let root = PathBuf::from(raw);
         if !root.as_os_str().is_empty() && !root.to_string_lossy().trim().is_empty() {
             return root;
@@ -768,7 +768,7 @@ pub struct Config {
     /// 运行时属性（不落盘）：CLI `--append-system-prompt`（可重复）。
     #[serde(skip)]
     pub append_system_prompt: Vec<String>,
-    /// 运行时属性（不落盘）：数据存储（默认 `PIE_DIR` / `./.pie` / `~/.pie`；测试可注入临时 root）。
+    /// 运行时属性（不落盘）：数据存储（默认 `PIE_HOME` / `./.pie` / `~/.pie`；测试可注入临时 root）。
     #[serde(skip)]
     pub storage: Storage,
 }
@@ -810,7 +810,7 @@ impl Config {
     /// `OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`。
     /// 只改内存、不写回配置文件（`save()` 照旧落盘当前值）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        // 数据根与配置路径用**同一个** `Storage` 算（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`）
+        // 数据根与配置路径用**同一个** `Storage` 算（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`）
         let storage = Storage::from_env();
         let path = storage.resolve_config_file(explicit);
         let mut config = if path.exists() {
@@ -1239,18 +1239,18 @@ pub fn runtime_state(repl_blocks: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 数据根目录：`PIE_DIR`（非空）→ `<cwd>/.pie`（存在才算）→ `<home>/.pie`。
+    /// 数据根目录：`PIE_HOME`（非空）→ `<cwd>/.pie`（存在才算）→ `<home>/.pie`。
     ///
     /// 只测「问环境」那两档：`<cwd>/.pie` 那档要改进程 cwd（会污染并行跑的用例），
     /// 而给 `pie_dir` 开注入参数是为了测试拆代码（不干）——那几行直接读代码。
     #[test]
     fn pie_dir_prefers_env_then_home() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_dir = std::env::var_os("PIE_DIR");
+        let old_dir = std::env::var_os("PIE_HOME");
         let old_home = std::env::var_os("HOME");
 
-        // 1) `PIE_DIR` 非空 → 直接用它（本地就算有 `.pie` 也不看）
-        set_env("PIE_DIR", "/tmp/pie-from-env");
+        // 1) `PIE_HOME` 非空 → 直接用它（本地就算有 `.pie` 也不看）
+        set_env("PIE_HOME", "/tmp/pie-from-env");
         assert_eq!(pie_dir(), PathBuf::from("/tmp/pie-from-env"));
 
         // 2) 空串 / 全空白 = 没设 → 往下走；cwd 没有 `.pie` 时就是 `$HOME/.pie`
@@ -1259,19 +1259,19 @@ mod tests {
             .map(|d| d.join(".pie").is_dir())
             .unwrap_or(false);
         for blank in ["", "   "] {
-            set_env("PIE_DIR", blank);
+            set_env("PIE_HOME", blank);
             if !cwd_has_pie {
                 assert_eq!(
                     pie_dir(),
                     PathBuf::from("/tmp/pie-home-stub/.pie"),
-                    "`PIE_DIR={blank:?}` 不是个能用的路径 → 当没设"
+                    "`PIE_HOME={blank:?}` 不是个能用的路径 → 当没设"
                 );
             }
         }
 
         match old_dir {
-            Some(v) => set_env("PIE_DIR", v),
-            None => unset_env("PIE_DIR"),
+            Some(v) => set_env("PIE_HOME", v),
+            None => unset_env("PIE_HOME"),
         }
         match old_home {
             Some(v) => set_env("HOME", v),
@@ -1279,33 +1279,33 @@ mod tests {
         }
     }
 
-    /// `PIE_DIR` 指到还不存在的目录：照用它（**不回去找 `~/.pie`**），并就地建出来。
+    /// `PIE_HOME` 指到还不存在的目录：照用它（**不回去找 `~/.pie`**），并就地建出来。
     #[test]
     fn storage_from_env_creates_a_missing_pie_dir() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_dir = std::env::var_os("PIE_DIR");
+        let old_dir = std::env::var_os("PIE_HOME");
         let parent = std::env::temp_dir().join(format!("pie-root-missing-{}", std::process::id()));
         let dir = parent.join("nested");
         let _ = std::fs::remove_dir_all(&parent);
 
-        set_env("PIE_DIR", &dir);
+        set_env("PIE_HOME", &dir);
         let storage = Storage::from_env();
         assert_eq!(storage.root, dir, "指定了就用它，不猜别的目录");
         assert!(dir.is_dir(), "不存在就建出来");
 
         let _ = std::fs::remove_dir_all(&parent);
         match old_dir {
-            Some(v) => set_env("PIE_DIR", v),
-            None => unset_env("PIE_DIR"),
+            Some(v) => set_env("PIE_HOME", v),
+            None => unset_env("PIE_HOME"),
         }
     }
 
-    /// `PIE_DIR` 指到一个**已经存在、里面是上一版 pie 的旧配置**的目录：照样用它，
+    /// `PIE_HOME` 指到一个**已经存在、里面是上一版 pie 的旧配置**的目录：照样用它，
     /// 不迁移、不清空、不覆盖 —— `<root>` 下已有的一律原样留着，`ensure_*` 只补缺的。
     #[test]
     fn storage_from_env_reuses_an_existing_pie_dir() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_dir = std::env::var_os("PIE_DIR");
+        let old_dir = std::env::var_os("PIE_HOME");
         let old_config = std::env::var_os("PIE_CONFIG_FILE");
         let root = std::env::temp_dir().join(format!("pie-root-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1318,12 +1318,12 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("memory.md"), "旧记忆").unwrap();
 
-        set_env("PIE_DIR", &root);
+        set_env("PIE_HOME", &root);
         set_env("PIE_CONFIG_FILE", ""); // 空 = 没设（不然这一项会把配置指到别处）
         let storage = Storage::from_env();
         assert_eq!(storage.root, root, "指定了就用它（里面有没有东西都一样）");
 
-        // 旧配置读得进来（不认识的键忽略、缺的键走默认），数据根也跟着 `PIE_DIR`
+        // 旧配置读得进来（不认识的键忽略、缺的键走默认），数据根也跟着 `PIE_HOME`
         let config = Config::load(None).expect("旧配置要能读");
         assert_eq!(config.model, "legacy-model");
         assert_eq!(config.storage.root, root);
@@ -1353,8 +1353,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         match old_dir {
-            Some(v) => set_env("PIE_DIR", v),
-            None => unset_env("PIE_DIR"),
+            Some(v) => set_env("PIE_HOME", v),
+            None => unset_env("PIE_HOME"),
         }
         match old_config {
             Some(v) => set_env("PIE_CONFIG_FILE", v),

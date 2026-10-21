@@ -329,7 +329,7 @@ mod tests {
 
     /// `files gc` 的判据：**既没人引用、又过了保护窗**才回收。
     ///
-    /// 用 `Storage::at(临时目录)` 注入（不动进程级 `PIE_DIR`、也不用环境锁）。
+    /// 用 `Storage::at(临时目录)` 注入（不动进程级 `PIE_HOME`、也不用环境锁）。
     #[test]
     fn garbage_needs_no_reference_and_past_protect_window() {
         let dir = std::env::temp_dir().join(format!("pie-cli-gc-{}", std::process::id()));

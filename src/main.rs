@@ -188,7 +188,7 @@ fn main() {
 
 async fn run(cli: Cli) -> i32 {
     // `--cwd`：工具的工作目录（默认当前目录）。**放在一切之前**：数据根（[`config::pie_dir`]：
-    // `PIE_DIR` → **这里**的 `<cwd>/.pie` → `~/.pie`）与配置路径都按当前目录算，`pie setup` 也得落在同一个根上。
+    // `PIE_HOME` → **这里**的 `<cwd>/.pie` → `~/.pie`）与配置路径都按当前目录算，`pie setup` 也得落在同一个根上。
     if let Some(cwd) = &cli.cwd
         && let Err(e) = std::env::set_current_dir(cwd)
     {
@@ -450,7 +450,7 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
-/// `pie setup`：把数据根（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`）下缺的默认件补齐 ——
+/// `pie setup`：把数据根（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`）下缺的默认件补齐 ——
 /// 默认配置文件 + 全局记忆种子 + `envs/base`（Python 环境）。
 ///
 /// 落点与成败全交给 [`config::Storage::setup`]（路径跟 `pie_dir` 走，不在这儿拼），

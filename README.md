@@ -24,7 +24,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 
 | 命令 | 作用 |
 | --- | --- |
-| `pie setup` | 补齐**数据根**（`PIE_DIR` → `<cwd>/.pie` → `~/.pie`；`PIE_DIR` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
+| `pie setup` | 补齐**数据根**（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`；`PIE_HOME` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
 | `pie context info` / `verify` / `gc [--delete]` | 列出压缩事件 / 校验落盘原文是否还在 / 列出或删除未引用的 `~/.pie/context/` 文件 |
 | `pie files list [--all]` / `gc [--delete] [--all]` | 列出图片记录 / 回收本地副本（`--all` 作用于云端上传件） |
@@ -95,7 +95,7 @@ cd bindings/pie-py && VIRTUAL_ENV=~/.pie/envs/base .venv/bin/maturin develop   #
 # 或先出 wheel 再装：maturin build --out dist → uv pip install --python ~/.pie/envs/base/bin/python dist/pie-*.whl
 ```
 
-上例里 `~/.pie/envs/base` 的实际路径跟着数据根走（`PIE_DIR` 一改就是 `<PIE_DIR>/envs/base`）。
+上例里 `~/.pie/envs/base` 的实际路径跟着数据根走（`PIE_HOME` 一改就是 `<PIE_HOME>/envs/base`）。
 ⚠ 它是**没开 abi3** 的扩展（按解释器版本编的）：base 是 3.13 就只要 `cp313` 那份，以后改了 Rust 要重跑同一条命令刷新。
 
 ```python
@@ -137,7 +137,7 @@ plugins = ["~/.pie/plugins"]                   # 文件或目录（目录取其�
   签名里声明同名的 `_参数` 就收得到，**显式传参优先**。例：`[tools.web_search] _max_characters = 3000`
   （注：`[tools.repl] _python` 这类内置工具键只对内置工具有意义）。
 - **整个绑定都能用**：工具里 `import pie` 拿到的就是真包（`pie.llm(...)` / `pie.Config` / `pie.Registry` / …）。
-  想顺手问一句就用 `pie.llm("…")` —— 它按环境变量（`PIE_DIR` / `PIE_CONFIG_FILE`）自己读配置，所以多数情况下
+  想顺手问一句就用 `pie.llm("…")` —— 它按环境变量（`PIE_HOME` / `PIE_CONFIG_FILE`）自己读配置，所以多数情况下
   与本次 `pie` 同一份；⚠ 命令行里的 `-c` / `-m` 这类**按次覆盖看不到**。
 - 与 `repl` 的关系：**共用解释器（同一个 venv），不共用进程**——工具里 `import` 得到的包，repl 里也 import 得到；
   但两边状态不互通（repl 的命名空间是模型可写的，工具不该和它共享）。解释器解析顺序：

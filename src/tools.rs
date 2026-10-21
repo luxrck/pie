@@ -239,7 +239,7 @@ fn snapshot_key(path: &Path) -> PathBuf {
 #[derive(Clone, Default)]
 pub struct ToolCtx {
     pub cancel: Option<crate::cancel::Cancel>,
-    /// 数据目录（bash 全文落盘要用；默认从 `PIE_DIR` 解析）。
+    /// 数据目录（bash 全文落盘要用；默认从 `PIE_HOME` 解析）。
     pub storage: crate::config::Storage,
     /// 本会话**转录快照**的路径（`Session::write_transcript` 每轮重写；没有会话语境时 `None`）。
     /// `repl` 把它交给解释器（`PIE_TRANSCRIPT`），于是 `history()` 能把历史当数据查。

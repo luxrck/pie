@@ -220,7 +220,7 @@ def fake_llm():
 @pytest.fixture()
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_llm):
     """把 `~/.pie` 指到临时目录（别碰真实会话/配置），并给一个指向假端点的配置。"""
-    monkeypatch.setenv("PIE_DIR", str(tmp_path / "pie"))
+    monkeypatch.setenv("PIE_HOME", str(tmp_path / "pie"))
     cfg = pie.Config()
     cfg.base_url = f"http://127.0.0.1:{fake_llm.server_port}/v1/"
     cfg.api_key = "test-key"
@@ -584,7 +584,7 @@ def test_tool_registry_specs_and_tool_defaults():
 
 
 def test_config_load_from_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("PIE_DIR", str(tmp_path / "pie"))
+    monkeypatch.setenv("PIE_HOME", str(tmp_path / "pie"))
     config_file = tmp_path / "custom.toml"
     config_file.write_text('model = "from-file"\ncontext_window = 1234\n', encoding="utf-8")
     cfg = pie.Config.load(str(config_file))
@@ -615,7 +615,7 @@ def test_module_level_run_uses_an_ephemeral_session(env):
     """`pie.run(task, config=…)`：无会话、不落盘，返回最终答复。"""
     cfg, llm, tools, _ = env
     assert pie.run("打个招呼", config=cfg) == "搞定了"
-    sessions_dir = Path(os.environ["PIE_DIR"]) / "sessions"
+    sessions_dir = Path(os.environ["PIE_HOME"]) / "sessions"
     assert not sessions_dir.exists() or not any(sessions_dir.iterdir()), "不该落盘"
 
 
@@ -639,7 +639,7 @@ def test_list_sessions_returns_cli_shaped_dicts(env):
 
 def test_config_to_dict_and_update_round_trip(tmp_path, monkeypatch):
     """`to_dict()` ↔ `update()`：只覆盖给出的键；未知键报错；运行时字段不受影响。"""
-    monkeypatch.setenv("PIE_DIR", str(tmp_path / "pie"))
+    monkeypatch.setenv("PIE_HOME", str(tmp_path / "pie"))
     cfg = pie.Config()
     d = cfg.to_dict()
     assert d["model"] == cfg.model and d["context_window"] == cfg.context_window

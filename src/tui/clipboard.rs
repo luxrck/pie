@@ -126,7 +126,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-paste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        crate::config::set_env("PIE_DIR", &dir);
+        crate::config::set_env("PIE_HOME", &dir);
 
         // 2x2 红色 RGBA
         let bytes = [255u8, 0, 0, 255].repeat(4);

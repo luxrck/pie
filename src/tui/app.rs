@@ -964,7 +964,7 @@ impl App {
 
     /// `/cd <路径>`：切工作目录（进程级 `set_current_dir`）。
     ///
-    /// 数据目录跟着重解析（`PIE_DIR` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）——切到带 `.pie` 的
+    /// 数据目录跟着重解析（`PIE_HOME` 优先 → 新 cwd 下的 `.pie` → `~/.pie`）——切到带 `.pie` 的
     /// 项目目录后，压缩落盘 / 图片副本 / 会话列表都落在那儿（与 CLI 的 `--cwd` 同一个口径）。
     ///
     /// ⚠ **不往会话历史里插说明**：模型看到的是 system prompt 末尾那节「运行时状态」，
@@ -1750,13 +1750,13 @@ mod tests {
     /// 这里只钉「历史没被污染」；那节本身的重拼在 `session::tests` 里钉。
     #[test]
     fn cd_switches_working_dir_and_announces_it() {
-        // cwd 与 `PIE_DIR` 都是进程级的 → 与其它环境类用例共用锁，收尾原样恢复
+        // cwd 与 `PIE_HOME` 都是进程级的 → 与其它环境类用例共用锁，收尾原样恢复
         let _g = crate::config::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let saved_cwd = std::env::current_dir().unwrap();
-        let saved_pie = std::env::var_os("PIE_DIR");
-        crate::config::unset_env("PIE_DIR");
+        let saved_pie = std::env::var_os("PIE_HOME");
+        crate::config::unset_env("PIE_HOME");
 
         let target = std::env::temp_dir().join(format!("pie-cd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&target);
@@ -1792,8 +1792,8 @@ mod tests {
 
         std::env::set_current_dir(&saved_cwd).unwrap();
         match saved_pie {
-            Some(v) => crate::config::set_env("PIE_DIR", v),
-            None => crate::config::unset_env("PIE_DIR"),
+            Some(v) => crate::config::set_env("PIE_HOME", v),
+            None => crate::config::unset_env("PIE_HOME"),
         }
         let _ = std::fs::remove_dir_all(&target);
     }
@@ -1894,7 +1894,7 @@ mod tests {
     ///
     /// ⚠ 会**写配置**的命令（`/model` / `/thinking`）会把配置文件写回：`Config::default()` 的
     /// `config_file` 是 `None` → 落到 `~/.pie/config.toml`（**用户真实的配置**）。
-    /// 用到这类命令的用例请自己建 `Config { config_file: Some(临时路径), .. }`（别改 `PIE_DIR`
+    /// 用到这类命令的用例请自己建 `Config { config_file: Some(临时路径), .. }`（别改 `PIE_HOME`
     /// 环境变量：那是进程级的，会跟并行跑的用例抢），见 `thinking_change_shows_up_in_the_status_bar`。
     fn app_with_rx() -> (App, UnboundedReceiver<UiEvent>) {
         let config = Config {
@@ -3023,7 +3023,7 @@ mod tests {
     ///
     /// ⚠ 会话的 `Config` 要显式指定 `config_file`：`/thinking` 会把配置**写回文件**，而
     /// `Config::default()` 的 `config_file` 是 `None` → 会落到**用户真实的** `~/.pie/config.toml`。
-    /// （别用环境变量改 `PIE_DIR` 代替：那是进程级的，会跟并行跑的其他用例抢。）
+    /// （别用环境变量改 `PIE_HOME` 代替：那是进程级的，会跟并行跑的其他用例抢。）
     #[test]
     fn thinking_change_shows_up_in_the_status_bar() {
         let dir = std::env::temp_dir().join(format!("pie-tui-thinking-{}", std::process::id()));
@@ -3263,7 +3263,7 @@ mod tests {
     /// `/clear` 归档当前窗口（**消息流不动**，刚归档的东西还能往上翻），
     /// `/reset` 只清历史（消息流也清）。
     ///
-    /// ⚠ 走 `PIE_DIR` 临时目录：窗口块落在 `$PIE_DIR/windows/`、会话与配置也写在那下面，
+    /// ⚠ 走 `PIE_HOME` 临时目录：窗口块落在 `$PIE_HOME/windows/`、会话与配置也写在那下面，
     /// 不重定向就落到用户真实的 `~/.pie/`。
     #[test]
     fn clear_archives_window_and_reset_wipes_history() {
@@ -3272,7 +3272,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-tui-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        crate::config::set_env("PIE_DIR", &dir);
+        crate::config::set_env("PIE_HOME", &dir);
 
         let mut app = test_app();
         app.cells.push(Cell::User("旧消息".into()));
@@ -3281,7 +3281,10 @@ mod tests {
         app.command("clear");
         let notice = last_notice(&app);
         assert!(notice.contains("窗口块"), "{notice}");
-        assert!(dir.join("windows").exists(), "窗口块落在 $PIE_DIR/windows/");
+        assert!(
+            dir.join("windows").exists(),
+            "窗口块落在 $PIE_HOME/windows/"
+        );
         assert!(
             app.cells.iter().any(|c| matches!(c, Cell::User(_))),
             "clear 不该清屏：{}",
