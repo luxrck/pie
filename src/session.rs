@@ -94,10 +94,18 @@ pub struct Session {
 }
 
 impl Drop for Session {
-    /// 会话结束（与 [`SessionEvent::Start`] 对应）：广播 [`SessionEvent::Close`]。
+    /// 会话结束（与 [`SessionEvent::Start`] 对应）：广播 [`SessionEvent::Close`]，
+    /// 并把**转录快照**（[`Session::transcript_path`]）带走。
+    ///
+    /// 快照只在本会话活着时有意义（解释器的 `history()` 读它）：留在那儿就是纯垃圾，
+    /// 而临时目录不一定会被清（OHOS 的 `TMPDIR` 是 `/data/local/tmp`，永远不会自动清），
+    /// 一个会话一份 → 跑几趟就一堆 `pie-transcript-*`。崩掉/被杀那几份清不掉，忍着。
     ///
     /// ⚠ 发事件的是 drop 的那条线程（TUI 主线程 / 绑定回收对象那条）—— 监听者里同样别阻塞。
     fn drop(&mut self) {
+        let transcript = self.transcript_path();
+        let _ = std::fs::remove_file(&transcript);
+        let _ = std::fs::remove_file(transcript.with_extension("tmp")); // 上次写到一半失败留下的
         self.bus.send(
             Event::Session(SessionEvent::Close {
                 id: config::name_of(&self.path),
@@ -2630,6 +2638,27 @@ mod tests {
             "{body2:?}"
         );
         let _ = std::fs::remove_file(&snap); // 落在临时目录，测完就收
+    }
+
+    /// 会话结束时把快照带走：临时目录里不该攒 `pie-transcript-*`
+    /// （OHOS 的 `TMPDIR` 是 `/data/local/tmp`，永远不会自动清）。
+    #[test]
+    fn transcript_snapshot_is_removed_when_the_session_ends() {
+        let dir = std::env::temp_dir().join(format!("pie-rs-transcript-{}", std::process::id()));
+        let config = Config {
+            storage: crate::config::Storage::at(&dir),
+            ..Config::default()
+        };
+        let mut s = Session::new(&config, Some("s.jsonl"), llm(), registry());
+        s.push_user("问一句");
+        s.write_transcript();
+        let snap = s.transcript_path();
+        assert!(snap.exists(), "{} 没写出来", snap.display());
+
+        drop(s);
+
+        assert!(!snap.exists(), "{} 没被删掉", snap.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 解释器代码块：**收进日志独立于压缩**（压缩会把 `tool_calls` 删掉），而那节**只列
