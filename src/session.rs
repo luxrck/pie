@@ -765,6 +765,8 @@ impl Session {
                 // ⚠ 只有真落了盘才设：`compact_tools` 靠 `compaction.is_some()` 跳过「已压过」的
                 // 消息，没落盘却设一段元数据会让工具级压缩永远压不动（曾经就是无条件标）。
                 let mut msg = Message::tool_result(&call.id, name, out.to_text());
+                // 成败只给界面回放用（不进 API）：失败才写，成功/旧会话缺省 `false`
+                msg.failed = out.failed;
                 if let Some(path) = &out.body.spill {
                     compacted.push(context::CompactEvent::tool(name, path));
                     msg.compaction = Some(Compaction::tool(path));
@@ -985,7 +987,7 @@ impl Session {
                             let out = match registry.dispatch(&call.function.name, &args, ctx).await
                             {
                                 Ok(out) => out,
-                                Err(e) => ToolOutput::text(format!("[工具错误] {e}")),
+                                Err(e) => ToolOutput::failure(format!("[工具错误] {e}")),
                             };
                             (out.to_text() != CANCEL_TEXT).then_some(out) // shell 被杀 → 哨兵 → 算取消
                         }
@@ -1012,6 +1014,7 @@ impl Session {
                     text: finished.to_text().clone(),
                     arguments: calls[index].function.arguments.clone(),
                     images: finished.canvas_images(),
+                    failed: finished.failed,
                 }),
                 None,
             );
@@ -1312,11 +1315,14 @@ impl Session {
                     } else {
                         format!("{headers}\n\n{full}")
                     };
-                    out.push(Message::tool_result(
-                        m.tool_call_id.clone().unwrap_or_default(),
-                        m.tool_name.clone().unwrap_or_default(),
-                        text,
-                    ));
+                    out.push(Message {
+                        failed: m.failed,
+                        ..Message::tool_result(
+                            m.tool_call_id.clone().unwrap_or_default(),
+                            m.tool_name.clone().unwrap_or_default(),
+                            text,
+                        )
+                    });
                 }
                 _ => out.push(m.clone()),
             }

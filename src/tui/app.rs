@@ -774,10 +774,14 @@ impl App {
                 });
             }
             UiEvent::Turn(TurnEvent::ToolResult {
-                name, text, images, ..
+                name,
+                text,
+                images,
+                failed,
+                ..
             }) => {
-                // 被取消的工具回的是哨兵文本（不是 `[exit=]` 头）→ 标 ⏹ 而不是 ✓
-                let status = pane::tool_status(&text);
+                // 被取消的工具回的是哨兵文本 → 标 ⏹；否则成败看事件里的 `failed`（不嗅文本）
+                let status = pane::tool_status_flagged(&text, failed);
                 self.repl.on_tool_result(&name, &text, status, &images);
                 Cell::finish_tool(&mut self.cells, &name, status, &text);
                 self.activity = Activity::Tool {
@@ -1611,7 +1615,7 @@ impl App {
 /// 正文格式：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]` + 一行 `[用户手动终止]`）。
 async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     let mut child = match crate::tools::spawn_shell(cmd) {
-        Ok((_, child)) => child,
+        Ok(child) => child,
         Err(e) => return (Status::Fail, format!("[exit=error]\n\n启动失败: {e}")),
     };
     let stdout = child.stdout.take().expect("piped");
@@ -1827,6 +1831,7 @@ mod tests {
             text: "42".into(),
             arguments: r#"{"code":"print(42)"}"#.into(),
             images: Vec::new(),
+            failed: false,
         }));
         assert!(!app.repl.is_empty());
 
@@ -3553,6 +3558,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                failed: false,
             }));
         }
         render_buffer(&mut app, 60, 24);
@@ -3591,6 +3597,7 @@ mod tests {
                 text: "x".into(),
                 arguments: args,
                 images: Vec::new(),
+                failed: false,
             }));
         }
         render_buffer(&mut app, 40, 12);

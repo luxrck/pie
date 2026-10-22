@@ -160,7 +160,12 @@ impl Cell {
                 }
                 "tool" => {
                     let content = m.content_text();
-                    let status = tool_status(&content);
+                    // 新会话带结构化的 `failed`；旧会话没这个字段（`false`）→ 退回嗅文本
+                    let status = if m.failed {
+                        Status::Fail
+                    } else {
+                        tool_status(&content)
+                    };
                     let body = Some(content.trim().to_string());
                     match pending.remove(&m.tool_call_id.clone().unwrap_or_default()) {
                         Some(idx) => {
@@ -219,13 +224,24 @@ pub fn tool_summary(arguments: &str) -> String {
     one_line(arguments, 240)
 }
 
-/// 工具结果的状态：取消哨兵文本 → `⏹`，否则看**第一行**的 `[exit=N]` 头（非 shell 工具没有
-/// 退出码 → 成功）。
+/// 实时事件的工具状态：取消看哨兵文本，其余**只看事件里的 `failed`**（不嗅文本）。
 ///
-/// 现在 `bash` **只在非 0 时**给这行头（一行里带 `exit` / `os` / `shell` 三个字段，2026-09-24 起），
-/// 所以「没头 = 成功」；判据只用到前缀，**不解析退出码**。`[exit=0]` 只可能来自旧会话
-/// （改之前录的），所以还得认。取消哨兵比对的是**整段等于** `CANCEL_TEXT`——手动 `!cmd` 那条路
-/// 是 `app` 显式给 `Status::Cancelled`（内容带 `[exit=cancelled]` 头，不走这个比对）。
+/// 工具不再往正文里塞 `[exit=…, os=…, shell=…]` 那种头（命令失败的原因本来就在它自己的
+/// stderr 里）；成败由 `ToolOutput::failed` → `TurnEvent::ToolResult.failed` 带过来。
+pub fn tool_status_flagged(content: &str, failed: bool) -> Status {
+    if content == CANCEL_TEXT {
+        Status::Cancelled
+    } else if failed {
+        Status::Fail
+    } else {
+        Status::Ok
+    }
+}
+
+/// **旧会话回放**的工具状态（`from_messages`）：那时候还没有结构化的 `failed`，成败只写在
+/// 正文里 —— `[exit=N]` 头（非 0 = 失败；`[exit=0]` 只来自更早的版本）、`[工具错误]`。
+///
+/// 新会话的 tool 消息带了 `failed`，那条路不走这个嗅探（见 [`Cell::from_messages`]）。
 pub fn tool_status(content: &str) -> Status {
     if content == CANCEL_TEXT {
         return Status::Cancelled;
@@ -1064,6 +1080,22 @@ mod tests {
             2
         );
         assert!(cells.iter().any(|c| matches!(c, Cell::User(_))));
+    }
+
+    /// 回放看 tool 消息上的**结构化 `failed`**（新会话）；没有那个字段的旧会话退回嗅文本
+    /// ——正文里已经没有 `[exit=…]` 头了，光靠文本分不出成败。
+    #[test]
+    fn replay_takes_the_structured_failed_flag() {
+        let palette = Palette::mocha();
+        let mut failed = Message::tool_result("c1", "bash", "ls: /nope: No such file or directory");
+        failed.failed = true;
+        let legacy = Message::tool_result("c2", "bash", "[exit=1]\n\nboom"); // 旧会话：只有文本
+        let fine = Message::tool_result("c3", "bash", "hi"); // 成功，无标记
+        let messages = vec![failed, legacy, fine];
+        let cells = Cell::from_messages(&messages);
+        let text = plain(rendered(&cells, &palette, 80, false).iter());
+        assert!(text.contains("✗ bash"), "失败的要有 ✗：{text}");
+        assert!(text.contains("✓ bash"), "成功的要有 ✓：{text}");
     }
 
     /// 用例诊断用：cell 的种类名（`Cell` 本身没实现 `Debug`）。

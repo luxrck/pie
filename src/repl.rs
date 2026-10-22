@@ -218,6 +218,7 @@ fn format_reply(
             }
         })
         .collect();
+    let reply_errored = reply.error.is_some();
     let mut body = String::new();
     for part in [
         reply.stdout.as_str(),
@@ -246,6 +247,8 @@ fn format_reply(
             },
         ),
         attachments,
+        // 代码抛异常（driver 给了 traceback）= 这次调用失败，界面标 ✗
+        failed: reply_errored,
     }
 }
 

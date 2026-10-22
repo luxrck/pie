@@ -93,17 +93,23 @@ pub enum Attachment {
     },
 }
 
-/// 工具执行的产出：**头区**（工具声明的那几行）+ 正文 + 产出的图。
+/// 工具执行的产出：**头区**（工具声明的那几行）+ 正文 + 产出的图 + 成败。
 ///
 /// 序列化只有 [`ToolOutput::to_text`] 一个出口（头区 → 落盘指针 → 正文），消息层 / 事件层 /
 /// 绑定都走它 —— 与旧的 `format_output(headers, body)` 逐字同义。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolOutput {
-    /// 头区：一行一个 `[...]`（`[exit=N, os=…, shell=…]`、`[解释器] 共 3 个：…` …）
+    /// 头区：一行一个 `[...]`（`[exit=N]`、`[解释器] 共 3 个：…` …）
     pub headers: Vec<String>,
     pub body: ToolBody,
     /// 产出的图（见 [`Attachment`]）—— `Model` 那条会进请求体，`Canvas` 只给界面
     pub attachments: Vec<Attachment>,
+    /// 这次调用**算失败**吗（`Err` 文本化、shell 非 0 退出、超时、解释器抛异常…）。
+    ///
+    /// **只给界面判 ✗/✓**，不进正文：命令失败时原因本来就在它自己的 stderr 里
+    /// （`ls: …: Permission denied`），再往正文塞一行头只是噪声。要跨进程回放就落到
+    /// tool 消息的 `failed` 字段上（`Message::failed`）。
+    pub failed: bool,
 }
 
 impl ToolOutput {
@@ -116,7 +122,22 @@ impl ToolOutput {
                 spill: None,
             },
             attachments: Vec::new(),
+            failed: false,
         }
+    }
+
+    /// 失败的结果：正文照旧给模型看，`failed` 让界面标 ✗。
+    pub fn failure(text: impl Into<String>) -> Self {
+        Self {
+            failed: true,
+            ..Self::text(text)
+        }
+    }
+
+    /// 标成失败（正文已经在手的场合，如超时）。
+    pub fn failed(mut self) -> Self {
+        self.failed = true;
+        self
     }
 
     /// 给界面的图（`Canvas` 那批）—— `TurnEvent` 只送这些（模型看不到它们）。
@@ -510,6 +531,7 @@ impl Tool for Read {
                     size,
                     dim,
                 }],
+                failed: false,
             });
         }
 
@@ -990,13 +1012,13 @@ impl Bash {
 
 /// 起一个跑 `command` 的 shell 进程（stdout / stderr 合并到同一条管道）。
 ///
-/// 返回**实际**用上的 shell 名（失败码那行头区要写它）+ 子进程。候选与选项见 [`Bash::SHELLS`] /
-/// [`Bash::SHELL_FLAG`]：逐个试，`ENOENT`（没这个件）与 `EACCES`（PATH 里那个目录不可读）都算
-/// 「这个候选不行」，换下一个；其余错（以及全部候选都起不来）带上 shell 名直接抛出去。
+/// 候选与选项见 [`Bash::SHELLS`] / [`Bash::SHELL_FLAG`]：逐个试，`ENOENT`（没这个件）与
+/// `EACCES`（PATH 里那个目录不可读）都算「这个候选不行」，换下一个；其余错（以及全部候选
+/// 都起不来）带上 shell 名直接抛出去。
 ///
 /// 独立进程组与「stderr 进 stdout」也在这儿：**只杀 shell 本体**会让它起的子孙变孤儿、
 /// 一直抱着管道写端，取消/超时就会卡到子孙自然退出（`cancel::kill_group` 靠的就是这个进程组）。
-pub fn spawn_shell(command: &str) -> std::io::Result<(&'static str, tokio::process::Child)> {
+pub fn spawn_shell(command: &str) -> std::io::Result<tokio::process::Child> {
     let mut last: Option<(&'static str, std::io::Error)> = None;
     for shell in Bash::SHELLS {
         let mut cmd = tokio::process::Command::new(shell);
@@ -1016,7 +1038,7 @@ pub fn spawn_shell(command: &str) -> std::io::Result<(&'static str, tokio::proce
             }
         }
         match cmd.spawn() {
-            Ok(child) => return Ok((shell, child)),
+            Ok(child) => return Ok(child),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1081,8 +1103,8 @@ impl Tool for Bash {
         }
         // 命令交给 shell（`bash -c`，没有 bash 就 `sh -c`；Windows 是 `cmd /C`）——候选、选项、
         // 进程组与管道只在 [`spawn_shell`] 一处。
-        let (shell, mut child) = match spawn_shell(&command) {
-            Ok(started) => started,
+        let mut child = match spawn_shell(&command) {
+            Ok(child) => child,
             Err(e) => return err(format!("启动失败: {e}")),
         };
         let stdout = child.stdout.take().expect("piped");
@@ -1133,7 +1155,8 @@ impl Tool for Bash {
                             kill_group();
                             return Ok(ToolOutput::text(format!(
                                 "[bash] 命令超过 {t}s 超时，可能仍在后台运行：{command}"
-                            )));
+                            ))
+                            .failed());
                         }
                     },
                     _ = &mut cancel_waiter => {
@@ -1154,21 +1177,17 @@ impl Tool for Bash {
             },
         };
 
-        // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，见 [`exit_code`]）
+        // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，见 [`exit_code`]）。
+        // 成败走结构化的 `failed`，**不再往正文里塞头** —— 命令失败时原因已经在它自己的输出里
+        // （`ls: …: Permission denied`）；TUI 的 ✗ 也看不到那个头了（看 `failed`）。
         let code = exit_code(&status);
         let out: String = chunks.concat();
 
-        // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
-        // 「判成败」：Rust TUI 的 `pane::tool_status` 只看**第一行**，所以失败必须
-        // 从这行就能认出来——判据是「`[exit=` 开头且不是 `[exit=0`」= 失败（没有任何头 = 成功）。
-        // 三个字段挤在一行（2026-09-24 起）：这行只为「判成败」存在，一行就够，也少两行噪声。
+        // 唯一的例外：命令失败却**什么都没说**（`grep -q` / `test` / `false` 这类）——
+        // 这时不给一行码，模型就只拿到一个空串、分不清成功失败。
         let mut headers: Vec<String> = Vec::new();
-        if code != 0 {
-            headers.push(format!(
-                "[exit={code}, os={}, shell={}]",
-                std::env::consts::OS,
-                shell
-            ));
+        if code != 0 && out.trim().is_empty() {
+            headers.push(format!("[exit={code}]"));
         }
 
         // shell 的 stdout 不可再生（进程一结束就没了）→ 超限就把**全文**落盘、正文只留头段预览。
@@ -1185,6 +1204,7 @@ impl Tool for Bash {
             headers,
             body,
             attachments: Vec::new(),
+            failed: code != 0,
         })
     }
 }
@@ -1594,14 +1614,9 @@ mod tests {
         Registry::new(HashMap::new())
     }
 
-    /// bash 失败时的唯一一行头（`impl Bash` 里那行格式的**测试侧镜像**）：
-    /// os / shell 跟着平台走，所以按常量拼期望值，别把 `linux` / `bash` 写死。
+    /// **静默失败**时那行头（`impl Bash` 里那个格式的测试侧镜像）：只有退出码。
     fn fail_header(code: i32) -> String {
-        format!(
-            "[exit={code}, os={}, shell={}]",
-            std::env::consts::OS,
-            Bash::SHELLS[0]
-        )
+        format!("[exit={code}]")
     }
 
     #[test]
@@ -1628,6 +1643,7 @@ mod tests {
                 spill: Some(PathBuf::from("/tmp/raw-x")),
             },
             attachments: Vec::new(),
+            failed: false,
         };
         assert_eq!(
             spilled.to_text(),
@@ -2305,15 +2321,17 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.to_text().starts_with(&format!("[exit=137, os=")),
+            out.to_text().starts_with(&fail_header(137)),
             "{}",
             out.to_text()
         );
+        assert!(out.failed, "被信号杀掉也算失败");
     }
 
-    /// 失败：只给一行头 `[exit=N, os=…, shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
+    /// 正文里不再有 `[exit=…]` 那种头：**只有「失败且没输出」时才补一行 `[exit=N]`**
+    /// （否则模型拿到空串，分不清成功失败）。成败走结构化的 `failed`。
     #[tokio::test]
-    async fn shell_exit_headers_only_on_failure() {
+    async fn shell_exit_header_only_when_failure_is_silent() {
         let reg = builtin();
         let ok = reg
             .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
@@ -2338,7 +2356,8 @@ mod tests {
             .unwrap();
         assert_eq!(bad.to_text(), headers, "失败且没输出：只有一行头");
 
-        let bad = reg
+        // 失败但有输出：**一个字都不加**（原因在命令自己的输出里），只把 `failed` 置上
+        let loud = reg
             .dispatch(
                 "bash",
                 &json!({"command": "echo boom; exit 3"}),
@@ -2346,20 +2365,22 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            bad.to_text(),
-            format!("{headers}\n\nboom\n"),
-            "头 + 空行 + 正文"
-        );
-        // 前端（Rust TUI 的 `pane::tool_status`）只拿**第一行**判成败：
-        // `[exit=` 开头且不是 `[exit=0…` = 失败（成功根本没有头）
-        let bad_text = bad.to_text();
-        let first = bad_text.lines().next().unwrap_or_default();
-        assert_eq!(first, headers, "{bad}");
-        assert!(
-            first.starts_with("[exit=") && !first.starts_with("[exit=0"),
-            "{bad}"
-        );
+        assert_eq!(loud.to_text(), "boom\n", "有输出的失败：正文原样");
+        assert!(loud.failed, "界面靠它画 ✗");
+
+        // 成功：`failed` 是 false
+        assert!(!ok.failed && !silent.failed);
+    }
+
+    /// 失败**且没输出**（`grep -q` / `test` / `false` 这类）→ 补一行退出码，别的都不加。
+    #[tokio::test]
+    async fn silent_failure_gets_the_exit_code_line() {
+        let out = builtin()
+            .dispatch("bash", &json!({"command": "false"}), ToolCtx::default())
+            .await
+            .unwrap();
+        assert_eq!(out.to_text(), fail_header(1));
+        assert!(out.failed);
     }
 
     /// 被信号干掉（`code()` 拿不到）→ 按 **shell 的口径** 记 `128 + 信号号`：

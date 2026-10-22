@@ -50,6 +50,8 @@ class ToolResultEvent(TypedDict):
     arguments: dict[str, Any]
     # 工具产出的图像（本地文件路径）——模型看不到，只有界面用（现在只有 `repl` 给）
     images: list[str]
+    # 这次调用算不算失败（界面画 ✗/✓ 用；正文里不再带 `[exit=…]` 那种头）
+    failed: bool
 
 class MessageEvent(TypedDict):
     type: Literal["message"]
@@ -150,6 +152,10 @@ class Message(TypedDict, total=False):
     reasoning_content: str
     compaction: dict[str, Any]
     synthetic: bool
+    # 这条 tool 消息对应的调用失败了（只在失败时出现；界面回放判 ✗/✓ 用）
+    failed: bool
+    # 这条 assistant 回复前「思考」了多久（毫秒，只在量到时出现）
+    thought_ms: int
 
 class BalanceInfo(TypedDict):
     currency: str

@@ -49,6 +49,8 @@ pub enum TurnEvent {
         arguments: String,
         /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
         images: Vec<PathBuf>,
+        /// 这次调用**算失败**吗（界面据此画 ✗/✓；正文里不再带 `[exit=…]` 之类的头）。
+        failed: bool,
     },
     /// 一条**完整的消息**组装好了（刚写进历史的那条）。
     ///
@@ -720,6 +722,7 @@ mod tests {
                 text: "ok".into(),
                 arguments: "{}".into(),
                 images: Vec::new(),
+                failed: false,
             }),
             Event::Turn(TurnEvent::Message {
                 message: Message::assistant("x"),

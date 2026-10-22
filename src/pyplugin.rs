@@ -370,6 +370,7 @@ impl Reply {
                 },
             ),
             attachments: Vec::new(),
+            failed: false,
         })
     }
 }

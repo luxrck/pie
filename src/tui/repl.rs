@@ -223,7 +223,12 @@ impl Repl {
                     continue;
                 };
                 let content = m.content_text();
-                view.entries[index].status = pane::tool_status(&content);
+                // 新会话看结构化的 `failed`；旧会话没这个字段 → 退回嗅文本
+                view.entries[index].status = if m.failed {
+                    Status::Fail
+                } else {
+                    pane::tool_status(&content)
+                };
                 view.entries[index].output = Some(content);
                 if let Some(images) = by_call.remove(id) {
                     view.entries[index].images = images;

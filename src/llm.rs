@@ -153,6 +153,10 @@ pub struct Message {
     /// 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    /// 这条 tool 消息对应的调用**失败**了（`false` = 成功 / 旧会话没记）：只给界面回放判 ✗/✓，
+    /// 不进 API（`to_api` 的 tool 分支只取 `content`）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
     /// 这条 assistant 回复前「思考」了多久（毫秒）：**只进会话文件、不进 API**（`to_api` 不带上它）。
     ///
     /// 实时视图里它是 TUI 现算的一行 `• Thought for 3.4s`；不落盘的话，退出再 `pie -r`
