@@ -1039,6 +1039,22 @@ fn with_shell(e: std::io::Error, shell: &str) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("{shell}: {e}"))
 }
 
+/// 进程退出码，**按 shell 的口径**：正常退出用它的 `code`；被信号杀掉记 `128 + 信号号`
+/// （= 你在自己终端里敲完命令 `echo $?` 看到的那个数，如 `kill -9` → 137）。
+///
+/// 为什么不就直接用 `status.code()`：被信号杀掉时它给 `None`，以前一律写 `-1` —— 模型/用户
+/// 只看到一句 `exit=-1`，既不知道是信号，也不知道是哪个。`-1` 现在只留给「连信号都拿不到」的情形。
+pub fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
+        return 128 + signal;
+    }
+    -1
+}
+
 impl Tool for Bash {
     async fn call(self, ctx: ToolCtx) -> ToolResult {
         let Self {
@@ -1138,8 +1154,8 @@ impl Tool for Bash {
             },
         };
 
-        // 退出码：被信号杀死时取 -1（都是「非正常退出」）
-        let code = status.code().unwrap_or(-1);
+        // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，见 [`exit_code`]）
+        let code = exit_code(&status);
         let out: String = chunks.concat();
 
         // 退出码头：**只在非 0 时给**（成功就是成功，不给模型/前端添噪声）。要它的地方是
@@ -2276,6 +2292,25 @@ mod tests {
         assert_eq!(out.to_text(), fail_header(3), "{out}");
     }
 
+    /// 被信号杀掉 → 头区按 shell 口径写 `128 + 信号号`（`kill -9` → 137），不是一句 `exit=-1`。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_command_reports_shell_style_code() {
+        let out = builtin()
+            .dispatch(
+                "bash",
+                &json!({"command": "kill -9 $$"}),
+                ToolCtx::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.to_text().starts_with(&format!("[exit=137, os=")),
+            "{}",
+            out.to_text()
+        );
+    }
+
     /// 失败：只给一行头 `[exit=N, os=…, shell=…]`；成功：**只有结果**（连 `[exit=0]` 都没有）。
     #[tokio::test]
     async fn shell_exit_headers_only_on_failure() {
@@ -2327,10 +2362,11 @@ mod tests {
         );
     }
 
-    /// 被信号干掉（`code()` 拿不到）→ `[exit=-1]`（与真 bash 一致：都是「非正常退出」）。
+    /// 被信号干掉（`code()` 拿不到）→ 按 **shell 的口径** 记 `128 + 信号号`：
+    /// `kill -TERM $$` → 143（在自己终端里 `echo $?` 也是这个数），不是一句 `-1`。
     #[cfg(unix)]
     #[tokio::test]
-    async fn killed_shell_reports_minus_one() {
+    async fn killed_shell_reports_shell_style_code() {
         let out = builtin()
             .dispatch(
                 "bash",
@@ -2339,7 +2375,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().starts_with(&fail_header(-1)), "{out}");
+        assert!(out.to_text().starts_with(&fail_header(143)), "{out}");
     }
 
     #[tokio::test]

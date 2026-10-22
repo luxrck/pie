@@ -1665,8 +1665,8 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
         Ok(status) => status,
         Err(e) => return (Status::Fail, format!("[exit=error]\n\n等待子进程失败: {e}")),
     };
-    // 退出码：被信号杀死时取 -1（都是「非正常退出」）
-    let code = status.code().unwrap_or(-1);
+    // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，与工具层的 bash 同一套）
+    let code = crate::tools::exit_code(&status);
     let mark = if code == 0 { Status::Ok } else { Status::Fail };
     (mark, out.trim_end_matches('\n').to_string())
 }
