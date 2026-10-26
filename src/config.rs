@@ -194,9 +194,10 @@ impl Storage {
 
     /// **插件目录**：`<root>/plugins/`（工具与扩展的代码都往这儿丢）。
     ///
-    /// **约定目录、存在即用**（与 `envs/base` 同一条风格）：往这儿丢 `*.py` 就生效，不用写
-    /// `[python] plugins`（两者可共存；见 `Config::python_plugin_entries`）。
-    pub fn python_plugins(&self) -> PathBuf {
+    /// **约定目录、存在即用**（与 `envs/base` 同一条风格）：往这儿丢 `*.py`（Python 工具 /
+    /// 扩展）或 `*.sh`（shell 工具）就生效，不用写 `[python] plugins`（两者可共存；见
+    /// `Config::python_plugin_entries` 与 `crate::shplugin`）。
+    pub fn plugins(&self) -> PathBuf {
         self.root.join("plugins")
     }
 
@@ -909,7 +910,7 @@ impl Config {
     /// 排在后头）—— 于是「往 `~/.pie/plugins/` 丢个 `.py`」就生效，不必写配置。
     pub fn python_plugin_entries(&self) -> Vec<String> {
         let mut out = self.python.plugins.clone();
-        let dir = self.storage.python_plugins();
+        let dir = self.storage.plugins();
         if dir.is_dir() {
             out.push(dir.to_string_lossy().into_owned());
         }
@@ -1500,7 +1501,7 @@ lean = true
             ..Config::default()
         };
         assert_eq!(config.python_plugin_entries(), ["x.py"], "目录不存在就不列");
-        std::fs::create_dir_all(storage.python_plugins()).unwrap();
+        std::fs::create_dir_all(storage.plugins()).unwrap();
         assert_eq!(
             config.python_plugin_entries().len(),
             2,

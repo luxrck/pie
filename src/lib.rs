@@ -11,6 +11,7 @@
 //!   - [`repl`]    —— `repl`：会话内持久的 IPython（长活子进程，状态挂 `state::SessionState`）
 //!   - [`pyhost`]  —— 长活 Python 宿主的传输与进程生命周期（`repl` / `pyplugin` 共用）
 //!   - [`pyplugin`]  —— 用 Python 写的工具：长活宿主子进程 + 同一张 `Registry`（无 CPython 嵌入）
+//!   - [`shplugin`] —— 用 shell 脚本写的工具：一个 `*.sh` = 一个工具（零解释器依赖，一次调用一个进程）
 //!   - [`cli`] —— 会话/图片文件的列表与维护（`pie sessions` / `files list|gc` 的数据源）
 //!   - [`state`]   —— 会话级状态（工具的长活对象 + 会话自己派生数据；`repl_blocks` 落盘那一条也住这儿）
 //!   - [`session`] —— 会话 JSONL + resume + **回合循环**（`Session::aturn`，原 loop.rs 已并入）
@@ -37,6 +38,7 @@ pub mod pyhost;
 pub mod pyplugin;
 pub mod repl;
 pub mod session;
+pub mod shplugin;
 pub mod state;
 pub mod tools;
 

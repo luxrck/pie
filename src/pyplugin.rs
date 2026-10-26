@@ -39,6 +39,7 @@ use crate::cancel::CANCEL_TEXT;
 use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
     CallFn, ExtensionHook, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
+    valid_tool_name,
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
@@ -283,16 +284,6 @@ fn files_of(entries: &[String]) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-/// 工具名得是 `[A-Za-z0-9_-]{1,64}`（OpenAI 兼容端点对 `function.name` 的硬要求；
-/// 与 Python 绑定 `register` 的那道校验同规矩）。
-fn valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 // ---------------------------------------------------------------- 宿主
@@ -1045,15 +1036,5 @@ def fine() -> str:
         assert_eq!(one.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tool_names_must_match_api_rules() {
-        assert!(valid_tool_name("echo"));
-        assert!(valid_tool_name("word_count-2"));
-        assert!(!valid_tool_name(""));
-        assert!(!valid_tool_name("有中文"));
-        assert!(!valid_tool_name("a.b"));
-        assert!(!valid_tool_name(&"x".repeat(65)));
     }
 }

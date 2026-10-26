@@ -144,6 +144,40 @@ plugins = ["~/.pie/plugins"]                   # 文件或目录（目录取其�
   `[python] interpreter` → `~/.pie/envs/base`（存在即用，`pie setup` 建的） → `python3`。
 - 两条边界：工具进程的 **cwd 固定在启动时**（TUI 里 `/cd` 不改它，要跟 cwd 走请用绝对路径）；**会话中途改工具文件不生效**，重启 `pie`。
 
+### shell 工具：一个 `.sh` = 一个工具（不装 Python）
+
+环境受限时（没 Python / 不想装包）把 `*.sh` 丢进同一个 `~/.pie/plugins/` 就多一个工具 ——
+**一次调用 spawn 一个脚本**，schema 写在 shebang 后面那段注释里，参数走命令行：
+
+```sh
+#!/bin/sh
+# schema! {
+#   "description": ["数一下目录里有多少个文件。"],
+#   "parameters": {
+#     "type": "object",
+#     "properties": { "dir": { "type": "string", "description": "目录（默认 .）" } }
+#   }
+# }
+dir=.
+for arg in "$@"; do
+    case $arg in
+        --dir=*) dir=${arg#*=} ;;
+        *) printf '未知参数：%s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+ls -A "$dir" | wc -l
+```
+
+- **schema 住注释里**：`# schema! { … }` 到括号配平为止（`description` 可以是数组；另有
+  `parameters` / `timeout_seconds`（默认 120）/ `name`（默认文件名主干））。
+- **参数走命令行**：`--名字=值`（名字与 schema 属性名逐字一致，只带这次真给了的，永远 `=` 不空格）。
+  私有参数（`[tools.<名字>] _hdc = "…"`，站点配置）走环境 `PIE_CFG_hdc`；环境另外只给
+  `PIE_HOME`（数据根）与 `PIE_TOOL_NAME`。
+- **stdout = 正文**；stderr 只在 `exit ≠ 0` 时补进正文；失败且静默 → 补一行 `[exit=N]`；超时 / `Esc`
+  杀整个进程组；超限与 `bash` 一样全文落盘。
+- **没有状态**：一次调用一个进程（要跨调用记东西就自己写 `$PIE_HOME`）；也**不支持**事件订阅（那是
+  Python 插件的事）。完整契约：`docs/sh-plugins.md`，示例：`examples/ohos_vision.sh`。
+
 ### 扩展：订阅事件 + 改当前实例
 
 同一个插件文件也可以**只当扩展用**（不注册工具）：`session.on(kind, fn)` 订阅会话事件，

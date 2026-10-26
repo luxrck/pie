@@ -1211,7 +1211,7 @@ impl Tool for Bash {
 
 // ---------------------------------------------------------------- 注册表
 
-/// 动态注册的调用体：内置工具包的是 `erased::<T>`（fn 指针），**Python 工具**包的是
+/// 动态注册的调用体：内置工具包的是 `erased::<T>`（fn 指针），**插件工具**（Python / shell）包的是
 /// 一段回调（绑定侧往 Python 里再叫一次）。两条路共用同一条分发链。
 pub type CallFn = std::sync::Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult> + Send + Sync>;
 
@@ -1221,7 +1221,7 @@ pub type CallFn = std::sync::Arc<dyn Fn(Value, ToolCtx) -> BoxFuture<ToolResult>
 /// `Debug` 手写（`Box<dyn Fn>` 不是 `Debug`，打印成 `<call>` 就够）。
 #[derive(Clone)]
 pub struct Plugin {
-    /// 工具名（`String`：Python 工具的名字是运行时给的，不是 `&'static str`）。
+    /// 工具名（`String`：插件工具的名字是运行时给的，不是 `&'static str`）。
     pub name: String,
     pub description: String,
     pub parameters: Value,
@@ -1343,7 +1343,7 @@ impl Registry {
         });
         self
     }
-    /// **动态注册**（Python 工具走这条）：名字 / 描述 / schema 都是运行时给的，
+    /// **动态注册**（Python / shell 插件走这条）：名字 / 描述 / schema 都是运行时给的，
     /// 调用体由调用方提供（绑定里就是「往 Python 里叫一次」那段）。
     ///
     /// 与 `with_tool` 同规矩：重名直接 panic（注册期编程错误，不是运行期数据问题）。
@@ -1490,30 +1490,42 @@ impl std::fmt::Debug for ToolHandle {
     }
 }
 
+/// 工具名得是 `[A-Za-z0-9_-]{1,64}`（OpenAI 兼容端点对 `function.name` 的硬要求）。
+///
+/// 住这儿是因为它有**两个**消费者（`pyplugin` / `shplugin`）—— 而「工具名能长什么样」本来就是
+/// 注册表的规矩。外部来的名字必须自己先过这一道：`with_dynamic` 撞重名是 panic（Rust 侧的编程错误）。
+pub fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// 按 `--tools` 说明裁剪**已注册的工具集**（无 spec / 空串 → 原样全量）。
 ///
-/// 解析优先级：内置工具名 > Python 工具名 > shell 子命令。
+/// 解析优先级：内置工具名 > 插件工具名（Python / shell）> shell 子命令。
 ///   - 名字 ∈ 内置（read/edit/writ/bash/repl）→ 启用该工具；
-///   - 名字 ∈ `registry` 里动态注册的 Python 工具（`pyplugin::load` 装进来的）→ 启用它；
+///   - 名字 ∈ `registry` 里动态注册的插件工具（`pyplugin` / `shplugin` 装进来的）→ 启用它；
 ///   - 其他名字 → 收集成 shell 允许的子命令白名单，并隐式启用**受限 shell**；
 ///   - 未显式列 shell 且没有任何非内置名 → shell 工具禁用。
 ///
 /// 示例：`"read"` → 仅 read；`"read,bash"` → read + 不限子命令的 bash；
 /// `"read,ls,grep"` → read + 只允许 ls/grep 的受限 bash（当 `ls`/`grep` 不是已注册的
-/// Python 工具时）；`"ls,grep"` → 仅受限 bash。
+/// 插件工具时）；`"ls,grep"` → 仅受限 bash。
 ///
-/// 传进来的 `registry` 是**全量**（内置 + Python 工具，见 `pyplugin::load`）：
-/// 「一个非内置名字是 Python 工具还是 shell 子命令」得先知道 Python 工具都叫什么。
+/// 传进来的 `registry` 是**全量**（内置 + 插件工具，见 `pyplugin::load` / `shplugin::load`）：
+/// 「一个非内置名字是插件工具还是 shell 子命令」得先知道插件工具都叫什么。
 pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
     const BUILTINS: [&str; 5] = ["read", "edit", "writ", "bash", "repl"];
 
-    let pyplugins: Vec<&str> = registry
+    let plugins: Vec<&str> = registry
         .names()
         .into_iter()
         .filter(|n| !BUILTINS.contains(n))
         .collect();
     let mut enabled: Vec<&'static str> = Vec::new();
-    let mut enabled_py: Vec<String> = Vec::new();
+    let mut enabled_plugins: Vec<String> = Vec::new();
     let mut allow_cmds: Vec<String> = Vec::new();
     for token in spec.unwrap_or("").split(',').map(str::trim) {
         if token.is_empty() {
@@ -1523,18 +1535,18 @@ pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
             if !enabled.contains(&name) {
                 enabled.push(name);
             }
-        } else if pyplugins.contains(&token) {
-            if !enabled_py.iter().any(|n| n == token) {
-                enabled_py.push(token.to_string());
+        } else if plugins.contains(&token) {
+            if !enabled_plugins.iter().any(|n| n == token) {
+                enabled_plugins.push(token.to_string());
             }
         } else if !allow_cmds.iter().any(|c| c == token) {
             allow_cmds.push(token.to_string());
         }
     }
 
-    // 无 spec、或「五个内置全列且没有 Python 工具 / 白名单」→ 默认全量
-    if (enabled.is_empty() && enabled_py.is_empty() && allow_cmds.is_empty())
-        || (allow_cmds.is_empty() && enabled_py.is_empty() && enabled.len() == BUILTINS.len())
+    // 无 spec、或「五个内置全列且没有插件工具 / 白名单」→ 默认全量
+    if (enabled.is_empty() && enabled_plugins.is_empty() && allow_cmds.is_empty())
+        || (allow_cmds.is_empty() && enabled_plugins.is_empty() && enabled.len() == BUILTINS.len())
     {
         return registry;
     }
@@ -1570,9 +1582,9 @@ pub fn tools_from_spec(spec: Option<&str>, registry: Registry) -> Registry {
             _ => reg.with_tool::<Bash>("bash"),
         };
     }
-    // Python 工具：从全量表里按名字搬过来（定义与调用体一起，别重造）
+    // 插件工具：从全量表里按名字搬过来（定义与调用体一起，别重造）
     for plugin in &registry.plugins {
-        if enabled_py.iter().any(|n| n == &plugin.name) {
+        if enabled_plugins.iter().any(|n| n == &plugin.name) {
             reg.plugins.push(plugin.clone());
         }
     }
@@ -1617,6 +1629,16 @@ mod tests {
     /// **静默失败**时那行头（`impl Bash` 里那个格式的测试侧镜像）：只有退出码。
     fn fail_header(code: i32) -> String {
         format!("[exit={code}]")
+    }
+
+    #[test]
+    fn tool_names_must_match_api_rules() {
+        assert!(valid_tool_name("echo"));
+        assert!(valid_tool_name("word_count-2"));
+        assert!(!valid_tool_name(""));
+        assert!(!valid_tool_name("有中文"));
+        assert!(!valid_tool_name("a.b"));
+        assert!(!valid_tool_name(&"x".repeat(65)));
     }
 
     #[test]
@@ -2190,7 +2212,7 @@ mod tests {
         );
     }
 
-    /// 非内置名先跟已注册的 Python 工具对：对上 = 放行该工具（**不进** shell 白名单），对不上 = shell 子命令。
+    /// 非内置名先跟已注册的插件工具对：对上 = 放行该工具（**不进** shell 白名单），对不上 = shell 子命令。
     #[test]
     fn tools_from_spec_matches_python_tools_before_shell() {
         let call: CallFn = Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::text("ok")) }));

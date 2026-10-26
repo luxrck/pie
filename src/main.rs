@@ -86,7 +86,7 @@ struct Cli {
     #[arg(long)]
     models: bool,
 
-    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash/repl）启用该工具，Python 工具名启用它，其余名字当 shell 子命令白名单
+    /// 限制可用工具（逗号分隔）：内置名（read/edit/writ/bash/repl）启用该工具，插件工具名（Python / shell）启用它，其余名字当 shell 子命令白名单
     /// （如 `--tools read,ls,grep` = read + 只允许 ls/grep 的受限 bash）
     #[arg(long)]
     tools: Option<String>,
@@ -263,12 +263,14 @@ async fn run(cli: Cli) -> i32 {
             return 1;
         }
     };
-    // 工具集：先装出**全量**（内置 + 用 Python 写的工具），再按 `--tools` 裁剪。
-    // ⚠ 顺序要紧：`--tools` 里非内置的名字要先跟 Python 工具对（对上 = 放行该工具，
-    // 对不上 = shell 子命令白名单），所以 Python 工具得先装、名字先知道。
-    // 插件（工具 / 扩展）走一个长活宿主子进程（`[python] plugins`）；没配就是零开销，起不来 / 报错只告警。
-    // 解释器 / 工具文件 / 给宿主的 `PIE_*` 快照都从 `config` 取（一处解析，见 `pyplugin.rs`）。
+    // 工具集：先装出**全量**（内置 + 用 Python 写的工具 + 用 shell 写的工具），再按 `--tools` 裁剪。
+    // ⚠ 顺序要紧：`--tools` 里非内置的名字要先跟插件工具对（对上 = 放行该工具，
+    // 对不上 = shell 子命令白名单），所以插件工具得先装、名字先知道。
+    // Python 插件（工具 / 扩展）走一个长活宿主子进程（`[python] plugins`）；没配就是零开销，
+    // 起不来 / 报错只告警。解释器 / 工具文件 / 给宿主的 `PIE_*` 快照都从 `config` 取。
+    // shell 插件（`<root>/plugins/*.sh`）不起进程 —— 只读一遍文件头，一次调用才 spawn 一个脚本。
     let registry = pie::pyplugin::load(Registry::new(config.tool_defaults()), &config).await;
+    let registry = pie::shplugin::load(registry, &config);
     let registry = tools_from_spec(cli.tools.as_deref(), registry);
 
     // TTY 且没有任务 → 进 TUI（`-r` / `-s` 就接着那个会话聊）；非 TTY 保持原来的行为
