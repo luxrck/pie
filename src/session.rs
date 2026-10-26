@@ -896,9 +896,12 @@ impl Session {
             let Some(msg) = self.messages.get_mut(*idx) else {
                 continue;
             };
-            let Some(Content::Text(text)) = msg.content.take() else {
+            // 先借后写：`take()` 会先把 content 置空，万一是别的形状（重复处理 / 已经是 parts）
+            // 就会把正文永久弄丢。
+            let Some(Content::Text(text)) = &msg.content else {
                 continue;
             };
+            let text = text.clone();
             msg.content = Some(Content::Parts(vec![
                 json!({"type": "text", "text": text}),
                 json!({"type": "file", "file_id": file_id}),

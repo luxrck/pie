@@ -216,7 +216,8 @@ impl Message {
     }
 
     /// 转成发给模型的消息（**剥掉压缩元数据**）：
-    ///   - `tool`：只要 `tool_call_id` + `content`（空则 `""`）；
+    ///   - `tool`：只要 `tool_call_id` + `content`（`Content::Parts` 原样透传 —— `read` 的图就挂在
+    ///     这里；缺省 `""`）；
     ///   - `assistant` 带 `tool_calls`：**必须带 `reasoning_content`**（空串兜底），thinking 模式缺了报 400；
     ///   - `assistant` 有思考内容：带上；
     ///   - 其余：只有 `role` + `content`（多模态 parts 原样透传）。
@@ -225,9 +226,13 @@ impl Message {
             return json!({
                 "role": "tool",
                 "tool_call_id": self.tool_call_id.clone().unwrap_or_default(),
+                // ⚠ 多模态 parts 必须原样透传：`Session::attach_read_images` 把读到图的 tool 消息
+                // 改成了 `[{type:text}, {type:file, file_id}]`，只取 `Text` 会把它整条吞成空串 ——
+                // 图（连同那行 `[图片已读取: …]`）就再也到不了模型。
                 "content": match &self.content {
-                    Some(Content::Text(t)) => t.clone(),
-                    _ => String::new(),
+                    Some(Content::Text(t)) => json!(t),
+                    Some(Content::Parts(parts)) => json!(parts),
+                    None => json!(""),
                 },
             });
         }
@@ -1409,6 +1414,36 @@ mod tests {
         // 落盘（会话 JSONL）要保住它，否则回放还原不出「• Thought for …」
         let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.thought_ms, Some(1234));
+    }
+
+    /// 带图的 tool 消息（`Content::Parts`）必须**原样**进请求体。
+    ///
+    /// `read` 读到图时 `Session::attach_read_images` 会把 content 换成
+    /// `[{type:text}, {type:file, file_id}]`；`to_api` 的 tool 分支只取 `Text` 会把它整条
+    /// 吞成空串 —— 图连那行 `[图片已读取: …]` 一起到不了模型（模型只能瞎猜着描述）。
+    #[test]
+    fn tool_message_passes_content_parts_through_to_the_api() {
+        let mut m = Message::tool_result("call_1", "read", "[图片已读取: path=/tmp/a.png]");
+        m.content = Some(Content::Parts(vec![
+            json!({"type": "text", "text": "[图片已读取: path=/tmp/a.png]"}),
+            json!({"type": "file", "file_id": "file-abc"}),
+        ]));
+        let api = m.to_api();
+        assert_eq!(api["role"], "tool");
+        assert_eq!(api["tool_call_id"], "call_1");
+        let parts = api["content"].as_array().expect("parts 要原样透传");
+        assert_eq!(parts.len(), 2, "{api}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["file_id"], "file-abc");
+
+        // 没有 content 的 tool 消息仍是空串（不是 null，API 不接受 null）
+        let empty = Message {
+            role: "tool".into(),
+            tool_call_id: Some("call_2".into()),
+            ..Default::default()
+        };
+        assert_eq!(empty.to_api()["content"], "");
     }
 
     /// 超时错误要**说清楚在等什么、等了多久**。
