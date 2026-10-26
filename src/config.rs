@@ -1184,13 +1184,15 @@ pub fn build_system_prompt(
     let global_memory = std::fs::read_to_string(config.storage.global_memory()).unwrap_or_default();
     if !global_memory.is_empty() {
         memories.push(format!(
-            "## 全局记忆（{}）\n{global_memory}",
+            "## 全局记忆（{}）\n```markdown\n{global_memory}\n```",
             config.storage.global_memory().display()
         ));
     }
     let project_memory = read_text(resolve_prompt_file(MEMORY_FILE));
     if !project_memory.is_empty() {
-        memories.push(format!("## 项目记忆（{MEMORY_FILE}）\n{project_memory}"));
+        memories.push(format!(
+            "## 项目记忆（{MEMORY_FILE}）\n```markdown\n{project_memory}\n```"
+        ));
     }
     if !memories.is_empty() {
         parts.push(memories.join("\n\n"));
@@ -1606,7 +1608,10 @@ lean = true
         storage.ensure_global_memory();
         let path = storage.global_memory();
         let text = std::fs::read_to_string(&path).expect("种子文件已写入");
-        assert!(text.starts_with("# 全局记忆"), "{text}");
+        // 种子正文不带一级标题：拼进 system prompt 时外层已经有「## 全局记忆（路径）」
+        // 那一行 + 围栏，再来个 `# 全局记忆` 就是重复的两级标题。
+        assert!(text.starts_with("跨项目的持久记忆"), "{text}");
+        assert!(!text.contains("# 全局记忆"), "别带一级标题：{text}");
         assert!(text.contains("## 编码风格／工具链"), "带分类骨架：{text}");
         assert!(text.contains("说明段落不要删除"), "{text}");
 
