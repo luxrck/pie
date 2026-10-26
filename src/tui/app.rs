@@ -1619,8 +1619,9 @@ impl App {
 
 /// 跑一条手动 `!cmd`，返回（状态，结果正文）。
 ///
-/// 起进程一律走 [`crate::tools::spawn_shell`]（与工具层的 bash 同一个出口：候选 shell、独立进程组、
-/// stderr 合进 stdout 都在那儿）——只杀 shell 本体的话，持有 stdout 管道写端的子孙会让读端不 EOF。
+/// 起进程一律走 [`crate::tools::spawn_shell`]（与工具层的 bash 同一个出口：候选 shell、独立进程组
+/// 都在那儿）——只杀 shell 本体的话，持有 stdout 管道写端的子孙会让读端不 EOF。
+/// stderr 也要读（unix 上它已被 dup2 并进 stdout；Windows 上是另一根管道），见 [`crate::tools::drain_lines`]。
 /// 正文格式：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]` + 一行 `[用户手动终止]`）。
 async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     let mut child = match crate::tools::spawn_shell(cmd) {
@@ -1628,23 +1629,20 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
         Err(e) => return (Status::Fail, format!("[exit=error]\n\n启动失败: {e}")),
     };
     let stdout = child.stdout.take().expect("piped");
+    // stderr 也要读：unix 上它已被 dup2 并进 stdout（读到立即 EOF），Windows 上是另一根管道
+    // —— 不读就会在命令写满缓冲时把自己卡死（见 `tools::spawn_shell`）。
+    let stderr = child.stderr.take().expect("piped");
     // tokio 的 id() 在进程被回收后返回 None；0 表示“拿不到 pid”（不杀组）
     let pid = child.id().unwrap_or(0);
-    let mut chunks: Vec<String> = Vec::new();
+    let (mut chunks, mut errors) = (Vec::new(), Vec::new());
 
     let read_and_wait = async {
-        use tokio::io::AsyncBufReadExt;
-        let mut reader = tokio::io::BufReader::new(stdout);
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            chunks.push(String::from_utf8_lossy(&buf).into_owned());
-        }
-        child.wait().await
+        let (_, _, status) = tokio::join!(
+            crate::tools::drain_lines(stdout, &mut chunks),
+            crate::tools::drain_lines(stderr, &mut errors),
+            child.wait(),
+        );
+        status
     };
     // 取消分支不能碰 `chunks`/`child`（都被这个 future 借着）——先收尾，完了再放开它。
     let mut reading = Box::pin(read_and_wait);
@@ -1662,7 +1660,9 @@ async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
     };
     drop(reading);
 
-    let out = chunks.concat();
+    // unix：stderr 已并进 stdout（`errors` 恒空）；Windows：两根各读各的，拼在后面
+    let mut out = chunks.concat();
+    out.push_str(&errors.concat());
     if cancelled {
         // 与工具层同款：kill 后 wait 限时 3s（D-state 进程不能把界面拖死）
         let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;

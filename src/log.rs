@@ -106,8 +106,19 @@ mod tests {
     use std::sync::Arc;
 
     /// ⚠ 全局只有一个槽位、测试并行跑，所以「装 sink」只在这一个用例里做。
+    ///
+    /// 槽位是**进程级**的 → 别的用例同时 `warn` 出来的东西也会进这个 sink。所以断言只比较
+    /// **本用例自己那几条**（靠 `[retry]` / `流式请求` 识别），否则并行跑时随机红
+    /// （`shplugin` / `pyplugin` 那些「坏脚本跳过」的告警就是噪音源）。
     #[test]
     fn installed_sink_takes_over_until_dropped() {
+        fn ours(seen: &[String]) -> Vec<&str> {
+            seen.iter()
+                .map(String::as_str)
+                .filter(|line| line.contains("[retry]") || line.contains("流式请求"))
+                .collect()
+        }
+
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink_seen = seen.clone();
         let guard = install(move |notice| {
@@ -121,7 +132,7 @@ mod tests {
         progress("流式请求", "[retry] 第 3 次");
         progress_done("流式请求");
         assert_eq!(
-            seen.lock().unwrap().as_slice(),
+            ours(&seen.lock().unwrap()),
             [
                 "Warn/:[retry] 第 2 次",
                 "Progress/流式请求:[retry] 第 3 次",
@@ -132,12 +143,12 @@ mod tests {
         // 卸载后退回 stderr（这里只确认不再进 sink；那条会出现在测试捕获的 stderr 里）
         drop(guard);
         warn("[retry] 卸载之后写 stderr");
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(ours(&seen.lock().unwrap()).len(), 3);
 
         // 拒收（界面已退出）也退回 stderr
         let guard = install(|_| false);
         warn("[retry] 没人接就写 stderr");
         drop(guard);
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(ours(&seen.lock().unwrap()).len(), 3);
     }
 }

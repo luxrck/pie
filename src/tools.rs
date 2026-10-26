@@ -1010,7 +1010,11 @@ impl Bash {
     const SHELL_FLAG: &'static str = "/C";
 }
 
-/// 起一个跑 `command` 的 shell 进程（stdout / stderr 合并到同一条管道）。
+/// 起一个跑 `command` 的 shell 进程。
+///
+/// 输出：stdout 一根管道；**stderr 在 unix 上被 `dup2(1, 2)` 并进同一根**（顺序稳定、只有一条流）；
+/// Windows 上没有 `pre_exec` / dup2 → stderr 是**另一根**管道，调用方必须也读它（[`drain_lines`]），
+/// 否则命令往 stderr 写满管道缓冲（约 64KB）就会把自己卡死，而那些字也一个都看不到。
 ///
 /// 候选与选项见 [`Bash::SHELLS`] / [`Bash::SHELL_FLAG`]：逐个试，`ENOENT`（没这个件）与
 /// `EACCES`（PATH 里那个目录不可读）都算「这个候选不行」，换下一个；其余错（以及全部候选
@@ -1054,6 +1058,24 @@ pub fn spawn_shell(command: &str) -> std::io::Result<tokio::process::Child> {
     // 看不出是哪个 shell）
     let (shell, e) = last.expect("SHELLS 非空");
     Err(with_shell(e, shell))
+}
+
+/// 读完一根管道，按行追加进 `sink`（保留原始字节，不做行重整）。
+///
+/// 两个消费者：[`Bash::call`] 与 TUI 的 `!cmd`（`tui::app::exec_shell`）。两边都必须把 stderr 也读掉
+/// —— 见 [`spawn_shell`] 关于平台的说明（unix 上它读到的是立即 EOF：那根 fd 已在子进程里被 dup2 换掉）。
+pub async fn drain_lines<R: tokio::io::AsyncRead + Unpin>(reader: R, sink: &mut Vec<String>) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        sink.push(String::from_utf8_lossy(&buf).into_owned());
+    }
 }
 
 /// 给错误带上 shell 名（`启动失败: sh: Permission denied (os error 13)`）——kind 保留，方便调用方判。
@@ -1108,26 +1130,20 @@ impl Tool for Bash {
             Err(e) => return err(format!("启动失败: {e}")),
         };
         let stdout = child.stdout.take().expect("piped");
+        // stderr **也得读**：unix 上它已被 dup2 并进 stdout（这里读到立即 EOF）；Windows 上它是另一根
+        // 管道，不读就会在命令写满缓冲时卡死（见 [`spawn_shell`]）。
+        let stderr = child.stderr.take().expect("piped");
         // tokio 的 id() 在进程已被回收后返回 None；0 表示“拿不到 pid”（不杀组）
         let pid = child.id().unwrap_or(0);
-        let mut chunks: Vec<String> = Vec::new();
+        let (mut chunks, mut errors) = (Vec::new(), Vec::new());
 
-        // 逐块读 stdout（stderr 已 dup2 到同一管道）——用 read_until 保留原始字节，
-        // 不做行重整——原样累积，只在进度回调里剥掉换行。
         let read_and_wait = async {
-            use tokio::io::AsyncBufReadExt;
-            let mut reader = tokio::io::BufReader::new(stdout);
-            let mut buf: Vec<u8> = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                chunks.push(text);
-            }
-            child.wait().await
+            let (_, _, status) = tokio::join!(
+                drain_lines(stdout, &mut chunks),
+                drain_lines(stderr, &mut errors),
+                child.wait(),
+            );
+            status
         };
 
         // 取消（Esc）：与超时同款处理——杀掉**整个进程组**，返回哨兵文本
@@ -1181,7 +1197,10 @@ impl Tool for Bash {
         // 成败走结构化的 `failed`，**不再往正文里塞头** —— 命令失败时原因已经在它自己的输出里
         // （`ls: …: Permission denied`）；TUI 的 ✗ 也看不到那个头了（看 `failed`）。
         let code = exit_code(&status);
-        let out: String = chunks.concat();
+        // unix：stderr 已在同一个管道里（`errors` 恒空，顺序天然正确）；
+        // Windows：两根各读各的 → 拼在 stdout 后面（顺序不保证，但字不丢、也不卡死）。
+        let mut out: String = chunks.concat();
+        out.push_str(&errors.concat());
 
         // 唯一的例外：命令失败却**什么都没说**（`grep -q` / `test` / `false` 这类）——
         // 这时不给一行码，模型就只拿到一个空串、分不清成功失败。
@@ -2497,6 +2516,36 @@ mod tests {
             "1\n2\n3\n",
             "{out}"
         );
+    }
+
+    /// **stderr 必须被读掉**：unix 上它被 dup2 并进了 stdout，Windows 上它是**另一根**管道 ——
+    /// 后者不读就会在命令写满管道缓冲（约 64KB）时把自己卡死，而且那些字一个都看不到。
+    ///
+    /// 带 `timeout` 是为了把「卡死」变成一条失败的断言（而不是挂住整个测试套件）；
+    /// 在 unix 上这条主要盯的是「同时读两根流没把原来的合并顺序搞坏」。
+    #[tokio::test]
+    async fn stderr_is_drained_even_when_it_is_a_separate_pipe() {
+        #[cfg(unix)]
+        let command = "i=0; while [ $i -lt 30000 ]; do echo err-line-$i 1>&2; i=$((i+1)); done";
+        #[cfg(not(unix))]
+        let command = "for /L %i in (0,1,30000) do @echo err-line-%i 1>&2";
+
+        let out = builtin()
+            .dispatch(
+                "bash",
+                &json!({ "command": command, "timeout": 20 }),
+                ToolCtx::default(),
+            )
+            .await
+            .unwrap();
+        let text = out.to_text();
+        assert!(!text.contains("超时"), "stderr 没被读掉 → 卡住了：{text}");
+        assert!(
+            text.contains("err-line-29999"),
+            "尾巴要收全：{}",
+            &text[..200.min(text.len())]
+        );
+        assert!(!out.failed, "命令本身是成功的");
     }
 
     #[tokio::test]
