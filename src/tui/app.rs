@@ -666,6 +666,7 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match (key.code, ctrl, shift) {
             (KeyCode::Char('c'), true, _) => self.should_quit = true,
             (KeyCode::Char('d'), true, _) if self.input.is_empty() => self.should_quit = true,
@@ -679,11 +680,19 @@ impl App {
             // ⇧⏎ 在多数终端里就是 LF（= Ctrl+J），两个都认
             (KeyCode::Enter, _, true) | (KeyCode::Char('j'), true, _) => self.input.newline(),
             (KeyCode::Enter, _, false) => self.submit(),
-            // PgUp/PgDn：在 REPL 画布里滚画布，其余滚消息流（方向与消息流一致）
-            (KeyCode::PageUp, ..) if self.tab == Tab::Repl => self.repl.scroll(-8),
-            (KeyCode::PageDown, ..) if self.tab == Tab::Repl => self.repl.scroll(8),
-            (KeyCode::PageUp, ..) => self.scroll(-8),
-            (KeyCode::PageDown, ..) => self.scroll(8),
+            // Alt+↑/↓：不依赖鼠标的滚动（终端不上报鼠标事件时用：OHOS 模拟器 / 某些
+            // Windows 控制台）。步长与滚轮一致（3 行）；REPL 画布里滚画布。
+            // 正 = 往历史更早处（同 [`Self::scroll`] 的口径）：↑ 看更早、↓ 回底部。
+            (KeyCode::Up, ..) if alt && self.tab == Tab::Repl => self.repl.scroll(3),
+            (KeyCode::Down, ..) if alt && self.tab == Tab::Repl => self.repl.scroll(-3),
+            (KeyCode::Up, ..) if alt => self.scroll(3),
+            (KeyCode::Down, ..) if alt => self.scroll(-3),
+            // PgUp/PgDn：在 REPL 画布里滚画布，其余滚消息流。**PgUp = 看更早**（正），
+            // 与滚轮 / Alt+↑ 同向；以前这里写成 `-8`，按 PgUp 反而往底部跑（已修）。
+            (KeyCode::PageUp, ..) if self.tab == Tab::Repl => self.repl.scroll(8),
+            (KeyCode::PageDown, ..) if self.tab == Tab::Repl => self.repl.scroll(-8),
+            (KeyCode::PageUp, ..) => self.scroll(8),
+            (KeyCode::PageDown, ..) => self.scroll(-8),
             // 补全面板开着时：Tab 接受候选、↑/↓ 切候选
             (KeyCode::Tab, ..) if self.palette_visible() => self.palette_accept(),
             // `@` token 在、索引还没落地（刚敲下 `@` 那一两帧）时，Tab 不能变成一个字面
@@ -2757,6 +2766,33 @@ mod tests {
             app.scroll(-8);
         }
         assert_eq!(app.scroll_from_bottom, 0, "滚到底就夹住");
+    }
+
+    /// 终端不上报鼠标事件时（OHOS 模拟器 / 某些 Windows 控制台）的滚动路径：
+    /// `PgUp`/`PgDn` 与 `Alt+↑/↓` 都得能用，而且方向得是「↑ = 看更早」。
+    #[test]
+    fn page_keys_and_alt_arrows_scroll_without_mouse_events() {
+        let mut app = test_app();
+        let long: String = (0..40).map(|i| format!("第 {i} 行\n")).collect();
+        app.cells.push(Cell::User(long));
+        app.render_to_string(60, 12); // 先渲染一帧：`scroll` 靠上一帧的排版算上限
+        assert!(app.max_scroll() > 16, "内容得比可视区高得多");
+
+        // PgUp = 往更早（正方向）、PgDn = 回底部
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll_from_bottom, 8, "PgUp 该看更早的内容");
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.scroll_from_bottom, 0, "PgDn 回到底部跟随");
+
+        // Alt+↑ / Alt+↓ 同向，步长与滚轮一致（3 行）
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.scroll_from_bottom, 3);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        // 裸 ↑/↓ （无 Alt）仍然是输入框的历史 / 光标，不能误伤
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.scroll_from_bottom, 0, "不加 Alt 不该滚历史区");
     }
 
     /// 内容变短（工具行结算、`/clear` 之类）时，旧的偏移也得跟着夹回去——
