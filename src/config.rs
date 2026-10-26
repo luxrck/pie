@@ -547,6 +547,10 @@ pub fn fmt_local(secs: i64) -> String {
     fn local_utc_offset(secs: i64) -> i64 {
         // SAFETY: `localtime_r` 把结果写进我们给的 `tm`（返回的不是共享缓冲）
         unsafe {
+            // `libc::time_t` 在 musl / OHOS（libc 的 musl 分支）上被标了 deprecated：上游为「musl 1.2
+            // 把 32 位 time_t 改成 64 位」留的提醒（libc#1848）。但我们要的就是 **libc 自己那个类型**
+            // —— 换 `c_long` 在 musl32 的 time64 下就是拿 4 字节指针喂 8 字节参数（UB），所以只静音。
+            #[allow(deprecated)]
             let t = secs as libc::time_t;
             let mut tm: libc::tm = std::mem::zeroed();
             if libc::localtime_r(&t, &mut tm).is_null() {
