@@ -169,27 +169,39 @@ impl Storage {
         Self { root: root.into() }
     }
 
-    /// 会话目录：`<root>/sessions/`（会话 JSONL 的落脚处，`sessions` 子命令与 `-r` 都扫它）。
+    /// 会话根：`<root>/sessions/`（下面一个会话一个目录；`sessions` 子命令与 `-r` 都扫它）。
     pub fn sessions(&self) -> PathBuf {
         self.root.join("sessions")
     }
 
-    /// 压缩落盘正文目录：`<root>/context/`（`context info|verify|gc` 的地盘）。
-    pub fn context(&self) -> PathBuf {
-        self.root.join("context")
+    /// 一个会话的目录：`<root>/sessions/<id>/`（id 就是目录名）。
+    pub fn session_dir(&self, id: &str) -> PathBuf {
+        self.sessions().join(id)
+    }
+
+    /// 会话元数据：`<id>/meta.json`（`usage` / `windows` / `title` / `cwd` / 压缩计数 / `state`）。
+    pub fn session_meta(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("meta.json")
+    }
+
+    /// 会话消息：`<id>/messages.jsonl`（一行一条，**没有** `__meta__` 首行）。
+    pub fn session_messages(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("messages.jsonl")
+    }
+
+    /// 会话内的压缩原文目录：`<id>/context/`（随会话目录一起被删）。
+    pub fn session_context(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("context")
+    }
+
+    /// 会话内的窗口块目录：`<id>/windows/`（`/clear` 归档的原文）。
+    pub fn session_windows(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("windows")
     }
 
     /// 本地图片副本目录：`<root>/files/`（`files list|gc` 的地盘；与 `context/` 分开：那边是文本）。
     pub fn files(&self) -> PathBuf {
         self.root.join("files")
-    }
-
-    /// `/clear` 归档的窗口块目录：`<root>/windows/`。
-    ///
-    /// **刻意放在 `context/` 之外**：那是压缩落盘 + `context gc` 的地盘，而窗口块是用户
-    /// 主动归档的原文（`/clear` 产出）——`gc` 不该碰它。
-    pub fn windows(&self) -> PathBuf {
-        self.root.join("windows")
     }
 
     /// Python 环境目录：`<root>/envs/`（`pie setup` 用 uv 建环境就建在这里）。
@@ -290,7 +302,9 @@ impl Storage {
     ///
     /// 返回**落盘路径**——文件名主干就是 id（`img-<hash>` / `<prefix>-<hash>` / `window-<hash>`，
     /// 全是内容寻址的：同内容只落一份，已存在则不动），要 hash 段用 [`hash_of`]。
-    pub fn store(&self, what: StoreType<'_>) -> std::io::Result<PathBuf> {
+    /// 作用域由 `session` 定：`Blob` 进**全局** `files/`（必须不给），`Raw` / `Window` 进**会话目录**
+    /// 下的 `context/` / `windows/`（必须给）。给错方向直接 `Err` —— 别让它静默写到全局。
+    pub fn store(&self, session: Option<&Path>, what: StoreType<'_>) -> std::io::Result<PathBuf> {
         /// mime → 扩展名（图片副本是用户数据，名字里带扩展名才能双击打开；白名单之外给空串）。
         fn image_ext(mime: &str) -> &'static str {
             match mime {
@@ -303,43 +317,74 @@ impl Storage {
             }
         }
 
+        fn scope_err(msg: &str) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string())
+        }
         let (dir, name, body, mode): (PathBuf, String, &[u8], Option<u32>) = match what {
-            StoreType::Blob { data, mime } => (
-                self.files(),
-                format!("img-{}{}", hash_id(data), image_ext(mime)),
-                data,
-                Some(0o600),
-            ),
-            StoreType::Raw { prefix, body } => (
-                self.context(),
-                format!("{prefix}-{}", hash_id(body.as_bytes())),
-                body.as_bytes(),
-                None,
-            ),
-            StoreType::Window(body) => (
-                self.windows(),
-                format!("window-{}", hash_id(body.as_bytes())),
-                body.as_bytes(),
-                None,
-            ),
+            StoreType::Blob { data, mime } => {
+                if session.is_some() {
+                    return Err(scope_err("Blob 落全局池 files/，不要给会话目录"));
+                }
+                (
+                    self.files(),
+                    format!("img-{}{}", hash_id(data), image_ext(mime)),
+                    data,
+                    Some(0o600),
+                )
+            }
+            StoreType::Raw { prefix, body } => {
+                let Some(session) = session else {
+                    return Err(scope_err("Raw（压缩原文）必须给会话目录"));
+                };
+                (
+                    session.join("context"),
+                    format!("{prefix}-{}", hash_id(body.as_bytes())),
+                    body.as_bytes(),
+                    None,
+                )
+            }
+            StoreType::Window(body) => {
+                let Some(session) = session else {
+                    return Err(scope_err("Window（/clear 归档）必须给会话目录"));
+                };
+                (
+                    session.join("windows"),
+                    format!("window-{}", hash_id(body.as_bytes())),
+                    body.as_bytes(),
+                    None,
+                )
+            }
         };
         let path = dir.join(name);
         self.write_atomic(&path, body, mode)?;
         Ok(path)
     }
 
-    /// 写文件：先写**同目录**临时件再 rename（读者不会看到写了一半的文件）；已存在则不动
-    /// （名字都是内容寻址的：同名 ⇒ 同内容）。`mode` 只在 unix 生效（图片副本是用户数据 → 0o600）。
+    /// **覆盖写**一个文件（先写同目录临时件再 rename）：会话的 `meta.json` / `messages.jsonl`
+    /// 这类**可变**文件走这条。
     ///
-    /// 目录从 `path` 推（`store` 那边已经 join 好了），所以不用单独传。
+    /// 与 [`Storage::store`] 的分界：那边是「名字代表内容 —— 同内容只落一份、已存在就不动」，
+    /// 这边是「名字代表身份 —— 每次覆盖」。⚠ 拿 `store` 写 `meta.json`，第二次保存会**静默不更新**。
+    pub fn write_file(&self, path: &Path, body: &[u8]) -> std::io::Result<()> {
+        self.write_bytes(path, body, Some(0o600))
+    }
+
+    /// 内容寻址落盘用：**已存在则不动**（同名 ⇒ 同内容）。`mode` 只在 unix 生效（图片副本是用户数据 → 0o600）。
     fn write_atomic(&self, path: &Path, body: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+        if path.exists() {
+            return Ok(());
+        }
+        self.write_bytes(path, body, mode)
+    }
+
+    /// 原子写本身：先写**同目录**临时件再 rename（读者不会看到写了一半的文件）。
+    ///
+    /// 目录从 `path` 推（调用方已经 join 好了），所以不用单独传。
+    fn write_bytes(&self, path: &Path, body: &[u8], mode: Option<u32>) -> std::io::Result<()> {
         /// 给 io 错误补上路径上下文：std 的 `io::Error` 不带路径，而上层再包一层就又成了
         /// 「每个调用点手写 message」——所以写一次，所有 `store()` 的调用者都受益。
         fn with_path(path: &Path, e: std::io::Error) -> std::io::Error {
             std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
-        }
-        if path.exists() {
-            return Ok(());
         }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| with_path(dir, e))?;
@@ -1914,5 +1959,55 @@ lean = true
         let c = config.compaction.unwrap();
         assert_eq!(c.tool.unwrap().head, 30, "默认 head");
         assert_eq!(c.session.unwrap().tail, 5, "默认 tail");
+    }
+
+    /// `write_file` 是**覆盖**语义（会话的 meta / messages 走这条）；`store` 仍是内容寻址
+    /// （同名不重写）。两者共用同一个原子写实现 —— ⚠ 拿 `store` 写 `meta.json`，第二次保存会**静默不更新**。
+    #[test]
+    fn write_file_overwrites_while_store_stays_content_addressed() {
+        let dir = std::env::temp_dir().join(format!("pie-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::at(&dir);
+        let path = storage.session_meta("chat-1");
+        storage.write_file(&path, b"one").unwrap();
+        storage.write_file(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two", "第二次要生效");
+
+        let blob = storage
+            .store(
+                None,
+                StoreType::Blob {
+                    data: b"same",
+                    mime: "image/png",
+                },
+            )
+            .unwrap();
+        let again = storage
+            .store(
+                None,
+                StoreType::Blob {
+                    data: b"same",
+                    mime: "image/png",
+                },
+            )
+            .unwrap();
+        assert_eq!(blob, again, "同内容 → 同路径（已存在就不动）");
+        assert_eq!(std::fs::read(&again).unwrap(), b"same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个会话 = 一个目录：五个落点全在它下面（`Storage` 是**唯一**的路径来源，没有 `SessionDirs`）。
+    #[test]
+    fn session_paths_live_under_one_directory() {
+        let storage = Storage::at("/tmp/pie-root");
+        let dir = storage.session_dir("chat-1");
+        assert_eq!(dir, PathBuf::from("/tmp/pie-root/sessions/chat-1"));
+        assert_eq!(storage.session_meta("chat-1"), dir.join("meta.json"));
+        assert_eq!(
+            storage.session_messages("chat-1"),
+            dir.join("messages.jsonl")
+        );
+        assert_eq!(storage.session_context("chat-1"), dir.join("context"));
+        assert_eq!(storage.session_windows("chat-1"), dir.join("windows"));
     }
 }

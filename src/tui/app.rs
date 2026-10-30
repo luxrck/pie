@@ -3256,8 +3256,8 @@ mod tests {
         let notice = last_notice(&app);
         assert!(notice.contains("窗口块"), "{notice}");
         assert!(
-            dir.join("windows").exists(),
-            "窗口块落在 $PIE_HOME/windows/"
+            dir.join("sessions").exists(),
+            "窗口块落在会话目录下的 windows/"
         );
         assert!(
             app.cells.iter().any(|c| matches!(c, Cell::User(_))),

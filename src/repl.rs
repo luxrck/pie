@@ -206,10 +206,13 @@ fn format_reply(
         .iter()
         .filter_map(|s| std::fs::read(s).ok())
         .filter_map(|data| {
-            match ctx.storage.store(crate::config::StoreType::Blob {
-                data: &data,
-                mime: "image/png",
-            }) {
+            match ctx.storage.store(
+                None,
+                crate::config::StoreType::Blob {
+                    data: &data,
+                    mime: "image/png",
+                },
+            ) {
                 Ok(path) => Some(Attachment::Canvas { path }),
                 Err(e) => {
                     crate::log::warn(format!("[warn] repl 图副本写入失败: {e}"));
@@ -376,6 +379,7 @@ while True:
             transcript: None,
             state: Arc::new(crate::state::SessionState::default()),
             name: "repl".to_string(),
+            session_dir: Some(tmp.join("session")),
         }
     }
 
@@ -598,7 +602,7 @@ while True:
         let spill = out.body.spill.expect("应落盘");
         let full = std::fs::read_to_string(&spill).unwrap();
         assert!(full.contains("l4"), "落盘件应是全文: {full:?}");
-        assert_eq!(spill.parent().unwrap(), tmp.join("context"));
+        assert_eq!(spill.parent().unwrap(), tmp.join("session").join("context"));
     }
 
     #[tokio::test]

@@ -119,11 +119,6 @@ struct Cli {
 enum Cmd {
     /// 生成默认配置文件与全局记忆（已存在则原样保留）
     Setup,
-    /// 上下文压缩维护
-    Context {
-        #[command(subcommand)]
-        action: ContextAction,
-    },
     /// 图片上传件维护
     Files {
         #[command(subcommand)]
@@ -167,20 +162,6 @@ enum FilesAction {
         /// MIME 类型（缺省按扩展名推断：png / jpg / jpeg / gif / webp）
         #[arg(long)]
         mime: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ContextAction {
-    /// 列出所有压缩事件（存在会话文件首行 `__meta__.compaction_events` 里；只查默认 sessions 目录）
-    Info,
-    /// 校验压缩流水 / 消息引用的原文文件是否都在（同上，只查默认 sessions 目录）
-    Verify,
-    /// 列出 / 删除未被引用的 context 文件（同上，只统计默认 sessions 目录里的会话）
-    Gc {
-        /// 真正删除未引用文件
-        #[arg(long)]
-        delete: bool,
     },
 }
 
@@ -234,7 +215,6 @@ async fn run(cli: Cli) -> i32 {
             // 正常走不到（`run()` 开头已提前返回）——但这条臂留着：万一提前返回被挪掉，
             // `setup` 依旧是对的（它对已有文件一律不动，与启动时那发种子同级）。
             Cmd::Setup => setup_main(&cli),
-            Cmd::Context { action } => context_main(&config.storage, action),
             Cmd::Files { action } => files_main(&config, action).await,
             Cmd::Sessions { limit, all, json } => sessions_main(
                 &config.storage,
@@ -674,97 +654,6 @@ fn read_text_or_path(value: &str) -> String {
     }
 }
 
-/// `pie context info|verify|gc`：上下文压缩维护。
-fn context_main(storage: &config::Storage, action: &ContextAction) -> i32 {
-    match action {
-        ContextAction::Info => {
-            // 压缩事件流水住在**会话文件首行**（`__meta__.compaction_events`）——它跟消息里的
-            // `raw_path` 指针是同一趟车落盘的，所以不再有单独一份 manifest 文件要扫。
-            let mut sessions: Vec<std::path::PathBuf> = std::fs::read_dir(storage.sessions())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect();
-            sessions.sort();
-            let mut shown = 0usize;
-            for session in sessions {
-                let Ok(text) = std::fs::read_to_string(&session) else {
-                    continue;
-                };
-                let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
-                    continue;
-                };
-                let Ok(meta) = serde_json::from_str::<Value>(first) else {
-                    continue;
-                };
-                let Some(events) = meta.get("compaction_events").and_then(Value::as_array) else {
-                    continue;
-                };
-                if events.is_empty() {
-                    continue;
-                }
-                println!(
-                    "# {}",
-                    session
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                );
-                for e in events {
-                    println!("  {e}");
-                }
-                shown += events.len();
-            }
-            if shown == 0 {
-                println!(
-                    "暂无压缩记录（只查 {} 里的会话）",
-                    storage.sessions().display()
-                );
-            }
-            0
-        }
-        ContextAction::Verify => {
-            let mut missing: Vec<std::path::PathBuf> = cli::referenced_raw_paths(storage)
-                .into_iter()
-                .filter(|p| !p.exists())
-                .collect();
-            missing.sort();
-            if missing.is_empty() {
-                println!("OK：压缩流水 / 消息引用的原文文件都在");
-                0
-            } else {
-                println!("缺失 {} 个原文文件:", missing.len());
-                for p in missing {
-                    println!("  {}", p.display());
-                }
-                1
-            }
-        }
-        ContextAction::Gc { delete } => {
-            let garbage = cli::collect_context_garbage(storage);
-            // 引用集只来自 `sessions/` 里的会话（压缩流水与消息指针都在会话文件里）；
-            // 用 `-s <其它路径>` 存在别处的会话不在这份统计里 —— 说清楚，别让人以为它是全量的。
-            println!(
-                "未引用文件 {} 个（只统计 {} 里的会话）:",
-                garbage.len(),
-                storage.sessions().display()
-            );
-            for p in &garbage {
-                println!("  {}", p.display());
-            }
-            if *delete {
-                for p in &garbage {
-                    let _ = std::fs::remove_file(p);
-                }
-                println!("已删除 {} 个文件", garbage.len());
-            }
-            0
-        }
-    }
-}
-
 /// `pie files list|gc`：图片上传件维护。
 async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
     match action {
@@ -1033,15 +922,32 @@ fn open_session(
         let s = Session::resume(config, llm, registry)?;
         return Ok(s);
     }
+    // `-s <会话目录>/messages.jsonl` → 取父目录（方便从目录里点文件）
+    let id = id.map(|raw| {
+        let p = std::path::Path::new(raw);
+        if p.file_name().is_some_and(|n| n == "messages.jsonl") {
+            p.parent()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_else(|| raw.to_string())
+        } else {
+            raw.to_string()
+        }
+    });
     // 已存在 → 载入它。路径先算出来，同一个 `llm` / `registry` 直接交给 `load`
     //（`Session` 带 `Drop`，不能再建个壳再把字段拆出来复用）。
-    let path = Session::path_for(config, id);
+    let path = Session::path_for(config, id.as_deref());
     if path.exists() {
-        let s = Session::load(&path, config, llm, registry)?;
-        Ok(s)
-    } else {
-        Ok(Session::new(config, id, llm, registry))
+        // ⚠ 旧版会话是**一个 `.jsonl` 文件**：不报错的话就会被当成"新建一个同名目录"，
+        // 用户以为打开了旧会话、实际是空的。这一行是必需的（破坏性更新只给这一句提示）。
+        if path.is_file() {
+            return Err(format!(
+                "{} 是旧格式的会话文件，本版本不再支持（会话现在是一个目录；升级前备份或清空 sessions/）",
+                path.display()
+            ));
+        }
+        return Session::load(&path, config, llm, registry);
     }
+    Ok(Session::new(config, id.as_deref(), llm, registry))
 }
 
 async fn list_models(config: &config::Config) -> i32 {
@@ -1124,8 +1030,13 @@ mod tests {
         assert_eq!(json["turns"], 0);
         assert!(json["usage"]["calls"].is_number(), "{json}");
         assert!(
-            json["session"].as_str().unwrap().ends_with(".jsonl"),
-            "{json}"
+            json["session"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .is_some_and(|id| id.starts_with("ephemeral-")),
+            "session 现在是**会话目录**：{json}"
         );
 
         let transcript = result_text(&session, "答案", Mode::Transcript, None).unwrap();

@@ -60,7 +60,10 @@ impl ToolBody {
         };
         let spill = ctx
             .storage
-            .store(crate::config::StoreType::Raw { prefix, body: full })
+            .store(
+                ctx.session_dir.as_deref(),
+                crate::config::StoreType::Raw { prefix, body: full },
+            )
             .ok();
         ToolBody {
             content: head,
@@ -310,7 +313,7 @@ fn snapshot_key(path: &Path) -> PathBuf {
 /// 工具执行上下文：装**取消信号**、**数据目录**与**会话级状态槽**（将来放实时进度回调也走这条链）。
 ///
 /// 按值传（内部都是 `Arc`，`Clone` 便宜）：这样工具 future 仍是 `'static`，注册表里的函数指针不用改生命周期。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ToolCtx {
     pub cancel: Option<crate::cancel::Cancel>,
     /// 数据目录（bash 全文落盘要用；默认从 `PIE_HOME` 解析）。
@@ -323,6 +326,25 @@ pub struct ToolCtx {
     /// **这次调用的工具名**（注册名）——落盘文件名前缀（`context/<名字>-<hash>`）取它。
     /// 分发时由 `Session` 填（[`ToolCtx::named`]）；空串兜底成 `"tool"`。
     pub name: String,
+    /// **会话目录**（`<root>/sessions/<id>/`）：工具输出落盘进它下面的 `context/`。
+    /// 分发时由 `Session` 填（[`ToolCtx::in_session`]）。
+    ///
+    /// `None` = 没有会话语境（单测里 `ToolCtx::default()`），[`ToolBody::fit`] 就落临时目录
+    /// —— 不落盘等于把不可再生的输出**丢掉**，比落到一个没人清理的临时目录更糟。
+    pub session_dir: Option<PathBuf>,
+}
+
+impl Default for ToolCtx {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            storage: crate::config::Storage::default(),
+            transcript: None,
+            state: Arc::new(SessionState::default()),
+            name: String::new(),
+            session_dir: Some(std::env::temp_dir().join("pie-toolctx")),
+        }
+    }
 }
 
 impl ToolCtx {
@@ -337,7 +359,14 @@ impl ToolCtx {
             transcript: None,
             state,
             name: String::new(),
+            session_dir: None,
         }
+    }
+
+    /// 带上会话目录（`Session` 分发时调）：`Raw` 落盘进 `<dir>/context/`。
+    pub fn in_session(mut self, dir: &Path) -> Self {
+        self.session_dir = Some(dir.to_path_buf());
+        self
     }
 
     /// 带上工具名（注册名）——`Session` 分发时调，[`ToolBody::fit`] 拿它当落盘前缀。

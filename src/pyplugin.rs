@@ -442,6 +442,7 @@ session.on("tool_call", no_rm)
                 Arc::new(crate::state::SessionState::default()),
             )
             .named("pyplugin")
+            .in_session(&self.dir.join("session"))
         }
     }
 

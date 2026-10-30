@@ -106,10 +106,13 @@ fn store_image(storage: &crate::config::Storage, image: &arboard::ImageData<'_>)
     let mut png = std::io::Cursor::new(Vec::new());
     rgba.write_to(&mut png, image::ImageFormat::Png).ok()?;
     let path = storage
-        .store(crate::config::StoreType::Blob {
-            data: &png.into_inner(),
-            mime: "image/png",
-        })
+        .store(
+            None,
+            crate::config::StoreType::Blob {
+                data: &png.into_inner(),
+                mime: "image/png",
+            },
+        )
         .ok()?;
     Some(path.display().to_string())
 }

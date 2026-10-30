@@ -189,6 +189,7 @@ pub fn compact_session(
     messages: &mut Vec<Message>,
     config: &crate::config::SessionCompaction,
     storage: &Storage,
+    session: &Path,
 ) -> std::io::Result<Option<(PathBuf, CompactEvent)>> {
     // 先算成 owned（下面要整体改写 messages，不能再借它）
     let (dicts, old_summaries): (Vec<Value>, Vec<Message>) = {
@@ -214,7 +215,7 @@ pub fn compact_session(
     }
     // 块一律 pretty JSON 数组（与存量块同格式；`load_window_dicts` 两种都读）
     let raw = pretty_indent1(&Value::Array(dicts.clone()));
-    let path = storage.store(StoreType::Window(&raw))?;
+    let path = storage.store(Some(session), StoreType::Window(&raw))?;
     // 摘要直接拿手上的 dicts 算，不再读一遍盘
     let digest = summarize_turns(&dicts, config.head, config.tail);
     let mut summary = Message::system(window_summary_text(&path, &digest));
@@ -270,6 +271,7 @@ fn compact_tools(
     messages: &mut [Message],
     config: &crate::config::ToolCompaction,
     storage: &Storage,
+    session: &Path,
     cb: &mut dyn FnMut(CompactEvent),
 ) -> usize {
     let protected = protected_step_tool_indices(messages, config.keep_last_steps);
@@ -290,10 +292,13 @@ fn compact_tools(
             continue;
         }
         let prefix = m.tool_name.clone().unwrap_or_else(|| "tool".to_string());
-        let Ok(path) = storage.store(StoreType::Raw {
-            prefix: &prefix,
-            body: &content,
-        }) else {
+        let Ok(path) = storage.store(
+            Some(session),
+            StoreType::Raw {
+                prefix: &prefix,
+                body: &content,
+            },
+        ) else {
             continue;
         };
         let mut preview: Vec<&str> = lines[..config.head.min(lines.len())].to_vec();
@@ -319,6 +324,7 @@ fn compact_tools(
 fn compact_turns(
     messages: &mut Vec<Message>,
     storage: &Storage,
+    session: &Path,
     cb: &mut dyn FnMut(CompactEvent),
 ) -> usize {
     let completed = messages
@@ -352,7 +358,7 @@ fn compact_turns(
         }
         let Some((u, end)) = victim else { break };
         let span: Vec<Message> = messages[u + 1..end].to_vec();
-        let new_msg = compact_turn_span(&span, storage, cb);
+        let new_msg = compact_turn_span(&span, storage, session, cb);
         messages.splice(u + 1..end, std::iter::once(new_msg));
         count += 1;
     }
@@ -363,6 +369,7 @@ fn compact_turns(
 fn compact_turn_span(
     span: &[Message],
     storage: &Storage,
+    session: &Path,
     cb: &mut dyn FnMut(CompactEvent),
 ) -> Message {
     let raw = pretty_indent1(&Value::Array(
@@ -371,10 +378,13 @@ fn compact_turn_span(
             .collect(),
     ));
     let path = storage
-        .store(StoreType::Raw {
-            prefix: "turn",
-            body: &raw,
-        })
+        .store(
+            Some(session),
+            StoreType::Raw {
+                prefix: "turn",
+                body: &raw,
+            },
+        )
         .ok();
     let final_text = span
         .iter()
@@ -433,6 +443,7 @@ pub struct CompactStats {
 pub fn maybe_compact(
     messages: &mut Vec<Message>,
     config: &Config,
+    session: &Path,
     reported: Option<i64>,
 ) -> (CompactStats, Vec<CompactEvent>) {
     let mut stats = CompactStats::default();
@@ -451,10 +462,10 @@ pub fn maybe_compact(
     }
     let mut push = |e| events.push(e);
     if let Some(tool_config) = &compaction.tool {
-        stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
+        stats.tools = compact_tools(messages, tool_config, &config.storage, session, &mut push);
     }
     if compaction.turn {
-        stats.turns = compact_turns(messages, &config.storage, &mut push);
+        stats.turns = compact_turns(messages, &config.storage, session, &mut push);
     }
     if stats.tools > 0 || stats.turns > 0 {
         crate::log::warn(format!(
@@ -482,6 +493,7 @@ pub enum CompactMode {
 pub fn compact(
     messages: &mut Vec<Message>,
     config: &Config,
+    session: &Path,
     mode: CompactMode,
 ) -> (CompactStats, Vec<CompactEvent>) {
     let mut stats = CompactStats::default();
@@ -494,10 +506,10 @@ pub fn compact(
     if matches!(mode, CompactMode::Auto | CompactMode::Tools)
         && let Some(tool_config) = &compaction.tool
     {
-        stats.tools = compact_tools(messages, tool_config, &config.storage, &mut push);
+        stats.tools = compact_tools(messages, tool_config, &config.storage, session, &mut push);
     }
     if matches!(mode, CompactMode::Auto | CompactMode::Turns) && compaction.turn {
-        stats.turns = compact_turns(messages, &config.storage, &mut push);
+        stats.turns = compact_turns(messages, &config.storage, session, &mut push);
     }
     (stats, events)
 }
@@ -514,29 +526,12 @@ mod tests {
         Storage::default()
     }
 
-    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息。
-    ///
-    /// `referenced_raw_paths` 现在只扫 `sessions/`：流水在首行、指针在消息里，两者同一份文件。
-    fn write_session_with_events(
-        storage: &Storage,
-        events: &[serde_json::Value],
-        messages: &[Message],
-    ) {
-        let dir = storage.sessions();
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut out = format!(
-            "{}\n",
-            json!({"__meta__": true, "compaction_events": events})
-        );
-        for m in messages {
-            out.push_str(&format!("{}\n", serde_json::to_string(m).unwrap()));
-        }
-        std::fs::write(dir.join("s.jsonl"), out).unwrap();
-    }
-
     /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，只为测试读起来短）。
     fn raw(body: &str, prefix: &str) -> PathBuf {
-        storage().store(StoreType::Raw { prefix, body }).unwrap()
+        let session = storage().session_dir("test-session");
+        storage()
+            .store(Some(&session), StoreType::Raw { prefix, body })
+            .unwrap()
     }
 
     /// 测试会改进程级 `PIE_HOME` → 用全局锁把它们串行化（与 `llm` 的测试共用同一把锁）。
@@ -607,6 +602,7 @@ mod tests {
                 keep_last_steps: 1,
             },
             &storage(),
+            &storage().session_dir("s"),
             &mut |e| events.push(e),
         );
         assert_eq!(n, 1, "只压保护窗口（最近 1 个 step 批次）之外的那条");
@@ -646,6 +642,7 @@ mod tests {
                 &mut short,
                 &ToolCompaction::default(),
                 &storage(),
+                &storage().session_dir("s"),
                 &mut |_| {}
             ),
             0
@@ -668,7 +665,12 @@ mod tests {
             Message::assistant("第二轮答复"),
         ];
         let mut events: Vec<CompactEvent> = Vec::new();
-        let n = compact_turns(&mut msgs, &storage(), &mut |e| events.push(e));
+        let n = compact_turns(
+            &mut msgs,
+            &storage(),
+            &storage().session_dir("s"),
+            &mut |e| events.push(e),
+        );
         assert_eq!(n, 1);
         assert_eq!(msgs.len(), 5, "3 条叶子 → 1 条摘要");
         assert_eq!(msgs[1].role, "user", "user 保留");
@@ -687,7 +689,15 @@ mod tests {
             other => panic!("期望轮次级事件：{other:?}"),
         }
         // 已经压过 → 没有可再压的
-        assert_eq!(compact_turns(&mut msgs, &storage(), &mut |_| {}), 0);
+        assert_eq!(
+            compact_turns(
+                &mut msgs,
+                &storage(),
+                &storage().session_dir("s"),
+                &mut |_| {}
+            ),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -704,9 +714,10 @@ mod tests {
             Message::user("当前问题"),
         ];
         let config = SessionCompaction { head: 1, tail: 1 };
-        let (path, event) = compact_session(&mut msgs, &config, &storage())
-            .expect("落盘成功")
-            .expect("有内容可归档");
+        let (path, event) =
+            compact_session(&mut msgs, &config, &storage(), &storage().session_dir("s"))
+                .expect("落盘成功")
+                .expect("有内容可归档");
         assert!(path.exists(), "{path:?}");
         assert_eq!(event.level(), 3);
         assert_eq!(event.raw_path(), path);
@@ -730,7 +741,8 @@ mod tests {
             assert!(raw.contains(needle), "块里丢了 {needle}");
         }
         // 只剩 system + 旧摘要 → 没有再可归档的
-        let again = compact_session(&mut msgs, &config, &storage()).unwrap();
+        let again =
+            compact_session(&mut msgs, &config, &storage(), &storage().session_dir("s")).unwrap();
         assert!(again.is_none(), "只剩 system + 旧摘要 → 没内容可归档");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -756,12 +768,12 @@ mod tests {
 
         // 没有上报（本次会话还没发过请求）→ 不动
         let mut short = vec![Message::system("s"), Message::user("hi")];
-        let (stats, events) = maybe_compact(&mut short, &config, None);
+        let (stats, events) = maybe_compact(&mut short, &config, &storage().session_dir("s"), None);
         assert_eq!(stats, CompactStats::default());
         assert!(events.is_empty());
 
         // 有上报但没到软阈值（400×0.8 = 320）→ 也不动
-        let (stats, _) = maybe_compact(&mut short, &config, Some(10));
+        let (stats, _) = maybe_compact(&mut short, &config, &storage().session_dir("s"), Some(10));
         assert_eq!(stats, CompactStats::default());
 
         // 一条巨长 tool 输出（≈ 5000 字符 → 远超 400×0.8）→ 触发工具级压缩
@@ -772,7 +784,8 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"),
         ];
-        let (stats, events) = maybe_compact(&mut long, &config, Some(9999));
+        let (stats, events) =
+            maybe_compact(&mut long, &config, &storage().session_dir("s"), Some(9999));
         assert_eq!(stats.tools, 1);
         assert_eq!(events.len(), 1, "工具级事件也从这里回报");
         assert!(matches!(long[2].compaction, Some(Compaction::Tool { .. })));
@@ -797,7 +810,8 @@ mod tests {
             Message::assistant("a1"),
             Message::user("q2"),
         ];
-        let (_, events) = maybe_compact(&mut msgs, &config, Some(9999));
+        let (_, events) =
+            maybe_compact(&mut msgs, &config, &storage().session_dir("s"), Some(9999));
         assert!(events.iter().all(|e| e.level() < 3), "{events:?}");
         assert!(
             msgs.iter()
@@ -817,7 +831,12 @@ mod tests {
             ..Default::default()
         };
         let mut msgs = vec![Message::system("s"), Message::user("hi")];
-        let (stats, events) = compact(&mut msgs, &config, CompactMode::Auto);
+        let (stats, events) = compact(
+            &mut msgs,
+            &config,
+            &storage().session_dir("s"),
+            CompactMode::Auto,
+        );
         assert!(stats.skipped.is_some());
         assert_eq!(stats.turns, 0);
         assert!(events.is_empty());
@@ -840,7 +859,12 @@ mod tests {
             assistant_calls("c2", "bash"),
             Message::tool_result("c2", "bash", "ok"), // 最近一批：受 keep 保护
         ];
-        let (stats, events) = compact(&mut msgs, &config, CompactMode::Auto);
+        let (stats, events) = compact(
+            &mut msgs,
+            &config,
+            &storage().session_dir("s"),
+            CompactMode::Auto,
+        );
         assert_eq!(stats.tools, 1, "压掉保护窗口之外那条长输出");
         assert_eq!(stats.turns, 1, "第一轮（已完成）压成摘要");
         assert_eq!(events.len(), 2, "工具级 + 轮次级各一条");
@@ -876,12 +900,16 @@ mod tests {
             CompactEvent::Tool { tool, .. } => assert_eq!(tool, "bash"),
             other => panic!("期望工具级事件：{other:?}"),
         }
-        // 关键：压缩流水 + raw_path 都引用了它 → GC 不能删
-        // （流水住在**会话文件首行**：`__meta__.compaction_events`，跟消息同一趟车落盘）
-        let entry_json = serde_json::to_value(&entry).unwrap();
-        write_session_with_events(&storage(), std::slice::from_ref(&entry_json), &[]);
-        assert!(crate::cli::referenced_raw_paths(&storage()).contains(&full));
-        assert!(!crate::cli::collect_context_garbage(&storage()).contains(&full));
+        // 关键：原文落在**会话目录**的 `context/` 下（删会话目录 = 一起回收，不再有引用扫描）
+        assert_eq!(
+            full.parent(),
+            Some(
+                storage()
+                    .session_dir("test-session")
+                    .join("context")
+                    .as_path()
+            )
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

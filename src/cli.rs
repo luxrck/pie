@@ -8,8 +8,7 @@
 //! ⚠ 模块名 `cli` 是**按用途**取的（命令行子命令的数据源），不是「只在 CLI 编译进来」：它一直在 lib 里，
 //! TUI（同一个二进制）与 Python 绑定（`pie.list_sessions`）也都用它。
 
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -32,51 +31,57 @@ pub struct SessionInfo {
     pub first_query: String,
 }
 
-/// 列出历史会话（按 mtime 降序；`limit = None` = 全部）。
+/// 列出历史会话（按 `messages.jsonl` 的 mtime 降序；`limit = None` = 全部）。
+///
+/// ⚠ **mtime 取 `messages.jsonl`**，不能取会话目录：目录只在增删条目时变，改文件内容不动它。
+/// 没有 `messages.jsonl` 的目录跳过（`save` 两次 rename 之间崩掉的残留）。
 pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<SessionInfo> {
     let Ok(entries) = std::fs::read_dir(storage.sessions()) else {
         return Vec::new();
     };
-    let mut files: Vec<(i64, PathBuf, u64)> = entries
+    let mut dirs: Vec<(i64, PathBuf, u64)> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| {
-            let meta = p.metadata().ok()?;
+        .filter(|p| p.is_dir())
+        .filter_map(|dir| {
+            let meta = dir.join("messages.jsonl").metadata().ok()?;
             let mtime = meta
                 .modified()
                 .ok()?
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_secs() as i64;
-            Some((mtime, p, meta.len()))
+            Some((mtime, dir, meta.len()))
         })
         .collect();
-    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    dirs.sort_by_key(|f| std::cmp::Reverse(f.0));
     if let Some(limit) = limit {
-        files.truncate(limit);
+        dirs.truncate(limit);
     }
-    files
-        .into_iter()
-        .map(|(mtime, path, size)| {
+    dirs.into_iter()
+        .map(|(mtime, dir, size)| {
             let mut turns = 0usize;
             let mut api_calls = 0i64;
             let mut first_query = String::new();
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            // 元数据在 `meta.json`（`sessions -l` 只需要它 + 消息里的用户条数）
+            if let Ok(text) = std::fs::read_to_string(dir.join("meta.json"))
+                && let Ok(meta) = serde_json::from_str::<Value>(&text)
+            {
+                api_calls = meta
+                    .get("usage")
+                    .and_then(|u| u.get("calls"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if let Some(t) = meta.get("title").and_then(Value::as_str) {
+                    first_query = t.to_string();
+                }
+            }
+            if let Ok(text) = std::fs::read_to_string(dir.join("messages.jsonl")) {
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
                     let Ok(v) = serde_json::from_str::<Value>(line) else {
                         continue;
                     };
-                    if v.get("__meta__").is_some() {
-                        api_calls = v
-                            .get("usage")
-                            .and_then(|u| u.get("calls"))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0);
-                        if let Some(t) = v.get("title").and_then(Value::as_str) {
-                            first_query = t.to_string();
-                        }
-                    } else if v.get("role").and_then(Value::as_str) == Some("user")
+                    if v.get("role").and_then(Value::as_str) == Some("user")
                         && !v.get("synthetic").and_then(Value::as_bool).unwrap_or(false)
                     {
                         turns += 1;
@@ -89,8 +94,8 @@ pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<Ses
                 }
             }
             SessionInfo {
-                id: name_of(&path),
-                path,
+                id: name_of(&dir),
+                path: dir,
                 mtime,
                 size,
                 turns,
@@ -107,52 +112,34 @@ pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<Ses
 /// `__meta__.files` 之前没有任何引用，但路径可能正躺在输入框 / 某条命令里。
 pub const GC_PROTECT_HOURS: u64 = 24;
 
-/// 遍历所有会话记录里的图片条目：`(会话文件, hash_id, 条目)`。
+/// 遍历所有会话的图片条目：`(会话目录, hash_id, 条目)`。
+///
+/// 数据源是各会话的 `meta.json`（`files` 表）——**只读那一个文件**，不碰 `messages.jsonl`
+/// （后者可能几十 MB：历史里把图内联成 base64 的那批）。
 pub fn iter_session_files(sessions_dir: &Path) -> Vec<(PathBuf, String, Value)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
         return out;
     };
-    let mut files: Vec<PathBuf> = entries
+    let mut dirs: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter(|p| p.is_dir())
         .collect();
-    files.sort();
-    for file in files {
-        // ⚠ **只读首行**：会话文件可能几十 MB（历史上把图内联成 base64 的那批），
-        // `read_to_string` 会把整份读进内存 —— 而列表只需要 `__meta__` 那一行。
-        let Ok(fh) = std::fs::File::open(&file) else {
+    dirs.sort();
+    for dir in dirs {
+        let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else {
             continue;
         };
-        let mut reader = BufReader::new(fh);
-        let mut first = String::new();
-        while first.trim().is_empty() {
-            first.clear();
-            match reader.read_line(&mut first) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-        if first.trim().is_empty() {
-            continue;
-        }
-        let Ok(meta) = serde_json::from_str::<Value>(&first) else {
+        let Ok(meta) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if !meta
-            .get("__meta__")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
         let Some(map) = meta.get("files").and_then(Value::as_object) else {
             continue;
         };
         for (hash, entry) in map {
             if entry.is_object() {
-                out.push((file.clone(), hash.clone(), entry.clone()));
+                out.push((dir.clone(), hash.clone(), entry.clone()));
             }
         }
     }
@@ -209,121 +196,31 @@ pub fn collect_file_garbage(storage: &config::Storage, protect_hours: u64) -> Ve
     garbage
 }
 
-/// 被引用的**压缩原文**：所有会话的 `__meta__.compaction_events` + 所有消息里的 `compaction.path`。
-///
-/// 两者都在**会话文件**里（同一趟车落盘），所以这里只扫 `sessions/`。
-pub fn referenced_raw_paths(storage: &config::Storage) -> HashSet<PathBuf> {
-    let mut refs: HashSet<PathBuf> = HashSet::new();
-    let Ok(entries) = std::fs::read_dir(storage.sessions()) else {
-        return refs;
-    };
-    for session in entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-    {
-        let Ok(text) = std::fs::read_to_string(&session) else {
-            continue;
-        };
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if v.get("__meta__").is_some() {
-                // 首行 `__meta__`：压缩事件流水（`compaction_events`）里的指针也算引用
-                if let Some(events) = v.get("compaction_events").and_then(Value::as_array) {
-                    for e in events {
-                        // 新键是 `path`；旧会话里叫 `raw_path`（这里裸读 `Value`，不走 serde 的 alias）
-                        let raw = e
-                            .get("path")
-                            .or_else(|| e.get("raw_path"))
-                            .and_then(Value::as_str);
-                        if let Some(raw) = raw
-                            && let Some(abs) = absolutize(raw)
-                        {
-                            refs.insert(abs);
-                        }
-                    }
-                }
-                continue;
-            }
-            // 消息里的压缩元数据：`{"compaction":{"kind":"turn","path":…}}`
-            // （轮次级落盘失败时没有 `path`——那种消息本来就没引用什么）
-            let raw = v
-                .get("compaction")
-                .and_then(|c| c.get("path"))
-                .and_then(Value::as_str);
-            if let Some(raw) = raw
-                && let Some(abs) = absolutize(raw)
-            {
-                refs.insert(abs);
-            }
-        }
-    }
-    refs
-}
-
-/// 相对路径按「当前目录」补全（不要求文件存在）。
-fn absolutize(path: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        return Some(p);
-    }
-    std::env::current_dir().ok().map(|cwd| cwd.join(p))
-}
-
-/// `context/` 下没有被任何会话引用的落盘原文（可安全删除）。窗口块在 `windows/`，不受影响。
-pub fn collect_context_garbage(storage: &config::Storage) -> Vec<PathBuf> {
-    /// 是不是 `Storage::store` 落的那种文件：`<前缀>-<16 位十六进制 hash>`。
-    /// 拿它当「只回收自己写的东西」的判据——同一个目录里还可能有别的文件，别误删。
-    fn is_stored(path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return false;
-        };
-        let Some((_, hash)) = name.rsplit_once('-') else {
-            return false;
-        };
-        hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-
-    let referenced = referenced_raw_paths(storage);
-    let mut garbage: Vec<PathBuf> = std::fs::read_dir(storage.context())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| is_stored(p))
-        .filter(|p| !referenced.contains(p))
-        .collect();
-    garbage.sort();
-    garbage
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Storage;
 
-    /// 列表**只读首行**：文件尾损坏（非 UTF-8 / 半截行）也不该让这个会话从列表里消失。
-    ///
-    /// 以前是 `read_to_string` 整份读 → 尾部坏一字节就 `Err` → 整个会话漏掉；
-    /// 而它可能几十 MB（历史上把图内联成 base64 的那批），读进来还白占内存。
+    /// 图片条目从 `meta.json` 读：**不碰 `messages.jsonl`**（后者可能几十 MB）。
+    /// 消息文件坏了也不该让这个会话的图片记录消失。
     #[test]
-    fn listing_reads_only_the_first_line_so_a_broken_tail_is_harmless() {
+    fn listing_reads_only_the_meta_so_a_broken_messages_file_is_harmless() {
         let dir = std::env::temp_dir().join(format!("pie-cli-first-line-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Storage::at(&dir);
-        std::fs::create_dir_all(storage.sessions()).unwrap();
+        let session = storage.session_dir("s");
+        std::fs::create_dir_all(&session).unwrap();
         let meta = serde_json::json!({
-            "__meta__": true,
             "files": {"img-x": {"file_id": "f1", "local": "/tmp/x.png"}}
         });
-        let mut bytes = format!("{meta}\n").into_bytes();
-        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, b'\n']); // 尾部：不是合法 UTF-8
-        std::fs::write(storage.sessions().join("s.jsonl"), bytes).unwrap();
+        std::fs::write(session.join("meta.json"), meta.to_string()).unwrap();
+        // 消息文件：尾部不是合法 UTF-8
+        let mut bytes = b"{\"role\":\"user\",\"content\":\"hi\"}\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, b'\n']);
+        std::fs::write(session.join("messages.jsonl"), bytes).unwrap();
 
         let rows = iter_session_files(&storage.sessions());
-        assert_eq!(rows.len(), 1, "首行有效就够：{rows:?}");
+        assert_eq!(rows.len(), 1, "meta 有效就够：{rows:?}");
         assert_eq!(rows[0].1, "img-x");
     }
 
@@ -337,10 +234,13 @@ mod tests {
         let storage = Storage::at(&dir);
         let blob = |data: &[u8]| {
             storage
-                .store(config::StoreType::Blob {
-                    data,
-                    mime: "image/png",
-                })
+                .store(
+                    None,
+                    config::StoreType::Blob {
+                        data,
+                        mime: "image/png",
+                    },
+                )
                 .expect("落副本")
         };
         std::fs::create_dir_all(storage.sessions()).unwrap();
@@ -356,11 +256,13 @@ mod tests {
             .set_modified(old)
             .unwrap();
         // 一个会话的 meta 引用 referenced
+        let session = storage.session_dir("s");
+        std::fs::create_dir_all(&session).unwrap();
         let meta = serde_json::json!({
-            "__meta__": true,
             "files": {"img-x": {"file_id": "f1", "local": referenced.display().to_string()}}
         });
-        std::fs::write(storage.sessions().join("s.jsonl"), format!("{meta}\n")).unwrap();
+        std::fs::write(session.join("meta.json"), meta.to_string()).unwrap();
+        std::fs::write(session.join("messages.jsonl"), "").unwrap();
 
         // 会话记录（`files list` 的数据源）读得出来，file_id 索引也建得出
         let rows = iter_session_files(&storage.sessions());
@@ -372,63 +274,6 @@ mod tests {
         assert!(garbage.contains(&orphan_old), "{garbage:?}");
         assert!(!garbage.contains(&referenced), "被会话引用 → 不能收");
         assert!(!garbage.contains(&orphan_fresh), "保护窗口内 → 不能收");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 造一个会话文件：首行 `__meta__`（带 `compaction_events`）+ 给定消息。
-    fn write_session_with_events(
-        storage: &Storage,
-        events: &[Value],
-        messages: &[crate::llm::Message],
-    ) {
-        let dir = storage.sessions();
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut out = format!(
-            "{}\n",
-            serde_json::json!({"__meta__": true, "compaction_events": events})
-        );
-        for m in messages {
-            out.push_str(&format!("{}\n", serde_json::to_string(m).unwrap()));
-        }
-        std::fs::write(dir.join("s.jsonl"), out).unwrap();
-    }
-
-    /// `context gc` 的判据：`context/` 下没被任何会话引用的落盘原文才回收。
-    ///
-    /// （旧键名 `raw_path` + 旧 `level` 也要认——会话文件是裸读 `Value`，不走 serde 的 alias。）
-    #[test]
-    fn context_gc_keeps_referenced_files_only() {
-        let dir = std::env::temp_dir().join(format!("pie-cli-ctx-gc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let storage = Storage::at(&dir);
-        std::fs::create_dir_all(storage.sessions()).unwrap();
-        let put = |prefix: &str, body: &str| {
-            storage
-                .store(config::StoreType::Raw { prefix, body })
-                .unwrap()
-        };
-        let referenced = put("bash", "referenced");
-        let in_message = put("turn", "in-message");
-        let orphan = put("turn", "orphan");
-        write_session_with_events(
-            &storage,
-            &[serde_json::json!({"level": 1, "raw_path": referenced.display().to_string()})],
-            &[{
-                // 消息侧的引用来自 `compaction.path`（这里抽查轮次级那条路子）
-                let mut m = crate::llm::Message::assistant("摘要");
-                m.compaction = Some(crate::llm::Compaction::turn(Some(&in_message)));
-                m
-            }],
-        );
-        let garbage = collect_context_garbage(&storage);
-        assert!(garbage.contains(&orphan), "{garbage:?}");
-        assert!(!garbage.contains(&referenced), "{garbage:?}");
-        assert!(
-            !garbage.contains(&in_message),
-            "消息里的指针也算引用：{garbage:?}"
-        );
-        assert!(referenced_raw_paths(&storage).contains(&referenced));
-        assert!(referenced_raw_paths(&storage).contains(&in_message));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

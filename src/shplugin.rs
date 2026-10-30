@@ -564,6 +564,7 @@ mod tests {
                 crate::config::Storage::at(&self.dir),
                 Arc::new(crate::state::SessionState::default()),
             )
+            .in_session(&self.dir.join("session"))
         }
     }
 
@@ -855,7 +856,8 @@ mod tests {
             cancel.clone(),
             crate::config::Storage::at(&fixture.dir),
             Arc::new(crate::state::SessionState::default()),
-        );
+        )
+        .in_session(&fixture.dir.join("session"));
         cancel.cancel();
         let out = registry.dispatch("slow", &json!({}), ctx).await.unwrap();
         assert_eq!(out.status, Status::Cancelled);

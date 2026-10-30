@@ -45,9 +45,14 @@ pub(crate) const ERROR_TURN_PREFIX: &str = "[请求失败] ";
 /// （超过就只留正文那行文本描述）。
 const INLINE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// 会话目录里的两个固定文件名（`save` / `load` 各一处，别在别处再写字面量）。
+const META_FILE: &str = "meta.json";
+const MESSAGES_FILE: &str = "messages.jsonl";
+
 #[derive(Debug)]
 pub struct Session {
-    /// 会话 JSONL 自身的路径（也是 `save` 的默认目标）。
+    /// 会话**目录**（`<root>/sessions/<id>/`）：`meta.json` 与 `messages.jsonl` 都住在它下面，
+    /// 也是 `save` 的默认目标（**首次 save 才真正建出来**）。
     pub path: PathBuf,
     /// 配置快照（压缩水位 / 压缩参数（含保护窗口）/ 数据目录都从它取）。
     pub config: Config,
@@ -153,8 +158,8 @@ impl ThoughtClock {
 }
 
 impl Session {
-    /// 新建会话：`id` 给了就用它（纯名字 → `~/.pie/sessions/<id>.jsonl`，带目录/绝对路径 → 原样），
-    /// 否则按时间戳新建文件。
+    /// 新建会话：`id` 给了就用它（纯名字 → `~/.pie/sessions/<id>/`，带目录/绝对路径 → 原样），
+    /// 否则按时间戳新建目录。
     ///
     /// `llm` / `tools` 由调用方给：
     /// 外面已经建好的客户端 /（可能被 `--tools` 裁剪过的）工具集直接收进来。
@@ -162,13 +167,13 @@ impl Session {
         Self::at(Self::path_for(config, id), config, llm, registry)
     }
 
-    /// `id` 解析出来的会话文件路径：纯名字 → `<sessions>/<name>.jsonl`；带目录 / 绝对路径 → 原样；
-    /// `None` → 时间戳新文件。
+    /// `id` 解析出来的**会话目录**：纯名字 → `<sessions>/<name>`；带目录 / 绝对路径 → 原样；
+    /// `None` → `chat-<时间戳>` 新目录。
     ///
     /// [`Session::new`] 用它；CLI 的「已存在就载入」也得先算出同一个路径
     /// —— `Session` 现在带 `Drop`，不能再生一个壳再把字段拆出来复用。
     pub fn path_for(config: &Config, id: Option<&str>) -> PathBuf {
-        resolve_path(&config.storage.sessions(), id)
+        resolve_dir(&config.storage.sessions(), id)
     }
 
     /// 临时会话（`pie "任务"` 用）：不落盘（别调 `save`，压缩事件也就不会落盘），其余完全一样。
@@ -180,7 +185,7 @@ impl Session {
             config
                 .storage
                 .sessions()
-                .join(format!("ephemeral-{}.jsonl", timestamp())),
+                .join(format!("ephemeral-{}", timestamp())),
             config,
             llm,
             registry,
@@ -233,82 +238,83 @@ impl Session {
         }
     }
 
-    /// 从 JSONL 恢复（`path` 必须存在）。
+    /// 从会话目录恢复：`<dir>/meta.json`（元数据）+ `<dir>/messages.jsonl`（消息）。
     pub fn load(
-        path: &Path,
+        dir: &Path,
         config: &Config,
         llm: LlmClient,
         registry: Registry,
     ) -> Result<Self, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|e| format!("读取会话失败 {}: {e}", path.display()))?;
-        let mut session = Self::at(path.to_path_buf(), config, llm, registry);
+        let mut session = Self::at(dir.to_path_buf(), config, llm, registry);
+        // **先 meta**（`Session` 自举所需：usage / windows / title），再 messages —— 与 `save`
+        // 的写入顺序对称。meta 读不出来 = 这个目录不是会话（或坏了），直接报错。
+        let meta_path = dir.join(META_FILE);
+        let meta_text = fs::read_to_string(&meta_path)
+            .map_err(|e| format!("读取会话元数据失败 {}: {e}", meta_path.display()))?;
+        let meta: Value = serde_json::from_str(&meta_text)
+            .map_err(|e| format!("会话元数据不是合法 JSON {}: {e}", meta_path.display()))?;
+        if let Some(u) = meta.get("usage") {
+            session.usage = serde_json::from_value(u.clone()).unwrap_or_default();
+        }
+        session.title = meta
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        session.windows = meta
+            .get("windows")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 压缩事件流水（与消息里的 `compaction` 指针同车落盘）
+        // 逐条解析：单条坏（手改过？）只丢那条，不让整份流水变空
+        session.compaction_events = meta
+            .get("compaction_events")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 图片 id 表（hash_id → 上传记录）
+        session.files = meta
+            .get("files")
+            .and_then(Value::as_object)
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）——它住在会话状态槽里
+        let blocks: Vec<ReplBlock> = meta
+            .get("repl_blocks")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|b| serde_json::from_value(b.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        session.state.repl_blocks().load(blocks);
+
+        let messages_path = dir.join(MESSAGES_FILE);
+        let text = fs::read_to_string(&messages_path)
+            .map_err(|e| format!("读取会话消息失败 {}: {e}", messages_path.display()))?;
         let mut restored: Vec<Message> = Vec::new();
         for (n, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let value: Value = serde_json::from_str(line)
-                .map_err(|e| format!("会话文件第 {} 行不是合法 JSON: {e}", n + 1))?;
-            if value
-                .get("__meta__")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                if let Some(u) = value.get("usage") {
-                    session.usage = serde_json::from_value(u.clone()).unwrap_or_default();
-                }
-                session.title = value
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                // 窗口块列表（旧键 `fs` 是更早的写法，一并兼容）
-                let windows = value.get("windows").or_else(|| value.get("fs"));
-                session.windows = windows
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(PathBuf::from)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // 压缩事件流水（与消息里的 `compaction` 指针同车落盘）
-                // 逐条解析：单条坏（手改过？）只丢那条，不让整份流水变空
-                session.compaction_events = value
-                    .get("compaction_events")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // 图片 id 表（hash_id → 上传记录）
-                session.files = value
-                    .get("files")
-                    .and_then(Value::as_object)
-                    .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
-                // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）——它住在会话状态槽里
-                let blocks: Vec<ReplBlock> = value
-                    .get("repl_blocks")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|b| serde_json::from_value(b.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                session.state.repl_blocks().load(blocks);
-                continue;
-            }
+                .map_err(|e| format!("会话消息第 {} 行不是合法 JSON: {e}", n + 1))?;
             // 旧 system（提示词 / 窗口摘要）丢掉：按当前提示词重建
             if value.get("role").and_then(Value::as_str) == Some("system") {
                 continue;
             }
             let msg: Message = serde_json::from_value(value)
-                .map_err(|e| format!("会话文件第 {} 行不是合法消息: {e}", n + 1))?;
+                .map_err(|e| format!("会话消息第 {} 行不是合法消息: {e}", n + 1))?;
             restored.push(msg);
         }
         // 防御：带 tool_calls 却没有 reasoning_content 的 assistant 消息补空串
@@ -497,7 +503,8 @@ impl Session {
             self.config.storage.clone(),
             self.state.clone(),
         )
-        .with_transcript(self.transcript_path());
+        .with_transcript(self.transcript_path())
+        .in_session(&self.path);
         self.registry.handle(name, ctx)
     }
 
@@ -645,8 +652,12 @@ impl Session {
             steps += 1;
 
             // 请求前：拿上一次 API 上报的水位判一次（本次会话还没发过请求 → 不压）
-            let (stats, mut events) =
-                context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            let (stats, mut events) = context::maybe_compact(
+                &mut self.messages,
+                &self.config,
+                &self.path,
+                self.usage.prompt_tokens,
+            );
             send_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
@@ -674,6 +685,7 @@ impl Session {
                         let (stats, mut events) = context::compact(
                             &mut self.messages,
                             &self.config,
+                            &self.path,
                             context::CompactMode::Auto,
                         );
                         send_compacted(&bus, &events);
@@ -713,8 +725,12 @@ impl Session {
             let tool_calls = result.tool_calls.clone();
             self.usage.record(&result.usage);
             // 请求后：provider 上报的 `prompt_tokens` 是最准的水位（上下文只增不减），拿它再判一次
-            let (stats, mut events) =
-                context::maybe_compact(&mut self.messages, &self.config, self.usage.prompt_tokens);
+            let (stats, mut events) = context::maybe_compact(
+                &mut self.messages,
+                &self.config,
+                &self.path,
+                self.usage.prompt_tokens,
+            );
             send_compacted(&bus, &events);
             compacted.append(&mut events);
             self.refresh_after_compaction(&stats);
@@ -1046,6 +1062,7 @@ impl Session {
                                 self.state.clone(),
                             )
                             .with_transcript(self.transcript_path())
+                            .in_session(&self.path)
                             // 工具名 → `ToolBody::fit` 的落盘前缀（`ctx.name`）
                             .named(&call.function.name);
                             let out = match registry.dispatch(&call.function.name, &args, ctx).await
@@ -1147,7 +1164,7 @@ impl Session {
         let local = match self
             .config
             .storage
-            .store(config::StoreType::Blob { data, mime })
+            .store(None, config::StoreType::Blob { data, mime })
         {
             Ok(path) => path,
             Err(e) => {
@@ -1206,16 +1223,13 @@ impl Session {
         }
     }
 
-    /// 整文件重写会话（历史不长，简单可靠）。
+    /// 整份重写会话：**先 `meta.json`、后 `messages.jsonl`**（顺序见下面的注释）。
+    ///
+    /// 首次 `save` 才把会话目录建出来（`Session::new` 不建：避免在 `sessions/` 里堆空目录）。
     pub fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("创建会话目录失败 {}: {e}", parent.display()))?;
-        }
+        let dir = self.path.clone();
+        fs::create_dir_all(&dir).map_err(|e| format!("创建会话目录失败 {}: {e}", dir.display()))?;
         let mut meta = json!({
-            "__meta__": true,
             "usage": self.usage,
             "windows": self
                 .windows
@@ -1241,32 +1255,29 @@ impl Session {
             // 空表不写：没跑过 repl 的会话不该多一个键
             meta["repl_blocks"] = json!(blocks);
         }
+        // **顺序纪律：先写可退化的派生层，最后写唯一真相。**
+        //
+        // `/clear` 是唯一让两者同时大改的操作：meta 超前（登记了归档块、消息还没清）→ resume 会
+        // 重建摘要 + 还留着完整历史 = 重复，数据都在；反过来（消息已清、归档块没登记）→ 那段历史
+        // **静默丢失**。宁可重复，不可丢失 —— 别把这两行的顺序改反。
+        //
+        // 原子性由 `Storage::write_file`（同目录临时件 + rename）保证。
+        let storage = &self.config.storage;
+        let meta_path = dir.join(META_FILE);
+        storage
+            .write_file(&meta_path, format!("{}\n", json_line(&meta)?).as_bytes())
+            .map_err(|e| format!("写入会话元数据失败 {}: {e}", meta_path.display()))?;
+
         let mut out = String::new();
-        out.push_str(&json_line(&meta)?);
-        out.push('\n');
         for m in &self.messages {
             out.push_str(&json_line(m)?);
             out.push('\n');
         }
-        // **原子落盘**：先写同目录的临时件，再 `rename`（同一文件系统上 rename 是原子的）。
-        //
-        // 为什么非这么干不可：会话是**用户数据的唯一副本**（压缩原文 / 图片副本都有 gc 保护窗，
-        // 会话没了就是没了），而直接 `fs::write` 到目标上——写到一半崩/断电/盘满——留下的是一份
-        // **截断的**会话。目录里其它落盘（`Storage::store`）早就是 temp + rename 了，只有它例外。
-        let name = self
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let tmp = self
-            .path
-            .with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-        fs::write(&tmp, out).map_err(|e| format!("写入会话失败 {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &self.path).map_err(|e| {
-            let _ = fs::remove_file(&tmp); // 换不过去就把临时件收走，别在目录里留垃圾
-            format!("落盘会话失败 {}: {e}", self.path.display())
-        })
+        let messages_path = dir.join(MESSAGES_FILE);
+        storage
+            .write_file(&messages_path, out.as_bytes())
+            .map_err(|e| format!("写入会话消息失败 {}: {e}", messages_path.display()))?;
+        Ok(())
     }
 
     /// 恢复 / 新建后的概览（CLI 提示用）。
@@ -1277,7 +1288,7 @@ impl Session {
     /// 手动压缩（`/compact`）：不看水位，按 `mode` 压；轮次级一路压到不能再压。
     /// **不含会话级**（整窗口归档是 `/clear` 的事）。
     pub fn compact(&mut self, mode: context::CompactMode) -> context::CompactStats {
-        let (stats, events) = context::compact(&mut self.messages, &self.config, mode);
+        let (stats, events) = context::compact(&mut self.messages, &self.config, &self.path, mode);
         self.compaction_events.extend(events);
         stats
     }
@@ -1529,9 +1540,12 @@ impl Session {
             .unwrap_or_default();
         // 归档前的消息条数（`count` 就是它：本次有多少条被压进了窗口块）
         let before = self.messages.len();
-        if let Some((path, event)) =
-            context::compact_session(&mut self.messages, &session_config, &self.config.storage)?
-        {
+        if let Some((path, event)) = context::compact_session(
+            &mut self.messages,
+            &session_config,
+            &self.config.storage,
+            &self.path,
+        )? {
             self.compaction_events.push(event);
             self.bus.send(
                 Event::Session(SessionEvent::Cleared {
@@ -1802,21 +1816,16 @@ pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
 }
 
 /// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
-fn resolve_path(dir: &Path, id: Option<&str>) -> PathBuf {
+fn resolve_dir(sessions: &Path, id: Option<&str>) -> PathBuf {
     match id {
-        None => dir.join(format!("chat-{}.jsonl", timestamp())),
+        None => sessions.join(format!("chat-{}", timestamp())),
         Some(id) => {
             let p = Path::new(id);
             let is_path = p.is_absolute() || p.parent().is_some_and(|d| !d.as_os_str().is_empty());
             if is_path {
                 p.to_path_buf()
             } else {
-                let stem = p
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                dir.join(format!("{stem}.jsonl"))
+                sessions.join(p)
             }
         }
     }
@@ -1828,34 +1837,37 @@ fn timestamp() -> String {
     format!("{}-{:06}", now.as_secs(), now.subsec_micros())
 }
 
-/// 目录里最新的会话文件；`cwd` 匹配的优先（没有 cwd 的旧文件算不匹配）。
+/// 目录里最新的会话；`cwd` 匹配的优先。
+///
+/// ⚠ **按 `messages.jsonl` 的 mtime 排**，不能按目录 mtime：目录只在增删条目时变，
+/// 改文件内容不动它 —— 那样「最近的会话」会选错。
 fn latest_in(dir: &Path, cwd: Option<&str>) -> Option<PathBuf> {
-    let mut files: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)
+    let mut dirs: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)
         .ok()?
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| {
-            let path = e.path();
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((mtime, path))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|session| {
+            let messages = session.join(MESSAGES_FILE);
+            let mtime = messages.metadata().ok()?.modified().ok()?;
+            Some((mtime, session))
         })
         .collect();
-    files.sort_by_key(|f| std::cmp::Reverse(f.0)); // mtime 降序
+    dirs.sort_by_key(|f| std::cmp::Reverse(f.0)); // mtime 降序
     if let Some(cwd) = cwd
-        && let Some((_, path)) = files
+        && let Some((_, path)) = dirs
             .iter()
             .find(|(_, p)| meta_cwd(p).as_deref() == Some(cwd))
     {
         return Some(path.clone());
     }
-    files.first().map(|(_, p)| p.clone())
+    dirs.first().map(|(_, p)| p.clone())
 }
 
-/// 读会话文件 meta 行里的 `cwd`（旧会话没有该键 → None）。
-fn meta_cwd(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    let first = text.lines().find(|l| !l.trim().is_empty())?;
-    let value: Value = serde_json::from_str(first).ok()?;
+/// 读 `<dir>/meta.json` 里的 `cwd`（旧会话 / 没写过 → None）。
+fn meta_cwd(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(META_FILE)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
     value.get("cwd").and_then(Value::as_str).map(str::to_string)
 }
 
@@ -1878,14 +1890,17 @@ mod tests {
     /// 落一张图片副本 → 路径（`StoreType::Blob` 的薄包装，只为测试读起来短）。
     fn blob(data: &[u8], mime: &str) -> PathBuf {
         storage()
-            .store(config::StoreType::Blob { data, mime })
+            .store(None, config::StoreType::Blob { data, mime })
             .unwrap()
     }
 
-    /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，仅供测试）。
+    /// 落一段压缩原文 → 路径（`StoreType::Raw` 的薄包装，仅供测试）：进固定的测试会话目录。
     fn raw(body: &str, prefix: &str) -> PathBuf {
         storage()
-            .store(config::StoreType::Raw { prefix, body })
+            .store(
+                Some(&storage().session_dir("test-session")),
+                config::StoreType::Raw { prefix, body },
+            )
             .unwrap()
     }
 
@@ -1905,8 +1920,20 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("pie-session-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// 手写一个会话目录（`meta.json` + `messages.jsonl`）——测 `load` 用。
+    fn write_session(dir: &Path, meta: Value, messages: &[Value]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        let mut body = String::new();
+        for m in messages {
+            body.push_str(&serde_json::to_string(m).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(dir.join("messages.jsonl"), body).unwrap();
     }
 
     fn usage(prompt: i64) -> Usage {
@@ -2133,7 +2160,7 @@ mod tests {
             Some(Compaction::Session { .. })
         ));
         let block = PathBuf::from(s.messages[1].compaction.as_ref().unwrap().path().unwrap());
-        assert!(block.starts_with(storage().windows()), "{block:?}");
+        assert!(block.starts_with(s.path.join("windows")), "{block:?}");
         assert!(block.exists(), "{block:?}");
         // 块里是**原文**（三条都在），且文件名最后一段就是内容 hash
         let raw = std::fs::read_to_string(&block).unwrap();
@@ -2147,7 +2174,9 @@ mod tests {
         );
         // 内容寻址：同一段内容再归档一次 → 还是那个文件（已存在则不动）
         assert_eq!(
-            storage().store(config::StoreType::Window(&raw)).unwrap(),
+            storage()
+                .store(Some(&s.path), config::StoreType::Window(&raw))
+                .unwrap(),
             block,
             "同内容同路径"
         );
@@ -2179,8 +2208,8 @@ mod tests {
         // save → load：流水跟着 `__meta__` 一起往返（与消息里的指针同一趟车）
         s.save().expect("save");
         // 落盘形状：类型看 `kind` 标签，不再写冗余的 `level`
-        let saved = std::fs::read_to_string(&s.path).unwrap();
-        let meta = saved.lines().next().unwrap_or_default();
+        let saved = std::fs::read_to_string(s.path.join("meta.json")).unwrap();
+        let meta = saved.as_str();
         assert!(meta.contains("\"kind\":\"session\""), "{meta}");
         assert!(!meta.contains("\"level\""), "{meta}");
         let back =
@@ -2383,14 +2412,17 @@ mod tests {
             storage: config::Storage::at(&dir),
             ..Default::default()
         };
-        let mut s = Session::new(&config, Some("s.jsonl"), llm(), registry());
+        let mut s = Session::new(&config, Some("s"), llm(), registry());
         // `repl.rs` 转存后的持久副本（`files/img-<hash>.png`）
         let image = config
             .storage
-            .store(config::StoreType::Blob {
-                data: b"png-bytes",
-                mime: "image/png",
-            })
+            .store(
+                None,
+                config::StoreType::Blob {
+                    data: b"png-bytes",
+                    mime: "image/png",
+                },
+            )
             .unwrap();
         let call = |id: &str| ToolCall {
             id: id.into(),
@@ -2570,8 +2602,10 @@ mod tests {
     fn load_rebuilds_window_summaries() {
         let _g = env_lock();
         let dir = pie_dir_tmp("win");
-        std::fs::create_dir_all(storage().context()).unwrap();
-        let block = storage().context().join("session-abc.txt");
+        std::fs::create_dir_all(storage().session_context("test-session")).unwrap();
+        let block = storage()
+            .session_context("test-session")
+            .join("session-abc.txt");
         let raw = json!([
             {"role": "user", "content": "旧问题"},
             {"role": "assistant", "content": "旧答复"}
@@ -2579,18 +2613,14 @@ mod tests {
         std::fs::write(&block, serde_json::to_string(&raw).unwrap()).unwrap();
         let path = dir.join("s.jsonl");
         let meta = json!({
-            "__meta__": true,
             "windows": [block.display().to_string()],
             "usage": {"calls": 1}
         });
-        std::fs::write(
+        write_session(
             &path,
-            format!(
-                "{meta}\n{}\n",
-                json!({"role": "user", "content": "当前问题"})
-            ),
-        )
-        .unwrap();
+            meta,
+            &[json!({"role": "user", "content": "当前问题"})],
+        );
 
         let s = Session::load(&path, &Config::default(), llm(), registry()).expect("load");
         assert_eq!(s.messages.len(), 3, "system prompt + 窗口摘要 + 真实消息");
@@ -2613,7 +2643,7 @@ mod tests {
     fn full_history_expands_compaction_pointers() {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history");
-        std::fs::create_dir_all(storage().context()).unwrap();
+        std::fs::create_dir_all(storage().session_context("test-session")).unwrap();
         let config = Config::default();
         let mut s = Session::ephemeral(&config, llm(), registry());
 
@@ -2679,7 +2709,7 @@ mod tests {
     fn full_history_falls_back_when_raw_is_gone() {
         let _g = env_lock();
         let dir = pie_dir_tmp("full-history-gone");
-        std::fs::create_dir_all(storage().context()).unwrap();
+        std::fs::create_dir_all(storage().session_context("test-session")).unwrap();
         let config = Config::default();
         let mut s = Session::ephemeral(&config, llm(), registry());
 
@@ -2832,27 +2862,32 @@ mod tests {
             storage: crate::config::Storage::at(&dir),
             ..Config::default()
         };
-        let mut s = Session::new(&config, Some("atomic.jsonl"), llm(), registry());
+        let mut s = Session::new(&config, Some("atomic"), llm(), registry());
         s.push_user("第一轮");
         s.save().unwrap();
-        assert!(std::fs::read_to_string(&s.path).unwrap().contains("第一轮"));
+        let messages = s.path.join("messages.jsonl");
+        assert!(
+            std::fs::read_to_string(&messages)
+                .unwrap()
+                .contains("第一轮")
+        );
 
         // 再存一次：**整份替换**（不是追加）——先手工往文件尾塞一行垃圾
         {
             use std::io::Write;
             let mut fh = std::fs::OpenOptions::new()
                 .append(true)
-                .open(&s.path)
+                .open(&messages)
                 .unwrap();
             fh.write_all("{\"role\":\"user\",\"content\":\"垃圾行\"}\n".as_bytes())
                 .unwrap();
         }
         s.save().unwrap();
-        let after = std::fs::read_to_string(&s.path).unwrap();
+        let after = std::fs::read_to_string(&messages).unwrap();
         assert!(!after.contains("垃圾行"), "旧内容要整份消失：{after}");
 
-        // 目录里不留临时件（`.<名字>.tmp-<pid>`）
-        let leftovers: Vec<String> = std::fs::read_dir(config.storage.sessions())
+        // 会话目录里不留临时件（`.<名字>.tmp-<pid>`）
+        let leftovers: Vec<String> = std::fs::read_dir(&s.path)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -3055,7 +3090,7 @@ mod tests {
         s.messages.push(Message::assistant("a1"));
         s.messages.push(Message::user("q2"));
         s.messages.push(Message::assistant("a2"));
-        let (stats, _) = context::maybe_compact(&mut s.messages, &config, Some(9_999_999));
+        let (stats, _) = context::maybe_compact(&mut s.messages, &config, &s.path, Some(9_999_999));
         assert!(stats.turns > 0, "这一轮该被压掉");
         assert!(
             s.messages[0]
@@ -3154,11 +3189,10 @@ mod tests {
     #[test]
     fn legacy_and_current_event_keys_both_load() {
         let config = Config::default();
-        let path = tmp("legacy-events.jsonl");
+        let dir = tmp("legacy-events");
         let old_path = PathBuf::from("/tmp/pie-legacy/context/bash-0123456789abcdef");
         let new_path = PathBuf::from("/tmp/pie-legacy/context/bash-fedcba9876543210");
         let meta = json!({
-            "__meta__": true,
             "compaction_events": [
                 {"ts": 1, "level": 1, "kind": "tool", "tool": "bash",
                  "raw_path": old_path.display().to_string(), "raw_hash": "0123456789abcdef"},
@@ -3169,9 +3203,9 @@ mod tests {
                 {"ts": 4, "kind": "some-future-kind"},
             ]
         });
-        std::fs::write(&path, format!("{meta}\n")).expect("write");
+        write_session(&dir, meta, &[]);
 
-        let s = Session::load(&path, &config, llm(), registry()).expect("load");
+        let s = Session::load(&dir, &config, llm(), registry()).expect("load");
         assert_eq!(
             s.compaction_events.len(),
             3,
@@ -3193,7 +3227,7 @@ mod tests {
             new_path.as_path(),
             "新键 path"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 落盘把 C1 控制符 / U+2028 转义掉：否则按「Unicode 行边界」切行的读者（`splitlines()`）
@@ -3201,35 +3235,42 @@ mod tests {
     #[test]
     fn save_escapes_control_chars_that_break_line_readers() {
         let config = Config::default();
-        let path = tmp("c1.jsonl");
-        let mut s = Session::at(path.clone(), &config, llm(), registry());
+        let dir = tmp("c1");
+        let mut s = Session::at(dir.clone(), &config, llm(), registry());
         let payload = "a\u{85}b\u{2028}c\u{9f}d";
         s.messages
             .push(Message::tool_result("call_1", "bash", payload));
         s.save().expect("save");
 
-        let text = std::fs::read_to_string(&path).expect("read");
-        for c in text.chars() {
-            assert!(
-                !matches!(c, '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}'),
-                "还有没转义的字符: U+{:04X}",
-                c as u32
-            );
-        }
+        let escape_check = |text: &str| {
+            for c in text.chars() {
+                assert!(
+                    !matches!(c, '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}'),
+                    "还有没转义的字符: U+{:04X}",
+                    c as u32
+                );
+            }
+        };
+        let meta_text = std::fs::read_to_string(dir.join("meta.json")).expect("read meta");
+        escape_check(&meta_text);
+        serde_json::from_str::<Value>(meta_text.trim()).expect("meta 是单行合法 JSON");
+
+        let text = std::fs::read_to_string(dir.join("messages.jsonl")).expect("read");
+        escape_check(&text);
         assert!(text.contains(r"\u0085"), "{text}");
         // 剩下的换行只有真正的行分隔 → 就是「splitlines 类读者也切不开」
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "{lines:?}"); // meta + system + tool
+        assert_eq!(lines.len(), 2, "{lines:?}"); // system + tool
         for line in &lines {
             serde_json::from_str::<Value>(line).expect("每行都是合法 JSON");
         }
         // 转义对语义透明：读回来还是原来的字符
-        let back = Session::load(&path, &config, llm(), registry()).expect("load");
+        let back = Session::load(&dir, &config, llm(), registry()).expect("load");
         let Some(Content::Text(back_text)) = back.messages.last().unwrap().content.as_ref() else {
             panic!("最后一条该是 tool 文本消息");
         };
         assert_eq!(back_text, payload);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 模型请求失败（外部因素）→ 历史里补一条带错误信息的 assistant 消息，**不留悬空提问**。
@@ -3412,20 +3453,29 @@ mod tests {
 
     /// **向后兼容**：旧版写下的会话（含未知字段 / 旧 system / null token）必须能读。
     #[test]
-    fn loads_legacy_written_session() {
+    fn load_drops_stale_system_and_fills_reasoning() {
         let config = Config::default();
-        let path = tmp("py.jsonl");
-        let jsonl = [
-            r#"{"__meta__":true,"usage":{"prompt_tokens":123,"completion_tokens":null,"total_tokens":null,"prompt_cache_hit_tokens":null,"prompt_cache_miss_tokens":null,"reasoning_tokens":null,"calls":3},"windows":[],"cwd":"/tmp","title":"旧会话"}"#,
-            r#"{"role":"system","content":"SENTINEL-OLD-SYSTEM","compaction":{"kind":"session","path":"/x"}}"#,
-            r#"{"role":"user","content":"你好","synthetic":false}"#,
-            r#"{"role":"assistant","content":"在的","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}"#,
-            r#"{"role":"tool","content":"[exit=0]\n\n/tmp","tool_call_id":"call_1"}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, format!("{jsonl}\n")).unwrap();
+        let dir = tmp("hand-written");
+        let meta = json!({
+            "usage": {"prompt_tokens": 123, "completion_tokens": null, "total_tokens": null,
+                      "prompt_cache_hit_tokens": null, "prompt_cache_miss_tokens": null,
+                      "reasoning_tokens": null, "calls": 3},
+            "windows": [],
+            "cwd": "/tmp",
+            "title": "旧会话"
+        });
+        let messages: Vec<Value> = serde_json::from_str(
+            r#"[
+            {"role":"system","content":"SENTINEL-OLD-SYSTEM","compaction":{"kind":"session","path":"/x"}},
+            {"role":"user","content":"你好","synthetic":false},
+            {"role":"assistant","content":"在的","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]},
+            {"role":"tool","content":"header! { \"status\": \"failed\" }\n\n/tmp","tool_call_id":"call_1"}
+            ]"#,
+        )
+        .unwrap();
+        write_session(&dir, meta, &messages);
 
-        let s = Session::load(&path, &config, llm(), registry()).expect("load");
+        let s = Session::load(&dir, &config, llm(), registry()).expect("load");
         assert_eq!(s.title.as_deref(), Some("旧会话"));
         assert_eq!(s.usage.calls, 3);
         assert_eq!(s.usage.prompt_tokens, Some(123));
@@ -3437,7 +3487,7 @@ mod tests {
         );
         // 带 tool_calls 但缺 reasoning_content → 补空串（否则 thinking 模式回放报 400）
         assert_eq!(s.messages[2].reasoning_content.as_deref(), Some(""));
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// resume：同 cwd 优先；都不匹配时取 mtime 最新的。
@@ -3448,20 +3498,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, cwd: &str, title: &str| {
-            let path = dir.join(name);
-            let meta = format!(
-                r#"{{"__meta__":true,"usage":{{"calls":1}},"windows":[],"cwd":"{cwd}","title":"{title}"}}"#
-            );
-            std::fs::write(
-                &path,
-                format!("{meta}\n{}\n", r#"{"role":"user","content":"hi"}"#),
-            )
-            .unwrap();
-            path
+            let session = dir.join(name);
+            let meta = json!({"usage": {"calls": 1}, "windows": [], "cwd": cwd, "title": title});
+            write_session(&session, meta, &[json!({"role": "user", "content": "hi"})]);
+            session
         };
-        let same_cwd = write("a.jsonl", "/work/dir", "same-cwd");
+        let same_cwd = write("a", "/work/dir", "same-cwd");
         std::thread::sleep(std::time::Duration::from_millis(20)); // 拉开 mtime
-        let other_cwd = write("b.jsonl", "/elsewhere", "other-cwd");
+        let other_cwd = write("b", "/elsewhere", "other-cwd");
 
         // cwd 匹配优先（哪怕它更旧）
         let s = Session::resume_in(&dir, Some("/work/dir"), &config, llm(), registry()).unwrap();

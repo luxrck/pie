@@ -26,7 +26,6 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | --- | --- |
 | `pie setup` | 补齐**数据根**（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`；`PIE_HOME` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
-| `pie context info` / `verify` / `gc [--delete]` | 列出压缩事件 / 校验落盘原文是否还在 / 列出或删除未引用的 `~/.pie/context/` 文件 |
 | `pie files list [--all]` / `gc [--delete] [--all]` | 列出图片记录 / 回收本地副本（`--all` 作用于云端上传件） |
 | `pie files upload <路径> [--mime <类型>]` | 把一个文件传到 Files API、打印 `file_id`（运维用：不写会话记录，`read` 读图那条路上传时自动完成） |
 
@@ -230,10 +229,10 @@ session.on("tool_call", no_rm)
   换窗口会让当前轮的工作记忆只剩摘要（模型「失忆」），自动做不合适；服务端 400 被认成「上下文超限」时
   只会再强压一次工具级/轮次级，压不动就报错（`log::warn` 提示 `/clear`）。
   TUI 里可以 `/compact [tools|turns|auto]` 手动压一次（不看水位）；`pie --stat "任务"` 跑完会把上下文占用 / 压缩事件 / API 用量打到 stderr。
-- 压缩级别**只升不降**；落盘按内容 sha256 寻址（同一份内容只存一次）。维护用 `pie context info` / `verify` / `gc`（见上面的子命令表）。
+- 压缩级别**只升不降**；落盘按内容 sha256 寻址（同一份内容只存一次），落在**会话目录**里（`sessions/<id>/context/`），删会话目录即回收。
 - 压掉的是**体积**，不是**结构**：被压走的 repl 代码块会集中保留在 system prompt 末尾那节（见上面 repl 那节）；
   `[轮次原文已保存: …]` / `[历史窗口: …]` 这些指针都是**真路径**，模型可以 `read` 回去。
-- 目录分工：压缩落盘在 `~/.pie/context/`（`context gc` 的地盘）；`/clear` 归档的窗口块在 `~/.pie/windows/`（用户主动归档，GC 不碰）。
+- 目录分工：一个会话 = 一个目录 `sessions/chat-<ts>/`（`meta.json` + `messages.jsonl` + `context/` + `windows/`）；`files/` 是全局图片池。
 
 ```toml
 [compaction]                 # 写了即开启；整段 `compaction = false` = 完全不压，某级 `false` = 只关那一级
