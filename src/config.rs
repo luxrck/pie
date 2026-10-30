@@ -664,12 +664,12 @@ pub fn thousands(n: i64) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
-/// 环境变量覆盖：`OPENAI_API_KEY` → `api_key`。空串视为没设（不覆盖配置文件里的值）。
+/// 环境变量兜底：`OPENAI_API_KEY` → `api_key`（**只在配置文件没给时**用）。空串视为没设。
 pub fn env_api_key() -> Option<String> {
     non_empty_var("OPENAI_API_KEY")
 }
 
-/// 环境变量覆盖：`OPENAI_BASE_URL` → `base_url`。空串视为没设。
+/// 环境变量兜底：`OPENAI_BASE_URL` → `base_url`（**只在配置文件没给时**用）。空串视为没设。
 pub fn env_base_url() -> Option<String> {
     non_empty_var("OPENAI_BASE_URL")
 }
@@ -875,25 +875,37 @@ impl Default for Config {
 impl Config {
     /// 从配置文件加载。文件不存在 → 全默认值（要不要补齐默认件由 CLI 层负责）。
     ///
-    /// 加载后按环境变量覆盖两项（空串 / 全空白视为没设 → 不动配置文件里的值）：
-    /// `OPENAI_API_KEY` → `api_key`、`OPENAI_BASE_URL` → `base_url`。
-    /// 只改内存、不写回配置文件（`save()` 照旧落盘当前值）。
+    /// **配置文件优先，环境变量只兜底**：`api_key` / `base_url` 在配置文件里显式给了
+    /// 非空值时用文件里的；没给（缺键 / 空串 / 全空白）才用 `OPENAI_API_KEY` /
+    /// `OPENAI_BASE_URL`。只改内存、不写回配置文件（`save()` 照旧落盘当前值）。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         // 数据根与配置路径用**同一个** `Storage` 算（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`）
         let storage = Storage::from_env();
         let path = storage.resolve_config_file(explicit);
-        let mut config = if path.exists() {
+        let (mut config, provided) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::Io(path.clone(), e.to_string()))?;
-            toml::from_str::<Config>(&text)
-                .map_err(|e| ConfigError::Parse(path.clone(), e.to_string()))?
+            let config = toml::from_str::<Config>(&text)
+                .map_err(|e| ConfigError::Parse(path.clone(), e.to_string()))?;
+            // 「配置文件里显式给了」的判据：键存在且值不是空串/全空白（空串 = 没设）
+            let raw: toml::Table = toml::from_str(&text).unwrap_or_default();
+            let provided = |key: &str| {
+                raw.get(key)
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            };
+            (config, (provided("api_key"), provided("base_url")))
         } else {
-            Config::default()
+            (Config::default(), (false, false))
         };
-        if let Some(key) = env_api_key() {
+        if !provided.0
+            && let Some(key) = env_api_key()
+        {
             config.api_key = key;
         }
-        if let Some(url) = env_base_url() {
+        if !provided.1
+            && let Some(url) = env_base_url()
+        {
             config.base_url = url;
         }
         config.storage = storage;
@@ -1728,15 +1740,9 @@ lean = true
         let back = Config::load(Some(&path)).expect("读回默认配置");
         let dflt = Config::default();
         assert_eq!(back.model, dflt.model);
-        // `load` 会被 `OPENAI_*` 环境变量覆盖：预期值也要过同样的门
-        assert_eq!(
-            back.base_url,
-            env_base_url().unwrap_or_else(|| dflt.base_url.clone())
-        );
-        assert_eq!(
-            back.api_key,
-            env_api_key().unwrap_or_else(|| dflt.api_key.clone())
-        );
+        // 配置文件优先：写出来的默认值会压过 `OPENAI_*` 环境变量
+        assert_eq!(back.base_url, dflt.base_url);
+        assert_eq!(back.api_key, dflt.api_key);
         assert_eq!(back.reserved_tokens, dflt.reserved_tokens);
         assert_eq!(back.context_window, dflt.context_window);
         assert_eq!(back.tui.lean, dflt.tui.lean);
@@ -1753,9 +1759,10 @@ lean = true
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `OPENAI_API_KEY` / `OPENAI_BASE_URL` 覆盖配置里对应的两项；**空串 / 全空白 = 没设**。
+    /// **配置文件优先，环境变量只兜底**：文件里显式给了非空值 → 用文件里的；
+    /// 没给（缺键 / 空串 / 全空白）→ 才用 `OPENAI_API_KEY` / `OPENAI_BASE_URL`。
     #[test]
-    fn env_overrides_api_key_and_base_url() {
+    fn config_file_wins_over_env() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("pie-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1770,20 +1777,34 @@ lean = true
         let prev_key = std::env::var("OPENAI_API_KEY").ok();
         let prev_url = std::env::var("OPENAI_BASE_URL").ok();
 
-        // 设了就用环境变量的值（压过配置文件）
+        // 环境变量设了也**不覆盖**配置文件里的值（文件优先）
         set_env("OPENAI_API_KEY", "sk-env");
         set_env("OPENAI_BASE_URL", "https://env.example/v1");
         let config = Config::load(Some(&path)).expect("load");
-        assert_eq!(config.api_key, "sk-env");
-        assert_eq!(config.base_url, "https://env.example/v1");
+        assert_eq!(config.api_key, "sk-file", "配置文件优先");
+        assert_eq!(config.base_url, "https://file.example/", "配置文件优先");
         assert_eq!(config.config_file.as_deref(), Some(path.as_path()));
 
-        // 空串 / 全空白 = 没设 → 保留配置文件里的值
-        set_env("OPENAI_API_KEY", "");
-        set_env("OPENAI_BASE_URL", "   ");
+        // 配置文件缺这两项 → 环境变量兜底
+        let bare = dir.join("bare.toml");
+        std::fs::write(&bare, "model = \"m\"\n").unwrap();
+        let config = Config::load(Some(&bare)).expect("load");
+        assert_eq!(config.api_key, "sk-env", "缺键时环境变量兜底");
+        assert_eq!(config.base_url, "https://env.example/v1");
+
+        // 配置文件里写空串 / 全空白 = 没设 → 也兜底
+        std::fs::write(&path, "api_key = \"\"\nbase_url = \"   \"\n").unwrap();
+        let config = Config::load(Some(&path)).expect("load");
+        assert_eq!(config.api_key, "sk-env", "空串视为没设");
+        assert_eq!(config.base_url, "https://env.example/v1");
+
+        // 环境变量是空串 / 全空白 = 没设 → 保留配置文件里的值（这里是默认值）
+        std::fs::write(&path, "api_key = \"sk-file\"\n").unwrap();
+        set_env("OPENAI_API_KEY", "   ");
+        set_env("OPENAI_BASE_URL", "");
         let config = Config::load(Some(&path)).expect("load");
         assert_eq!(config.api_key, "sk-file");
-        assert_eq!(config.base_url, "https://file.example/");
+        assert_eq!(config.base_url, Config::default().base_url);
 
         match prev_key {
             Some(v) => set_env("OPENAI_API_KEY", v),
