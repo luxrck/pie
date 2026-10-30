@@ -384,7 +384,7 @@ impl Usage {
 /// 会话级用量：token 字段是**最近一次** API 上报的值（**不累计求和**——
 /// 上下文是累积的，最近一次的 `prompt_tokens` 就是当前上下文大小），只有 `calls` 累加。
 ///
-/// 字段名即 `__meta__.usage` 的形状。
+/// 字段名即 `meta.json` 里 `usage` 的形状。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageTracker {
@@ -1081,8 +1081,8 @@ impl LlmClient {
 
 // ---------------------------------------------------------------- Files API（图片上传件）
 //
-// 本地副本命名、`__meta__.files` 条目字段、`expires_after` 语义都收敛在这里
-// （不单独开一个 files.rs）。
+// 上传文件名（`img-<hash><ext>`，服务端靠它反解回本地 id）、`expires_after` 语义都收敛在这里
+// （不单独开一个 files.rs）。本地上传缓存（`Session.files`）不落盘：首次用图时 `GET /files` 对一次账。
 //
 // **优先 Files API**（历史里只存 `file_id`）；上传失败 / `files_api = false` 时由
 // `Session::settle_output` 回退内联 base64（`image_url` data URI，有 `INLINE_MAX_BYTES` 上限）。

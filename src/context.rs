@@ -438,8 +438,8 @@ pub struct CompactStats {
 /// **第三级（会话级）不在这里**：那一级只由用户手动 `/clear` 触发（见 [`compact_session`]）——
 /// 自动压缩只做工具级 / 轮次级（换表示：原文落盘 + 指针/摘要，窗口不动）。
 ///
-/// 产出的事件**随返回值交给调用方**：会话层拿去登记 `windows` / 落进 `__meta__.compaction_events`。
-/// 不走 `on_event` —— 事件是内部记账（gc 靠它保护原文），不是展示流。
+/// 产出的事件**随返回值交给调用方**：会话层拿去登记 `windows` / 落进 `meta.json` 的 `compaction_events`。
+/// 不走 `on_event` —— 事件是内部记账，不是展示流。
 pub fn maybe_compact(
     messages: &mut Vec<Message>,
     config: &Config,

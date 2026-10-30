@@ -4,14 +4,18 @@
 //! 两半，分开只会让每次调用在两模块之间穿 7 个参数（其中 4 个还是 `self` 的字段）。
 //! 一次性模式改走 `Session::ephemeral()`（不落盘、压缩事件只在内存）。
 //!
-//! **持久化契约**：
-//!   - 一行一条 JSON：首行 `__meta__`（usage / windows / cwd / title / files / compaction_events），之后每行一条消息；
+//! **持久化契约**：一个会话 = **一个目录** `~/.pie/sessions/chat-<unix 秒>-<微秒>/`
+//!
+//!   - `meta.json`：usage / windows / cwd / title / 压缩流水 / `state`（工具的小状态）；
+//!   - `messages.jsonl`：一行一条消息，**没有 `__meta__` 首行**；
+//!   - `context/`（压缩原文）与 `windows/`（`/clear` 归档）：跟着会话走，删目录即回收；
+//!   - 首次 `save` 才建目录，写入顺序 `meta → messages`（宁可重复不可丢失）；
 //!   - 恢复时**丢弃文件里的 system 消息**，按当前 SYSTEM.md / AGENTS.md / MEMORY.md 重建
 //!     （提示词会变，历史里那份旧 system 没有意义）；
-//!   - 会话目录是 `~/.pie/sessions/`，resume 按 mtime 选最新、「同 cwd 优先」（读 meta 里的 `cwd`；
-//!     旧会话没这个键就当不匹配）；未知字段 serde 直接忽略。
+//!   - resume 按 `messages.jsonl` 的 mtime 选最新、「同 cwd 优先」（读 `meta.json` 的 `cwd`）；
+//!     子会话（`parent` 非空）不参与；未知字段 serde 直接忽略。
 //!
-//! 文件名用 `chat-<unix 秒>-<微秒>.jsonl`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
+//! 目录名用 `chat-<unix 秒>-<微秒>`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -70,7 +74,7 @@ pub struct Session {
     /// 旧会话里的键是 `raw_path` / `raw_hash`，靠 `CompactEvent` 的 serde alias 读回）。
     ///
     /// 以前单独 append 到 `~/.pie/context/<会话名>.manifest.jsonl`；现在**只住内存**，
-    /// `save()` 时作为 `__meta__.compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
+    /// `save()` 时作为 `meta.json` 的 `compaction_events` 一起落盘——于是它跟消息里的 `compaction` 指针
     /// **同一趟车**，不会出现「账记了、指针没记」（`ephemeral` 会话不 `save`，自然也就不落盘）。
     pub compaction_events: Vec<context::CompactEvent>,
     /// 插件的**事件订阅**凭据（`Registry` 带进来的）——留着它们只是**保活**：
@@ -80,7 +84,7 @@ pub struct Session {
     pub messages: Vec<Message>,
     /// 用量：token 是最近一次上报值，`calls` 累计（见 `UsageTracker`）。
     pub usage: UsageTracker,
-    /// 历史窗口块（会话级压缩产出，写进 `__meta__.windows`）。
+    /// 历史窗口块（会话级压缩产出，写进 `meta.json` 的 `windows`）。
     pub windows: Vec<PathBuf>,
     /// 图片上传缓存：`hash_id`（`img-<hash>`）→ 上传件。**运行时数据、不落盘** ——
     /// 能从 `GET /files` 重建（见 [`Session::sync_files`]），丢了只是重传一次。
@@ -808,7 +812,7 @@ impl Session {
                 };
                 let name = call.function.name.as_str();
                 // 产出物的会话侧收尾**放在消息构造之前**：要送给模型的图按配置走 Files API
-                // （`file_id`）或内联 base64，`repl` 的画布图登记进 `__meta__.files`。
+                // （`file_id`）或内联 base64，`repl` 的画布图记进 `meta["state"]["repl"].images`。
                 // 什么都没投递（`vision` 关 / 超限 / 文件没了）→ 消息保持纯文本（天然降级）。
                 let attachments = self.settle_output(call, &out).await;
                 // 工具自带落盘（bash / repl / pyplugin 超限）→ 消息**进历史前**就带上原文指针（工具级），
@@ -902,7 +906,7 @@ impl Session {
     }
 
     /// 一批工具产出物的**会话侧收尾**：要送给模型的图先上传（拿 `file_id`），`repl` 的画布图
-    /// 登记进 `__meta__.files`。返回该结果要挂进 tool 消息的 `file_id` 列表（空 = 纯文本）。
+    /// 记进 `meta["state"]["repl"].images`。返回该结果要挂进 tool 消息的 `file_id` 列表（空 = 纯文本）。
     ///
     /// **在消息进历史之前调**：图是 tool 消息 content 的一部分（`[{type:text}, {type:file}]`），
     /// 构造消息时就该备齐 —— 旧版是先 push 纯文本、回头按下标 `get_mut` 改 content，那份
@@ -959,13 +963,6 @@ impl Session {
                         ));
                     }
                 }
-                // `repl` 画布图（只给界面看，模型看不到）→ 登记进 `__meta__.files`：
-                // 图落地后是 `files/img-<hash>.png`，而 `files gc` 的判据是「未被任何会话的
-                // `__meta__.files[*].local` 引用 + 放置超过 `GC_PROTECT_HOURS`」——不登记就活不过
-                // 一天；`calls` 则是 `Repl::from_messages` 把图配回那次调用的唯一线索
-                // （`hash → entry` 本身没有调用维度）。
-                // 与 `read` 那条路共用同一张表（同内容 = 同 hash）→ **按字段合并**：已有的
-                // `file_id` / `base_url` 等照旧留着，只补自己这几项。
                 // `repl` 画布图（只给界面看，模型看不到）→ `state.repl.images`：
                 // `call_id → 本地路径`，`-r` 之后画布靠它把图配回那次调用。
                 // 它**不上传**，所以不属于 `Session.files`（那是"要送给模型"的上传缓存）。
@@ -1826,9 +1823,9 @@ fn escape_control_chars(json: String) -> String {
 
 // ---------------------------------------------------------------- 图片文件管理
 //
-// 本地那一侧的事都在这里（`llm.rs` 只放 Files API 协议）：内容寻址副本、`__meta__.files`
-// 记录表、本地副本的 GC 清单。目录本身住 `config::Storage`（`sessions()` /
-// `files()`）——磁盘布局一处可见。
+// 本地那一侧的事都在这里（`llm.rs` 只放 Files API 协议）：内容寻址副本 + `Session.files`
+// 上传缓存（**运行时**，能从 `GET /files` 重建）。目录本身住 `config::Storage`
+// （`sessions()` / `files()`）——磁盘布局一处可见。
 
 /// 一张图的上传缓存（**运行时**，不落盘）：能从 `GET /files` 重建，所以丢了只重传。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1851,7 +1848,7 @@ impl ImageEntry {
     }
 }
 
-/// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
+/// `id` 解析：None → 时间戳**目录名**；纯名字 → `<sessions>/<name>/`；带目录/绝对路径 → 原样。
 fn resolve_dir(sessions: &Path, id: Option<&str>) -> PathBuf {
     match id {
         None => sessions.join(format!("chat-{}", timestamp())),
@@ -2291,7 +2288,7 @@ mod tests {
         );
         assert_eq!(path, &block);
 
-        // save → load：流水跟着 `__meta__` 一起往返（与消息里的指针同一趟车）
+        // save → load：流水跟着 `meta.json` 一起往返（与消息里的指针同一趟车）
         s.save().expect("save");
         // 落盘形状：类型看 `kind` 标签，不再写冗余的 `level`
         let saved = std::fs::read_to_string(s.path.join("meta.json")).unwrap();
@@ -2909,7 +2906,7 @@ mod tests {
             "标题前面那段不该变（缓存前缀照旧）：{after}"
         );
 
-        // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建（它是会话状态槽里的一个条目）
+        // 5) 日志随 `meta["state"]["repl"]` 落盘 → `-r` 之后那节能重建（它是会话状态槽里的一个条目）
         s.save().unwrap();
         let mut loaded = Session::load(&s.path, &config, llm(), registry()).unwrap();
         let reloaded = loaded.state.repl().snapshot();

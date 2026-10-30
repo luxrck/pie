@@ -151,7 +151,7 @@ def _read_records(path):
             continue
         obj = json.loads(line)
         if isinstance(obj, dict) and obj.get("__meta__"):
-            continue  # 会话文件的首行元信息
+            continue  # 旧版会话文件的首行元信息（现在的快照没有这一行，留着兼容老快照）
         out.append(obj)
     return out
 

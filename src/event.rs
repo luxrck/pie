@@ -5,7 +5,7 @@
 //! 词汇表 —— 从 `session` / `llm` / `context` 三处搬来的三类事件：
 //!   - [`TurnEvent`]    语义：回合 → 消费者（TUI / CLI / 绑定）
 //!   - [`ChunkEvent`]  传输增量：模型层内部（`stream()` 的增量，被翻成 `TurnEvent`）
-//!   - [`CompactEvent`] 压缩记账：随会话落盘（`__meta__.compaction_events`）
+//!   - [`CompactEvent`] 压缩记账：随会话落盘（`meta.json` 的 `compaction_events`）
 //!
 //! **故意不在这里的东西**：
 //!   - `tui::UiEvent` —— 它引用 `LlmError` / `Balance` / `Snapshot` / `Status` / `files::Index`，

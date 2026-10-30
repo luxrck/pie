@@ -175,6 +175,7 @@ class SessionRow(TypedDict):
 
     id: str
     file: str
+    """会话**目录**的路径（旧版本这里是 `.jsonl` 文件）。"""
     mtime: int
     size: int
     turns: int
@@ -350,7 +351,9 @@ class Session:
         """临时会话：不落盘、不写 manifest（服务 / notebook 用）。"""
 
     @staticmethod
-    def load(path: str, config: Config, llm: LlmClient, tools: Registry) -> Session: ...
+    def load(path: str, config: Config, llm: LlmClient, tools: Registry) -> Session:
+        """从会话**目录**恢复（`<数据根>/sessions/<id>/`）。"""
+
     @staticmethod
     def resume(config: Config, llm: LlmClient, tools: Registry) -> Session: ...
 

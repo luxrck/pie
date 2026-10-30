@@ -171,7 +171,7 @@ impl PySession {
         Self::wrap(CoreSession::ephemeral(&core_config, llm, tools))
     }
 
-    /// 从 JSONL 恢复（`path` 必须存在）。
+    /// 从会话**目录**恢复（`path` = `<数据根>/sessions/<id>/`，必须有 `meta.json` + `messages.jsonl`）。
     #[staticmethod]
     fn load(
         path: &str,
@@ -290,7 +290,7 @@ impl PySession {
         crate::json_to_py(py, &Value::Array(values))
     }
 
-    /// 压缩历史（会话首行 `__meta__.compaction_events` 的每条事件，dict 列表）。
+    /// 压缩历史（`meta.json` 里 `compaction_events` 的每条事件，dict 列表）。
     fn compression_history(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let guard = self.lock()?;
         crate::to_py(py, &guard.compaction_events)
@@ -298,7 +298,7 @@ impl PySession {
 
     // ------------------------------------------------------------ 写
 
-    /// 落盘（`~/.pie/sessions/<名字>.jsonl`，与 CLI 同格式）。
+    /// 落盘（`~/.pie/sessions/<名字>/`：`meta.json` + `messages.jsonl`，与 CLI 同格式）。
     fn save(&self) -> PyResult<()> {
         self.lock()?.save().map_err(pie_error)
     }

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `repl_blocks` 最多留这么多个（超出丢最老的）——同时限住 `__meta__` 与那节 system prompt。
+/// `repl_blocks` 最多留这么多个（超出丢最老的）——同时限住 `meta["state"]["repl"]` 与那节 system prompt。
 pub const REPL_BLOCKS_MAX: usize = 24;
 /// 单个 cell 存进日志/显示的字符上限（超了截断 + 提示看原文）。
 pub const REPL_BLOCK_MAX_CHARS: usize = 2000;
@@ -59,7 +59,7 @@ impl std::fmt::Debug for SessionState {
     }
 }
 
-/// 解释器跑过的单个代码块（`__meta__.repl_blocks` 的一条）。
+/// 解释器跑过的单个代码块（`meta["state"]["repl"].blocks` 的一条）。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReplBlock {
     /// 工具调用的 id（判「它还在不在当前对话里」就靠它）。

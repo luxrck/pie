@@ -107,7 +107,7 @@ struct Script {
     name: String,
     /// pie 什么时候杀它（秒；`[tools.<名字>] _timeout_seconds` 能覆盖）。
     timeout: i64,
-    /// `PIE_HOME`：数据根（脚本要往 `files/` 放产物时用 —— 那是 `pie files gc` 认得的位置）。
+    /// `PIE_HOME`：数据根（脚本要往 `files/` 放产物时用 —— `pie files list` / `rm` 认的就是那个位置）。
     ///
     /// ⚠ 没有「状态目录」：一次调用一个进程，**跨调用状态该不该有、放哪儿、怎么清理，都是脚本
     /// 自己的事**（要就自己 `mkdir -p "$PIE_HOME/state/$PIE_TOOL_NAME"`）。给壳体加一层状态目录

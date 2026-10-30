@@ -24,9 +24,9 @@ pub struct SessionInfo {
     pub size: u64,
     /// 真实用户消息数（`synthetic` 的图片消息不算）。
     pub turns: usize,
-    /// `__meta__.usage.calls`（累计 API 请求数）。
+    /// `meta.json` 里 `usage.calls`（累计 API 请求数）。
     pub api_calls: i64,
-    /// 标题（`__meta__.title`），没有就用首个用户消息。
+    /// 标题（`meta.json` 的 `title`），没有就用首个用户消息。
     pub first_query: String,
 }
 

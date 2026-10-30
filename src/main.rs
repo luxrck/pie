@@ -714,7 +714,7 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
 ///
 /// **运维命令**：`file_id` 只能给人自己拼请求 / 排障用——它进不了会话（`read` 读图那条路是
 /// 工具产出 `Attachment::Model`、由 `Session::settle_output` 在消息构造前上传）。
-/// 所以这里既不写会话记录（`files list` 看不到它），也不落本地副本（`files gc` 碰不到它）。
+/// 所以这里既不写会话记录（`files list` 看不到它），也不落本地副本（`files rm` 不认它）。
 async fn files_upload(config: &config::Config, path: &std::path::Path, mime: Option<&str>) -> i32 {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -777,7 +777,7 @@ async fn files_upload(config: &config::Config, path: &std::path::Path, mime: Opt
         .unwrap_or_else(|| "永久".to_string());
     println!("{}  {}  {bytes} B  过期={expires}", uploaded.id, mime);
     println!(
-        "（只调了 Files API：不写会话记录，`files list` 不会列出它；`files gc --all` 会清掉云端全部上传件）"
+        "（只调了 Files API：不写会话记录，`files list` 不会列出它；`files rm <id> --all` 删的是它那种云端件）"
     );
     0
 }

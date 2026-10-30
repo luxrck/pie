@@ -569,7 +569,8 @@ pub fn hash_id(data: &[u8]) -> String {
 /// `img-<hash>` / `<前缀>-<hash>` / `chat-<秒>-<微秒>`（扩展名不算）。
 ///
 /// ⚠ 别拿它当 [`hash_of`] 用：主干是整个 id（带 `img-` 那截前缀），`hash_of` 才只取 hash 段。
-/// 消费方：图片副本的 id（`session.rs`，与 `__meta__.files` 的键同形）、会话列表的 id（`cli.rs`）。
+/// 消费方：图片副本的 id（`session.rs`，与 `Session.files` / `state.repl.images` 的键同形）、
+/// 会话列表的 id（`cli.rs`）。
 pub fn name_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -594,7 +595,7 @@ pub fn image_ext(mime: &str) -> &'static str {
 /// 从落盘路径取回 hash 段（[`Storage::store`] 那套命名的**逆运算**：`<前缀>-<hash>[.扩展名]`）。
 ///
 /// 落盘只给路径、不返回 id，要 hash 的地方（`raw_hash` 之类的元数据）就靠这个反推；
-/// 消费方：`session.rs` 的压缩流水（`__meta__.compaction_events`）与窗口块元数据。
+/// 消费方：`session.rs` 的压缩流水（`meta.json` 的 `compaction_events`）与窗口块元数据。
 pub fn hash_of(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())

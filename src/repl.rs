@@ -197,9 +197,9 @@ fn format_reply(
     max_bytes: Option<i64>,
 ) -> ToolOutput {
     // 图像附件：driver 出的是**临时** PNG（一小时后它自己会清），这里转存进内容寻址的本地副本
-    // 目录（`files/img-<hash>.png`）——会话 `__meta__.files` 记的 `local` 才立得住，`files gc`
-    // 也才认得出它还被引用（见 `Session::settle_output`）。读不到字节的（已被删掉的
-    // 临时图）直接跳过。
+    // 目录（`files/img-<hash>.png`）——副本落在那儿才能被 `-r` 的画布、`pie files list` 认出来
+    // （见 `Session::settle_output`：它把 `call_id → 路径` 记进 `meta["state"]["repl"].images`）。
+    // 读不到字节的（已被删掉的临时图）直接跳过。
     // 去向是 `Canvas`：**只给界面**（TUI 画布），模型看不到——模型自己知道它画了什么。
     let attachments: Vec<Attachment> = reply
         .images
