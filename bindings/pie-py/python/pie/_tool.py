@@ -16,7 +16,30 @@ import types
 from dataclasses import dataclass
 from typing import Any, Callable, Union, get_args, get_origin, get_type_hints, overload
 
-__all__ = ["Tool", "tool"]
+__all__ = ["SessionProxy", "Tool", "tool"]
+
+
+class SessionProxy:
+    """**标记类型**：工具函数把第一个位置参数标注成它，宿主就会把「当前会话的 `S`」递进来。
+
+    用法（插件里）：
+
+    ```python
+    from pie import SessionProxy, tool
+
+    @tool(description="…")
+    def remember(S: SessionProxy, text: str) -> str:
+        S.state.setdefault("items", []).append(text)   # 本会话 + 本工具的一份 dict
+        return "ok"
+    ```
+
+    ⚠ 它只用来**标注**：真正传进来的是宿主那边的代理对象（带 `state` / `cancel()` 等方法），
+    这个类本身不会被实例化。
+
+    ⚠ `import` 期（模块加载时）拿不到会话 —— 只有一次工具调用的**期间** `S` 才有内容。
+    """
+
+
 
 
 @dataclass
@@ -27,6 +50,9 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     handler: Callable[..., str]
+    #: 这个工具要会话代理（`S`）作第一个位置参数 —— 宿主据此决定调用 `handler(S, **kw)` 还是
+    #: `handler(**kw)`。老插件不声明就照旧（**零改动**）。
+    wants_s: bool = False
 
     def definition(self) -> dict[str, Any]:
         """OpenAI 线上形状的工具定义（与 `Registry.tool_specs()` 里那条同形）。"""
@@ -103,7 +129,28 @@ def tool(
             hints = {}
         props: dict[str, Any] = {}
         required: list[str] = []
+        wants_s = False
+        first_positional: str | None = None
         for pname, param in sig.parameters.items():
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ) and first_positional is None:
+                first_positional = pname
+            anno_of = hints.get(pname, param.annotation)
+            if anno_of is SessionProxy:
+                # 会话代理：**必须是第一个位置参数**（宿主按位置递），且不进 schema
+                if pname != first_positional:
+                    raise TypeError(
+                        f"{fn.__name__}: 会话代理必须是第一个位置参数（现在它在第 "
+                        f"{list(sig.parameters).index(pname) + 1} 位）"
+                    )
+                wants_s = True
+                continue
+            if pname == "S":
+                raise TypeError(
+                    f"{fn.__name__}: 参数 S 要标注成 `S: SessionProxy`（它由宿主注入，不是模型给的）"
+                )
             if pname in ("self", "cls") or pname.startswith("_"):
                 continue  # 下划线开头的参数是注入项，不进 schema
             if parameters and pname in parameters:
@@ -124,6 +171,7 @@ def tool(
             description=desc,
             parameters={"type": "object", "properties": props, "required": required},
             handler=fn,
+            wants_s=wants_s,
         )
 
     return decorate(direct) if direct is not None else decorate

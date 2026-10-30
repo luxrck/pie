@@ -344,6 +344,15 @@ async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
     if let Some(dir) = script.path.parent() {
         env.push(("PIE_PLUGIN_DIR".to_string(), dir.display().to_string()));
     }
+    // 会话身份：脚本要"跟着这次对话"记东西（或开子会话 `pie -s …`）时用它。
+    // ⚠ 目录**存在即建** —— 首次 `save` 之前它还不存在，直接给路径脚本会写失败。
+    if let Some(dir) = &ctx.session_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            crate::log::warn(format!("[shplugin] 建会话目录失败 {}: {e}", dir.display()));
+        }
+        env.push(("PIE_SESSION_ID".to_string(), crate::config::name_of(dir)));
+        env.push(("PIE_SESSION_DIR".to_string(), dir.display().to_string()));
+    }
 
     let mut child = match spawn_script(&script.path, &env, &argv) {
         Ok(child) => child,
@@ -357,10 +366,14 @@ async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
     };
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        // 完整 args 走 stdin（一行 compact JSON，写完立刻关）。脚本可以不读就退出 → 写入拿到
-        // EPIPE，那是「参数没被消费」，**不是失败**。
-        let json = Value::Object(payload).to_string();
-        let _ = stdin.write_all(json.as_bytes()).await;
+        // stdin = 一行 compact JSON：`{"args": {…}, "state": {…}}`（**契约 v3**）。
+        // `state` 是本会话该工具上次交回来的那份（没有就是 `{}`）。
+        // 脚本可以不读就退出 → 写入拿到 EPIPE，那是「参数没被消费」，**不是失败**。
+        let json = json!({
+            "args": Value::Object(payload),
+            "state": ctx.state.tool_states().get(&script.name).unwrap_or_else(|| json!({})),
+        });
+        let _ = stdin.write_all(json.to_string().as_bytes()).await;
         let _ = stdin.write_all(b"\n").await;
         drop(stdin);
     }
@@ -376,6 +389,18 @@ async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
             // （`Session::settle_output` 上传 → `file_id` 挂进这条 tool 消息）。脚本因此不需要
             // 知道 Files API 存在，模型也不必再 `read` 一遍截图。
             let (headers, body) = crate::header::split_header_body(&output);
+            // `state` 是**宿主消费的键**：取出来存进会话，再从正文里摘掉 —— 它不是给模型看的
+            // （工具的内部记账），留在头区模型每轮都会读到一遍。
+            let mut headers = headers;
+            let state_values: Vec<Value> = headers
+                .iter()
+                .filter(|(key, _)| key == "state")
+                .map(|(_, value)| value.clone())
+                .collect();
+            headers.retain(|(key, _)| key != "state");
+            if let Some(last) = state_values.last() {
+                ctx.state.tool_states().commit(&script.name, last.clone());
+            }
             let mut attachments = Vec::new();
             for (_, value) in headers.iter().filter(|(key, _)| key == "image") {
                 let paths: Vec<&str> = match value {
@@ -994,5 +1019,83 @@ mod tests {
         let spec = read_spec(&dir.join("ohos_vision.sh")).unwrap();
         assert_eq!(spec.name, "ohos_vision", "名字默认取文件名主干");
         assert_eq!(spec.timeout, 120, "schema 里的 timeout_seconds 要生效");
+    }
+    /// `state` 走**纯函数模型**：stdin 的 `{"args", "state"}` 进、头区 `state` 出 —— 宿主消费掉，
+    /// 模型看不到（那是工具的内部记账），第二次调用读得到上次写的那份。
+    #[tokio::test]
+    async fn state_round_trips_through_stdin_and_the_header() {
+        let fixture = Fixture::new("state");
+        fixture.script(
+            "counter.sh",
+            "#!/bin/sh\n# schema! {\n#   \"description\": \"数数\"\n# }\n\
+             seen=$(cat)\n\
+             printf 'header! { \"state\": {\"n\": 2} }\\n\\n'\n\
+             printf 'stdin=%s\\n' \"$seen\"\n",
+        );
+        let registry = fixture.registry(HashMap::new());
+        let state = Arc::new(crate::state::SessionState::default());
+        let ctx = || {
+            ToolCtx::with_cancel(
+                crate::cancel::Cancel::new(),
+                crate::config::Storage::at(&fixture.dir),
+                state.clone(),
+            )
+            .in_session(&fixture.dir.join("session"))
+        };
+
+        // 第一次：stdin 里的 state 是空的；交回来的那份落进会话槽
+        let out = registry
+            .dispatch("counter", &json!({"q": "x"}), ctx())
+            .await
+            .unwrap();
+        // `state` 被宿主摘掉 → 头区空（脚本自己把 stdin 打出来是它的事，见下面那条）
+        let text = out.to_text();
+        let (headers, body) = crate::header::split_header_body(&text);
+        assert!(
+            headers.is_empty(),
+            "state 是宿主消费的键，头区该是空的：{headers:?}"
+        );
+        assert!(body.contains("\"args\":{\"q\":\"x\"}"), "{body}");
+        assert_eq!(state.tool_states().get("counter"), Some(json!({"n": 2})));
+
+        // 第二次：stdin 里带上了上次的 state（脚本把 stdin 原样打出来，所以看得到）
+        let out = registry
+            .dispatch("counter", &json!({}), ctx())
+            .await
+            .unwrap();
+        let text = out.to_text();
+        let (_, body) = crate::header::split_header_body(&text);
+        assert!(
+            body.contains("\"state\":{\"n\":2}"),
+            "第二次的 stdin 该带上上次交回去的 state：{body}"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    /// `PIE_SESSION_ID` / `PIE_SESSION_DIR`：脚本要知道"这是哪个会话"（开子会话、写会话级文件）。
+    /// ⚠ 目录**存在即建** —— 首次 `save` 之前它本来不存在。
+    #[tokio::test]
+    async fn session_identity_is_exported_and_the_dir_exists() {
+        let fixture = Fixture::new("session-env");
+        fixture.script(
+            "who.sh",
+            "#!/bin/sh\n# schema! {\n#   \"description\": \"报身份\"\n# }\n\
+             printf 'id=%s\\n' \"$PIE_SESSION_ID\"\n\
+             [ -d \"$PIE_SESSION_DIR\" ] && echo dir=yes || echo dir=no\n",
+        );
+        let registry = fixture.registry(HashMap::new());
+        let out = registry
+            .dispatch("who", &json!({}), fixture.ctx())
+            .await
+            .unwrap();
+        let session_dir = fixture.dir.join("session");
+        assert!(
+            out.to_text()
+                .contains(&format!("id={}", crate::config::name_of(&session_dir))),
+            "{}",
+            out.to_text()
+        );
+        assert!(out.to_text().contains("dir=yes"), "{}", out.to_text());
+        let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 }

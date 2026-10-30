@@ -1258,26 +1258,11 @@ impl Session {
         if !self.compaction_events.is_empty() {
             meta["compaction_events"] = json!(self.compaction_events);
         }
-        // `state`：内置 `repl` + 插件工具的裸 JSON。空的部分不写（没跑过 repl 的会话
+        // `state`：内置 `repl` + 插件工具的裸 JSON。空的就整个不写（没跑过 repl 的会话
         // 不该多一个键）。`Session.files` **不落盘**：它是运行时缓存，能从 `GET /files` 重建。
-        let mut state = serde_json::Map::new();
-        let blocks = self.state.repl().snapshot();
-        let images = self.state.repl().images();
-        if !blocks.is_empty() || !images.is_empty() {
-            let mut repl = serde_json::Map::new();
-            if !blocks.is_empty() {
-                repl.insert("blocks".into(), json!(blocks));
-            }
-            if !images.is_empty() {
-                repl.insert("images".into(), json!(images));
-            }
-            state.insert("repl".into(), Value::Object(repl));
-        }
-        for (tool, value) in self.state.tool_states().snapshot() {
-            state.insert(tool, value);
-        }
-        if !state.is_empty() {
-            meta["state"] = Value::Object(state);
+        let state = state_object(&self.state);
+        if state.as_object().is_some_and(|o| !o.is_empty()) {
+            meta["state"] = state;
         }
         // **顺序纪律：先写可退化的派生层，最后写唯一真相。**
         //
@@ -1717,7 +1702,7 @@ impl Session {
         if self.registry.extensions().is_empty() {
             return;
         }
-        let ctx = json!({
+        let base = json!({
             "session_id": session_id,
             "session_path": self.path.display().to_string(),
             "cwd": std::env::current_dir()
@@ -1725,12 +1710,18 @@ impl Session {
                 .unwrap_or_default(),
             "model": self.config.model,
         });
+        let state = self.state.clone();
         for hook in self.registry.extensions().to_vec() {
             for kind in &hook.subscribe {
                 let hook = hook.clone();
-                let ctx = ctx.clone();
-                self.extensions
-                    .push(self.bus.on(kind, move |event| (hook.on_event)(event, &ctx)));
+                let base = base.clone();
+                let state = state.clone();
+                // `state` 按事件分级带：`tool_call` 带**该工具**那份、delta 不带（一轮上千帧）、
+                // 其余低频事件带全量 —— 见 `extension_ctx`。
+                self.extensions.push(self.bus.on(kind, move |event| {
+                    let ctx = extension_ctx(&base, event, &state);
+                    (hook.on_event)(event, &ctx)
+                }));
             }
         }
     }
@@ -1901,6 +1892,45 @@ fn meta_cwd(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join(META_FILE)).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     value.get("cwd").and_then(Value::as_str).map(str::to_string)
+}
+
+/// `meta["state"]` 那个 object（落盘与事件帧共用）：内置 `repl` + 插件工具的裸 JSON。
+fn state_object(state: &SessionState) -> Value {
+    let mut out = serde_json::Map::new();
+    let blocks = state.repl().snapshot();
+    let images = state.repl().images();
+    if !blocks.is_empty() || !images.is_empty() {
+        let mut repl = serde_json::Map::new();
+        if !blocks.is_empty() {
+            repl.insert("blocks".into(), json!(blocks));
+        }
+        if !images.is_empty() {
+            repl.insert("images".into(), json!(images));
+        }
+        out.insert("repl".into(), Value::Object(repl));
+    }
+    for (tool, value) in state.tool_states().snapshot() {
+        out.insert(tool, value);
+    }
+    Value::Object(out)
+}
+
+/// 事件帧里的 `ctx`：在静态事实之上按事件**分级**带 `state`。
+///
+/// - `tool_call` → 带**这次要调的那个工具**的 state（插件最常见的用法：调用前查一眼自己记的东西）；
+/// - `content_delta` / `reasoning_delta` → **不带**（一轮上千帧，每帧塞一份是纯浪费）；
+/// - 其余低频事件（`turn_start` / `turn_done` / `message` / `compacted` / …）→ 带全量。
+fn extension_ctx(base: &Value, event: &Event, state: &SessionState) -> Value {
+    let mut ctx = base.clone();
+    match event {
+        Event::Turn(TurnEvent::ToolCall { name, .. }) => {
+            ctx["state"] = state.tool_states().get(name).unwrap_or_else(|| json!({}));
+        }
+        Event::Turn(TurnEvent::ContentDelta { .. })
+        | Event::Turn(TurnEvent::ReasoningDelta { .. }) => {}
+        _ => ctx["state"] = state_object(state),
+    }
+    ctx
 }
 
 fn first_line(text: &str) -> Option<String> {

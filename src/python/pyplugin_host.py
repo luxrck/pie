@@ -48,6 +48,7 @@ import json
 import os
 import sys
 import threading
+import types
 
 # 协议输出：dup 一份**原始** stdout（后面就把 sys.stdout 换成 stderr）
 _PROTOCOL = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
@@ -84,9 +85,13 @@ class _Proxy:
     方法白名单就是会话自己那批公开操作（不另造 API）。
     """
 
-    def __init__(self, ctx):
+    def __init__(self, ctx, state=None, readonly=False):
         self.__dict__.update(ctx or {})
         self.__dict__["_session"] = (ctx or {}).get("session_id", "")
+        # `state` 是**本会话 + 本工具**的 dict（形状由工具自己定）；事件里给只读视图。
+        self.__dict__["state"] = (
+            types.MappingProxyType(state or {}) if readonly else dict(state or {})
+        )
 
     def _act(self, method, **args):
         return _call(self._session, method, args)
@@ -183,10 +188,20 @@ def _load(path, index):
     return module
 
 
-def _run(tool_obj, rid, kwargs, lock):
-    """一次工具调用（跑在线程池里；async handler 丢给后台 loop 跑完再交回来）。"""
+def _run(tool_obj, rid, kwargs, lock, session, state):
+    """一次工具调用（跑在线程池里；async handler 丢给后台 loop 跑完再交回来）。
+
+    `state` 是**本会话 + 本工具**的那份 dict（上次调用结束时交回去的）：声明了
+    `S: SessionProxy` 的工具拿到它、改它，**这次调用返回时整份交回**（Rust 侧写进
+    `meta["state"][<工具名>]`）。没声明 `S` 的老工具一点都感觉不到。
+    """
+    proxy = _Proxy({"session_id": session}, state) if tool_obj.wants_s else None
     try:
-        out = tool_obj.handler(**kwargs)
+        out = (
+            tool_obj.handler(proxy, **kwargs)
+            if proxy is not None
+            else tool_obj.handler(**kwargs)
+        )
         if inspect.isawaitable(out):  # async handler（或者同步 handler 返回了协程）
             out = asyncio.run_coroutine_threadsafe(out, _LOOP).result()
     except BaseException as e:  # 含 sys.exit()：工具怎么炸都不该带走宿主
@@ -201,7 +216,11 @@ def _run(tool_obj, rid, kwargs, lock):
             lock,
         )
         return
-    _emit({"id": rid, "text": out}, lock)
+    reply = {"id": rid, "text": out}
+    if proxy is not None:
+        # 声明了 S = 认领了 state：整份交回（没改也交，覆盖是幂等的）
+        reply["state"] = proxy.state
+    _emit(reply, lock)
 
 
 def _run_event(event, ctx, rid, lock):
@@ -211,9 +230,11 @@ def _run_event(event, ctx, rid, lock):
     """
     reason = None
     kind = event.get("type") if isinstance(event, dict) else None
+    state = (ctx or {}).get("state") or {}
     for fn in SESSION.handlers.get(kind, []):
         try:
-            out = fn(event, _Proxy(ctx))
+            # ⚠ 签名是 `fn(S, event)`：`S` 永远在第一位（与工具一致）；事件里 `S.state` 只读。
+            out = fn(_Proxy(ctx, state, readonly=True), event)
         except BaseException as e:  # 插件自己出错：告警 + 当通过（fail-open）
             print("插件处理 %s 时抛异常: %s: %s" % (kind, type(e).__name__, e), file=sys.stderr)
             continue
@@ -297,7 +318,15 @@ def _main():
                 lock,
             )
             continue
-        pool.submit(_run, tool_obj, rid, kwargs, lock)
+        pool.submit(
+            _run,
+            tool_obj,
+            rid,
+            kwargs,
+            lock,
+            request.get("session"),
+            request.get("state"),
+        )
 
 
 _main()

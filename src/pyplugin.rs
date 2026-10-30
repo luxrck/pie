@@ -237,13 +237,28 @@ async fn call(host: &PyHost, tool: &str, args: Value, ctx: ToolCtx) -> ToolResul
         ),
         None => (None, None),
     };
-    let payload = json!({"tool": tool, "arguments": args});
+    // 帧里带**会话身份**与该工具当前的 `state`：宿主据此初始化 `S`（`S.session_id` 也能用，
+    // 工具要开子会话时得知道父是谁）。没有会话语境（单测）就不带。
+    let session = ctx.session_dir.as_deref().map(crate::config::name_of);
+    let state = ctx.state.tool_states().get(tool);
+    let payload = json!({
+        "tool": tool,
+        "arguments": args,
+        "session": session,
+        "state": state,
+    });
     match host
         .request(payload, ctx.cancel.as_ref(), None, Interrupt::Kill)
         .await
     {
         Ok(Outcome::Reply(value)) => match serde_json::from_value::<Reply>(value) {
-            Ok(reply) => reply.into_result(&ctx, max_lines, max_bytes),
+            Ok(reply) => {
+                // 交回来的 state 先落进会话槽，再转成工具结果（顺序无关，只是别丢了）
+                if let Some(state) = &reply.state {
+                    ctx.state.tool_states().commit(tool, state.clone());
+                }
+                reply.into_result(&ctx, max_lines, max_bytes)
+            }
             Err(e) => Err(ToolError(format!("[pyplugin] 应答不是预期的形状: {e}"))),
         },
         // 取消 = 杀掉整个进程组（在飞的含本次一起失败，下次调用懒重启）——
@@ -334,6 +349,10 @@ struct Reply {
     text: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    /// 工具交回来的 `S.state`（**只有声明了 `S` 的工具才会带**）：整份写进
+    /// `meta["state"][<工具名>]`。形状由工具自己定，这里不解释。
+    #[serde(default)]
+    state: Option<Value>,
 }
 
 impl Reply {
@@ -378,7 +397,7 @@ mod tests {
     /// 一个**插件**（不是工具）：只订阅 `tool_call`，含 `rm ` 就否决。
     /// 理由里带上 `S.session_id` —— 证明帧里的 `ctx`（会话身份）也到位了。
     const PLUGIN: &str = r#"
-def no_rm(ev, S):
+def no_rm(S, ev):
     if ev["name"] == "bash" and "rm " in ev["arguments"]["command"]:
         return "策略拒绝：检测到 rm（来自插件 %s）" % S.session_id
     return None
@@ -536,7 +555,7 @@ def loud() -> str:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_plugin_can_act_on_the_session() {
         const ACTOR: &str = r#"
-def stop(ev, S):
+def stop(S, ev):
     S.cancel()          # 立即档：不碰 &mut Session → 当场生效
     return None
 
@@ -573,7 +592,7 @@ session.on("tool_call", stop)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_plugin_can_queue_an_action_that_lands_at_the_apply_point() {
         const SETTER: &str = r#"
-def switch(ev, S):
+def switch(S, ev):
     S.set_model("from-plugin")      # 排队档：要 &mut self → 等 apply point
     return None
 
@@ -1037,5 +1056,50 @@ def fine() -> str:
         assert_eq!(one.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// **`S` 是第一个位置参数**：读得到上次交回去的 `state`，这次写进去的调用结束就落进会话槽
+    /// （`meta["state"][<工具名>]`），下一次调用再递回来。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_python_tool_reads_and_writes_its_state() {
+        const TOOL: &str = r#"
+from pie import SessionProxy, tool
+
+@tool(description="数一数被调了几次（会话级）")
+def counter(S: SessionProxy) -> str:
+    seen = S.state.get("n", 0) + 1
+    S.state["n"] = seen
+    return str(seen)
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("state", TOOL);
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
+        // 同一个 `SessionState` 跨两次调用（生产里就是会话自己那一份）
+        let state = Arc::new(crate::state::SessionState::default());
+        let ctx = |cancel| {
+            ToolCtx::with_cancel(
+                cancel,
+                crate::config::Storage::at(fixture.dir.join("storage")),
+                state.clone(),
+            )
+            .in_session(&fixture.dir.join("session"))
+        };
+
+        let out = registry
+            .dispatch("counter", &json!({}), ctx(crate::cancel::Cancel::new()))
+            .await
+            .expect("counter");
+        assert_eq!(out.to_text(), "1");
+        assert_eq!(
+            state.tool_states().get("counter"),
+            Some(json!({"n": 1})),
+            "声明了 S 的工具：调用结束时把 state 交回来"
+        );
+
+        let out = registry
+            .dispatch("counter", &json!({}), ctx(crate::cancel::Cancel::new()))
+            .await
+            .expect("counter");
+        assert_eq!(out.to_text(), "2", "第二次读到了上次那份");
+        let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 }

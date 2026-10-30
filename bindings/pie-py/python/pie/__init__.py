@@ -73,7 +73,7 @@ from ._pie_rs import (
     version,
 )
 
-from ._tool import Tool, tool
+from ._tool import SessionProxy, Tool, tool
 
 __all__ = [
     "Cancel",
