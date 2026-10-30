@@ -241,9 +241,11 @@ def test_config_defaults_and_repr_masks_key():
     assert cfg.compaction is True
     cfg.compaction = False
     assert cfg.compaction is False
-    # api_key 不许整串漏进 repr
+    # api_key 不许整串漏进 repr（默认是**空串** → 空串当然“包含于”任何字符串，得先有 key 才谈泄漏）
+    assert cfg.api_key == "", "默认不内置 key"
+    cfg.api_key = "sk-1234567890abcdef"
     assert cfg.api_key not in repr(cfg)
-    assert "…" in repr(cfg)
+    assert "sk-1" in repr(cfg) and "…" in repr(cfg)
 
 
 def test_exception_hierarchy():

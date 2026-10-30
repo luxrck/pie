@@ -21,7 +21,10 @@ default = ["asyncio"]
 asyncio = ["dep:pyo3-async-runtimes"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+# `abi3-py39`：走 CPython 的**稳定 ABI**（M4）—— 一条 `cp39-abi3` wheel 覆盖 3.9 及以上的所有
+# CPython（不含 free-threading 的 `cp3XXt`，那要另出）。代价：只能用 `Py_LIMITED_API` 白名单里的
+# C API，PyO3 在编译期把关。
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 # 核心库：**default-features = false** → 不把 TUI（ratatui / crossterm / arboard…）编进来。
 pie = { path = "../..", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
