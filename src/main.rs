@@ -219,6 +219,8 @@ async fn run(cli: Cli) -> i32 {
                 &config.storage,
                 if *all { None } else { Some(*limit) },
                 *json,
+                // `--all` 连子会话（工具开的）一起列
+                *all,
             ),
         };
     }
@@ -496,8 +498,13 @@ fn setup_main(cli: &Cli) -> i32 {
 }
 
 /// `pie sessions`：列出历史会话。
-fn sessions_main(storage: &config::Storage, limit: Option<usize>, json: bool) -> i32 {
-    let rows = cli::list_sessions(storage, limit);
+fn sessions_main(
+    storage: &config::Storage,
+    limit: Option<usize>,
+    json: bool,
+    include_children: bool,
+) -> i32 {
+    let rows = cli::list_sessions(storage, limit, include_children);
     if json {
         let values: Vec<Value> = rows
             .iter()
@@ -949,7 +956,13 @@ fn open_session(
                 path.display()
             ));
         }
-        return Session::load(&path, config, llm, registry);
+        let mut session = Session::load(&path, config, llm, registry)?;
+        // **接管**：显式打开的如果是工具开的子会话，就把它变回普通会话 —— 否则用户接着聊的
+        // 这条永远进不了 `-r`（`latest_in` 跳过有 `parent` 的）。
+        if session.parent.take().is_some() {
+            pie::log::warn("这是工具开的子会话：已接管，从现在起按普通会话保存");
+        }
+        return Ok(session);
     }
     Ok(Session::new(config, id.as_deref(), llm, registry))
 }

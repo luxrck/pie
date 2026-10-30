@@ -30,11 +30,25 @@ pub struct SessionInfo {
     pub first_query: String,
 }
 
+/// 读 `<dir>/meta.json` 里的 `parent`（`None` = 主会话 / 读不出来）。
+fn meta_parent(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("parent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// 列出历史会话（按 `messages.jsonl` 的 mtime 降序；`limit = None` = 全部）。
 ///
 /// ⚠ **mtime 取 `messages.jsonl`**，不能取会话目录：目录只在增删条目时变，改文件内容不动它。
 /// 没有 `messages.jsonl` 的目录跳过（`save` 两次 rename 之间崩掉的残留）。
-pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<SessionInfo> {
+pub fn list_sessions(
+    storage: &config::Storage,
+    limit: Option<usize>,
+    include_children: bool,
+) -> Vec<SessionInfo> {
     let Ok(entries) = std::fs::read_dir(storage.sessions()) else {
         return Vec::new();
     };
@@ -43,6 +57,8 @@ pub fn list_sessions(storage: &config::Storage, limit: Option<usize>) -> Vec<Ses
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
+        // 子会话（`meta.parent` 非空 = 某个工具开的）默认不列：它们不是"跟用户的对话"
+        .filter(|p| include_children || meta_parent(p).is_none())
         .filter_map(|dir| {
             let meta = dir.join("messages.jsonl").metadata().ok()?;
             let mtime = meta.modified().ok()?;
@@ -138,7 +154,7 @@ mod tests {
         // 没有 messages.jsonl 的目录 = 崩溃残留 → 跳过
         std::fs::create_dir_all(storage.session_dir("half-saved")).unwrap();
 
-        let rows = list_sessions(&storage, None);
+        let rows = list_sessions(&storage, None, false);
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["b", "a"], "按时间倒序、跳过没有 messages 的目录");
         assert_eq!(rows[0].first_query, "后的");

@@ -23,6 +23,7 @@ __all__ = [
     "Registry",
     "arun",
     "list_sessions",
+    "session_dir",
     "run",
     "version",
 ]
@@ -331,8 +332,18 @@ class Subscription:
 
 class Session:
     @staticmethod
-    def new(config: Config, llm: LlmClient, tools: Registry, id: str | None = ...) -> Session:
-        """新建会话（落盘，`save()` 时写文件）。"""
+    def new(
+        config: Config,
+        llm: LlmClient,
+        tools: Registry,
+        id: str | None = ...,
+        parent: str | None = ...,
+    ) -> Session:
+        """新建会话（落盘，`save()` 时写文件）。
+
+        `parent` 给父会话 id → 写进 `meta.parent`：`sessions -l` 与 `-r` 会跳过它
+        （工具开的**子会话**与主会话平级，但不抢 `-r`、不进列表）。
+        """
 
     @staticmethod
     def ephemeral(config: Config, llm: LlmClient, tools: Registry) -> Session:
@@ -469,6 +480,9 @@ def arun(
     """`run` 的**异步**版：语义一样（一次性、无会话、不落盘），返回可 await 的对象。
 
     不绕线程（回合跑在进程级 runtime 上）；⚠ 要求调用时处于运行中的 asyncio loop。"""
+
+def session_dir(id: str) -> str:
+    """一个会话 id 对应的**目录**（`<数据根>/sessions/<id>/`；不一定存在，首次 save 才建）。"""
 
 def list_sessions(limit: int | None = ...) -> list[SessionRow]:
     """历史会话（按 mtime 降序；`limit=None` = 全部）。"""

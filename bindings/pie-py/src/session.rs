@@ -145,12 +145,23 @@ impl PySession {
 
 #[pymethods]
 impl PySession {
-    /// 新建会话：`id` 给纯名字 → `~/.pie/sessions/<id>.jsonl`（带目录 / 绝对路径则原样）。
+    /// 新建会话：`id` 给纯名字 → `~/.pie/sessions/<id>/`（带目录 / 绝对路径则原样）。
+    ///
+    /// `parent` 给父会话 id → 写进 `meta.parent`：`sessions -l` 与 `-r` 会跳过它
+    /// （工具开的**子会话**与主会话平级，但不该抢 `-r`、也不该出现在列表里）。
     #[staticmethod]
-    #[pyo3(signature = (config, llm, tools, id=None))]
-    fn new(config: &PyConfig, llm: &PyLlmClient, tools: &PyRegistry, id: Option<&str>) -> Self {
+    #[pyo3(signature = (config, llm, tools, id=None, parent=None))]
+    fn new(
+        config: &PyConfig,
+        llm: &PyLlmClient,
+        tools: &PyRegistry,
+        id: Option<&str>,
+        parent: Option<&str>,
+    ) -> Self {
         let (core_config, llm, tools) = Self::build(config, llm, tools);
-        Self::wrap(CoreSession::new(&core_config, id, llm, tools))
+        let mut session = CoreSession::new(&core_config, id, llm, tools);
+        session.parent = parent.map(str::to_string);
+        Self::wrap(session)
     }
 
     /// 临时会话：**不落盘、不写压缩 manifest**（一次性任务 / notebook / 服务用）。

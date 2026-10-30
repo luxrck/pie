@@ -87,8 +87,13 @@ pub struct Session {
     pub files: HashMap<String, ImageEntry>,
     /// `files` 是否已跟服务端同步过（一次会话一次；失败也置位，别每条消息都试）。
     files_synced: bool,
-    /// 会话标题 = 首个用户输入的首行（写进 `__meta__.title`）。
+    /// 会话标题 = 首个用户输入的首行（写进 `meta["title"]`）。
     pub title: Option<String>,
+    /// **父会话 id**（`meta["parent"]`）：`Some` = 这是某个工具开的子会话。
+    ///
+    /// 与主会话**平级**（都在 `sessions/` 下）——`sessions -l` 与 `-r` 按它过滤，
+    /// `pie -s <子会话>` 显式打开时清空 = **接管**（从此是正常会话）。
+    pub parent: Option<String>,
     /// 用户消息条数（载入时按历史重算）。
     pub turn_count: usize,
     /// 启动时拉取的可用模型 id（`/model` 的候选；**不持久化**）。
@@ -261,6 +266,10 @@ impl Session {
         }
         session.title = meta
             .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        session.parent = meta
+            .get("parent")
             .and_then(Value::as_str)
             .map(str::to_string);
         session.windows = meta
@@ -1255,6 +1264,9 @@ impl Session {
         if let Some(t) = &self.title {
             meta["title"] = json!(t);
         }
+        if let Some(parent) = &self.parent {
+            meta["parent"] = json!(parent);
+        }
         if !self.compaction_events.is_empty() {
             meta["compaction_events"] = json!(self.compaction_events);
         }
@@ -1677,6 +1689,7 @@ impl Session {
             files: HashMap::new(),
             files_synced: false,
             title: None,
+            parent: None,
             turn_count: 0,
             available_models: None,
             bus: EventBus::new(),
@@ -1870,6 +1883,7 @@ fn latest_in(dir: &Path, cwd: Option<&str>) -> Option<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
+        .filter(|p| meta_parent(p).is_none()) // **子会话不参与 `-r`**（否则它一跑就抢走 resume）
         .filter_map(|session| {
             let messages = session.join(MESSAGES_FILE);
             let mtime = messages.metadata().ok()?.modified().ok()?;
@@ -1885,6 +1899,16 @@ fn latest_in(dir: &Path, cwd: Option<&str>) -> Option<PathBuf> {
         return Some(path.clone());
     }
     dirs.first().map(|(_, p)| p.clone())
+}
+
+/// 读 `<dir>/meta.json` 里的 `parent`（`None` = 主会话）。
+fn meta_parent(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(META_FILE)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("parent")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// 读 `<dir>/meta.json` 里的 `cwd`（旧会话 / 没写过 → None）。

@@ -315,6 +315,18 @@ fn arun(
 /// 列出历史会话（按 mtime 降序）：`[{id, file, mtime, size, turns, api_calls, first_query}]`。
 ///
 /// 键名与 CLI `pie sessions --json` 一致。`limit=None` = 全部。
+/// 一个会话 id 对应的**目录**（`<数据根>/sessions/<id>/`）。
+///
+/// 要与 `Session.new(id=…)` / `Session.load(path)` 配合用时（例：判断子会话是否已存在）。
+/// 目录不一定存在（首次 `save` 才建）。
+#[pyfunction]
+fn session_dir(id: &str) -> String {
+    pie::config::Storage::default()
+        .session_dir(id)
+        .display()
+        .to_string()
+}
+
 #[pyfunction]
 #[pyo3(signature = (limit=None))]
 fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {
@@ -322,7 +334,8 @@ fn list_sessions(py: Python<'_>, limit: Option<usize>) -> PyResult<Py<PyAny>> {
     let list = PyList::empty(py);
     // 与 CLI 同口径：走默认数据根（`PIE_HOME` → `./.pie` → `~/.pie`）
     let storage = pie::config::Storage::default();
-    for r in pie::cli::list_sessions(&storage, limit) {
+    // 绑定的 `list_sessions()` 只列主会话（与 CLI 默认一致；子会话是工具的内部对话）
+    for r in pie::cli::list_sessions(&storage, limit, false) {
         let d = PyDict::new(py);
         d.set_item("id", r.id)?;
         d.set_item("file", r.path.display().to_string())?;
@@ -349,6 +362,7 @@ fn _pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "asyncio")]
     m.add_function(wrap_pyfunction!(arun, m)?)?;
     m.add_function(wrap_pyfunction!(list_sessions, m)?)?;
+    m.add_function(wrap_pyfunction!(session_dir, m)?)?;
     m.add_function(wrap_pyfunction!(crate::llm::llm, m)?)?;
     #[cfg(feature = "asyncio")]
     m.add_function(wrap_pyfunction!(crate::llm::allm, m)?)?;

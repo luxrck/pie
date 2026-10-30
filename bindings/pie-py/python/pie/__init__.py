@@ -69,6 +69,7 @@ from ._pie_rs import (
     arun,
     list_sessions,
     llm,
+    session_dir,
     run,
     version,
 )
@@ -90,6 +91,7 @@ __all__ = [
     "allm",
     "arun",
     "list_sessions",
+    "session_dir",
     "llm",
     "run",
     "tool",
