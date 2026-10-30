@@ -3586,6 +3586,21 @@ mod tests {
         // 都不匹配 → 取 mtime 最新
         let s = Session::resume_in(&dir, Some("/nope"), &config, llm(), registry()).unwrap();
         assert_eq!(s.title.as_deref(), Some("other-cwd"));
+
+        // 更新的**子会话**（有 `parent`）不参与 `-r`：否则工具每跑一次就把用户上次的对话挤掉
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let child = dir.join("child");
+        write_session(
+            &child,
+            json!({"usage": {"calls": 1}, "windows": [], "cwd": "/nope", "parent": "b"}),
+            &[json!({"role": "user", "content": "子任务"})],
+        );
+        let s = Session::resume_in(&dir, Some("/nope"), &config, llm(), registry()).unwrap();
+        assert_eq!(
+            s.title.as_deref(),
+            Some("other-cwd"),
+            "子会话不该抢走 resume"
+        );
         assert_eq!(s.path, other_cwd);
         // 空目录 → 报错不 panic
         let empty = std::env::temp_dir().join(format!("pie-sessempty-{}", std::process::id()));
