@@ -140,18 +140,17 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum FilesAction {
-    /// 列出图片记录（默认：本地会话记录；加 --all 改列云端）
+    /// 列出本地图片副本（加 --all 改列云端上传件）
     List {
         /// 调 Files API 列出服务端本账号的全部上传件
         #[arg(long)]
         all: bool,
     },
-    /// 回收本地副本（加 --delete 真删；加 --all 另清空云端）
-    Gc {
-        /// 真正删除未引用副本
-        #[arg(long)]
-        delete: bool,
-        /// 调 Files API 清空服务端本账号的全部上传件
+    /// 删掉一张图的本地副本（加 --all 连云端那份一起删）
+    Rm {
+        /// 图片 id（`files list` 第一列，形如 `img-3f9a…`）
+        id: String,
+        /// 连服务端那份一起删（之后那条历史里的图会降级成占位文本）
         #[arg(long)]
         all: bool,
     },
@@ -661,61 +660,45 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             if *all {
                 return files_remote_list(config).await;
             }
-            let rows = cli::iter_session_files(&config.storage.sessions());
+            // **以磁盘为准**：`files/` 下有什么就列什么（会话里不再存图片账本）
+            let dir = config.storage.files();
+            let mut rows: Vec<(String, u64)> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("img-"))
+                        .unwrap_or(false)
+                })
+                .map(|p| {
+                    let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+                    (
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        size,
+                    )
+                })
+                .collect();
+            rows.sort();
             if rows.is_empty() {
-                println!(
-                    "暂无图片记录（会话 __meta__.files 为空；副本目录 {}）",
-                    config.storage.files().display()
-                );
+                println!("本地没有图片副本（{}）", dir.display());
                 return 0;
             }
-            for (session_file, image_hash, entry) in rows {
-                let size = entry.get("size").and_then(Value::as_i64).unwrap_or(0);
-                let mime = entry.get("mime").and_then(Value::as_str).unwrap_or("?");
-                let local = entry.get("local").and_then(Value::as_str).unwrap_or("");
-                let local_name = std::path::Path::new(local)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                println!("{image_hash}  {size:>10} B  {mime}  {local_name}");
-                let file_id = entry.get("file_id").and_then(Value::as_str);
-                let expires = entry.get("expires_at").and_then(Value::as_f64);
-                let expires_txt = match expires {
-                    Some(t) if t > 0.0 => config::fmt_local(t as i64),
-                    // 没记有效期 = 服务端永久件；`repl` 出的是纯本地图（从不上传）→ 谈不上过期
-                    None if file_id.is_some() => "永久".to_string(),
-                    _ => "-".to_string(),
-                };
+            for (name, size) in rows {
                 println!(
-                    "    file_id={}  过期={expires_txt}  源={}",
-                    file_id.unwrap_or("-"),
-                    entry.get("src").and_then(Value::as_str).unwrap_or("")
+                    "{}  {:>10} B",
+                    name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s),
+                    size
                 );
-                println!("    会话={}", session_stem(&session_file));
             }
             0
         }
-        FilesAction::Gc { delete, all } => {
-            let garbage = cli::collect_file_garbage(&config.storage, cli::GC_PROTECT_HOURS);
-            println!(
-                "可回收的本地副本 {} 个（未被任何会话引用、且已放置超过 {} 小时）:",
-                garbage.len(),
-                cli::GC_PROTECT_HOURS
-            );
-            for path in &garbage {
-                println!("  {}", path.display());
-            }
-            if *delete {
-                for path in &garbage {
-                    let _ = std::fs::remove_file(path);
-                }
-                println!("已删除 {} 个文件", garbage.len());
-            }
-            if *all {
-                return files_gc_remote(config).await;
-            }
-            0
-        }
+        FilesAction::Rm { id, all } => files_rm(config, id, *all).await,
         FilesAction::Upload { path, mime } => files_upload(config, path, mime.as_deref()).await,
     }
 }
@@ -812,9 +795,8 @@ async fn files_remote_list(config: &config::Config) -> i32 {
         println!("服务端没有上传件（云端为空）");
         return 0;
     }
-    let index = cli::file_id_index(&config.storage);
     println!(
-        "服务端上传件 {} 个（云端那份；本地记录见不带 --all 的 `pie files list`）:",
+        "服务端上传件 {} 个（云端那份；本地副本见不带 --all 的 `pie files list`）:",
         files.len()
     );
     for f in files {
@@ -832,18 +814,48 @@ async fn files_remote_list(config: &config::Config) -> i32 {
             .expires_at
             .map(config::fmt_local)
             .unwrap_or_else(|| "永久".into());
-        let sessions = index
-            .get(&f.id)
-            .map(|v| v.join("、"))
-            .unwrap_or_else(|| "未记录".into());
-        println!("    上传={created}  过期={expires}  会话={sessions}");
+        println!("    上传={created}  过期={expires}");
     }
     0
 }
 
-/// `pie files gc --all`：调 Files API 清空服务端上传件（本地副本 / 会话记录不动）。
-/// 单个删除失败不中断，有失败返回 1。
-async fn files_gc_remote(config: &config::Config) -> i32 {
+/// `pie files rm <id> [--all]`：删一张图的本地副本（`--all` 连云端那份一起删）。
+///
+/// - **默认只删本地**：无害 —— 历史里那条 tool 消息的 `file` 块带的是 `file_id`，服务端那份还在；
+///   下次同图 `read` 会从源文件重新落一份副本（内容寻址，幂等）。唯一的损失是源文件没了时的那份备份。
+/// - **`--all` 连云端一起删**：`file_id` 失效 → 下一条请求 400 → `downgrade_file_blocks` 把历史里的
+///   图就地降级成占位文本（回合继续，自愈，但模型从此看不到那张图）。**这会改变历史效果**。
+async fn files_rm(config: &config::Config, id: &str, all: bool) -> i32 {
+    // 本地：`files/<id>.<ext>`（扩展名由内容定，同 id 只有一个）
+    let dir = config.storage.files();
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if stem != id {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    println!("已删除本地副本 {}", path.display());
+                }
+                Err(e) => eprintln!("删除失败 {}: {e}", path.display()),
+            }
+        }
+    }
+    if !all {
+        if removed == 0 {
+            eprintln!("{id} 没有本地副本（`pie files list` 看现有的）");
+            return 1;
+        }
+        return 0;
+    }
+    // 云端：按文件名反查（我们上传的名字就是 `img-<hash><ext>`）
     let client = match files_client(config) {
         Ok(c) => c,
         Err(e) => {
@@ -859,30 +871,29 @@ async fn files_gc_remote(config: &config::Config) -> i32 {
         }
     };
     let mut deleted = 0usize;
-    let mut failed = 0usize;
     for f in &files {
+        let stem = f
+            .filename
+            .as_deref()
+            .and_then(|n| n.rsplit_once('.').map(|(s, _)| s))
+            .unwrap_or_default();
+        if stem != id {
+            continue;
+        }
         match client.delete_file(&f.id).await {
             Ok(()) => {
                 deleted += 1;
-                println!(
-                    "  已删除 {}  {}",
-                    f.id,
-                    f.filename.clone().unwrap_or_else(|| "?".into())
-                );
+                println!("已删除云端上传件 {}（{}）", f.id, stem);
             }
-            Err(e) => {
-                failed += 1;
-                eprintln!("  删除失败 {}: {e}", f.id);
-            }
+            Err(e) => eprintln!("删除失败 {}: {e}", f.id),
         }
     }
-    println!("服务端上传件：已删除 {deleted} 个");
-    if failed > 0 {
-        eprintln!("{failed} 个删除失败（见 stderr）");
-        1
-    } else {
-        0
+    if deleted == 0 {
+        eprintln!("服务端没有 {id} 对应的上传件");
+        return 1;
     }
+    println!("（历史里引用它的图会在下一次请求 400 后就地降级成占位文本）");
+    0
 }
 
 /// 建一个调 Files API 的客户端（不可逆操作前先把「打到哪个账号」写清楚：多套配置时看得出来）。
@@ -901,13 +912,6 @@ fn files_client(config: &config::Config) -> Result<LlmClient, String> {
         .collect();
     println!("Files API: {}  key=…{tail}", config.base_url);
     LlmClient::new(config).map_err(|e| e.to_string())
-}
-
-/// `file_id` → 记着它的会话名（给 `list --all` 标注用）。
-fn session_stem(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 /// 打开会话：`--resume` 恢复最近的；`--session <id|路径>` 已存在则载入、否则新建。

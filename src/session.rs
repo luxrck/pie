@@ -13,7 +13,7 @@
 //!
 //! 文件名用 `chat-<unix 秒>-<微秒>.jsonl`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -27,7 +27,7 @@ use crate::cancel::{CANCEL_TEXT, Cancel};
 use crate::config::{self, Config};
 use crate::context;
 use crate::llm::{
-    self, ChunkEvent, Compaction, Content, Delivered, LlmClient, LlmError, LlmResult, Message,
+    ChunkEvent, Compaction, Content, Delivered, LlmClient, LlmError, LlmResult, Message,
     RequestOptions, ToolCall, UsageTracker,
 };
 use crate::state::{REPL_BLOCK_MAX_CHARS, ReplBlock, SessionState};
@@ -82,8 +82,11 @@ pub struct Session {
     pub usage: UsageTracker,
     /// 历史窗口块（会话级压缩产出，写进 `__meta__.windows`）。
     pub windows: Vec<PathBuf>,
-    /// 图片 id 表：`hash_id` → 上传记录（写进 `__meta__.files`；见 `llm::ImageStore`）。
-    pub files: HashMap<String, Value>,
+    /// 图片上传缓存：`hash_id`（`img-<hash>`）→ 上传件。**运行时数据、不落盘** ——
+    /// 能从 `GET /files` 重建（见 [`Session::sync_files`]），丢了只是重传一次。
+    pub files: HashMap<String, ImageEntry>,
+    /// `files` 是否已跟服务端同步过（一次会话一次；失败也置位，别每条消息都试）。
+    files_synced: bool,
     /// 会话标题 = 首个用户输入的首行（写进 `__meta__.title`）。
     pub title: Option<String>,
     /// 用户消息条数（载入时按历史重算）。
@@ -281,15 +284,12 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
-        // 图片 id 表（hash_id → 上传记录）
-        session.files = meta
-            .get("files")
-            .and_then(Value::as_object)
-            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        // 解释器代码块日志（与那节 system prompt 同源；坏条目单独丢）——它住在会话状态槽里
-        let blocks: Vec<ReplBlock> = meta
-            .get("repl_blocks")
+        // `state`：内置 `repl`（代码块 + 画布图索引）+ 插件工具的裸 JSON。
+        // 每条**各自解析**：一条坏了只丢那一条，不连坐（`meta.json` 是整份 JSON，解析一次全有）。
+        let state = meta.get("state").cloned().unwrap_or_else(|| json!({}));
+        let repl = state.get("repl").cloned().unwrap_or_else(|| json!({}));
+        let blocks: Vec<ReplBlock> = repl
+            .get("blocks")
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
@@ -297,7 +297,28 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
-        session.state.repl_blocks().load(blocks);
+        let images: BTreeMap<String, Vec<String>> = repl
+            .get("images")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .map(|(call, paths)| {
+                        let paths = paths
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (call.clone(), paths)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        session.state.repl().load(blocks, images);
+        session.state.tool_states().load(&state);
 
         let messages_path = dir.join(MESSAGES_FILE);
         let text = fs::read_to_string(&messages_path)
@@ -909,18 +930,11 @@ impl Session {
                     if !self.config.vision {
                         continue;
                     }
-                    if self.config.files_api {
-                        let filename = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let src = path.to_string_lossy().into_owned();
-                        if let Some(file_id) =
-                            self.ensure_image_file(&data, mime, &filename, &src).await
-                        {
-                            delivered.push(Delivered::File { file_id });
-                            continue;
-                        }
+                    if self.config.files_api
+                        && let Some(file_id) = self.ensure_image_file(&data, mime).await
+                    {
+                        delivered.push(Delivered::File { file_id });
+                        continue;
                     }
                     // 没有 Files API（关掉或上传失败）→ 内联 base64
                     if data.len() <= INLINE_MAX_BYTES {
@@ -943,40 +957,16 @@ impl Session {
                 // （`hash → entry` 本身没有调用维度）。
                 // 与 `read` 那条路共用同一张表（同内容 = 同 hash）→ **按字段合并**：已有的
                 // `file_id` / `base_url` 等照旧留着，只补自己这几项。
+                // `repl` 画布图（只给界面看，模型看不到）→ `state.repl.images`：
+                // `call_id → 本地路径`，`-r` 之后画布靠它把图配回那次调用。
+                // 它**不上传**，所以不属于 `Session.files`（那是"要送给模型"的上传缓存）。
                 Attachment::Canvas { path } => {
                     if !path.is_file() {
                         continue;
                     }
-                    let hash_id = config::name_of(path);
-                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    let filename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let entry = self
-                        .files
-                        .entry(hash_id.clone())
-                        .or_insert_with(|| json!({}));
-                    entry["hash_id"] = json!(hash_id);
-                    entry["size"] = json!(size);
-                    entry["mime"] = json!("image/png");
-                    entry["local"] = json!(path.display().to_string());
-                    if entry.get("filename").is_none() {
-                        entry["filename"] = json!(filename);
-                    }
-                    if entry.get("src").is_none() {
-                        entry["src"] = json!("repl");
-                    }
-                    // `calls`：产出过这张图的调用（去重追加）——resume 就靠它把图配回画布那条记录
-                    let mut calls = entry
-                        .get("calls")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    if !calls.iter().any(|v| v.as_str() == Some(call.id.as_str())) {
-                        calls.push(json!(call.id));
-                    }
-                    entry["calls"] = json!(calls);
+                    self.state
+                        .repl()
+                        .record_images(&call.id, std::slice::from_ref(path));
                 }
             }
         }
@@ -1138,29 +1128,16 @@ impl Session {
         changed
     }
 
-    /// 保证这张图有一个可用的 `file_id`：先落本地副本 → 命中可用记录就复用，否则上传。
+    /// 保证这张图有一个可用的 `file_id`：先落本地副本 → 命中可用缓存就复用，否则上传。
     ///
-    /// 未开启（`files_api = false` / `vision = false`）或上传失败 → `None`，调用方就不注入图片
-    /// （由 `settle_output` 决定是否回退内联 base64）。记录就地写进 `self.files`（下次 `save` 带上）。
-    async fn ensure_image_file(
-        &mut self,
-        data: &[u8],
-        mime: &str,
-        filename: &str,
-        src: &str,
-    ) -> Option<String> {
-        let (enabled, base_url, key_fp, ttl_days) = {
-            let config = &self.config;
-            (
-                config.files_api && config.vision,
-                config.base_url.trim_end_matches('/').to_string(),
-                llm::key_fingerprint(&config.api_key),
-                config.files_ttl_days as i64,
-            )
-        };
-        if !enabled {
+    /// 未开启（`files_api = false` / `vision = false`）或上传失败 → `None`，由调用方决定是否
+    /// 回退内联 base64。缓存**不落盘**（[`Session::files`] 是运行时数据），第一次用到图时先跟
+    /// 服务端对一次账（[`Session::sync_files`]）。
+    async fn ensure_image_file(&mut self, data: &[u8], mime: &str) -> Option<String> {
+        if !(self.config.files_api && self.config.vision) {
             return None;
         }
+        // 本地副本（内容寻址：同图只落一份；扩展名由 mime 归一，见 `config::image_ext`）
         let local = match self
             .config
             .storage
@@ -1172,19 +1149,24 @@ impl Session {
                 return None;
             }
         };
-        // 文件名主干就是 id（`img-<hash>`）——扫描 `files/` 时也是这么反推的
-        let image_hash = config::name_of(&local);
+        let image_hash = config::name_of(&local); // `img-<hash>`
+        self.sync_files().await;
         if let Some(entry) = self.files.get(&image_hash)
-            && entry_is_usable(entry, &base_url, &key_fp)
+            && entry.usable()
         {
-            return entry
-                .get("file_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            return Some(entry.file_id.clone());
         }
+        // 上传名 = `img-<hash><ext>`：服务端能按名字**反解回本地 id** —— `sync_files` 靠这个
+        // 把上过传的图重新认回来（服务端不去重，但至少不会因为缓存丢了就重复上传）。
+        let filename = format!("{image_hash}{}", config::image_ext(mime));
         let uploaded = match self
             .llm
-            .upload_file(data.to_vec(), filename, mime, ttl_days)
+            .upload_file(
+                data.to_vec(),
+                &filename,
+                mime,
+                self.config.files_ttl_days as i64,
+            )
             .await
         {
             Ok(v) => v,
@@ -1194,31 +1176,61 @@ impl Session {
                 return None;
             }
         };
-        // **按字段合并**：同 hash 可能已被 `repl` 那条路登记过（`calls` / `src`）——整条覆盖
-        // 会把那些抹掉（下次 `repl` 出的同张图就配不回画布了）。这里只动上传相关的字段。
-        let entry = self
-            .files
-            .entry(image_hash.clone())
-            .or_insert_with(|| json!({}));
-        entry["hash_id"] = json!(image_hash);
-        entry["size"] = json!(data.len());
-        entry["mime"] = json!(mime);
-        entry["filename"] = json!(filename);
-        entry["src"] = json!(src);
-        entry["local"] = json!(local.display().to_string());
-        entry["file_id"] = json!(uploaded.id);
-        entry["base_url"] = json!(base_url);
-        entry["key_fp"] = json!(key_fp);
-        entry["uploaded_at"] = json!(config::now().as_secs() as i64);
-        entry["expires_at"] = json!(uploaded.expires_at);
+        self.files.insert(
+            image_hash,
+            ImageEntry {
+                file_id: uploaded.id.clone(),
+                expires_at: uploaded.expires_at,
+                local,
+            },
+        );
         Some(uploaded.id)
+    }
+
+    /// 跟服务端对一次账（**一次会话一次**，失败也置位）：`GET /files` 里叫 `img-<hash>.<ext>`
+    /// 的条目就是我们的上传件 → 重建 [`Session::files`]。
+    ///
+    /// 这张表**不落盘**，所以它是"丢了能重建"的缓存：换机器 / 缓存被清 → 靠这次同步认回来，
+    /// 不用重传。列表是账号级的（会带别的会话传的图），无害 —— 它只是一个 `hash → id` 的表。
+    async fn sync_files(&mut self) {
+        if self.files_synced {
+            return;
+        }
+        self.files_synced = true;
+        let files_dir = self.config.storage.files();
+        let items = match self.llm.list_files().await {
+            Ok(items) => items,
+            Err(e) => {
+                crate::log::warn(format!("[warn] 图片缓存同步失败（用本地缓存继续）: {e}"));
+                return;
+            }
+        };
+        for item in items {
+            let Some(name) = item.filename.as_deref() else {
+                continue;
+            };
+            let Some((stem, _ext)) = name.split_once('.') else {
+                continue;
+            };
+            if !stem.starts_with("img-") {
+                continue; // 不是我们传的（`pie files upload` 之类）
+            }
+            self.files.insert(
+                stem.to_string(),
+                ImageEntry {
+                    file_id: item.id,
+                    expires_at: item.expires_at,
+                    local: files_dir.join(name),
+                },
+            );
+        }
     }
 
     /// 把某个 `file_id` 标成失效（服务端删了 / 换了 key）：下次同图重新上传。
     fn invalidate_file(&mut self, file_id: &str) {
         for entry in self.files.values_mut() {
-            if entry.get("file_id").and_then(Value::as_str) == Some(file_id) {
-                entry["expires_at"] = json!(0);
+            if entry.file_id == file_id {
+                entry.expires_at = Some(0); // 0 = 早就过期 → 下次同图直接重传
             }
         }
     }
@@ -1243,17 +1255,29 @@ impl Session {
         if let Some(t) = &self.title {
             meta["title"] = json!(t);
         }
-        if !self.files.is_empty() {
-            // 空表不写：别把每个会话文件都撑起来
-            meta["files"] = json!(self.files);
-        }
         if !self.compaction_events.is_empty() {
             meta["compaction_events"] = json!(self.compaction_events);
         }
-        let blocks = self.state.repl_blocks().snapshot();
-        if !blocks.is_empty() {
-            // 空表不写：没跑过 repl 的会话不该多一个键
-            meta["repl_blocks"] = json!(blocks);
+        // `state`：内置 `repl` + 插件工具的裸 JSON。空的部分不写（没跑过 repl 的会话
+        // 不该多一个键）。`Session.files` **不落盘**：它是运行时缓存，能从 `GET /files` 重建。
+        let mut state = serde_json::Map::new();
+        let blocks = self.state.repl().snapshot();
+        let images = self.state.repl().images();
+        if !blocks.is_empty() || !images.is_empty() {
+            let mut repl = serde_json::Map::new();
+            if !blocks.is_empty() {
+                repl.insert("blocks".into(), json!(blocks));
+            }
+            if !images.is_empty() {
+                repl.insert("images".into(), json!(images));
+            }
+            state.insert("repl".into(), Value::Object(repl));
+        }
+        for (tool, value) in self.state.tool_states().snapshot() {
+            state.insert(tool, value);
+        }
+        if !state.is_empty() {
+            meta["state"] = Value::Object(state);
         }
         // **顺序纪律：先写可退化的派生层，最后写唯一真相。**
         //
@@ -1399,9 +1423,9 @@ impl Session {
     /// 幂等（按 call id 去重，重复扫不会重复记）。当前这轮不在压缩的受害范围里
     /// （轮次级只压「已完成」的轮，会话级只由用户手动 `/clear`）→ 下一轮再收也来得及。
     fn collect_repl_blocks(&mut self) {
-        // 日志住在会话状态槽里（`state::ReplBlocks`）：它比消息活得久，压缩把 `tool_calls` 删掉
+        // 日志住在会话状态槽里（`state::ReplState`）：它比消息活得久，压缩把 `tool_calls` 删掉
         // 之后还得靠它把那几个 cell 摆回 system prompt。
-        let log = self.state.repl_blocks();
+        let log = self.state.repl();
         let seen: HashSet<String> = log.snapshot().into_iter().map(|b| b.id).collect();
         let mut fresh: Vec<ReplBlock> = Vec::new();
         for m in &self.messages {
@@ -1436,8 +1460,8 @@ impl Session {
     /// 于是它有两条白拿的性质：两次压缩之间消息没变 → 返回值**逐字相同**（缓存不受影响）；
     /// 刚被压走东西的那一刻才变 —— 而那正是缓存已经全废的时刻。
     fn repl_section(&self) -> String {
-        // 日志住在会话状态槽里（见 `state::ReplBlocks`）：只列**已被压缩带走**的 cell。
-        let blocks = self.state.repl_blocks().snapshot();
+        // 日志住在会话状态槽里（见 `state::ReplState`）：只列**已被压缩带走**的 cell。
+        let blocks = self.state.repl().snapshot();
         let live: HashSet<&str> = self
             .messages
             .iter()
@@ -1517,6 +1541,9 @@ impl Session {
     #[allow(dead_code)] // 入口是交互层的 `/clear`
     pub fn reset(&mut self) {
         self.messages.truncate(1);
+        // 历史没了 → `state` 里的引用（`repl` 的代码块 / 画布图）也就成了噪声
+        self.state.repl().clear();
+        self.state.tool_states().clear();
     }
 
     /// `/clear`：把当前窗口（system 与**既有窗口摘要**除外）整块写进 `~/.pie/windows/` 落盘，开新窗口。
@@ -1663,6 +1690,7 @@ impl Session {
             usage: UsageTracker::default(),
             windows: Vec::new(),
             files: HashMap::new(),
+            files_synced: false,
             title: None,
             turn_count: 0,
             available_models: None,
@@ -1798,21 +1826,25 @@ fn escape_control_chars(json: String) -> String {
 // 记录表、本地副本的 GC 清单。目录本身住 `config::Storage`（`sessions()` /
 // `files()`）——磁盘布局一处可见。
 
-/// 记录还能不能直接用：同一 key / base_url + 未过期（`expires_at` 缺失 = 服务端永久保留）。
-pub fn entry_is_usable(entry: &Value, base_url: &str, key_fp: &str) -> bool {
-    if entry.get("file_id").and_then(Value::as_str).is_none() {
-        return false;
+/// 一张图的上传缓存（**运行时**，不落盘）：能从 `GET /files` 重建，所以丢了只重传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEntry {
+    /// 服务端上传件 id（历史消息里的 `file` 块引用的就是它）。
+    pub file_id: String,
+    /// 过期时间（unix 秒）；`None` = 服务端永久件。`Some(0)` = 已被标失效 → 下次重传。
+    pub expires_at: Option<i64>,
+    /// 本地副本（`files/img-<hash>.<ext>`）——`files list` 展示用；副本被手工删了也照记。
+    pub local: PathBuf,
+}
+
+impl ImageEntry {
+    /// 还能不能直接用：未标失效、未过期（留 1 分钟余量，别卡在过期边缘）。
+    fn usable(&self) -> bool {
+        match self.expires_at {
+            None => true,
+            Some(t) => config::now().as_secs_f64() < t as f64 - 60.0,
+        }
     }
-    if entry.get("base_url").and_then(Value::as_str) != Some(base_url) {
-        return false;
-    }
-    if entry.get("key_fp").and_then(Value::as_str) != Some(key_fp) {
-        return false;
-    }
-    let Some(expires_at) = entry.get("expires_at").and_then(Value::as_f64) else {
-        return true; // 未记有效期 = 永久
-    };
-    config::now().as_secs_f64() < expires_at - 60.0 // 留 1 分钟余量，别卡在过期边缘
 }
 
 /// `id` 解析：None → 时间戳文件名；纯名字 → `<sessions>/<name>.jsonl`；带目录/绝对路径 → 原样。
@@ -2326,7 +2358,11 @@ mod tests {
         });
         s.files.insert(
             "img-1".into(),
-            json!({"file_id": "file-abc", "expires_at": 9_999_999_999i64}),
+            ImageEntry {
+                file_id: "file-abc".into(),
+                expires_at: Some(9_999_999_999),
+                local: PathBuf::new(),
+            },
         );
 
         assert!(s.downgrade_file_blocks());
@@ -2341,7 +2377,7 @@ mod tests {
             );
         }
         // 记录被标失效 → 下次同图重传
-        assert_eq!(s.files["img-1"]["expires_at"], json!(0));
+        assert_eq!(s.files["img-1"].expires_at, Some(0));
         // 再调一次：已经没 file 块了 → 没改动
         assert!(!s.downgrade_file_blocks());
         let _ = std::fs::remove_file(&path);
@@ -2376,36 +2412,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 缓存条目能不能直接用：只看到期时间（`None` = 服务端永久件；`Some(0)` = 已标失效）。
+    ///
+    /// `base_url` / `key_fp` 不再进条目：缓存每次会话都跟**当前**端点 + 当前 key 的
+    /// `GET /files` 对一次账，换了端点/key 的旧 id 自然查不到 → 掉出缓存 → 重传。
     #[test]
-    fn entry_usability_depends_on_key_base_url_and_expiry() {
-        let base = "https://api.deepseek.com";
-        let fp = llm::key_fingerprint("sk-test");
-        let ok = json!({"file_id": "f1", "base_url": base, "key_fp": fp});
-        assert!(entry_is_usable(&ok, base, &fp));
-        assert!(!entry_is_usable(
-            &ok,
-            base,
-            &llm::key_fingerprint("sk-other")
-        )); // 换 key
-        assert!(!entry_is_usable(&ok, "https://other", &fp)); // 换 base_url
-        assert!(!entry_is_usable(&json!({}), base, &fp)); // 没有 file_id
-        let soon = config::now().as_secs_f64() + 30.0; // 不足 1 分钟余量
-        assert!(!entry_is_usable(
-            &json!({"file_id": "f1", "base_url": base, "key_fp": fp, "expires_at": soon}),
-            base,
-            &fp
-        ));
-        let later = config::now().as_secs_f64() + 3600.0;
-        assert!(entry_is_usable(
-            &json!({"file_id": "f1", "base_url": base, "key_fp": fp, "expires_at": later}),
-            base,
-            &fp
-        ));
+    fn image_entry_usability_depends_on_expiry_only() {
+        let entry = |expires_at: Option<i64>| ImageEntry {
+            file_id: "f1".into(),
+            expires_at,
+            local: PathBuf::new(),
+        };
+        assert!(entry(None).usable(), "未记有效期 = 永久件");
+        assert!(entry(Some(config::now().as_secs() as i64 + 3600)).usable());
+        let soon = config::now().as_secs() as i64 + 30; // 不足 1 分钟余量
+        assert!(!entry(Some(soon)).usable(), "留 1 分钟余量，别卡在过期边缘");
+        assert!(!entry(Some(0)).usable(), "0 = 已被标失效");
     }
 
-    /// `repl` 出的图登记两条命脉：`local`（`files gc` 才认得“还被引用”）+ `calls`（`-r` 才配回画布）。
+    /// `repl` 出的画布图登记在 `state.repl.images`（`call_id → 本地路径`）：
+    /// `-r` 之后画布靠它把图配回那次调用；**不上传**，所以不进 `Session.files`。
     #[test]
-    fn repl_images_are_registered_for_gc_and_resume() {
+    fn repl_canvas_images_land_in_state() {
         let dir = std::env::temp_dir().join(format!("pie-repl-img-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let config = Config {
@@ -2413,7 +2441,6 @@ mod tests {
             ..Default::default()
         };
         let mut s = Session::new(&config, Some("s"), llm(), registry());
-        // `repl.rs` 转存后的持久副本（`files/img-<hash>.png`）
         let image = config
             .storage
             .store(
@@ -2442,37 +2469,28 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(s.settle_output(&call("c1"), &out()));
 
-        let hash = config::name_of(&image);
-        assert_eq!(s.files[&hash]["local"], json!(image.display().to_string()));
+        let images = s.state.repl().images();
         assert_eq!(
-            s.files[&hash]["calls"],
-            json!(["c1"]),
+            images["c1"],
+            vec![image.display().to_string()],
             "记下那图是哪次调用产的"
         );
-        assert_eq!(s.files[&hash]["src"], json!("repl"));
-        assert!(
-            s.files[&hash].get("file_id").is_none(),
-            "本地图不上传，没有 file_id"
-        );
+        assert!(s.files.is_empty(), "画布图不上传，不进上传缓存");
 
-        // 同一次调用重复产出 → 不重复记；另一次调用再产出 → 追加
+        // 同一次调用重复产出 → 不重复记；另一次调用再产出 → 各自的桶
         rt.block_on(s.settle_output(&call("c1"), &out()));
         rt.block_on(s.settle_output(&call("c2"), &out()));
-        assert_eq!(s.files[&hash]["calls"], json!(["c1", "c2"]));
+        let images = s.state.repl().images();
+        assert_eq!(images["c1"], vec![image.display().to_string()], "不重复");
+        assert_eq!(images["c2"], vec![image.display().to_string()]);
 
-        // 落盘后 `files gc`：副本刚落的、又没人引用——没有这条登记就会被当成垃圾回收。
-        // 保护窗设 0（即“过了”，只看引用）→ 能留下就说明 `local` 生效了。
+        // 落盘 → 读回：画布索引跟着 `meta.state.repl` 走
         s.save().unwrap();
-        let garbage = crate::cli::collect_file_garbage(&config.storage, 0);
-        assert!(
-            !garbage.contains(&image),
-            "登记过 `local` 就该留住：{garbage:?}"
-        );
+        let back = Session::load(&s.path, &s.config, llm(), registry()).expect("load");
+        assert_eq!(back.state.repl().images(), images);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `vision = false`（默认）时，即使 `files_api = true` 也不上传/不附图——
-    /// 多模态输入是**显式开关**（中转站上的多模态模型靠名字猜不到）。
     #[test]
     fn settle_output_skips_images_when_vision_is_off() {
         let _g = env_lock();
@@ -2578,13 +2596,13 @@ mod tests {
         };
         let mut s = Session::new(
             &config,
-            Some(dir.join("s.jsonl").to_str().unwrap()),
+            Some(dir.join("s").to_str().unwrap()),
             llm(),
             registry(),
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
         assert!(
-            rt.block_on(s.ensure_image_file(b"bytes", "image/png", "x.png", "/tmp/x.png"))
+            rt.block_on(s.ensure_image_file(b"bytes", "image/png"))
                 .is_none()
         );
         assert!(s.files.is_empty());
@@ -2807,7 +2825,7 @@ mod tests {
         // 1) 采集：独立于压缩，只按 call id 去重（重复扫不重复记）
         s.collect_repl_blocks();
         s.collect_repl_blocks();
-        let blocks = s.state.repl_blocks().snapshot();
+        let blocks = s.state.repl().snapshot();
         assert_eq!(blocks.len(), 2, "{blocks:?}");
         assert_eq!(blocks[0].code, "df = 1");
 
@@ -2840,7 +2858,7 @@ mod tests {
         // 5) 日志随 `__meta__` 落盘 → `-r` 之后那节能重建（它是会话状态槽里的一个条目）
         s.save().unwrap();
         let mut loaded = Session::load(&s.path, &config, llm(), registry()).unwrap();
-        let reloaded = loaded.state.repl_blocks().snapshot();
+        let reloaded = loaded.state.repl().snapshot();
         assert_eq!(reloaded.len(), 2, "{reloaded:?}");
         loaded.refresh_runtime_state();
         assert!(
@@ -3026,7 +3044,7 @@ mod tests {
             });
         }
         s.collect_repl_blocks();
-        let blocks = s.state.repl_blocks().snapshot();
+        let blocks = s.state.repl().snapshot();
         assert_eq!(blocks.len(), REPL_BLOCKS_MAX);
         assert_eq!(blocks[0].code, "x = 3", "丢最老的三个");
         assert_eq!(blocks[REPL_BLOCKS_MAX - 1].code, "x = 26");

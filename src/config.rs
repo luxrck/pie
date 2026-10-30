@@ -305,18 +305,6 @@ impl Storage {
     /// 作用域由 `session` 定：`Blob` 进**全局** `files/`（必须不给），`Raw` / `Window` 进**会话目录**
     /// 下的 `context/` / `windows/`（必须给）。给错方向直接 `Err` —— 别让它静默写到全局。
     pub fn store(&self, session: Option<&Path>, what: StoreType<'_>) -> std::io::Result<PathBuf> {
-        /// mime → 扩展名（图片副本是用户数据，名字里带扩展名才能双击打开；白名单之外给空串）。
-        fn image_ext(mime: &str) -> &'static str {
-            match mime {
-                "image/jpeg" => ".jpg",
-                "image/png" => ".png",
-                "image/gif" => ".gif",
-                "image/webp" => ".webp",
-                "image/bmp" => ".bmp",
-                _ => "",
-            }
-        }
-
         fn scope_err(msg: &str) -> std::io::Error {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string())
         }
@@ -586,6 +574,21 @@ pub fn name_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// 图片的规范扩展名（**由 mime 定**，不看源文件名）：副本命名与上传文件名都用它。
+///
+/// 这条是「`hash → 路径` 唯一」的前提：同一份内容永远是同一个 hash + 同一个后缀
+/// （`jpeg` 一律归成 `.jpg`），不会出现同 hash 两份副本。白名单之外给空串。
+pub fn image_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/bmp" => ".bmp",
+        _ => "",
+    }
 }
 
 /// 从落盘路径取回 hash 段（[`Storage::store`] 那套命名的**逆运算**：`<前缀>-<hash>[.扩展名]`）。

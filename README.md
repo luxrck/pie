@@ -26,7 +26,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | --- | --- |
 | `pie setup` | 补齐**数据根**（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`；`PIE_HOME` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
-| `pie files list [--all]` / `gc [--delete] [--all]` | 列出图片记录 / 回收本地副本（`--all` 作用于云端上传件） |
+| `pie files list [--all]` / `rm <id> [--all]` | 列出本地副本（`--all` 列云端上传件）/ 删一张图（`--all` 连云端那份一起删） |
 | `pie files upload <路径> [--mime <类型>]` | 把一个文件传到 Files API、打印 `file_id`（运维用：不写会话记录，`read` 读图那条路上传时自动完成） |
 
 **选项**（都只作用于本次运行，不写回配置）：

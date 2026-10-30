@@ -252,10 +252,11 @@ impl App {
         let snapshot = Snapshot::capture(&session);
         // resume 的历史：把已有对话回放进消息流**与 REPL 画布**（新会话只有 system → 什么都不做）。
         // 走 `full_history()`，压缩过的回合也是「当初界面上看到的样子」而不是摘要 + 指针。
-        // （画布的图靠 `__meta__.files` 里的 `calls` 认回来，见 `Repl::from_messages`。）
+        // （画布的图靠 `state.repl.images` 认回来，见 `Repl::from_messages`。）
         let history = session.full_history();
         let cells = Cell::from_messages(&history);
-        let repl = Repl::from_messages(&history, &session.files).with_picker(picker);
+        let images = session.state.repl().images();
+        let repl = Repl::from_messages(&history, &images).with_picker(picker);
         // 主题：`Config.theme`（族名 / 具体 flavor 都认，见 `Palette::from_name`）。认不出来就用
         // 默认并留一句告警——`run()` 里装好出口后再说（此刻 raw mode + 交替屏，写 stderr 会砸花）。
         let (palette, theme_warning) = Palette::resolve(&session.config.theme);
