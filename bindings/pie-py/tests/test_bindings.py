@@ -1165,3 +1165,25 @@ def test_registered_tool_can_return_a_dict(env):
     # 名字对了 = 注册进请求体的那个工具真的被调到了
     assert [t["function"]["name"] for t in server.requests[-1].get("tools") or []] != []
     assert result["name"] == "structured"
+
+
+def test_config_exposes_vision(env):
+    """`Config.vision`：新加的传图总开关（默认开；关掉 = 只留正文那行文本）。"""
+    cfg, _, _, _ = env
+    assert cfg.vision is True
+    cfg.vision = False
+    assert cfg.to_dict()["vision"] is False
+
+
+def test_register_rejects_tools_that_want_a_session_proxy(env):
+    """声明了 `S: SessionProxy` 的工具只能交给 pyplugin —— 绑定注册时就该报清楚。"""
+    cfg, _, _, _ = env
+    reg = pie.Registry.builtins(cfg)
+
+    @pie.tool(description="要会话代理")
+    def needs_s(S: pie.SessionProxy, text: str) -> str:
+        return text
+
+    with pytest.raises(ValueError) as err:
+        reg.register(needs_s)
+    assert "SessionProxy" in str(err.value)

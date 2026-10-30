@@ -2481,6 +2481,34 @@ mod tests {
         assert!(!entry(Some(0)).usable(), "0 = 已被标失效");
     }
 
+    /// 插件工具的裸 JSON（`state.<工具名>`）跟着 `meta.json` 往返；`reset` 清掉、`/clear` 不动。
+    #[test]
+    fn tool_states_survive_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("pie-tool-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            storage: config::Storage::at(&dir),
+            ..Default::default()
+        };
+        let s = Session::new(&config, Some("s"), llm(), registry());
+        s.state
+            .tool_states()
+            .commit("counter", json!({"n": 3, "tags": ["a"]}));
+        s.save().unwrap();
+
+        let back = Session::load(&s.path, &s.config, llm(), registry()).expect("load");
+        assert_eq!(
+            back.state.tool_states().get("counter"),
+            Some(json!({"n": 3, "tags": ["a"]}))
+        );
+
+        // `reset` 清（历史没了，这些引用就是噪声）
+        let mut back = back;
+        back.reset();
+        assert_eq!(back.state.tool_states().get("counter"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `repl` 出的画布图登记在 `state.repl.images`（`call_id → 本地路径`）：
     /// `-r` 之后画布靠它把图配回那次调用；**不上传**，所以不进 `Session.files`。
     #[test]

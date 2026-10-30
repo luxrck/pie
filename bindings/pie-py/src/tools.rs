@@ -184,12 +184,27 @@ impl PyRegistry {
     ) -> PyResult<()> {
         // ① 解析出四个零件（两种用法都收敛到这儿）
         let (name, description, parameters, handler) = match tool {
-            Some(t) => (
-                t.getattr("name")?.extract::<String>()?,
-                t.getattr("description")?.extract::<String>()?,
-                t.getattr("parameters")?,
-                t.getattr("handler")?.unbind(),
-            ),
+            Some(t) => {
+                // 声明了会话代理的工具只能由 pyplugin 宿主调：绑定是**同步直调 handler** 的，
+                // 没有 `S` 可给 —— 到这里就报清楚，别等到调用时一个缺参数的 TypeError。
+                if t.getattr("wants_s")
+                    .and_then(|v| v.extract::<bool>())
+                    .unwrap_or(false)
+                {
+                    let name: String = t.getattr("name")?.extract()?;
+                    return Err(PyValueError::new_err(format!(
+                        "工具 {name:?} 声明了会话代理 `S: SessionProxy`：它只能交给 `pie` 的 \
+                         pyplugin 宿主（`~/.pie/plugins/`）跑 —— 绑定是直接调 handler 的，没有 \
+                         会话代理可给。去掉那个参数，或把这份工具放进插件目录。"
+                    )));
+                }
+                (
+                    t.getattr("name")?.extract::<String>()?,
+                    t.getattr("description")?.extract::<String>()?,
+                    t.getattr("parameters")?,
+                    t.getattr("handler")?.unbind(),
+                )
+            }
             None => {
                 let name = name.ok_or_else(|| {
                     PyValueError::new_err("register() 要么给 tool=，要么给 name= 与 handler=")

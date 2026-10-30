@@ -212,6 +212,19 @@ impl PyConfig {
         self.inner.system_prompt = value;
     }
 
+    /// 是否把图送给模型（`read` 读到的、插件截图）。
+    ///
+    /// 关掉 → 只留正文那行 `[图片已读取: …]`，模型看不到图；开着且 `files_api` 就上传，
+    /// 否则回退内联 base64（有 8MB 上限）。默认开。
+    #[getter]
+    fn vision(&self) -> bool {
+        self.inner.vision
+    }
+    #[setter]
+    fn set_vision(&mut self, value: bool) {
+        self.inner.vision = value;
+    }
+
     /// 同一批 `tool_calls` 是否并发执行（工具共享可变状态时必须设 False）。
     #[getter]
     fn parallel_tools(&self) -> bool {

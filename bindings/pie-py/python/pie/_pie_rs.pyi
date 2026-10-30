@@ -219,6 +219,8 @@ class Config:
     append_system_prompt: list[str]
     system_prompt: str | None
     """替换基础 system prompt（运行时属性、不落盘）；`None` = 用内置/仓库那份。"""
+    vision: bool
+    """是否把图送给模型（`read` 读到的、插件截图）；关掉只留正文那行文本描述。默认开。"""
     parallel_tools: bool
     """同一批 tool_calls 是否并发（工具共享可变状态时必须 False）。"""
 
@@ -358,6 +360,7 @@ class Session:
     def resume(config: Config, llm: LlmClient, tools: Registry) -> Session: ...
 
     path: str
+    """会话**目录**（`<数据根>/sessions/<id>/`）；首次 `save()` 之前不一定存在。"""
     messages: list[Message]
     full_history: list[Message]
     """把压缩指针展开成完整转录（调试视图）。"""
