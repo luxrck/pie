@@ -313,7 +313,7 @@ def test_turn_runs_tool_and_streams_events(env):
 
     result = events[4]
     assert result["name"] == "bash"
-    # 成功**只有正文**（成败另有结构化的 `failed`；正文里的 `[exit=N]` 只在「失败且没输出」时补）：
+    # 成功**只有正文**（成败另有结构化的 `status`；零输出失败才会自动补 `status` 头）：
     # 说明 shell 真跑了
     assert result["text"] == "hi\n"
     assert "hi" in result["text"]

@@ -223,13 +223,13 @@ impl Repl {
                     continue;
                 };
                 let content = m.content_text();
-                // 新会话看结构化的 `failed`；旧会话没这个字段 → 退回嗅文本
-                view.entries[index].status = if m.failed {
-                    Status::Fail
-                } else {
-                    pane::tool_status(&content)
+                // 新会话看结构化的 `status`；旧会话退回 `failed`，再不行才嗅文本
+                view.entries[index].status = match m.effective_status() {
+                    Some(status) => status.into(),
+                    None => pane::tool_status(&content),
                 };
-                view.entries[index].output = Some(content);
+                view.entries[index].output =
+                    Some(crate::header::strip_headers(&content).to_string());
                 if let Some(images) = by_call.remove(id) {
                     view.entries[index].images = images;
                 }

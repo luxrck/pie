@@ -125,6 +125,7 @@ impl Palette {
             Status::Ok => ("✓", self.ok),
             Status::Fail => ("✗", self.fail),
             Status::Cancelled => ("⏹", self.cancelled),
+            Status::Timeout => ("⏱", self.warn),
             Status::Running => ("•", self.muted),
         }
     }
@@ -187,15 +188,25 @@ impl Palette {
 }
 
 /// 工具活动的状态轴（盒子/单行/状态栏共用）。
-///
-/// `Cancelled` 暂时没被构造（取消通路是下一步的事）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum Status {
     Running,
     Ok,
     Fail,
     Cancelled,
+    /// 超时（与失败分开：图标与颜色不同，正文里还有`超出 Ns`的说明）。
+    Timeout,
+}
+
+impl From<crate::tools::Status> for Status {
+    fn from(status: crate::tools::Status) -> Self {
+        match status {
+            crate::tools::Status::Success => Status::Ok,
+            crate::tools::Status::Failed => Status::Fail,
+            crate::tools::Status::Cancelled => Status::Cancelled,
+            crate::tools::Status::Timeout { .. } => Status::Timeout,
+        }
+    }
 }
 
 /// 活动指示的 spinner 帧（braille，与 codex 那种滚动点类似但更省宽度）。

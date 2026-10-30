@@ -38,8 +38,8 @@ use serde_json::{Value, json};
 use crate::cancel::CANCEL_TEXT;
 use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
-    CallFn, ExtensionHook, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
-    valid_tool_name,
+    CallFn, ExtensionHook, Limits, Registry, Status, ToolBody, ToolCtx, ToolError, ToolOutput,
+    ToolResult, valid_tool_name,
 };
 
 /// 宿主脚本正文（编译期嵌入；见该文件的协议说明）。
@@ -361,7 +361,7 @@ impl Reply {
                 },
             ),
             attachments: Vec::new(),
-            failed: false,
+            status: Status::Success,
         })
     }
 }
@@ -915,7 +915,7 @@ def ping(text: str) -> str:
             .await
             .expect("big 成功");
         assert!(
-            out.to_text().contains("[工具输出全文已保存: "),
+            out.to_text().contains("\"saved\""),
             "超限要给指针：{}",
             out.to_text()
         );

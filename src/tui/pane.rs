@@ -86,7 +86,7 @@ impl Cell {
                 && *status == Status::Running
             {
                 *status = outcome;
-                *b = Some(body.trim().to_string());
+                *b = Some(crate::header::strip_headers(body).trim().to_string());
                 return;
             }
         }
@@ -160,13 +160,13 @@ impl Cell {
                 }
                 "tool" => {
                     let content = m.content_text();
-                    // 新会话带结构化的 `failed`；旧会话没这个字段（`false`）→ 退回嗅文本
-                    let status = if m.failed {
-                        Status::Fail
-                    } else {
-                        tool_status(&content)
+                    // 新会话带结构化的 `status`；旧会话退回旧字段 `failed`，再不行才嗅文本
+                    let status = match m.effective_status() {
+                        Some(status) => status.into(),
+                        None => tool_status(&content),
                     };
-                    let body = Some(content.trim().to_string());
+                    // 展示层剥掉 `header! { … }` 块（用户只看命令输出，不看元数据）
+                    let body = Some(crate::header::strip_headers(&content).trim().to_string());
                     match pending.remove(&m.tool_call_id.clone().unwrap_or_default()) {
                         Some(idx) => {
                             if let Cell::Tool {
@@ -224,24 +224,15 @@ pub fn tool_summary(arguments: &str) -> String {
     one_line(arguments, 240)
 }
 
-/// 实时事件的工具状态：取消看哨兵文本，其余**只看事件里的 `failed`**（不嗅文本）。
-///
-/// 工具不再往正文里塞 `[exit=…, os=…, shell=…]` 那种头（命令失败的原因本来就在它自己的
-/// stderr 里）；成败由 `ToolOutput::failed` → `TurnEvent::ToolResult.failed` 带过来。
-pub fn tool_status_flagged(content: &str, failed: bool) -> Status {
-    if content == CANCEL_TEXT {
-        Status::Cancelled
-    } else if failed {
-        Status::Fail
-    } else {
-        Status::Ok
-    }
+/// 实时事件的工具状态：直接用事件里的结构化 `status`（不再嗅文本）。
+pub fn tool_status_flagged(status: crate::tools::Status) -> Status {
+    status.into()
 }
 
-/// **旧会话回放**的工具状态（`from_messages`）：那时候还没有结构化的 `failed`，成败只写在
-/// 正文里 —— `[exit=N]` 头（非 0 = 失败；`[exit=0]` 只来自更早的版本）、`[工具错误]`。
+/// **旧会话回放**的工具状态（`from_messages`）：那时候还没有结构化的 `status` / `failed`，
+/// 成败只写在正文里 —— `[exit=N]` 头（非 0 = 失败；`[exit=0]` 只来自更早的版本）、`[工具错误]`。
 ///
-/// 新会话的 tool 消息带了 `failed`，那条路不走这个嗅探（见 [`Cell::from_messages`]）。
+/// 新会话的 tool 消息带了 `status`，那条路不走这个嗅探（见 [`Cell::from_messages`]）。
 pub fn tool_status(content: &str) -> Status {
     if content == CANCEL_TEXT {
         return Status::Cancelled;
@@ -1088,7 +1079,7 @@ mod tests {
     fn replay_takes_the_structured_failed_flag() {
         let palette = Palette::mocha();
         let mut failed = Message::tool_result("c1", "bash", "ls: /nope: No such file or directory");
-        failed.failed = true;
+        failed.status = Some(crate::tools::Status::Failed);
         let legacy = Message::tool_result("c2", "bash", "[exit=1]\n\nboom"); // 旧会话：只有文本
         let fine = Message::tool_result("c3", "bash", "hi"); // 成功，无标记
         let messages = vec![failed, legacy, fine];

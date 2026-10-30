@@ -786,11 +786,11 @@ impl App {
                 name,
                 text,
                 images,
-                failed,
+                status,
                 ..
             }) => {
-                // 被取消的工具回的是哨兵文本 → 标 ⏹；否则成败看事件里的 `failed`（不嗅文本）
-                let status = pane::tool_status_flagged(&text, failed);
+                // 结局是结构化的（`Status`）→ 直接映射成界面状态（不嗅文本）
+                let status = pane::tool_status_flagged(status);
                 self.repl.on_tool_result(&name, &text, status, &images);
                 Cell::finish_tool(&mut self.cells, &name, status, &text);
                 self.activity = Activity::Tool {
@@ -1619,69 +1619,29 @@ impl App {
 
 /// 跑一条手动 `!cmd`，返回（状态，结果正文）。
 ///
-/// 起进程一律走 [`crate::tools::spawn_shell`]（与工具层的 bash 同一个出口：候选 shell、独立进程组
-/// 都在那儿）——只杀 shell 本体的话，持有 stdout 管道写端的子孙会让读端不 EOF。
-/// stderr 也要读（unix 上它已被 dup2 并进 stdout；Windows 上是另一根管道），见 [`crate::tools::drain_lines`]。
-/// 正文格式：`[exit=N]\n\n<输出>`（取消 → `[exit=cancelled]` + 一行 `[用户手动终止]`）。
+/// 起进程与收输出都走工具层的同一个出口（[`crate::tools::spawn_shell`] + [`crate::tools::collect`]）：
+/// 候选 shell、独立进程组、stderr 归并（`2>&1`）、超时/取消杀组全在那儿。
+/// 正文就是命令输出（取消时在后面补一行 `[用户手动终止]`），**不再带 `[exit=…]` 文本**。
 async fn exec_shell(cmd: &str, cancel: &Cancel) -> (Status, String) {
-    let mut child = match crate::tools::spawn_shell(cmd) {
+    let child = match crate::tools::spawn_shell(cmd) {
         Ok(child) => child,
-        Err(e) => return (Status::Fail, format!("[exit=error]\n\n启动失败: {e}")),
+        Err(e) => return (Status::Fail, format!("启动失败: {e}")),
     };
-    let stdout = child.stdout.take().expect("piped");
-    // stderr 也要读：unix 上它已被 dup2 并进 stdout（读到立即 EOF），Windows 上是另一根管道
-    // —— 不读就会在命令写满缓冲时把自己卡死（见 `tools::spawn_shell`）。
-    let stderr = child.stderr.take().expect("piped");
-    // tokio 的 id() 在进程被回收后返回 None；0 表示“拿不到 pid”（不杀组）
-    let pid = child.id().unwrap_or(0);
-    let (mut chunks, mut errors) = (Vec::new(), Vec::new());
-
-    let read_and_wait = async {
-        let (_, _, status) = tokio::join!(
-            crate::tools::drain_lines(stdout, &mut chunks),
-            crate::tools::drain_lines(stderr, &mut errors),
-            child.wait(),
-        );
-        status
-    };
-    // 取消分支不能碰 `chunks`/`child`（都被这个 future 借着）——先收尾，完了再放开它。
-    let mut reading = Box::pin(read_and_wait);
-    let mut cancelled = false;
-    let outcome = tokio::select! {
-        waited = &mut reading => Some(waited),
-        _ = cancel.cancelled() => {
-            #[cfg(unix)]
-            if pid != 0 {
-                unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-            }
-            cancelled = true;
-            None
+    match crate::tools::collect(child, None, Some(cancel.clone())).await {
+        Ok(crate::tools::Ended::Done { output, code }) => {
+            let status = if code == 0 { Status::Ok } else { Status::Fail };
+            (status, output.trim_end_matches('\n').to_string())
         }
-    };
-    drop(reading);
-
-    // unix：stderr 已并进 stdout（`errors` 恒空）；Windows：两根各读各的，拼在后面
-    let mut out = chunks.concat();
-    out.push_str(&errors.concat());
-    if cancelled {
-        // 与工具层同款：kill 后 wait 限时 3s（D-state 进程不能把界面拖死）
-        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-        return (
+        // `!cmd` 不设超时（用户手跑的命令可能很久），这一支只做保底
+        Ok(crate::tools::Ended::TimedOut { output, secs }) => {
+            (Status::Fail, format!("超过 {secs}s 未结束：\n{output}"))
+        }
+        Ok(crate::tools::Ended::Cancelled { output }) => (
             Status::Cancelled,
-            format!(
-                "[exit=cancelled]\n\n{}\n[{CANCEL_TEXT}]",
-                out.trim_end_matches('\n')
-            ),
-        );
+            format!("{}\n[{CANCEL_TEXT}]", output.trim_end_matches('\n')),
+        ),
+        Err(e) => (Status::Fail, format!("等待子进程失败: {e}")),
     }
-    let status = match outcome.expect("未取消时必然等到结果") {
-        Ok(status) => status,
-        Err(e) => return (Status::Fail, format!("[exit=error]\n\n等待子进程失败: {e}")),
-    };
-    // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，与工具层的 bash 同一套）
-    let code = crate::tools::exit_code(&status);
-    let mark = if code == 0 { Status::Ok } else { Status::Fail };
-    (mark, out.trim_end_matches('\n').to_string())
 }
 
 /// `/cd` 的 `~` 展开：`~` / `~/x` → 主目录下；其余原样（相对路径按当前 cwd 解析）。
@@ -1840,7 +1800,7 @@ mod tests {
             text: "42".into(),
             arguments: r#"{"code":"print(42)"}"#.into(),
             images: Vec::new(),
-            failed: false,
+            status: crate::tools::Status::Success,
         }));
         assert!(!app.repl.is_empty());
 
@@ -3372,7 +3332,6 @@ mod tests {
         app.on_turn_event(event);
         let flat = squash(&app.render_to_string(80, 24));
         assert!(flat.contains("⏹bash($sleep30)"), "{flat}");
-        assert!(flat.contains("[exit=cancelled]"), "{flat}");
         assert!(flat.contains("用户手动终止"), "{flat}");
         assert!(!app.busy);
     }
@@ -3594,7 +3553,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
-                failed: false,
+                status: crate::tools::Status::Success,
             }));
         }
         render_buffer(&mut app, 60, 24);
@@ -3633,7 +3592,7 @@ mod tests {
                 text: "x".into(),
                 arguments: args,
                 images: Vec::new(),
-                failed: false,
+                status: crate::tools::Status::Success,
             }));
         }
         render_buffer(&mut app, 40, 12);

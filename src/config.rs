@@ -822,6 +822,13 @@ pub struct Config {
     pub tui: TuiConfig,
     pub files_api: bool,
     pub files_ttl_days: usize,
+    /// 模型是否支持**多模态输入**（把 read 到的图 / 插件截图直接送给模型）。
+    ///
+    /// 默认开（由模型名白名单猜改为显式开关：中转站上的多模态模型猜不到）。投递路线：
+    /// `files_api = true` → Files API 上传，历史里只存 `file_id`；没有 Files API / 上传失败 →
+    /// 回退内联 base64（有 `INLINE_MAX_BYTES` 上限）；`vision = false` 则完全不传图，
+    /// 正文那行 `[图片已读取: …]` 仍在。
+    pub vision: bool,
     /// 同一批 tool_calls 是否并发执行。
     pub parallel_tools: bool,
 
@@ -862,6 +869,7 @@ impl Default for Config {
             tui: TuiConfig::default(),
             files_api: true,
             files_ttl_days: 30,
+            vision: true,
             parallel_tools: true,
             config_file: None,
             auto_compact_threshold: None,
@@ -1107,6 +1115,7 @@ impl Config {
         put("tui", V::Table(tui));
         put("files_api", V::Boolean(self.files_api));
         put("files_ttl_days", V::Integer(self.files_ttl_days as i64));
+        put("vision", V::Boolean(self.vision));
         put("parallel_tools", V::Boolean(self.parallel_tools));
         V::Table(t)
     }

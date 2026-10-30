@@ -4,7 +4,7 @@
 //! 消息是扁平 `Vec<Message>`（没有类层级），靠 `role` + `compaction` + `synthetic` 判定，
 //! 三种压缩都以「就地改写消息列表」实现：
 //!   - **工具级**（level 1）：`keep_last_steps` 个 step 批次**之外**的 tool 输出，行数超过
-//!     `head+tail` 就全文落盘 + 头部/尾部留预览，内容换成 `[工具输出全文已保存: <path>]` 指针；
+//!     `head+tail` 就全文落盘 + 头部/尾部留预览，头区给 `header! { "saved": "<path>" }`；
 //!   - **轮次级**（level 2）：已完成的轮次（最后一个 user 之前的）压成一条摘要 assistant
 //!     （user 保留），原文落盘成 `[轮次原文已保存: <path>]`，摘要只留模型最终输出；
 //!   - **会话级**（level 3）：当前轮之前的整段历史落盘成**窗口块**
@@ -302,8 +302,8 @@ fn compact_tools(
             preview.extend_from_slice(&lines[lines.len().saturating_sub(config.tail)..]);
         }
         m.content = Some(Content::Text(format!(
-            "[工具输出全文已保存: {}]\n\n{}",
-            path.display(),
+            "header! {{ \"saved\": {} }}\n\n{}",
+            serde_json::to_string(&path.display().to_string()).expect("路径可序列化"),
             preview.join("\n")
         )));
         m.compaction = Some(Compaction::tool(&path));
@@ -400,7 +400,10 @@ fn compact_turn_span(
     }
     // 落盘失败（极端情况）：只放摘要，不写假指针
     let content = match &path {
-        Some(p) => format!("[轮次原文已保存: {}]\n\n{body}", p.display()),
+        Some(p) => format!(
+            "header! {{ \"saved\": {} }}\n\n{body}",
+            serde_json::to_string(&p.display().to_string()).expect("路径可序列化")
+        ),
         None => body,
     };
     let mut msg = Message::assistant(content);
@@ -614,7 +617,7 @@ mod tests {
             Some(Compaction::Tool { .. })
         ));
         let text = compressed.content_text();
-        assert!(text.starts_with("[工具输出全文已保存: "), "{text}");
+        assert!(text.starts_with("header! { \"saved\": "), "{text}");
         assert!(
             text.contains("line 1") && text.contains("line 200"),
             "{text}"
@@ -671,7 +674,7 @@ mod tests {
         assert_eq!(msgs[1].role, "user", "user 保留");
         assert!(matches!(msgs[2].compaction, Some(Compaction::Turn { .. })));
         let text = msgs[2].content_text();
-        assert!(text.starts_with("[轮次原文已保存: "), "{text}");
+        assert!(text.starts_with("header! { \"saved\": "), "{text}");
         assert!(text.contains("...[中间过程省略]..."), "{text}");
         assert!(text.contains("第一轮答复"), "{text}");
         assert!(PathBuf::from(msgs[2].compaction.as_ref().unwrap().path().unwrap()).exists());

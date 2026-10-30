@@ -24,7 +24,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::cancel::{CANCEL_TEXT, SIGINT};
 use crate::pyhost::{DEFAULT_PYTHON, Interrupt, Outcome, PyHost, Spec};
 use crate::tools::{
-    Attachment, Limits, Tool, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
+    Attachment, Header, Limits, Status, Tool, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult,
 };
 
 /// 驱动脚本正文（编译期嵌入；它自己用 IPython 的 `InteractiveShell`）。
@@ -198,7 +198,7 @@ fn format_reply(
 ) -> ToolOutput {
     // 图像附件：driver 出的是**临时** PNG（一小时后它自己会清），这里转存进内容寻址的本地副本
     // 目录（`files/img-<hash>.png`）——会话 `__meta__.files` 记的 `local` 才立得住，`files gc`
-    // 也才认得出它还被引用（见 `session::record_repl_images`）。读不到字节的（已被删掉的
+    // 也才认得出它还被引用（见 `Session::settle_output`）。读不到字节的（已被删掉的
     // 临时图）直接跳过。
     // 去向是 `Canvas`：**只给界面**（TUI 画布），模型看不到——模型自己知道它画了什么。
     let attachments: Vec<Attachment> = reply
@@ -248,33 +248,37 @@ fn format_reply(
         ),
         attachments,
         // 代码抛异常（driver 给了 traceback）= 这次调用失败，界面标 ✗
-        failed: reply_errored,
+        status: if reply_errored {
+            Status::Failed
+        } else {
+            Status::Success
+        },
     }
 }
 
-/// 输出头区：解释器状态那一行（`[解释器] 共 3 个：df, f, math（本次新增：df）`）。
+/// 输出头区：解释器状态（`repl` = 变量数，`defined` = 名字，`new` = 本次新增）。
 ///
 /// 为什么每次调用都报（包括“空”）：模型看不到解释器内部，压缩之后它连自己写过的代码块都没了
 /// —— “里面有什么”得由每次执行自己带回来，而不能靠模型另发一次询问（白搭一次往返）。
 /// 为什么放**头区**：`head_prefix` 保留的是开头，超限截断/落盘时它得跟着走；
 /// 而“输出很长”恰恰是最需要它的场合。
-fn headers(reply: &Reply) -> Vec<String> {
+fn headers(reply: &Reply) -> Header {
     let Some(state) = &reply.state else {
-        return Vec::new(); // driver 没上报（假驱动）—— 别凭空说“空”
+        return Header::new(); // driver 没上报（假驱动）—— 别凭空说“空”
     };
-    let mut line = if state.total == 0 {
-        "[解释器] 空".to_string()
-    } else {
-        let mut line = format!("[解释器] 共 {} 个：{}", state.total, state.names.join(", "));
+    let mut headers = Header::new();
+    headers.push(("repl".into(), json!(state.total)));
+    if state.total > 0 {
+        let mut names = state.names.join(", ");
         if state.total > state.names.len() {
-            line.push('…');
+            names.push('…');
         }
-        line
-    };
-    if !state.defined.is_empty() {
-        line.push_str(&format!("（本次新增：{}）", state.defined.join(", ")));
+        headers.push(("defined".into(), json!(names)));
     }
-    vec![line]
+    if !state.defined.is_empty() {
+        headers.push(("new".into(), json!(state.defined.join(", "))));
+    }
+    headers
 }
 
 #[cfg(test)]
@@ -425,11 +429,18 @@ while True:
         let ctx = ctx_at(&tempdir("ns"));
 
         let out = run_code(&reg, &ctx, py, "ns:any").await;
-        assert!(
-            out.to_text()
-                .starts_with("[解释器] 共 3 个：df, f, math（本次新增：df）\n\nline1\n"),
-            "{out:?}"
-        );
+        let text = out.to_text();
+        let (headers, body) = crate::header::split_header_body(&text);
+        let get = |key: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("repl"), Some(json!(3)), "{out:?}");
+        assert_eq!(get("defined"), Some(json!("df, f, math")), "{out:?}");
+        assert_eq!(get("new"), Some(json!("df")), "{out:?}");
+        assert!(body.starts_with("line1\n"), "{out:?}");
         // 没上报状态的驱动（上面的 FAKE）不该凭空多出这一行
         let plain = run_code(&reg, &ctx, py, "hello").await;
         assert!(plain.to_text().starts_with("call#"), "{plain:?}");
@@ -447,11 +458,14 @@ while True:
             "code": "ns:long", "_python": py, "_driver": FAKE, "_max_lines": 2
         });
         let out = reg.dispatch("repl", &args, ctx.clone()).await.unwrap();
-        assert!(out.to_text().starts_with("[解释器] 共 3 个："), "{out:?}");
+        let text = out.to_text();
+        assert!(text.starts_with("header! {"), "{out:?}");
+        let (headers, _) = crate::header::split_header_body(&text);
         assert!(
-            out.to_text().contains("[工具输出全文已保存: "),
-            "指针也在头区：{out:?}"
+            headers.iter().any(|(k, _)| k == "repl"),
+            "解释器状态要在头区：{out:?}"
         );
+        assert!(text.contains("\"saved\""), "指针也在头区：{out:?}");
         assert!(
             out.to_text().contains("line1\nline2\n"),
             "只留开头两行：{out:?}"
@@ -572,7 +586,11 @@ while True:
             "code": "l1\nl2\nl3\nl4", "_python": py, "_driver": FAKE, "_max_lines": 2
         });
         let out = reg.dispatch("repl", &args, ctx.clone()).await.unwrap();
-        assert!(out.to_text().starts_with("[工具输出全文已保存:"), "{out:?}");
+        assert!(out.to_text().starts_with("header! {"), "{out:?}");
+        assert!(
+            out.to_text().contains("\"saved\""),
+            "落盘指针在头区: {out:?}"
+        );
         assert!(
             out.to_text().contains("call#1: l1\nl2\n"),
             "只留开头两行: {out:?}"

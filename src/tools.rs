@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::state::SessionState;
@@ -30,7 +30,7 @@ pub struct Limits {
 /// 工具的正文：一段文本 + 「全文太长已落盘」时的指针。
 ///
 /// `content` 永远是**正文本身**（没落盘 = 全文；落盘 = 头段预览）。
-/// ⚠ **指针行不进这里**：`[工具输出全文已保存: …]` 由 [`ToolOutput::to_text`] 从 `spill`
+/// ⚠ **指向落盘件的行不进这里**：`saved` 键由 [`ToolOutput::to_text`] 从 `spill`
 /// 生成 —— 指针只有一个来源（以前是构造点手写、拼进正文，同一件事两处表达）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolBody {
@@ -93,50 +93,73 @@ pub enum Attachment {
     },
 }
 
-/// 工具执行的产出：**头区**（工具声明的那几行）+ 正文 + 产出的图 + 成败。
+/// 头区：`(键, JSON 值)` 的有序列表（语法见 [`crate::header`]）。
+pub type Header = crate::header::Headers;
+
+/// 工具调用的**结局**（结构化事实；[`ToolOutput::to_text`] 会把它镜像进头区的 `status` 键）。
+///
+/// 取消与超时是一等状态，不再靠「正文是否等于 CANCEL_TEXT」或「退出码是不是 128+n」去猜。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    #[default]
+    Success,
+    Failed,
+    Cancelled,
+    /// 超时（`secs` = 本次生效的超时秒数）。
+    Timeout {
+        secs: i64,
+    },
+}
+
+/// 工具执行的产出：**头区**（`header! { … }` 块）+ 正文 + 产出的图 + 结局。
 ///
 /// 序列化只有 [`ToolOutput::to_text`] 一个出口（头区 → 落盘指针 → 正文），消息层 / 事件层 /
-/// 绑定都走它 —— 与旧的 `format_output(headers, body)` 逐字同义。
+/// 绑定都走它。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolOutput {
-    /// 头区：一行一个 `[...]`（`[exit=N]`、`[解释器] 共 3 个：…` …）
-    pub headers: Vec<String>,
+    /// 头区：`(键, JSON 值)` 有序列表（`lines` / `total` / `image` / `saved` …）。
+    pub headers: Header,
     pub body: ToolBody,
     /// 产出的图（见 [`Attachment`]）—— `Model` 那条会进请求体，`Canvas` 只给界面
     pub attachments: Vec<Attachment>,
-    /// 这次调用**算失败**吗（`Err` 文本化、shell 非 0 退出、超时、解释器抛异常…）。
+    /// 这次调用**怎么结束的**（成功 / 失败 / 取消 / 超时）。
     ///
-    /// **只给界面判 ✗/✓**，不进正文：命令失败时原因本来就在它自己的 stderr 里
-    /// （`ls: …: Permission denied`），再往正文塞一行头只是噪声。要跨进程回放就落到
-    /// tool 消息的 `failed` 字段上（`Message::failed`）。
-    pub failed: bool,
+    /// **只给界面与回放**（不进 API）；头区里的 `status` 是它的镜像，由 `to_text` 自动注入。
+    pub status: Status,
 }
 
 impl ToolOutput {
-    /// 只有正文（没有头区、没有落盘、没有图）——绝大多数工具的返回。
+    /// 只有正文（没有头区、没有落盘、没有图）—— 绝大多数工具的返回。
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            headers: Vec::new(),
+            headers: Header::new(),
             body: ToolBody {
                 content: text.into(),
                 spill: None,
             },
             attachments: Vec::new(),
-            failed: false,
+            status: Status::Success,
         }
     }
 
-    /// 失败的结果：正文照旧给模型看，`failed` 让界面标 ✗。
+    /// 失败的结果：正文照旧给模型看，`status` 让界面标 ✗。
     pub fn failure(text: impl Into<String>) -> Self {
-        Self {
-            failed: true,
-            ..Self::text(text)
-        }
+        Self::text(text).with_status(Status::Failed)
     }
 
     /// 标成失败（正文已经在手的场合，如超时）。
-    pub fn failed(mut self) -> Self {
-        self.failed = true;
+    pub fn failed(self) -> Self {
+        self.with_status(Status::Failed)
+    }
+
+    /// 标成取消（Esc）。
+    pub fn cancelled(self) -> Self {
+        self.with_status(Status::Cancelled)
+    }
+
+    pub fn with_status(mut self, status: Status) -> Self {
+        self.status = status;
         self
     }
 
@@ -153,13 +176,43 @@ impl ToolOutput {
 
     /// **唯一序列化出口**：头区 → （落盘了才有的）指针行 → 正文。
     ///
-    /// 指针行在这儿生成（工具里不再手写）—— 「有没有落盘」只有 `body.spill` 一处事实。
+    /// `status` 镜像也在这里注入（工具不手写）：
+    ///   - `Success` 不写；`Failed` 只在正文为空时写 `status: "failed"`；
+    ///   - `Timeout` 写 `status: "timeout"` + `timeout_secs`；`Cancelled` 总是写。
     pub fn to_text(&self) -> String {
         let mut headers = self.headers.clone();
-        if let Some(path) = &self.body.spill {
-            headers.push(format!("[工具输出全文已保存: {}]", path.display()));
+        if !headers.iter().any(|(key, _)| key == "status") {
+            match self.status {
+                Status::Success => {}
+                Status::Failed if self.body.content.is_empty() => {
+                    headers.insert(0, ("status".into(), json!("failed")));
+                }
+                Status::Failed => {}
+                Status::Cancelled => {
+                    headers.insert(0, ("status".into(), json!("cancelled")));
+                }
+                Status::Timeout { secs } => {
+                    headers.insert(0, ("status".into(), json!("timeout")));
+                    if !headers.iter().any(|(key, _)| key == "timeout_secs") {
+                        headers.insert(1, ("timeout_secs".into(), json!(secs)));
+                    }
+                }
+            }
         }
-        format_output(&headers, &self.body.content)
+        if let Some(path) = &self.body.spill {
+            headers.push(("saved".into(), json!(path.display().to_string())));
+            if let Ok(meta) = std::fs::metadata(path) {
+                headers.push(("bytes".into(), json!(meta.len())));
+            }
+        }
+        let block = crate::header::render(&headers);
+        if block.is_empty() {
+            self.body.content.clone()
+        } else if self.body.content.is_empty() {
+            block
+        } else {
+            format!("{block}\n\n{}", self.body.content)
+        }
     }
 }
 
@@ -379,26 +432,10 @@ fn strip_schema_noise(value: &mut Value) {
 // 模块级只留这一件小事（四个工具都以它收尾）。其余辅助逻辑（图片嗅探 / 字节预算 / 头部截断 /
 // 全文落盘 / 命令构造 / edit 诊断）一律并进对应工具的 `call`。
 
-/// 统一「Headers\n\nBody」：headers 一行一个 `[...]`；body 非空时用空行分隔。
-///
-/// 内置工具都用它 → 留在这儿，「输出格式只有一处定义」。
-/// 没有头区就直接给正文（`bash` 成功时就是这种）——否则会以空串 join 出一个多余的空行。
-pub(crate) fn format_output(headers: &[String], body: &str) -> String {
-    if headers.is_empty() {
-        return body.to_string();
-    }
-    let head = headers.join("\n");
-    if body.is_empty() {
-        head
-    } else {
-        format!("{head}\n\n{body}")
-    }
-}
-
 /// 超限只保留**开头**连续段（未超限 → `None`）。
 ///
 /// 取头部而不是尾部：`cat 大文件` / 一大段 `print`，开头才是你要看的那部分；被截掉的尾巴由
-/// `[工具输出全文已保存: …]` 指针给出。只由 [`ToolBody::fit`] 调（不可再生的输出才走那条）。
+/// 头区的 `saved` 键给出。只由 [`ToolBody::fit`] 调（不可再生的输出才走那条）。
 fn head_prefix(out: &str, max_lines: Option<i64>, max_bytes: Option<i64>) -> Option<String> {
     if max_lines.is_none() && max_bytes.is_none() {
         return None;
@@ -432,8 +469,12 @@ fn head_prefix(out: &str, max_lines: Option<i64>, max_bytes: Option<i64>) -> Opt
 /// 读取文件内容：文本按 UTF-8 全文或 offset（1 起）/ limit 分页读取。
 // 结构体即参数：doc 注释 → 参数描述，非 `Option` 即必填，`#[schemars(skip)]` 的是私有参数。
 // ⚠ 结构体 doc 的**首行**就是发给模型的工具描述（schemars 把 doc 挂到 schema 根上），
-// 所以额外的说明必须写成普通注释，否则会被拼进 description。
+// 所以额外的说明必须写成普通注释，否则会被拼进 description —— 要写多行描述就用
+// `#[schemars(description = …)]` 显式给（它盖掉 doc，见下面的 `Edit`）。
 #[derive(Deserialize, JsonSchema)]
+#[schemars(
+    description = "读取文件内容（UTF-8）：默认整份读回；超限只给开头 + `[已截断：可用 offset=N 继续读]`（内容可再生，不落盘）。\n读取图片（PNG / JPEG / GIF / WebP / BMP）时返回图像引用，图片内容会作为多模态图像消息随对话发送给模型（offset / limit 对图片无效）；其他二进制只报大小。"
+)]
 pub struct Read {
     /// Path to the file to read (relative or absolute)
     pub path: String,
@@ -531,7 +572,7 @@ impl Tool for Read {
                     size,
                     dim,
                 }],
-                failed: false,
+                status: Status::Success,
             });
         }
 
@@ -602,19 +643,25 @@ impl Tool for Read {
         let omitted = want - picked.len();
 
         let body = picked.join("\n");
-        let mut headers = vec![format!(
-            "[行 {}-{}，共 {total} 行]",
-            start + 1,
-            start + picked.len()
-        )];
+        let mut headers = Header::new();
+        headers.push((
+            "lines".into(),
+            json!(format!("{}-{}", start + 1, start + picked.len())),
+        ));
+        headers.push(("total".into(), json!(total)));
         if omitted > 0 {
             // 不落盘：read 的内容可再生（原文件还在），续读拿到的是完整内容。
-            headers.push(format!(
-                "[已截断：可用 offset={} 继续读]",
-                start + picked.len() + 1
-            ));
+            headers.push(("next".into(), json!(start + picked.len() + 1)));
         }
-        Ok(ToolOutput::text(format_output(&headers, &body)))
+        Ok(ToolOutput {
+            headers,
+            body: ToolBody {
+                content: body,
+                spill: None,
+            },
+            attachments: Vec::new(),
+            status: Status::Success,
+        })
     }
 }
 
@@ -931,10 +978,10 @@ impl Tool for Edit {
         if let Err(e) = std::fs::write(p, out) {
             return err(format!("写入失败 {path}: {e}"));
         }
-        Ok(ToolOutput::text(format_output(
-            &[format!("[已替换 {} 处: {path}]", edits.len())],
-            "",
-        )))
+        Ok(ToolOutput {
+            headers: vec![("replaced".into(), json!(edits.len()))],
+            ..ToolOutput::text("")
+        })
     }
 }
 
@@ -958,14 +1005,13 @@ impl Tool for Writ {
             return err(format!("创建目录失败 {}: {e}", parent.display()));
         }
         match std::fs::write(p, &content) {
-            Ok(()) => Ok(ToolOutput::text(format_output(
-                &[format!(
-                    "[已写入 {path}（{} 字符，{} 行）]",
-                    content.chars().count(),
-                    content.matches('\n').count() + 1
-                )],
-                "",
-            ))),
+            Ok(()) => Ok(ToolOutput {
+                headers: vec![
+                    ("wrote".into(), json!(content.chars().count())),
+                    ("lines".into(), json!(content.matches('\n').count() + 1)),
+                ],
+                ..ToolOutput::text("")
+            }),
             Err(e) => err(format!("写入失败 {path}: {e}")),
         }
     }
@@ -1028,19 +1074,7 @@ pub fn spawn_shell(command: &str) -> std::io::Result<tokio::process::Child> {
         let mut cmd = tokio::process::Command::new(shell);
         cmd.arg(Bash::SHELL_FLAG).arg(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-            // stderr 合并进 stdout，保证输出顺序稳定
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::dup2(1, 2) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        grouped(cmd.as_std_mut());
         match cmd.spawn() {
             Ok(child) => return Ok(child),
             Err(e)
@@ -1081,6 +1115,143 @@ pub async fn drain_lines<R: tokio::io::AsyncRead + Unpin>(reader: R, sink: &mut 
 /// 给错误带上 shell 名（`启动失败: sh: Permission denied (os error 13)`）——kind 保留，方便调用方判。
 fn with_shell(e: std::io::Error, shell: &str) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("{shell}: {e}"))
+}
+// ---------------------------------------------------------------- 子进程（bash / shplugin / !cmd 共用）
+
+/// 一个子进程的**结局**。三态都带着**已读输出**——超时/取消时它往往是唯一的线索。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    Done { output: String, code: i32 },
+    TimedOut { output: String, secs: i64 },
+    Cancelled { output: String },
+}
+
+impl Ended {
+    /// 已读到的输出（三态都有）。
+    pub fn output(&self) -> &str {
+        match self {
+            Self::Done { output, .. }
+            | Self::TimedOut { output, .. }
+            | Self::Cancelled { output } => output,
+        }
+    }
+}
+
+/// 起进程的公共 configure：独立进程组 + **stderr 并进 stdout**（Unix 用 `dup2(1, 2)`）。
+///
+/// 独立进程组是取消/超时（`kill_group`）的前提；stderr 合并是为了「一根流、顺序稳定」
+/// （Windows 没有 `pre_exec`，由调用方在命令层做 `2>&1` 或读两根管道后拼接）。
+pub fn grouped(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::dup2(1, 2) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// 收一个子进程的输出：读流 + 超时 + 取消，**三态都保留已读输出**。
+///
+/// `timeout = None` 表示不限时；超时/取消走 `kill_group`（杀掉整个进程组），
+/// 然后先 `drop` 读取 future 再取缓冲区——否则「报错后才卡住」的那段输出会丢。
+pub async fn collect(
+    mut child: tokio::process::Child,
+    timeout: Option<std::time::Duration>,
+    cancel: Option<crate::cancel::Cancel>,
+) -> std::io::Result<Ended> {
+    async fn read_all<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>, buf: &mut Vec<u8>) {
+        let Some(mut reader) = reader else { return };
+        use tokio::io::AsyncReadExt;
+        let _ = reader.read_to_end(buf).await;
+    }
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let pid = child.id().unwrap_or(0);
+    let kill = || crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut reading = Box::pin(async {
+        let (_, _, status) = tokio::join!(
+            read_all(stdout, &mut out),
+            read_all(stderr, &mut err),
+            child.wait(),
+        );
+        status
+    });
+    let mut cancel_waiter = Box::pin(async {
+        match cancel {
+            Some(cancel) => cancel.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    });
+
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let waited = if let Some(limit) = timeout {
+        tokio::select! {
+            r = tokio::time::timeout(limit, &mut reading) => match r {
+                Ok(status) => Some(status),
+                Err(_) => {
+                    timed_out = true;
+                    None
+                }
+            },
+            _ = &mut cancel_waiter => {
+                cancelled = true;
+                None
+            }
+        }
+    } else {
+        tokio::select! {
+            status = &mut reading => Some(status),
+            _ = &mut cancel_waiter => {
+                cancelled = true;
+                None
+            }
+        }
+    };
+    // 先放开借用再取缓冲区
+    drop(reading);
+    drop(cancel_waiter);
+
+    if timed_out || cancelled {
+        kill();
+        // 杀完给 3s 回收（D-state 进程不能把调用方拖死）
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+    }
+
+    let mut output = String::from_utf8_lossy(&out).into_owned();
+    if !err.is_empty() {
+        output.push_str(&String::from_utf8_lossy(&err));
+    }
+    if cancelled {
+        return Ok(Ended::Cancelled { output });
+    }
+    if timed_out {
+        let secs = timeout.map(|d| d.as_secs() as i64).unwrap_or(0);
+        return Ok(Ended::TimedOut { output, secs });
+    }
+    let status = waited.expect("未取消/未超时必然等到结果")?;
+    Ok(Ended::Done {
+        output,
+        code: exit_code(&status),
+    })
+}
+
+/// 取一段文本的**尾部** `n` 行（超时/取消时附在正文后面用）。
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 /// 进程退出码，**按 shell 的口径**：正常退出用它的 `code`；被信号杀掉记 `128 + 信号号`
@@ -1125,89 +1296,41 @@ impl Tool for Bash {
         }
         // 命令交给 shell（`bash -c`，没有 bash 就 `sh -c`；Windows 是 `cmd /C`）——候选、选项、
         // 进程组与管道只在 [`spawn_shell`] 一处。
-        let mut child = match spawn_shell(&command) {
+        let child = match spawn_shell(&command) {
             Ok(child) => child,
             Err(e) => return err(format!("启动失败: {e}")),
         };
-        let stdout = child.stdout.take().expect("piped");
-        // stderr **也得读**：unix 上它已被 dup2 并进 stdout（这里读到立即 EOF）；Windows 上它是另一根
-        // 管道，不读就会在命令写满缓冲时卡死（见 [`spawn_shell`]）。
-        let stderr = child.stderr.take().expect("piped");
-        // tokio 的 id() 在进程已被回收后返回 None；0 表示“拿不到 pid”（不杀组）
-        let pid = child.id().unwrap_or(0);
-        let (mut chunks, mut errors) = (Vec::new(), Vec::new());
-
-        let read_and_wait = async {
-            let (_, _, status) = tokio::join!(
-                drain_lines(stdout, &mut chunks),
-                drain_lines(stderr, &mut errors),
-                child.wait(),
-            );
-            status
+        // 收输出 + 超时 + 取消：三态都保留已读输出（超时/取消时它往往是唯一的线索）。
+        // `kill_group` 与「先 drop future 再取缓冲」的细节都住在 [`collect`] 一处。
+        let limit = timeout
+            .filter(|t| *t > 0)
+            .map(|t| std::time::Duration::from_secs(t as u64));
+        let ended = match collect(child, limit, ctx.cancel.clone()).await {
+            Ok(ended) => ended,
+            Err(e) => return err(format!("等待子进程失败: {e}")),
         };
-
-        // 取消（Esc）：与超时同款处理——杀掉**整个进程组**，返回哨兵文本
-        // （上层看到 `CANCEL_TEXT` 就收尾：补全未执行的 tool 消息 + 写一条终止 assistant 消息）。
-        let cancel_waiter = async {
-            match ctx.cancel.clone() {
-                Some(cancel) => cancel.cancelled().await,
-                None => std::future::pending::<()>().await,
+        let (out, status) = match ended {
+            Ended::Done { output, code } => {
+                let status = if code == 0 {
+                    Status::Success
+                } else {
+                    Status::Failed
+                };
+                (output, status)
+            }
+            Ended::TimedOut { output, secs } => {
+                let mut text = format!("[bash] 命令超过 {secs}s 超时，可能仍在后台运行：{command}");
+                let tail = tail_lines(&output, 20);
+                if !tail.trim().is_empty() {
+                    text.push_str("\n\n");
+                    text.push_str(&tail);
+                }
+                return Ok(ToolOutput::text(text).with_status(Status::Timeout { secs }));
+            }
+            Ended::Cancelled { .. } => {
+                return Ok(ToolOutput::text(crate::cancel::CANCEL_TEXT).cancelled());
             }
         };
-        tokio::pin!(cancel_waiter);
-        // 杀进程组：只杀 `bash` 会让它启动的孙进程变孤儿并继续持有管道写端（原语在 `cancel`）。
-        let kill_group = || crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
-
-        let status = match timeout {
-            Some(t) if t > 0 => {
-                let dur = std::time::Duration::from_secs(t as u64);
-                tokio::select! {
-                    waited = tokio::time::timeout(dur, read_and_wait) => match waited {
-                        Ok(Ok(st)) => st,
-                        Ok(Err(e)) => return err(format!("等待子进程失败: {e}")),
-                        Err(_) => {
-                            // 超时：杀**整个进程组**。只 kill 本体杀不掉持有管道写端的子孙进程，
-                            // 而管道不 EOF 就会把等待卡到子孙自然退出（实测能卡满 timeout）。
-                            kill_group();
-                            return Ok(ToolOutput::text(format!(
-                                "[bash] 命令超过 {t}s 超时，可能仍在后台运行：{command}"
-                            ))
-                            .failed());
-                        }
-                    },
-                    _ = &mut cancel_waiter => {
-                        kill_group();
-                        return Ok(ToolOutput::text(crate::cancel::CANCEL_TEXT));
-                    }
-                }
-            }
-            _ => tokio::select! {
-                waited = read_and_wait => match waited {
-                    Ok(st) => st,
-                    Err(e) => return err(format!("等待子进程失败: {e}")),
-                },
-                _ = &mut cancel_waiter => {
-                    kill_group();
-                    return Ok(ToolOutput::text(crate::cancel::CANCEL_TEXT));
-                }
-            },
-        };
-
-        // 退出码：与 shell 同口径（被信号杀掉记 `128 + 信号号`，见 [`exit_code`]）。
-        // 成败走结构化的 `failed`，**不再往正文里塞头** —— 命令失败时原因已经在它自己的输出里
-        // （`ls: …: Permission denied`）；TUI 的 ✗ 也看不到那个头了（看 `failed`）。
-        let code = exit_code(&status);
-        // unix：stderr 已在同一个管道里（`errors` 恒空，顺序天然正确）；
-        // Windows：两根各读各的 → 拼在 stdout 后面（顺序不保证，但字不丢、也不卡死）。
-        let mut out: String = chunks.concat();
-        out.push_str(&errors.concat());
-
-        // 唯一的例外：命令失败却**什么都没说**（`grep -q` / `test` / `false` 这类）——
-        // 这时不给一行码，模型就只拿到一个空串、分不清成功失败。
-        let mut headers: Vec<String> = Vec::new();
-        if code != 0 && out.trim().is_empty() {
-            headers.push(format!("[exit={code}]"));
-        }
 
         // shell 的 stdout 不可再生（进程一结束就没了）→ 超限就把**全文**落盘、正文只留头段预览。
         // （截断/落盘/指针的规矩都住在 `ToolBody::fit` 里一处。）
@@ -1220,10 +1343,10 @@ impl Tool for Bash {
             },
         );
         Ok(ToolOutput {
-            headers,
+            headers: Header::new(),
             body,
             attachments: Vec::new(),
-            failed: code != 0,
+            status,
         })
     }
 }
@@ -1645,10 +1768,16 @@ mod tests {
         Registry::new(HashMap::new())
     }
 
-    /// **静默失败**时那行头（`impl Bash` 里那个格式的测试侧镜像）：只有退出码。
-    fn fail_header(code: i32) -> String {
-        format!("[exit={code}]")
+    /// 解析 `to_text()` 的头区（`read` / `edit` 的断言用）。
+    fn headers_of(out: &ToolOutput) -> std::collections::BTreeMap<String, Value> {
+        crate::header::split_header_body(&out.to_text())
+            .0
+            .into_iter()
+            .collect()
     }
+
+    /// **零输出失败**时自动注入的那行头（`ToolOutput::to_text` 生成）。
+    const SILENT_FAIL: &str = "header! { \"status\": \"failed\" }";
 
     #[test]
     fn tool_names_must_match_api_rules() {
@@ -1660,38 +1789,29 @@ mod tests {
         assert!(!valid_tool_name(&"x".repeat(65)));
     }
 
-    #[test]
-    fn format_output_omits_blank_line_when_body_empty() {
-        assert_eq!(format_output(&["[exit=0]".into()], ""), "[exit=0]");
-        assert_eq!(format_output(&["[exit=0]".into()], "hi"), "[exit=0]\n\nhi");
-        // 没有头区 → 直接给正文（`bash` 成功时就是这种；别以空串 join 出多余空行）
-        assert_eq!(format_output(&[], "hi"), "hi");
-        assert_eq!(format_output(&[], ""), "");
-    }
-
     /// 指针行**只有一个来源**（`body.spill`）：序列化后它的出现次数恒等于 `spill.is_some()`。
     /// 守住这条是为了防哪天有人在 `body.content` 里又拼一遍指针（那就又变成两处事实）。
     #[test]
     fn spill_pointer_comes_only_from_body_spill() {
         let inline = ToolOutput::text("hi");
         assert_eq!(inline.to_text(), "hi");
-        assert_eq!(inline.to_text().matches("[工具输出全文已保存:").count(), 0);
+        assert_eq!(inline.to_text().matches("\"saved\"").count(), 0);
 
+        // 落盘 → 头区多出 `saved`（`/tmp/raw-x` 不存在，所以没有 `bytes`）
         let spilled = ToolOutput {
-            headers: vec!["[exit=1]".into()],
+            headers: vec![("exit".into(), json!(1))],
             body: ToolBody {
                 content: "head".into(),
                 spill: Some(PathBuf::from("/tmp/raw-x")),
             },
             attachments: Vec::new(),
-            failed: false,
+            status: Status::Success,
         };
         assert_eq!(
             spilled.to_text(),
-            "[exit=1]\n[工具输出全文已保存: /tmp/raw-x]\n\nhead",
-            "顺序与旧的 `format_output` 一致：头区（指针行也是头区的一行）→ 空行 → 正文"
+            "header! {\n    \"exit\": 1,\n    \"saved\": \"/tmp/raw-x\"\n}\n\nhead",
         );
-        assert_eq!(spilled.to_text().matches("[工具输出全文已保存:").count(), 1);
+        assert_eq!(spilled.to_text().matches("\"saved\"").count(), 1);
 
         // 正文里自己写了一个「像指针」的行 → 那只是正文，不构成事实来源
         let fake = ToolOutput::text("[工具输出全文已保存: /nope]");
@@ -1825,14 +1945,10 @@ mod tests {
         // ⚠ TIFF/ICO/WAV 的魔数全在 ASCII + 控制字符范围 → UTF-8 解得出来，**仍当文本读**；
         // 这里要断言的是「不被当成图片」。真正走二进制分支的是解不出 UTF-8 的字节。
         for (name, bytes, marker) in [
-            ("text", b"hello world\n".to_vec(), "[行 1-1，共 1 行]"),
-            ("tiff", b"II*\0\x08\0\0\0".to_vec(), "[行 1-1，共 1 行]"),
-            (
-                "ico",
-                b"\x00\x00\x01\x00\x01\x00".to_vec(),
-                "[行 1-1，共 1 行]",
-            ),
-            ("wav", wav, "[行 1-1，共 1 行]"),
+            ("text", b"hello world\n".to_vec(), "header! {"),
+            ("tiff", b"II*\0\x08\0\0\0".to_vec(), "header! {"),
+            ("ico", b"\x00\x00\x01\x00\x01\x00".to_vec(), "header! {"),
+            ("wav", wav, "header! {"),
             ("binary", vec![0xff, 0xfe, 0x00, 0x01], "[二进制文件"),
         ] {
             let p = tmp(&format!("plain-{name}"));
@@ -1869,7 +1985,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().starts_with("[行 1-2，共 5 行]"), "{out}");
+        assert_eq!(headers_of(&out)["lines"], json!("1-2"), "{out}");
+        assert_eq!(headers_of(&out)["total"], json!(5), "{out}");
         assert!(out.to_text().ends_with("a\nb"), "{out}");
 
         // limit 是模型显式分页（不算截断）；_max_lines（配置注入的私有参数）才给续读提示
@@ -1881,10 +1998,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            out.to_text().contains("[已截断：可用 offset=3 继续读]"),
-            "{out}"
-        );
+        assert_eq!(headers_of(&out)["next"], json!(3), "{out}");
 
         // 字节预算：行不含换行 → 每行 "a" 算 2 字节（+1）；5 字节装得下 2 行
         let out = reg
@@ -1895,11 +2009,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().starts_with("[行 1-2，共 5 行]"), "{out}");
-        assert!(
-            out.to_text().contains("[已截断：可用 offset=3 继续读]"),
-            "{out}"
-        );
+        assert_eq!(headers_of(&out)["lines"], json!("1-2"), "{out}");
+        assert_eq!(headers_of(&out)["next"], json!(3), "{out}");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1959,7 +2070,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().contains("已替换 2 处"), "{out}");
+        assert_eq!(headers_of(&out)["replaced"], json!(2), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "ALPHA\nBETA\n");
 
         // 重叠 → 报错且不写入
@@ -2112,6 +2223,20 @@ mod tests {
             builtin().names(),
             vec!["read", "edit", "writ", "bash", "repl"]
         );
+    }
+
+    /// `read` 的独有能力（图片走多模态）只写在它自己的 description 里
+    /// （`prompts/system.md` 不再复述工具清单 → 这里丢了模型就不知道能读图）。
+    #[test]
+    fn read_description_mentions_images() {
+        let specs = builtin().tool_specs();
+        let read = specs
+            .iter()
+            .find(|s| s["function"]["name"] == "read")
+            .expect("read 未注册");
+        let desc = read["function"]["description"].as_str().unwrap_or_default();
+        assert!(desc.contains("多模态图像"), "{desc}");
+        assert!(desc.contains("已截断"), "{desc}");
     }
 
     // 自测工具（非内置）：验证 `.with_tool` 这条公开路径。
@@ -2339,20 +2464,21 @@ mod tests {
         // stderr 已合并到 stdout（顺序稳定：同一个管道）
     }
 
+    /// 非 0 退出且**零输出**：`to_text` 自动补一行 `status: "failed"`（否则模型只拿到空串）。
     #[tokio::test]
-    async fn shell_reports_nonzero_exit_code() {
+    async fn shell_nonzero_exit_with_no_output_gets_the_status_header() {
         let out = builtin()
             .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        // 没输出 → 结果就是那一行头
-        assert_eq!(out.to_text(), fail_header(3), "{out}");
+        assert_eq!(out.to_text(), SILENT_FAIL, "{out}");
+        assert_eq!(out.status, Status::Failed);
     }
 
-    /// 被信号杀掉 → 头区按 shell 口径写 `128 + 信号号`（`kill -9` → 137），不是一句 `exit=-1`。
+    /// 被信号杀掉也是 `Failed`：不再把 `128+n` 编进正文（它与「程序自己 exit 137」不可区分）。
     #[cfg(unix)]
     #[tokio::test]
-    async fn signal_killed_command_reports_shell_style_code() {
+    async fn signal_killed_command_is_a_failure() {
         let out = builtin()
             .dispatch(
                 "bash",
@@ -2361,18 +2487,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            out.to_text().starts_with(&fail_header(137)),
-            "{}",
-            out.to_text()
+        assert_eq!(
+            out.to_text(),
+            SILENT_FAIL,
+            "零输出失败：只给自动注入的 status 头"
         );
-        assert!(out.failed, "被信号杀掉也算失败");
+        assert_eq!(out.status, Status::Failed);
     }
 
-    /// 正文里不再有 `[exit=…]` 那种头：**只有「失败且没输出」时才补一行 `[exit=N]`**
-    /// （否则模型拿到空串，分不清成功失败）。成败走结构化的 `failed`。
+    /// **只有「失败且没输出」才补 `status` 头**（有输出时原因已在正文里）。
     #[tokio::test]
-    async fn shell_exit_header_only_when_failure_is_silent() {
+    async fn shell_status_header_only_when_failure_is_silent() {
         let reg = builtin();
         let ok = reg
             .dispatch("bash", &json!({"command": "echo hi"}), ToolCtx::default())
@@ -2387,17 +2512,17 @@ mod tests {
         assert_eq!(
             silent.to_text(),
             "",
-            "成功且没输出：结果为空（没有 `[exit=0]` 可给）"
+            "成功且没输出：结果为空（成功不写 status 头）"
         );
 
-        let headers = fail_header(3);
+        let want = SILENT_FAIL;
         let bad = reg
             .dispatch("bash", &json!({"command": "exit 3"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(bad.to_text(), headers, "失败且没输出：只有一行头");
+        assert_eq!(bad.to_text(), want, "失败且没输出：只给 status 头");
 
-        // 失败但有输出：**一个字都不加**（原因在命令自己的输出里），只把 `failed` 置上
+        // 失败但有输出：**一个字都不加**（原因在命令自己的输出里），只把 `status` 置上
         let loud = reg
             .dispatch(
                 "bash",
@@ -2407,28 +2532,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loud.to_text(), "boom\n", "有输出的失败：正文原样");
-        assert!(loud.failed, "界面靠它画 ✗");
+        assert_eq!(loud.status, Status::Failed, "界面靠它画 ✗");
 
-        // 成功：`failed` 是 false
-        assert!(!ok.failed && !silent.failed);
+        // 成功：`status` 是 Success
+        assert_eq!(
+            (ok.status, silent.status),
+            (Status::Success, Status::Success)
+        );
     }
 
-    /// 失败**且没输出**（`grep -q` / `test` / `false` 这类）→ 补一行退出码，别的都不加。
+    /// 失败**且没输出**（`grep -q` / `test` / `false` 这类）→ 自动补一行 status。
     #[tokio::test]
-    async fn silent_failure_gets_the_exit_code_line() {
+    async fn silent_failure_gets_the_status_header() {
         let out = builtin()
             .dispatch("bash", &json!({"command": "false"}), ToolCtx::default())
             .await
             .unwrap();
-        assert_eq!(out.to_text(), fail_header(1));
-        assert!(out.failed);
+        assert_eq!(out.to_text(), SILENT_FAIL);
+        assert_eq!(out.status, Status::Failed);
     }
 
     /// 被信号干掉（`code()` 拿不到）→ 按 **shell 的口径** 记 `128 + 信号号`：
     /// `kill -TERM $$` → 143（在自己终端里 `echo $?` 也是这个数），不是一句 `-1`。
     #[cfg(unix)]
     #[tokio::test]
-    async fn killed_shell_reports_shell_style_code() {
+    async fn killed_shell_is_a_failure() {
         let out = builtin()
             .dispatch(
                 "bash",
@@ -2437,7 +2565,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().starts_with(&fail_header(143)), "{out}");
+        assert_eq!(out.to_text(), SILENT_FAIL, "{out}");
+        assert_eq!(out.status, Status::Failed);
     }
 
     #[tokio::test]
@@ -2450,31 +2579,16 @@ mod tests {
             )
             .await
             .unwrap();
-        // 超限 → 只留**开头** + 独立指针（shell 的 stdout 不可再生，是唯一该落盘的）
-        assert!(out.to_text().contains("[工具输出全文已保存: "), "{out}");
+        // 超限 → 只留**开头** + 独立的 `saved` 键（shell 的 stdout 不可再生，是唯一该落盘的）
+        assert!(out.to_text().contains("\"saved\""), "{out}");
         let full = out.to_text();
         let body = full.split("\n\n").nth(1).expect("有 body");
         assert!(body.starts_with("1\n"), "{body}");
         assert!(body.contains("5\n") && !body.contains("6\n"), "{body}");
 
-        // 但全文仍然落盘（经指针可取回）——「取头部」丢的只是可见性，不是信息
-        let text = out.to_text();
-        let spill = text
-            .lines()
-            .find_map(|l| l.strip_prefix("[工具输出全文已保存: ")?.strip_suffix(']'))
-            .expect("有落盘指针");
-        let full = std::fs::read_to_string(spill).expect("落盘文件可读");
-        // 结构化：路径也随结果交出来（消息层据此**构造时**就设 `compaction`，不再靠文本嗅探）
-        let spilled = out
-            .body
-            .spill
-            .clone()
-            .expect("落盘 → ToolOutput.body.spill 有值");
-        assert_eq!(
-            spilled,
-            PathBuf::from(spill),
-            "结构化路径与正文里的指针一致"
-        );
+        // 但全文仍然落盘（从 `body.spill` 取回）——「取头部」丢的只是可见性，不是信息
+        let spill = out.body.spill.clone().expect("落盘 → body.spill 有值");
+        let full = std::fs::read_to_string(&spill).expect("落盘文件可读");
         assert!(
             full.starts_with("1\n") && full.contains("200\n"),
             "落盘内容不完整"
@@ -2510,7 +2624,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.to_text().contains("全文已保存"), "{out}");
+        assert!(out.to_text().contains("\"saved\""), "{out}");
         assert_eq!(
             out.to_text().split("\n\n").nth(1).unwrap(),
             "1\n2\n3\n",
@@ -2545,7 +2659,7 @@ mod tests {
             "尾巴要收全：{}",
             &text[..200.min(text.len())]
         );
-        assert!(!out.failed, "命令本身是成功的");
+        assert_eq!(out.status, Status::Success, "命令本身是成功的");
     }
 
     #[tokio::test]
@@ -2562,10 +2676,30 @@ mod tests {
             .await
             .unwrap();
         assert!(out.to_text().contains("超时"), "{out}");
+        assert_eq!(out.status, Status::Timeout { secs: 1 }, "超时是一等状态");
         assert!(
             started.elapsed().as_secs() < 10,
             "超时路径被卡住了: {:?}",
             started.elapsed()
         );
+    }
+
+    /// 超时前已经打出来的东西要留着（否则「报错后才卡住」的原因就永远看不到）。
+    #[tokio::test]
+    async fn timeout_keeps_the_output_already_read() {
+        let out = builtin()
+            .dispatch(
+                "bash",
+                &json!({"command": "echo BEFORE; echo EBEFORE 1>&2; sleep 30", "timeout": 1}),
+                ToolCtx::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.status, Status::Timeout { secs: 1 });
+        let text = out.to_text();
+        assert!(text.contains("BEFORE"), "{text}");
+        assert!(text.contains("EBEFORE"), "stderr 也已并进正文：{text}");
+        assert!(text.contains("\"status\": \"timeout\""), "{text}");
+        assert!(text.contains("\"timeout_secs\": 1"), "{text}");
     }
 }

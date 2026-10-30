@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::llm::Message;
+use crate::tools::Status;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------- 语义（回合 → 消费者）
@@ -49,8 +50,8 @@ pub enum TurnEvent {
         arguments: String,
         /// 工具产出的**图像**（本地文件路径）——只给界面用（模型看不到）。
         images: Vec<PathBuf>,
-        /// 这次调用**算失败**吗（界面据此画 ✗/✓；正文里不再带 `[exit=…]` 之类的头）。
-        failed: bool,
+        /// 这次调用的**结局**（界面据此画 ✓/✗/⏹/⏱；正文里不再带 `[exit=…]` 之类的头）。
+        status: Status,
     },
     /// 一条**完整的消息**组装好了（刚写进历史的那条）。
     ///
@@ -722,7 +723,7 @@ mod tests {
                 text: "ok".into(),
                 arguments: "{}".into(),
                 images: Vec::new(),
-                failed: false,
+                status: Status::Success,
             }),
             Event::Turn(TurnEvent::Message {
                 message: Message::assistant("x"),

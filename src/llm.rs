@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::tools::Status;
 
 // ---------------------------------------------------------------- 消息（线上格式）
 
@@ -30,6 +31,18 @@ use crate::config::Config;
 pub enum Content {
     Text(String),
     Parts(Vec<Value>),
+}
+
+/// 要挂进 tool 消息的附件（`Session::settle_output` 的产出）。
+///
+/// 两条投递路：
+///   - [`Delivered::File`]：Files API 上传件的 `file_id`（历史里只存 id，图只传一次）；
+///   - [`Delivered::Inline`]：内联 base64（`image_url` data URI）——**只给没有 Files API 的端点**用，
+///     图会留在历史里、每轮请求重发。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivered {
+    File { file_id: String },
+    Inline { mime: String, data: Vec<u8> },
 }
 
 impl Content {
@@ -153,10 +166,15 @@ pub struct Message {
     /// 非用户输入注入的消息（如图片）：不构成轮次边界、不计轮数。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
-    /// 这条 tool 消息对应的调用**失败**了（`false` = 成功 / 旧会话没记）：只给界面回放判 ✗/✓，
+    /// 这条 tool 消息的**结局**（`None` = 旧会话没有这个字段）：只给界面回放判 ✗/✓，
     /// 不进 API（`to_api` 的 tool 分支只取 `content`）。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+    /// 旧会话里的布尔字段（**只读兼容**：`true` → `Failed`、`false` → `Success`）。
+    ///
+    /// 新数据只写 `status`；这个字段靠 [`Message::effective_status`] 归一。
+    #[serde(default, rename = "failed", skip_serializing)]
+    pub legacy_failed: Option<bool>,
     /// 这条 assistant 回复前「思考」了多久（毫秒）：**只进会话文件、不进 API**（`to_api` 不带上它）。
     ///
     /// 实时视图里它是 TUI 现算的一行 `• Thought for 3.4s`；不落盘的话，退出再 `pie -r`
@@ -166,6 +184,18 @@ pub struct Message {
 }
 
 impl Message {
+    /// 有效的结局：新字段优先；旧会话只有布尔 `failed`；都没有 → `None`
+    /// （由回放层退回文本嗅探，见 `tui::pane::tool_status`）。
+    pub fn effective_status(&self) -> Option<Status> {
+        self.status.or(self.legacy_failed.map(|failed| {
+            if failed {
+                Status::Failed
+            } else {
+                Status::Success
+            }
+        }))
+    }
+
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -206,9 +236,76 @@ impl Message {
         tool_name: impl Into<String>,
         text: impl Into<String>,
     ) -> Self {
+        Self::tool_result_with_attachments(tool_call_id, tool_name, text, &[])
+    }
+
+    /// tool 消息：正文 + 要送给模型的图（`file` / `image_url` part）。
+    ///
+    /// 附件必须**先备好**再构造消息：`Session::settle_output` 在回填 tool 消息之前就把
+    /// `read` 读到的图处理掉，然后把 [`Delivered`] 一股脑交到这里，content 一次成型。
+    /// **不是**先写纯文本再回头改。附件为空时与 [`Message::tool_result`] 完全相同（纯文本）。
+    pub fn tool_result_with_attachments(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        text: impl Into<String>,
+        attachments: &[Delivered],
+    ) -> Self {
+        let text = text.into();
+        if attachments.is_empty() {
+            return Self {
+                role: "tool".into(),
+                content: Some(Content::Text(text)),
+                tool_call_id: Some(tool_call_id.into()),
+                tool_name: Some(tool_name.into()),
+                ..Default::default()
+            };
+        }
+        // 标准 base64（RFC 4648）：内联图用。没有另一个消费者，所以是嵌套 fn。
+        fn b64(data: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+            for chunk in data.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                out.push(TABLE[(n >> 18) as usize & 63] as char);
+                out.push(TABLE[(n >> 12) as usize & 63] as char);
+                out.push(if chunk.len() > 1 {
+                    TABLE[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    TABLE[n as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        let mut parts = Vec::with_capacity(attachments.len() + 1);
+        if !text.is_empty() {
+            parts.push(json!({"type": "text", "text": text}));
+        }
+        for attachment in attachments {
+            match attachment {
+                Delivered::File { file_id } => {
+                    parts.push(json!({"type": "file", "file_id": file_id}));
+                }
+                Delivered::Inline { mime, data } => parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{mime};base64,{}", b64(data)) },
+                })),
+            }
+        }
         Self {
             role: "tool".into(),
-            content: Some(Content::Text(text.into())),
+            content: Some(Content::Parts(parts)),
             tool_call_id: Some(tool_call_id.into()),
             tool_name: Some(tool_name.into()),
             ..Default::default()
@@ -226,8 +323,8 @@ impl Message {
             return json!({
                 "role": "tool",
                 "tool_call_id": self.tool_call_id.clone().unwrap_or_default(),
-                // ⚠ 多模态 parts 必须原样透传：`Session::attach_read_images` 把读到图的 tool 消息
-                // 改成了 `[{type:text}, {type:file, file_id}]`，只取 `Text` 会把它整条吞成空串 ——
+                // ⚠ 多模态 parts 必须原样透传：`Session::settle_output` 把读到图的 tool 消息
+                // 构造成 `[{type:text}, {type:file, file_id}]`，只取 `Text` 会把它整条吞成空串 ——
                 // 图（连同那行 `[图片已读取: …]`）就再也到不了模型。
                 "content": match &self.content {
                     Some(Content::Text(t)) => json!(t),
@@ -987,8 +1084,8 @@ impl LlmClient {
 // 本地副本命名、`__meta__.files` 条目字段、`expires_after` 语义都收敛在这里
 // （不单独开一个 files.rs）。
 //
-// **只走 Files API、不回退内联 base64**：上传失败（或模型不支持）时拿不到 `file_id` 就不注入
-// 图片（read 的标记文本仍在工具结果里）。
+// **优先 Files API**（历史里只存 `file_id`）；上传失败 / `files_api = false` 时由
+// `Session::settle_output` 回退内联 base64（`image_url` data URI，有 `INLINE_MAX_BYTES` 上限）。
 
 /// 服务端上传件（`GET /files` 的条目）：字段缺失给 None，别让展示层崩。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1001,13 +1098,14 @@ pub struct FileObject {
     pub expires_at: Option<i64>,
 }
 
-/// 支持 `file` 内容块的模型白名单。
+/// 支持 `file` 内容块的模型白名单（**仅给外部 / 绑定判断**——pie 自己的传图决策看
+/// `Config::vision`，不再按模型名猜）。
 pub const FILES_API_MODELS: [&str; 2] = ["deepseek-flash", "deepseek-v4-flash-vision-exp"];
 
 /// 服务端允许的上传有效期上限（天）。
 pub const TTL_MAX_DAYS: i64 = 30;
 
-/// 当前模型是否支持 `file` 内容块（不支持就别白传）。
+/// 这个模型名是否在 `file` 块白名单里（**不用于 `Session` 的传图决策**，那是 `Config::vision`）。
 pub fn model_supports_files(model: &str) -> bool {
     !model.is_empty() && FILES_API_MODELS.iter().any(|name| model.contains(name))
 }
@@ -1418,16 +1516,20 @@ mod tests {
 
     /// 带图的 tool 消息（`Content::Parts`）必须**原样**进请求体。
     ///
-    /// `read` 读到图时 `Session::attach_read_images` 会把 content 换成
-    /// `[{type:text}, {type:file, file_id}]`；`to_api` 的 tool 分支只取 `Text` 会把它整条
-    /// 吞成空串 —— 图连那行 `[图片已读取: …]` 一起到不了模型（模型只能瞎猜着描述）。
+    /// `read` 读到图时 `Session::settle_output` 先备好附件、再用
+    /// [`Message::tool_result_with_attachments`] 一次构造出 `[{type:text}, {type:file, file_id}]`
+    /// （或 `image_url` 内联）；`to_api` 的 tool 分支只取 `Text` 会把它整条吞成空串 ——
+    /// 图连那行 `[图片已读取: …]` 一起到不了模型（模型只能瞎猜着描述）。
     #[test]
     fn tool_message_passes_content_parts_through_to_the_api() {
-        let mut m = Message::tool_result("call_1", "read", "[图片已读取: path=/tmp/a.png]");
-        m.content = Some(Content::Parts(vec![
-            json!({"type": "text", "text": "[图片已读取: path=/tmp/a.png]"}),
-            json!({"type": "file", "file_id": "file-abc"}),
-        ]));
+        let m = Message::tool_result_with_attachments(
+            "call_1",
+            "read",
+            "[图片已读取: path=/tmp/a.png]",
+            &[Delivered::File {
+                file_id: "file-abc".into(),
+            }],
+        );
         let api = m.to_api();
         assert_eq!(api["role"], "tool");
         assert_eq!(api["tool_call_id"], "call_1");
@@ -1436,6 +1538,24 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[1]["type"], "file");
         assert_eq!(parts[1]["file_id"], "file-abc");
+
+        // 内联 base64：`image_url` part（没有 Files API 的端点走这条）
+        let inline = Message::tool_result_with_attachments(
+            "call_2",
+            "read",
+            "",
+            &[Delivered::Inline {
+                mime: "image/png".into(),
+                data: b"hi".to_vec(),
+            }],
+        );
+        let parts = inline.to_api()["content"].as_array().cloned().unwrap();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(
+            parts[0]["image_url"]["url"], "data:image/png;base64,aGk=",
+            "标准 base64（`hi` → aGk=）"
+        );
 
         // 没有 content 的 tool 消息仍是空串（不是 null，API 不接受 null）
         let empty = Message {

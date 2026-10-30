@@ -27,11 +27,11 @@
 //!
 //!   - **schema 住 shebang 后面那段注释里**（`# schema! { … }`）：脚本自己就能被模型读懂、
 //!     也不需要一个额外的清单文件；注释里的块对 shell 完全无副作用（`sh` 只把它当注释）；
-//!   - **参数走命令行**（`--名字=值`）：一条调用在日志 / `ps` / `set -x` 里**自解释**，
-//!     照抄就能手工复现 —— 这正是 shell 工具好在哪里的地方（`docs/sh-plugins.md` §3 有与
-//!     「走环境变量」的权衡）；
-//!   - **私有参数（`_` 开头）走环境变量**（`PIE_CFG_<名字>`）：那是**站点配置**，不是这次调用
-//!     的输入，本来就该在进程环境里；模型也看不见它们（`_` 不进 schema）；
+//!   - **参数走命令行 `--键名=值`**：顶层标量一个参数一个（bool → `1`/`0`、数字按 JSON 字面量、
+//!     字符串原样；**不经过 shell**，空格与换行都安全）；数组 / 对象只在 **stdin 的一行
+//!     compact JSON** 里；`PIE_ARG_<键名>` 环境变量**仍然导出**（老脚本兼容，新脚本别依赖）；
+//!   - **私有参数（`_` 开头）是站点配置**：`--_file=…`（环境变量另给 `PIE_ARG__file`，多一个
+//!     下划线），模型看不见它们（`_` 不进 schema）；
 //!   - stdout = 正文、stderr = 失败时才补进正文、`exit != 0` = 失败。超限落盘与 bash 同路
 //!     （`ToolBody::fit`）。
 //!
@@ -53,7 +53,8 @@ use serde_json::{Value, json};
 use crate::cancel::CANCEL_TEXT;
 use crate::config::Config;
 use crate::tools::{
-    CallFn, Limits, Registry, ToolBody, ToolCtx, ToolError, ToolOutput, ToolResult, valid_tool_name,
+    Attachment, CallFn, Ended, Limits, Registry, Status, ToolBody, ToolCtx, ToolError, ToolOutput,
+    ToolResult, valid_tool_name,
 };
 
 /// 默认超时（秒）：`# schema!` 里没写 `timeout_seconds` 就用它。
@@ -281,23 +282,33 @@ impl DeclText {
 
 /// 一次调用：参数分拣 → 起脚本 → 收输出。
 ///
-/// 分拣规则只有一条：**`_` 开头的是站点配置**（→ `PIE_CFG_*` 环境变量），其余是这次调用的
-/// 输入（→ `--名字=值`）；`_max_lines` / `_max_bytes` 是宿主旋钮（两边都不进）。
+/// 分拣规则：`_max_lines` / `_max_bytes` 是**宿主旋钮**（摘掉、不投递）；`_timeout_seconds`
+/// 既管宿主超时、也原样给脚本（它自己内部的 `timeout` 常要）；其余键全部投递。
+///
+/// 投递三种投影（同一个 args）：**argv** 里每个顶层标量一个 `--键名=值`（主通道，规则见
+/// [`scalar_text`]）；**stdin** 一行 compact JSON（数组 / 对象只能从这儿拿）；
+/// **`PIE_ARG_<键名>`** 环境变量（兼容旧脚本，规则见 [`env_name`]）。
 async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
-    let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut argv: Vec<String> = Vec::new();
     let mut limits = Limits::default();
     let mut timeout = script.timeout;
+    let mut payload = serde_json::Map::new();
     if let Some(map) = args.as_object() {
         for (key, value) in map {
             // `null` = 模型显式说「没有」→ 当没给（让脚本自己的默认值说话）
             if value.is_null() {
                 continue;
             }
-            let text = as_text(value);
             match key.as_str() {
-                "_max_lines" => limits.lines = value.as_i64(),
-                "_max_bytes" => limits.bytes = value.as_i64(),
+                "_max_lines" => {
+                    limits.lines = value.as_i64();
+                    continue;
+                }
+                "_max_bytes" => {
+                    limits.bytes = value.as_i64();
+                    continue;
+                }
                 // 超时是**两用**的：pie 用它杀脚本，脚本自己也常要它（它内部的 `timeout` 之类）
                 "_timeout_seconds" => {
                     if let Some(secs) = value.as_i64()
@@ -305,17 +316,36 @@ async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
                     {
                         timeout = secs;
                     }
-                    env.push((cfg_env(key), text));
                 }
-                _ if key.starts_with('_') => env.push((cfg_env(key), text)),
-                _ => argv.push(format!("--{key}={text}")),
+                _ => {}
+            }
+            payload.insert(key.clone(), value.clone());
+            if let Some(text) = scalar_text(value) {
+                // 主通道：`--键名=值`（一个参数一个值，不经过 shell）
+                argv.push(format!("--{key}={text}"));
+                // 兼容通道：`PIE_ARG_<键名>`（键名不是合法标识符就导不出）
+                if let Some(name) = env_name(key) {
+                    env.push((name, text));
+                }
             }
         }
     }
+    let state_dir = script.home.join("state").join(&script.name);
+    // `PIE_STATE_DIR` 是跨调用状态的唯一去处（短命进程没有内存）：存在即建
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        crate::log::warn(format!(
+            "[shplugin] 建状态目录失败 {}: {e}",
+            state_dir.display()
+        ));
+    }
     env.push(("PIE_HOME".to_string(), script.home.display().to_string()));
-    env.push(("PIE_TOOL_NAME".to_string(), script.name.clone()));
+    env.push(("PIE_TOOL".to_string(), script.name.clone()));
+    env.push(("PIE_STATE_DIR".to_string(), state_dir.display().to_string()));
+    if let Some(dir) = script.path.parent() {
+        env.push(("PIE_PLUGIN_DIR".to_string(), dir.display().to_string()));
+    }
 
-    let child = match spawn_script(&script.path, &argv, &env) {
+    let mut child = match spawn_script(&script.path, &env, &argv) {
         Ok(child) => child,
         Err(e) => {
             return Err(ToolError(format!(
@@ -325,82 +355,124 @@ async fn run(script: &Script, args: Value, ctx: ToolCtx) -> ToolResult {
             )));
         }
     };
-    match wait_script(child, timeout, ctx.cancel.clone()).await {
-        // 成功时 stderr 是噪声（脚本自己的诊断）→ 丢掉；失败时它才是给模型的理由。
-        Ok(Ended::Exited {
-            out,
-            err: diag,
-            code,
-        }) => {
-            let mut body = out;
-            let mut headers = Vec::new();
-            if code != 0 {
-                if !diag.trim().is_empty() {
-                    if !body.is_empty() && !body.ends_with('\n') {
-                        body.push('\n');
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        // 完整 args 走 stdin（一行 compact JSON，写完立刻关）。脚本可以不读就退出 → 写入拿到
+        // EPIPE，那是「参数没被消费」，**不是失败**。
+        let json = Value::Object(payload).to_string();
+        let _ = stdin.write_all(json.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        drop(stdin);
+    }
+    let limit = (timeout > 0).then(|| std::time::Duration::from_secs(timeout as u64));
+    let ended = match crate::tools::collect(child, limit, ctx.cancel.clone()).await {
+        Ok(ended) => ended,
+        Err(e) => return Err(ToolError(format!("[{}] 等待脚本失败: {e}", script.name))),
+    };
+    match ended {
+        // stderr 已由 `collect` 并进 output（Unix `dup2`；Windows 两根读完拼接）。
+        Ended::Done { output, code } => {
+            // 头区里的 `image`（字符串或数组）→ 送给模型的图：与 `read` 读到图同一条投递路
+            // （`Session::settle_output` 上传 → `file_id` 挂进这条 tool 消息）。脚本因此不需要
+            // 知道 Files API 存在，模型也不必再 `read` 一遍截图。
+            let (headers, body) = crate::header::split_header_body(&output);
+            let mut attachments = Vec::new();
+            for (_, value) in headers.iter().filter(|(key, _)| key == "image") {
+                let paths: Vec<&str> = match value {
+                    Value::String(path) => vec![path.as_str()],
+                    Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                for path in paths {
+                    let path = Path::new(path);
+                    let mime = match path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("png") => "image/png",
+                        Some("jpg" | "jpeg") => "image/jpeg",
+                        Some("gif") => "image/gif",
+                        Some("webp") => "image/webp",
+                        Some("bmp") => "image/bmp",
+                        _ => {
+                            crate::log::warn(format!(
+                                "[shplugin] {}: image={} 不是认识的图片扩展名，不附",
+                                script.name,
+                                path.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    match std::fs::metadata(path) {
+                        Ok(meta) if meta.is_file() => attachments.push(Attachment::Model {
+                            path: path.to_path_buf(),
+                            mime: mime.to_string(),
+                            size: meta.len(),
+                            dim: None,
+                        }),
+                        _ => crate::log::warn(format!(
+                            "[shplugin] {}: image={} 文件不在，不附",
+                            script.name,
+                            path.display()
+                        )),
                     }
-                    body.push_str(&diag);
-                }
-                // 失败却**什么都没说**（`test -f x` 这种）→ 补一行码，否则模型只拿到空串
-                if body.trim().is_empty() {
-                    headers.push(format!("[exit={code}]"));
                 }
             }
             Ok(ToolOutput {
                 headers,
-                body: ToolBody::fit(&ctx, &body, limits),
-                attachments: Vec::new(),
-                failed: code != 0,
+                body: ToolBody::fit(&ctx, body, limits),
+                attachments,
+                status: if code == 0 {
+                    Status::Success
+                } else {
+                    Status::Failed
+                },
             })
         }
-        Ok(Ended::TimedOut { secs }) => Ok(ToolOutput::text(format!(
-            "[{}] 脚本超过 {secs}s 超时（可能仍在后台跑）：{}",
-            script.name,
-            script.path.display()
-        ))
-        .failed()),
+        Ended::TimedOut { output, secs } => {
+            let mut text = format!(
+                "[{}] 脚本超过 {secs}s 超时（可能仍在后台跑）：{}",
+                script.name,
+                script.path.display()
+            );
+            let tail = crate::tools::tail_lines(&output, 20);
+            if !tail.trim().is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&tail);
+            }
+            Ok(ToolOutput::text(text).with_status(Status::Timeout { secs }))
+        }
         // 与 `bash` 同款：杀进程组、回哨兵文本，上层据此收尾（补全未执行的 tool 消息）
-        Ok(Ended::Cancelled) => Ok(ToolOutput::text(CANCEL_TEXT)),
-        Err(e) => Err(ToolError(format!("[{}] 等待脚本失败: {e}", script.name))),
+        Ended::Cancelled { .. } => Ok(ToolOutput::text(CANCEL_TEXT).cancelled()),
     }
 }
 
-/// 脚本的结局（与 `bash` 工具的「跑完 / 超时 / 取消」三态同构，但**这里自己实现**：
-/// 那个是「一条命令、一条流、`bash -c`」，这个是「一个脚本文件、两根流、exec」）。
-enum Ended {
-    Exited { out: String, err: String, code: i32 },
-    TimedOut { secs: i64 },
-    Cancelled,
-}
-
-/// 起一个跑脚本的进程：参数按位置传（**不经过 `-c`**，所以空格 / 引号 / 换行不会被再解释一遍）。
+/// 起一个跑脚本的进程（参数走**命令行**：每个顶层标量一个 `--键名=值`，排在脚本路径之后；
+/// 数组 / 对象与完整 args 另走 stdin）。
 ///
 /// 脚本**可执行**（有 x 位）就直接 exec → shebang 说了算（「手工 `./tool.sh`」与「pie 跑」
 /// 于是是同一条路）；否则用 **`sh`** 跑它（这里**不做** `bash`/`sh` 候选轮询：脚本工具的
 /// 目标就是「哪台机器都有 sh」，要 bash 特性就 `chmod +x` 自己写 shebang）。
 ///
-/// 与 `bash` 工具的两点不同（都是脚本工具需要的）：stdin 给 `/dev/null`（脚本不该吃到 pie 的
-/// 终端）、stderr **不并进** stdout（诊断与正文分开，成功时那些噪声才丢得掉）。
+/// 与 `bash` 工具的不同：stdin 接的是 args 的 JSON（不接 pie 的终端）；**stderr 同样并进 stdout**
+/// （`grouped` 里的 `dup2`，与 bash 一致——成功时的 stderr 也是正文，不再丢弃）。
 ///
 /// 进程管线**住本模块**（与 `pyhost` 之于 `pyplugin` 同一套分工）：工具层只提供「一个工具长什么样」，
 /// 不替每种后端管子进程。
 fn spawn_script(
     path: &Path,
-    args: &[String],
     envs: &[(String, String)],
+    argv: &[String],
 ) -> std::io::Result<tokio::process::Child> {
     let configure = |cmd: &mut std::process::Command| {
-        cmd.args(args)
-            .envs(envs.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null())
+        cmd.envs(envs.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // 独立进程组：取消 / 超时按**组**杀（否则脚本起的子孙抱着管道写端，等待会被卡到它们退出）
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        // 独立进程组 + stderr 并进 stdout（与 bash 同一份 configure）
+        crate::tools::grouped(cmd);
     };
     #[cfg(unix)]
     {
@@ -408,99 +480,45 @@ fn spawn_script(
         let executable = std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
         if executable {
             let mut cmd = std::process::Command::new(path);
+            cmd.args(argv);
             configure(&mut cmd);
             return tokio::process::Command::from(cmd).spawn();
         }
     }
     let mut cmd = std::process::Command::new("sh");
     cmd.arg(path);
+    cmd.args(argv);
     configure(&mut cmd);
     tokio::process::Command::from(cmd).spawn()
 }
 
-/// 等一个脚本跑完：收齐 stdout / stderr，超时与取消都**杀整个进程组**。
+/// 参数值 → 命令行 / 环境变量里的**文本**：只处理顶层标量。
 ///
-/// 两根管道都得读（只读一根，另一根写满就把脚本堵住）；`timeout <= 0` 表示不限时。
-/// 杀组用的原语只有 `cancel::kill_group` 那一份，退出码口径也只有 `tools::exit_code` 那一份。
-async fn wait_script(
-    mut child: tokio::process::Child,
-    timeout: i64,
-    cancel: Option<crate::cancel::Cancel>,
-) -> std::io::Result<Ended> {
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    // tokio 的 id() 在进程已被回收后返回 None；0 表示“拿不到 pid”（不杀组）
-    let pid = child.id().unwrap_or(0);
-    let kill_group = || crate::cancel::kill_group(pid, crate::cancel::SIGKILL);
-
-    let read_and_wait = async {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let (_, _, status) = tokio::join!(
-            drain(stdout, &mut out),
-            drain(stderr, &mut err),
-            child.wait(),
-        );
-        status.map(|status| Ended::Exited {
-            out: String::from_utf8_lossy(&out).into_owned(),
-            err: String::from_utf8_lossy(&err).into_owned(),
-            code: crate::tools::exit_code(&status),
-        })
+/// bool → `1`/`0`（`[ "$V" = 1 ]`）、数字按 JSON 字面量（整数不带 `.0`）、字符串原样；
+/// **不给**：数组 / 对象（只能在 stdin 的 JSON 里拿）、含 NUL（argv 和 environ 都装不下）、
+/// 超过 4096 字节（环境变量侧会撞 `E2BIG`）。
+fn scalar_text(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(true) => "1".to_string(),
+        Value::Bool(false) => "0".to_string(),
+        _ => return None,
     };
-    tokio::pin!(read_and_wait);
+    (text.len() <= 4096 && !text.contains('\0')).then_some(text)
+}
 
-    // 取消（`Esc`）：`notify_waiters` 不补发 → 先查标志再 await（见 `cancel`）
-    let cancel_waiter = async {
-        match cancel {
-            Some(cancel) => cancel.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
-    tokio::pin!(cancel_waiter);
-
-    if timeout > 0 {
-        let limit = std::time::Duration::from_secs(timeout as u64);
-        tokio::select! {
-            waited = tokio::time::timeout(limit, &mut read_and_wait) => match waited {
-                Ok(done) => done,
-                Err(_) => {
-                    kill_group();
-                    Ok(Ended::TimedOut { secs: timeout })
-                }
-            },
-            _ = &mut cancel_waiter => {
-                kill_group();
-                Ok(Ended::Cancelled)
-            }
-        }
-    } else {
-        tokio::select! {
-            done = &mut read_and_wait => done,
-            _ = &mut cancel_waiter => {
-                kill_group();
-                Ok(Ended::Cancelled)
-            }
-        }
+/// 键名 → `PIE_ARG_<键名>`：只认 `[A-Za-z_][A-Za-z0-9_]*`（别的名字在 sh 里取不到）。
+/// 这类键仍会出现在 argv 与 stdin 里，只是没有环境变量那份。
+fn env_name(key: &str) -> Option<String> {
+    let mut chars = key.chars();
+    if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+        return None;
     }
-}
-
-/// 读完一根管道（读失败就当读了一半：被杀的子进程本来就会提前关管道）。
-async fn drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: &mut Vec<u8>) {
-    use tokio::io::AsyncReadExt;
-    let _ = reader.read_to_end(buf).await;
-}
-
-/// 参数值 → 命令行 / 环境变量里的**字符串**：字符串原样，其余按 JSON 字面量
-/// （`20` / `true` / `["a","b"]`）—— 一条规矩，脚本不用猜类型。
-fn as_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
     }
-}
-
-/// 私有参数 `_hdc` → 环境变量 `PIE_CFG_hdc`（只去**一个**前导下划线：`__x` → `PIE_CFG__x`）。
-fn cfg_env(key: &str) -> String {
-    format!("PIE_CFG_{}", key.strip_prefix('_').unwrap_or(key))
+    Some(format!("PIE_ARG_{key}"))
 }
 
 #[cfg(test)]
@@ -627,15 +645,19 @@ mod tests {
         assert_eq!(spec["function"]["parameters"]["type"], "object");
     }
 
-    /// **参数走命令行**：`--名字=值`，只带这次真的给了的；`_` 开头的走环境变量。
+    /// **参数走命令行**：每个顶层标量一个 `--键名=值`（bool → `1`/`0`、`null` 不设、`_` 原样带下划线）；
+    /// 数组 / 对象只在 stdin 那一行 JSON 里；`PIE_ARG_*` 仍导出（兼容）。
     #[tokio::test]
-    async fn args_go_to_argv_and_private_ones_to_env() {
-        let fixture = Fixture::new("argv");
+    async fn args_go_to_argv_and_stdin() {
+        let fixture = Fixture::new("args");
         fixture.script(
             "echo.sh",
             "#!/bin/sh\n# schema! {\n#   \"description\": \"回显\"\n# }\n\
-             for arg in \"$@\"; do printf '[%s]' \"$arg\"; done\n\
-             printf 'cfg=%s home=%s name=%s\\n' \"$PIE_CFG_hdc\" \"$PIE_HOME\" \"$PIE_TOOL_NAME\"\n",
+             printf 'stdin=%s\\n' \"$(cat)\"\n\
+             for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done\n\
+             printf 'q=%s b=%s n=%s tags=%s cfg=%s tool=%s\\n' \\\n\
+               \"$PIE_ARG_query\" \"$PIE_ARG_screenshot\" \"$PIE_ARG_max_items\" \\\n\
+               \"${PIE_ARG_tags-<unset>}\" \"$PIE_ARG__hdc\" \"$PIE_TOOL\"\n",
         );
         let mut table = toml::Table::new();
         table.insert("_hdc".to_string(), toml::Value::String("hdc 路径".into()));
@@ -648,39 +670,55 @@ mod tests {
             .dispatch(
                 "echo",
                 &json!({
-                    "query": "两个 词",          // 空格原样过去（argv 不经过 shell）
-                    "screenshot": true,
-                    "max_items": 20,
-                    "tags": ["a", "b"],          // 数组按 JSON 字面量给
-                    "skipped": Value::Null,      // null = 没给
-                    "unset": "x"
+                    "query": "两个 词",     // 空格原样过去（不经过 shell）
+                    "screenshot": true,     // bool → 1
+                    "max_items": 20,        // 数字不带 .0
+                    "tags": ["a", "b"],    // 数组只在 stdin 里
+                    "skipped": Value::Null, // null = 没给
                 }),
                 ctx.clone(),
             )
             .await
             .expect("跑通");
         let text = out.to_text();
-        for want in [
-            "[--query=两个 词]",
-            "[--screenshot=true]",
-            "[--max_items=20]",
-            "[--tags=[\"a\",\"b\"]]",
-            "[--unset=x]",
-        ] {
-            assert!(text.contains(want), "缺 {want}：{text}");
-        }
-        assert!(!text.contains("--skipped"), "null 不该变成参数：{text}");
-
-        // 环境事实：数据根 + 工具名（**没有**状态目录 —— 要状态就自己往 `$PIE_HOME` 里写）
-        let want = format!("cfg=hdc 路径 home={} name=echo", fixture.dir.display());
-        assert!(text.contains(&want), "该是 {want}：{text}");
         assert!(
-            !text.contains("PIE_STATE_DIR"),
-            "不该有 PIE_STATE_DIR：{text}"
+            text.contains(r#""query":"两个 词""#),
+            "stdin 仍是完整 args 的 JSON：{text}"
+        );
+        assert!(
+            text.contains(r#""tags":["a","b"]"#),
+            "数组只能从 stdin 拿：{text}"
+        );
+        assert!(!text.contains("skipped"), "null 不该出现在 stdin：{text}");
+        assert!(
+            text.contains("arg=--query=两个 词\n"),
+            "字符串原样进 argv（不经过 shell）：{text}"
+        );
+        assert!(text.contains("arg=--screenshot=1\n"), "bool → 1：{text}");
+        assert!(
+            text.contains("arg=--max_items=20\n"),
+            "数字按 JSON 字面量（不带 .0）：{text}"
+        );
+        assert!(
+            text.contains("arg=--_hdc=hdc 路径\n"),
+            "私有参数原样带下划线：{text}"
+        );
+        assert!(
+            !text.contains("--tags"),
+            "数组只在 stdin，不进 argv：{text}"
+        );
+        assert!(
+            text.contains("q=两个 词 b=1 n=20 tags=<unset> cfg=hdc 路径 tool=echo"),
+            "PIE_ARG_* 仍导出（兼容；bool → 1、`_hdc` → `PIE_ARG__hdc`）：{text}"
+        );
+        // 状态目录：跨调用状态的唯一去处，存在即建
+        assert!(
+            fixture.dir.join("state/echo").is_dir(),
+            "PIE_STATE_DIR 该建出来"
         );
     }
 
-    /// 成败与两条流：stdout 是正文、stderr 只在失败时补进来、静默失败补一行 `[exit=N]`。
+    /// 成败与两条流：stdout 是正文、stderr 并进正文（`2>&1`）、静默失败自动补 `status: failed`。
     #[tokio::test]
     async fn stdout_is_the_body_and_stderr_only_hurts_on_failure() {
         let fixture = Fixture::new("streams");
@@ -703,22 +741,85 @@ mod tests {
             .dispatch("ok", &json!({}), ctx.clone())
             .await
             .unwrap();
-        assert_eq!(ok.to_text(), "正文\n", "成功的 stderr 是噪声，丢掉");
-        assert!(!ok.failed);
+        assert_eq!(
+            ok.to_text(),
+            "正文\n诊断\n",
+            "stderr 现在并进 stdout（2>&1），成功也保留"
+        );
+        assert_eq!(ok.status, Status::Success);
 
         let bad = registry
             .dispatch("bad", &json!({}), ctx.clone())
             .await
             .unwrap();
         assert_eq!(bad.to_text(), "一半\n出错原因\n", "失败的 stderr 是理由");
-        assert!(bad.failed);
+        assert_eq!(bad.status, Status::Failed);
 
         let quiet = registry
             .dispatch("quiet", &json!({}), ctx.clone())
             .await
             .unwrap();
-        assert_eq!(quiet.to_text(), "[exit=4]", "静默失败要补一行码");
-        assert!(quiet.failed);
+        assert_eq!(
+            quiet.to_text(),
+            "header! { \"status\": \"failed\" }",
+            "静默失败要补一行 status"
+        );
+        assert_eq!(quiet.status, Status::Failed);
+    }
+
+    /// 首行头区的 `image=<路径>` → `Attachment::Model`（与 `read` 读到图同一条投递路：
+    /// `Session::settle_output` 上传后把 `file_id` 挂进 tool 消息，模型不必再 `read` 一遍）。
+    /// 不是图片扩展名 / 文件不在的只告警跳过；声明行本身仍留在正文里（模型看得到路径）。
+    #[tokio::test]
+    async fn image_in_the_header_becomes_an_attachment() {
+        let fixture = Fixture::new("image");
+        let png = fixture.dir.join("shot.png");
+        std::fs::write(&png, b"fake-png").unwrap();
+        let missing = fixture.dir.join("missing.png");
+        // 头区是 `header! { … }` 块（纯 JSON），`image` 可以是字符串或数组。
+        fixture.script(
+            "shot.sh",
+            &format!(
+                "#!/bin/sh\n# schema! {{\n#   \"description\": \"截图\"\n# }}\nprintf 'header! {{ \"shot\": \"%s\", \"image\": [\"%s\", \"%s\"] }}\\n\\n正文\\n' '{}' '{}' '{}'\n",
+                png.display(),
+                png.display(),
+                missing.display()
+            ),
+        );
+        let out = fixture
+            .registry(HashMap::new())
+            .dispatch("shot", &json!({}), fixture.ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.attachments.len(),
+            1,
+            "不存在的图不附：{:?}",
+            out.attachments
+        );
+        match &out.attachments[0] {
+            Attachment::Model {
+                path,
+                mime,
+                size,
+                dim,
+            } => {
+                assert_eq!(path, &png);
+                assert_eq!(mime, "image/png");
+                assert_eq!(*size, 8);
+                assert_eq!(*dim, None, "shplugin 不做魔数嗅探：没有尺寸可给");
+            }
+            other => panic!("该是 Model：{other:?}"),
+        }
+        // 头区原样保留（`shot` 与 `image` 都在），正文只剩「正文」
+        let text = out.to_text();
+        assert!(text.contains("\"shot\""), "{text}");
+        assert!(text.contains("\"image\""), "{text}");
+        assert!(text.ends_with("正文\n"), "{text}");
+        let (headers, body) = crate::header::split_header_body(&text);
+        assert!(headers.iter().any(|(k, _)| k == "image"), "{text}");
+        assert_eq!(body, "正文\n");
     }
 
     /// 超时（`_timeout_seconds` 覆盖 schema）与取消都杀掉整个进程组。
@@ -741,7 +842,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.to_text().contains("超时"), "{}", out.to_text());
-        assert!(out.failed);
+        assert_eq!(out.status, Status::Timeout { secs: 1 }, "超时是一等状态");
         assert!(
             started.elapsed().as_secs() < 10,
             "超时路径被卡住了: {:?}",
@@ -757,7 +858,8 @@ mod tests {
         );
         cancel.cancel();
         let out = registry.dispatch("slow", &json!({}), ctx).await.unwrap();
-        assert_eq!(out.to_text(), CANCEL_TEXT);
+        assert_eq!(out.status, Status::Cancelled);
+        assert!(out.to_text().contains(CANCEL_TEXT), "{}", out.to_text());
     }
 
     /// 超限走与 bash 同一条路：留头段 + 全文落盘。
@@ -779,7 +881,7 @@ mod tests {
             .await
             .unwrap();
         let text = out.to_text();
-        assert!(text.contains("[工具输出全文已保存: "), "{text}");
+        assert!(text.contains("\"saved\""), "{text}");
         assert!(text.contains("1\n2\n"), "只留开头：{text}");
         // 尾巴被截掉（注意别拿 “99” 直接查：落盘路径里的临时目录名可能就带着它）
         assert!(
@@ -845,9 +947,26 @@ mod tests {
     }
 
     #[test]
-    fn private_keys_become_env_names() {
-        assert_eq!(cfg_env("_hdc"), "PIE_CFG_hdc");
-        assert_eq!(cfg_env("__x"), "PIE_CFG__x");
+    fn scalar_text_and_env_name_follow_the_contract() {
+        // 文本：bool → 1/0、数字按 JSON 字面量、字符串原样
+        assert_eq!(scalar_text(&json!("a b")).as_deref(), Some("a b"));
+        assert_eq!(scalar_text(&json!(20)).as_deref(), Some("20"));
+        assert_eq!(scalar_text(&json!(true)).as_deref(), Some("1"));
+        assert_eq!(scalar_text(&json!(false)).as_deref(), Some("0"));
+        assert_eq!(scalar_text(&json!(["a"])), None, "数组只走 stdin");
+        assert_eq!(scalar_text(&json!({"a": 1})), None, "对象只走 stdin");
+        assert_eq!(scalar_text(&json!("x".repeat(4097))), None, "防 E2BIG");
+        assert_eq!(
+            scalar_text(&json!("a\u{0}b")),
+            None,
+            "NUL 装不进 argv/environ"
+        );
+
+        // 环境变量名：只认标识符（argv 不受这条限制）
+        assert_eq!(env_name("x").as_deref(), Some("PIE_ARG_x"));
+        assert_eq!(env_name("_file").as_deref(), Some("PIE_ARG__file"));
+        assert_eq!(env_name("有中文"), None);
+        assert_eq!(env_name("a-b"), None);
     }
 
     /// 仓库里的示例脚本得一直能被加载（schema 块写错 = 模型那边就少一个工具，而且还不好发现）。
