@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 // ⚠ 默认值**不在这里开 `DEFAULT_*` 常量**：类型自己有 `Default`（`impl Default for Config` /
 // `CompactionConfig` / …），值就写在那儿 —— 一处定义、改一处。这里只留**跨模块要用的**东西：
 // `THINKING_LEVELS`（`-t` 的合法值，TUI 的 `/thinking` 候选从它派生）、`REASONING_NONE`
-//（CLI 的 `-t off` 归一）、以及提示词文件名（`find_project_root` / `resolve_prompt_file` /
-// `build_system_prompt` 三处共用）。
+//（CLI 的 `-t off` 归一）、以及提示词文件名（`Storage::prompt_file` / `build_system_prompt`
+// 两处共用）。
 
 /// 思考深度的**全部合法写法**（`-t/--thinking` 收这些）—— **唯一事实来源**：
 /// TUI 的 `/thinking` 候选也从它派生（见 [`reasoning_levels`]）。
@@ -139,6 +139,16 @@ pub enum StoreType<'a> {
     Window(&'a str),
 }
 
+/// 一份**运行时**提示词文件（`SYSTEM.md` / `AGENTS.md` / `MEMORY.md`）：解析出来的路径 + 正文。
+///
+/// 路径一并给出：拼进 system prompt 时要把“这份提示 / 记忆在哪儿”写给模型 —— 它只知道文件名
+/// （项目根本身可能不在 cwd 上）就得自己猜。
+#[derive(Clone, Debug)]
+pub struct PromptFile {
+    pub path: PathBuf,
+    pub text: String,
+}
+
 impl Storage {
     /// 从环境解析默认 root：`PIE_HOME` → 当前目录下的 `.pie`（存在即用）→ `~/.pie`。
     ///
@@ -220,6 +230,60 @@ impl Storage {
     /// 全局记忆：`<root>/memory.md`（拼进 system prompt 的那份，`pie setup` 只种下骨架）。
     pub fn global_memory(&self) -> PathBuf {
         self.root.join("memory.md")
+    }
+
+    /// 项目根：从 cwd 往上找第一个含任一运行时提示词文件或 `.git` 的目录（找不到 = cwd）。
+    ///
+    /// 只服务提示词文件的解析（[`Storage::prompt_file`]）—— 与数据根（`root`）无关：
+    /// 提示词跟**项目**走，数据根跟用户 / `PIE_HOME` 走。
+    pub fn project_root(&self) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        cwd.ancestors()
+            .find(|dir| {
+                [AGENTS_FILE, MEMORY_FILE, SYSTEM_FILE, ".git"]
+                    .iter()
+                    .any(|m| dir.join(m).exists())
+            })
+            .map(Path::to_path_buf)
+            .unwrap_or(cwd)
+    }
+
+    /// 解析并读回一份**运行时**提示词文件（`SYSTEM.md` / `AGENTS.md` / `MEMORY.md`）。
+    ///
+    /// 绝对路径直接用；相对路径先找项目根，再退回 cwd。找不到 / 读不出来 = `None`。
+    pub fn prompt_file(&self, name: &str) -> Option<PromptFile> {
+        let name = Path::new(name);
+        let path = if name.is_absolute() {
+            name.exists().then(|| name.to_path_buf())?
+        } else {
+            [
+                self.project_root().join(name),
+                PathBuf::from(".").join(name),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())?
+        };
+        Some(PromptFile {
+            text: std::fs::read_to_string(&path).ok()?,
+            path,
+        })
+    }
+
+    /// 项目自己的 `SYSTEM.md`（角色提示；没有就由调用方退回内置那份）。
+    pub fn system_file(&self) -> Option<PromptFile> {
+        self.prompt_file(SYSTEM_FILE)
+    }
+
+    /// `AGENTS.md`：本项目的 agent 说明（约定、目录结构、常用命令）。
+    pub fn agents_file(&self) -> Option<PromptFile> {
+        self.prompt_file(AGENTS_FILE)
+    }
+
+    /// `MEMORY.md`：**项目**记忆（⚠ 与 `<root>/memory.md` 那份全局记忆不是一回事，
+    /// 见 [`Storage::global_memory`]）。
+    pub fn project_memory(&self) -> Option<PromptFile> {
+        self.prompt_file(MEMORY_FILE)
     }
 
     /// 内容寻址落盘：`Blob` 图片副本 / `Raw` 压缩原文 / `Window` 窗口块，见 [`StoreType`]。
@@ -1121,40 +1185,11 @@ where
 
 // ---------------------------------------------------------------- system prompt
 
-/// 从 cwd 向上找最近的「项目根」：含任一提示词文件或 `.git` 的目录。
-pub fn find_project_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    for dir in cwd.ancestors() {
-        if [AGENTS_FILE, MEMORY_FILE, SYSTEM_FILE, ".git"]
-            .iter()
-            .any(|m| dir.join(m).exists())
-        {
-            return dir.to_path_buf();
-        }
-    }
-    cwd
-}
-
-/// 解析提示词文件：绝对路径直接用；相对路径先找项目根，再退回 cwd。
-pub fn resolve_prompt_file(name: &str) -> Option<PathBuf> {
-    let p = Path::new(name);
-    if p.is_absolute() {
-        return p.exists().then(|| p.to_path_buf());
-    }
-    let root = find_project_root();
-    [root.join(p), PathBuf::from(".").join(p)]
-        .into_iter()
-        .find(|candidate| candidate.exists())
-}
-
-fn read_text(path: Option<PathBuf>) -> String {
-    path.and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default()
-}
-
 /// 按分层组装 system prompt：SYSTEM.md（角色）+ AGENTS.md（项目）+ 记忆（存在即加载）
 /// + **运行时状态节**（永远在最后，见 [`RUNTIME_STATE_HEADING`]）。
+///
+/// 三份运行时提示词文件的**解析与读取全在 [`Storage`] 上**（`system_file` / `agents_file` /
+/// `project_memory`）—— 调用方别再自己拼路径、自己往上找项目根。
 ///
 /// `system_prompt` 非空时替换 SYSTEM.md 基础提示；`append_system_prompt` 追加到记忆之后、运行时状态之前。
 pub fn build_system_prompt(
@@ -1164,7 +1199,11 @@ pub fn build_system_prompt(
 ) -> String {
     let base = match system_prompt {
         Some(s) => s.to_string(),
-        None => read_text(resolve_prompt_file(SYSTEM_FILE)),
+        None => config
+            .storage
+            .system_file()
+            .map(|f| f.text)
+            .unwrap_or_default(),
     };
     let base = if base.is_empty() {
         // 内置兜底 prompt（`prompts/system.md`）：编译期嵌入 → 仓库根没有 `SYSTEM.md` 时也能单文件跑
@@ -1176,23 +1215,28 @@ pub fn build_system_prompt(
 
     let mut parts = vec![base];
 
-    let agents = read_text(resolve_prompt_file(AGENTS_FILE));
-    if !agents.is_empty() {
-        parts.push(agents);
+    if let Some(agents) = config.storage.agents_file().filter(|f| !f.text.is_empty()) {
+        parts.push(agents.text);
     }
 
     let mut memories: Vec<String> = Vec::new();
-    let global_memory = std::fs::read_to_string(config.storage.global_memory()).unwrap_or_default();
+    let global = config.storage.global_memory();
+    let global_memory = std::fs::read_to_string(&global).unwrap_or_default();
     if !global_memory.is_empty() {
         memories.push(format!(
             "## 全局记忆（{}）\n```markdown\n{global_memory}\n```",
-            config.storage.global_memory().display()
+            global.display()
         ));
     }
-    let project_memory = read_text(resolve_prompt_file(MEMORY_FILE));
-    if !project_memory.is_empty() {
+    if let Some(memory) = config
+        .storage
+        .project_memory()
+        .filter(|f| !f.text.is_empty())
+    {
         memories.push(format!(
-            "## 项目记忆（{MEMORY_FILE}）\n```markdown\n{project_memory}\n```"
+            "## 项目记忆（{}）\n```markdown\n{}\n```",
+            memory.path.display(),
+            memory.text
         ));
     }
     if !memories.is_empty() {
@@ -1750,6 +1794,50 @@ lean = true
             None => unset_env("OPENAI_BASE_URL"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 三份运行时提示词文件的解析只有一条路：`Storage::prompt_file`（绝对 → 项目根 → cwd）。
+    /// 项目根 = 从 cwd 往上第一个含提示词文件或 `.git` 的目录。
+    #[test]
+    fn prompt_files_resolve_from_project_root_then_cwd() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::current_dir().unwrap();
+        let base = std::env::temp_dir().join(format!("pie-prompts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj");
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(nested.join("notes")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "项目说明").unwrap();
+        std::fs::write(root.join("MEMORY.md"), "项目记忆").unwrap();
+        std::fs::write(nested.join("notes/deep.md"), "cwd 下的相对子路径").unwrap();
+        let storage = Storage::at(base.join("data"));
+        let root = root.canonicalize().unwrap();
+        let nested = nested.canonicalize().unwrap();
+
+        std::env::set_current_dir(&nested).unwrap();
+        // 往上找：cwd 自己没有提示词文件 → 项目根是含 AGENTS.md 的那个祖先
+        assert_eq!(storage.project_root(), root);
+        let agents = storage.agents_file().expect("AGENTS.md 在项目根");
+        assert_eq!(agents.path, root.join("AGENTS.md"));
+        assert_eq!(agents.text, "项目说明");
+        assert_eq!(storage.project_memory().unwrap().text, "项目记忆");
+        // 没有就是没有（不是空串、也不是凭空拼一个路径）
+        assert!(storage.system_file().is_none());
+        assert!(storage.prompt_file("NOTHERE.md").is_none());
+        // 绝对路径直接用
+        let abs = nested.join("notes/deep.md");
+        assert_eq!(
+            storage.prompt_file(abs.to_str().unwrap()).unwrap().text,
+            "cwd 下的相对子路径"
+        );
+        // 相对子路径：项目根下没有 → 退回 cwd（两者不同时才会走到这一步）
+        assert_eq!(
+            storage.prompt_file("notes/deep.md").unwrap().text,
+            "cwd 下的相对子路径"
+        );
+
+        std::env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
