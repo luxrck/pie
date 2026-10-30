@@ -1135,3 +1135,33 @@ def test_aturn_cancel_really_stops_the_turn(env):
             __time.sleep(0.05)
     else:
         pytest.fail("取消之后会话一直锁着")
+
+
+def test_registered_tool_can_return_a_dict(env):
+    """绑定注册的工具也能返回 `dict`（与 pyplugin 同一套契约）：`header` 由 Rust 渲染成 `header!` 块。"""
+    cfg, llm, _, server = env
+    reg = pie.Registry.builtins(cfg)
+
+    @pie.tool(description="结构化返回")
+    def structured() -> dict:
+        return {
+            "body": "正文",
+            "header": {"count": 3, "tags": ["a"]},
+            "state": {"n": 1},
+        }
+
+    reg.register(structured)
+    session = pie.Session.ephemeral(cfg, llm, reg)
+    server.tool_name = "structured"
+    server.tool_arguments = "{}"
+    events = []
+    session.turn("来", on_event=events.append)
+
+    result = [e for e in events if e["type"] == "tool_result"][0]
+    text = result["text"]
+    assert text.startswith("header! {"), text
+    assert '"count": 3' in text and '"tags": ["a"]' in text, text
+    assert text.endswith("\n\n正文"), text
+    # 名字对了 = 注册进请求体的那个工具真的被调到了
+    assert [t["function"]["name"] for t in server.requests[-1].get("tools") or []] != []
+    assert result["name"] == "structured"

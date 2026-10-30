@@ -33,6 +33,86 @@ fn check_tool_name(name: &str) -> PyResult<()> {
     }
 }
 
+/// Python 工具返回值 → `ToolOutput`。
+///
+/// 与 `pyplugin` 宿主**同一套契约**（`docs/extension.md`「工具返回值」）：
+///
+/// - `str`：原样当正文（作者自己排 `header!` 块）；
+/// - `dict`：`{"body": str, "header": {…}, "state": {…}}`，键都可选。头区由 Rust 渲染
+///   （`header::render` 是唯一一份），`state` 落进会话槽（`meta["state"][<工具名>]`）。
+///
+/// 不认识的键直接报错 —— `{"bdy": …}` 静默忽略只会让人查半天。
+fn result_of(
+    raw: &Bound<'_, PyAny>,
+    tool: &str,
+    ctx: &tools::ToolCtx,
+) -> PyResult<tools::ToolOutput> {
+    if let Ok(text) = raw.extract::<String>() {
+        return Ok(tools::ToolOutput::text(text));
+    }
+    let dict = raw.cast::<PyDict>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "工具 {tool} 必须返回 str 或 dict（{{'body','header','state'}}），拿到 {}",
+            raw.get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))
+    })?;
+    for key in dict.keys() {
+        let key: String = key.extract()?;
+        if !matches!(key.as_str(), "body" | "header" | "state") {
+            return Err(PyValueError::new_err(format!(
+                "工具 {tool} 返回 dict 里有不认识的键：{key:?}（只认 body / header / state）"
+            )));
+        }
+    }
+    let field = |name: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+        Ok(match dict.get_item(name)? {
+            Some(v) if !v.is_none() => Some(v),
+            _ => None,
+        })
+    };
+    let body = match field("body")? {
+        Some(v) => v.extract::<String>()?,
+        None => String::new(),
+    };
+    let header = match field("header")? {
+        Some(v) => {
+            let value = crate::py_to_json(&v)?;
+            if !value.is_object() {
+                return Err(PyValueError::new_err(format!(
+                    "工具 {tool} 的 header 必须是 dict"
+                )));
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    if let Some(state) = field("state")? {
+        let value = crate::py_to_json(&state)?;
+        if !value.is_object() {
+            return Err(PyValueError::new_err(format!(
+                "工具 {tool} 的 state 必须是 dict"
+            )));
+        }
+        ctx.state.tool_states().commit(tool, value);
+    }
+    let mut headers = tools::Header::new();
+    if let Some(Value::Object(map)) = header {
+        headers.extend(map);
+    }
+    Ok(tools::ToolOutput {
+        headers,
+        body: tools::ToolBody {
+            content: body,
+            spill: None,
+        },
+        attachments: Vec::new(),
+        status: tools::Status::Success,
+    })
+}
+
 #[pyclass(name = "Registry", module = "pie")]
 pub struct PyRegistry {
     pub inner: Registry,
@@ -147,12 +227,12 @@ impl PyRegistry {
         // ③ 调用体：tokio 线程上 attach 回 GIL 调 Python（handler 按**关键字**传参）
         let handler_for_call = handler.clone_ref(py);
         let tool_name = name.clone();
-        let call: CallFn = Arc::new(move |args: Value, _ctx: tools::ToolCtx| {
+        let call: CallFn = Arc::new(move |args: Value, ctx: tools::ToolCtx| {
             let handler = Python::attach(|py| handler_for_call.clone_ref(py));
             let tool_name = tool_name.clone();
             Box::pin(async move {
                 Python::attach(|py| -> tools::ToolResult {
-                    let out = (|| -> PyResult<String> {
+                    let out = (|| -> PyResult<tools::ToolOutput> {
                         let kwargs = PyDict::new(py);
                         if let Some(map) = args.as_object() {
                             for (key, value) in map {
@@ -162,18 +242,9 @@ impl PyRegistry {
                             return Err(PyValueError::new_err("工具参数必须是 JSON 对象"));
                         }
                         let raw = handler.bind(py).call((), Some(&kwargs))?;
-                        raw.extract::<String>().map_err(|_| {
-                            PyValueError::new_err(format!(
-                                "工具 {tool_name} 必须返回 str，拿到 {}",
-                                raw.get_type()
-                                    .name()
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_default()
-                            ))
-                        })
+                        result_of(&raw, &tool_name, &ctx)
                     })();
-                    out.map(tools::ToolOutput::text)
-                        .map_err(|e| ToolError(format!("{e}")))
+                    out.map_err(|e| ToolError(format!("{e}")))
                 })
             })
         });
