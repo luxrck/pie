@@ -284,7 +284,7 @@ impl PyConfig {
     }
 
     fn __repr__(&self) -> String {
-        // api_key 一律打码：默认配置里的 key 是本部署的真实 key，别让 repr 泄露到日志里。
+        // api_key 一律打码（只留头尾 4 字符）：别让 repr 把用户的 key 写进日志。
         // （按**字符**取头尾，不用字节切片：key 里万ー有非 ASCII 就会 panic 在切字符边界上。）
         let key = &self.inner.api_key;
         let masked = if key.chars().count() > 8 {

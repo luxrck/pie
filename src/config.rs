@@ -902,9 +902,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: "deepseek-flash".to_string(),
-            // 本部署内置的默认 key；空串 = 用户没配
             base_url: "https://api.deepseek.com/".to_string(),
-            api_key: "<API_KEY>".to_string(),
+            // 默认不内置 key：空串 = 用户没配（`OPENAI_API_KEY` 兜底，见 `Config::load`）
+            api_key: String::new(),
             reasoning_effort: "high".to_string(),
             reserved_tokens: Some(128_000),
             context_window: 1024 * 1024,
@@ -1800,7 +1800,14 @@ lean = true
         assert_eq!(back.model, dflt.model);
         // 配置文件优先：写出来的默认值会压过 `OPENAI_*` 环境变量
         assert_eq!(back.base_url, dflt.base_url);
-        assert_eq!(back.api_key, dflt.api_key);
+        // 例外：默认 key 就是空串（不内置），而「空串 = 没设」→ `OPENAI_API_KEY` 兜底
+        assert!(dflt.api_key.is_empty());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("api_key = \"\"")
+        );
+        assert_eq!(back.api_key, env_api_key().unwrap_or_default());
         assert_eq!(back.reserved_tokens, dflt.reserved_tokens);
         assert_eq!(back.context_window, dflt.context_window);
         assert_eq!(back.tui.lean, dflt.tui.lean);
