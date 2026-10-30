@@ -765,12 +765,20 @@ def test_llm_without_config_reads_the_config_file(env, monkeypatch, tmp_path):
     assert server.requests[-1]["model"] == "file-model"
     assert server.last_headers["authorization"] == "Bearer file-key"
 
-    # `OPENAI_BASE_URL` 环境覆盖优先于文件（口径同 `Config::load`）
+    # **配置文件优先**：文件里给了 api_key 就用它，`OPENAI_*` 只是兜底（2026-10-27 起的口径）
     monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
     assert pie.llm("hi") == "来自配置文件"
-    assert server.last_headers["authorization"] == "Bearer env-key"
+    assert server.last_headers["authorization"] == "Bearer file-key"
     assert cfg.model, "env 只在这一路生效，不动传进来的 config"
+
+    # 文件里**没给** api_key → 环境变量兜底
+    config_file.write_text(
+        f'model = "file-model"\nbase_url = "http://127.0.0.1:{server.server_port}/v1/"\n',
+        encoding="utf-8",
+    )
+    assert pie.llm("hi") == "来自配置文件"
+    assert server.last_headers["authorization"] == "Bearer env-key"
 
 
 # ---------------------------------------------------------------- 存根对拍（防漂移）
