@@ -28,6 +28,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
 | `pie context info` / `verify` / `gc [--delete]` | 列出压缩事件 / 校验落盘原文是否还在 / 列出或删除未引用的 `~/.pie/context/` 文件 |
 | `pie files list [--all]` / `gc [--delete] [--all]` | 列出图片记录 / 回收本地副本（`--all` 作用于云端上传件） |
+| `pie files upload <路径> [--mime <类型>]` | 把一个文件传到 Files API、打印 `file_id`（运维用：不写会话记录，`read` 读图那条路上传时自动完成） |
 
 **选项**（都只作用于本次运行，不写回配置）：
 

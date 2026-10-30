@@ -160,6 +160,14 @@ enum FilesAction {
         #[arg(long)]
         all: bool,
     },
+    /// 把一个本地文件传到 Files API（打印 `file_id`；不写会话记录）
+    Upload {
+        /// 要上传的文件
+        path: std::path::PathBuf,
+        /// MIME 类型（缺省按扩展名推断：png / jpg / jpeg / gif / webp）
+        #[arg(long)]
+        mime: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -819,7 +827,80 @@ async fn files_main(config: &config::Config, action: &FilesAction) -> i32 {
             }
             0
         }
+        FilesAction::Upload { path, mime } => files_upload(config, path, mime.as_deref()).await,
     }
+}
+
+/// `pie files upload <path>`：把本地文件传到 Files API，打印 `file_id`。
+///
+/// **运维命令**：`file_id` 只能给人自己拼请求 / 排障用——它进不了会话（`read` 读图那条路是
+/// 工具产出 `Attachment::Model`、由 `Session::settle_output` 在消息构造前上传）。
+/// 所以这里既不写会话记录（`files list` 看不到它），也不落本地副本（`files gc` 碰不到它）。
+async fn files_upload(config: &config::Config, path: &std::path::Path, mime: Option<&str>) -> i32 {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("读不了 {}: {e}", path.display());
+            return 1;
+        }
+    };
+    if data.is_empty() {
+        eprintln!("{} 是空文件，没什么可传的", path.display());
+        return 1;
+    }
+    // 不读文件头（魔数嗅探是 `read` 那条路的事）：这儿只按扩展名猜，猜不出就让人给 `--mime`
+    let mime = match mime {
+        Some(m) => m.to_string(),
+        None => match path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png".to_string(),
+            Some("jpg" | "jpeg") => "image/jpeg".to_string(),
+            Some("gif") => "image/gif".to_string(),
+            Some("webp") => "image/webp".to_string(),
+            // Files API 只收 png / jpeg / gif / webp（bmp 之类服务端会 400）——猜不出就让人给 `--mime`
+            _ => {
+                eprintln!(
+                    "猜不出 {} 的 MIME 类型（Files API 收 png / jpeg / gif / webp），请用 --mime 指定",
+                    path.display()
+                );
+                return 1;
+            }
+        },
+    };
+    let client = match files_client(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "upload".to_string());
+    let bytes = data.len();
+    let uploaded = match client
+        .upload_file(data, &filename, &mime, config.files_ttl_days as i64)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("上传失败: {e}");
+            return 1;
+        }
+    };
+    let expires = uploaded
+        .expires_at
+        .map(config::fmt_local)
+        .unwrap_or_else(|| "永久".to_string());
+    println!("{}  {}  {bytes} B  过期={expires}", uploaded.id, mime);
+    println!(
+        "（只调了 Files API：不写会话记录，`files list` 不会列出它；`files gc --all` 会清掉云端全部上传件）"
+    );
+    0
 }
 
 /// `pie files list --all`：列出服务端本账号的全部上传件（顺带标出哪个会话记着它）。
