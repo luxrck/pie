@@ -49,7 +49,9 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, Any]
-    handler: Callable[..., str]
+    #: 返回 `str`（原样当工具输出）或 `dict`（`{"body", "header", "state"}` —— 结构化结果，
+    #: 头区由宿主渲染）。见 `docs/extension.md`「工具返回值」。
+    handler: Callable[..., str | dict[str, Any]]
     #: 这个工具要会话代理（`S`）作第一个位置参数 —— 宿主据此决定调用 `handler(S, **kw)` 还是
     #: `handler(**kw)`。老插件不声明就照旧（**零改动**）。
     wants_s: bool = False
@@ -92,7 +94,7 @@ def _type_to_schema(annotation: Any) -> dict[str, Any]:
 
 
 @overload
-def tool(fn: Callable[..., str]) -> Tool: ...
+def tool(fn: Callable[..., str | dict[str, Any]]) -> Tool: ...
 
 
 @overload
@@ -100,11 +102,11 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     parameters: dict[str, dict[str, Any]] | None = None,
-) -> Callable[[Callable[..., str]], Tool]: ...
+) -> Callable[[Callable[..., str | dict[str, Any]]], Tool]: ...
 
 
 def tool(
-    name: str | Callable[..., str] | None = None,
+    name: str | Callable[..., str | dict[str, Any]] | None = None,
     description: str | None = None,
     parameters: dict[str, dict[str, Any]] | None = None,
 ):
@@ -121,7 +123,7 @@ def tool(
     direct = name if name is not None and not isinstance(name, str) else None
     tool_name = name if isinstance(name, str) else None
 
-    def decorate(fn: Callable[..., str]) -> Tool:
+    def decorate(fn: Callable[..., str | dict[str, Any]]) -> Tool:
         sig = inspect.signature(fn)
         try:
             hints = get_type_hints(fn)  # 处理 `from __future__ import annotations` 的字符串注解

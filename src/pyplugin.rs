@@ -349,10 +349,14 @@ struct Reply {
     text: Option<String>,
     #[serde(default)]
     error: Option<String>,
-    /// 工具交回来的 `S.state`（**只有声明了 `S` 的工具才会带**）：整份写进
+    /// 工具交回来的 `state`（**只有声明了 `S` 的工具才会带**）：整份写进
     /// `meta["state"][<工具名>]`。形状由工具自己定，这里不解释。
     #[serde(default)]
     state: Option<Value>,
+    /// 结构化的头区（工具返回 `dict` 时给）：由 Rust 侧渲染成 `header! { … }` 文本 ——
+    /// 与工具自己手写的那种逐字相同（`header::render` 是唯一一份）。
+    #[serde(default)]
+    header: Option<Value>,
 }
 
 impl Reply {
@@ -367,10 +371,18 @@ impl Reply {
             return Err(ToolError(error));
         }
         let text = self.text.unwrap_or_default();
+        // 返回 `dict` 时给的 `header`：按插入顺序排成头区（`serde_json::Map` 默认按 key 排序，
+        // 顺序稳定即可）。不限制值的形状 —— 数组 / 嵌套对象都照原样渲染。
+        let mut headers = crate::tools::Header::new();
+        if let Some(Value::Object(map)) = self.header {
+            for (key, value) in map {
+                headers.push((key, value));
+            }
+        }
         // 与 `bash` / `repl` 同款：单元格输出一旦被消费就没了（不可再生）→ 超限把**全文**落盘、
         // 正文只留头段预览（截断/落盘/指针的规矩都在 `ToolBody::fit` 里一处；前缀取 `ctx.name`）。
         Ok(ToolOutput {
-            headers: Vec::new(),
+            headers,
             body: ToolBody::fit(
                 ctx,
                 &text,
@@ -1100,6 +1112,70 @@ def counter(S: SessionProxy) -> str:
             .await
             .expect("counter");
         assert_eq!(out.to_text(), "2", "第二次读到了上次那份");
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+    /// 返回 `dict`：`header` 由 Rust 侧渲染成 `header! { … }`（与手写逐字相同）、`body` 是正文、
+    /// `state` 是最终值（**返回值优先于 `S.state`**）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_python_tool_can_return_a_structured_result() {
+        const TOOL: &str = r#"
+from pie import SessionProxy, tool
+
+@tool(description="结构化返回")
+def structured(S: SessionProxy) -> dict:
+    S.state["ignored"] = True          # 会被返回值的 state 覆盖
+    return {
+        "body": "正文在这里",
+        "header": {"count": 3, "tags": ["a", "b"], "nested": {"k": 1}},
+        "state": {"n": 2},
+    }
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("structured", TOOL);
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
+        let state = Arc::new(crate::state::SessionState::default());
+        let ctx = ToolCtx::with_cancel(
+            crate::cancel::Cancel::new(),
+            crate::config::Storage::at(fixture.dir.join("storage")),
+            state.clone(),
+        )
+        .in_session(&fixture.dir.join("session"));
+
+        let out = registry
+            .dispatch("structured", &json!({}), ctx)
+            .await
+            .expect("structured");
+        let text = out.to_text();
+        assert!(text.starts_with("header! {"), "{text}");
+        assert!(text.contains("\"count\": 3"), "{text}");
+        assert!(text.contains("\"nested\": {"), "值不限制形状：{text}");
+        assert!(text.ends_with("\n\n正文在这里"), "{text}");
+        assert_eq!(
+            state.tool_states().get("structured"),
+            Some(json!({"n": 2})),
+            "返回值里的 state 优先于 S.state"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    /// 返回形状不对（未知键 / body 不是 str）→ 一条工具错误，**宿主不崩**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_result_shape_becomes_a_tool_error() {
+        const TOOL: &str = r#"
+from pie import tool
+
+@tool(description="坏的")
+def bad() -> dict:
+    return {"bdy": "写错键名了"}
+"#;
+        let Some(python) = host_python() else { return };
+        let fixture = Fixture::new("bad-shape", TOOL);
+        let registry = load(Registry::empty(HashMap::new()), &fixture.config(python)).await;
+        let err = registry
+            .dispatch("bad", &json!({}), fixture.ctx(crate::cancel::Cancel::new()))
+            .await
+            .expect_err("该报错");
+        assert!(err.0.contains("不认识的键"), "{:?}", err.0);
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 }

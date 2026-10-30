@@ -188,6 +188,42 @@ def _load(path, index):
     return module
 
 
+_RESULT_KEYS = {"body", "header", "state"}
+
+
+def _normalize_result(out):
+    """工具返回值 → `(body, header, state)`。
+
+    两种形状：
+
+    - `str`：**原样**当工具输出（作者自己排 `header! { … }` + 空行 + 正文）；
+    - `dict`：`{"body": str, "header": {…}, "state": {…}}` —— 三个键都可选，
+      头区由 Rust 侧渲染（与手写的那种文本逐字相同），`state` 是这次调用结束时的最终值。
+      不认识的键直接报错（`{"bdy": …}` 静默忽略只会让人查半天）。
+    """
+    if isinstance(out, str):
+        return out, None, None
+    if not isinstance(out, dict):
+        raise TypeError(
+            "工具必须返回 str 或 dict（{'body','header','state'}），拿到 %s" % type(out).__name__
+        )
+    unknown = set(out) - _RESULT_KEYS
+    if unknown:
+        raise TypeError(
+            "返回 dict 里有不认识的键：%s（只认 body / header / state）" % sorted(unknown)
+        )
+    body = out.get("body", "")
+    if not isinstance(body, str):
+        raise TypeError("body 必须是 str，拿到 %s" % type(body).__name__)
+    header = out.get("header")
+    if header is not None and not isinstance(header, dict):
+        raise TypeError("header 必须是 dict，拿到 %s" % type(header).__name__)
+    state = out.get("state")
+    if state is not None and not isinstance(state, dict):
+        raise TypeError("state 必须是 dict，拿到 %s" % type(state).__name__)
+    return body, header, state
+
+
 def _run(tool_obj, rid, kwargs, lock, session, state):
     """一次工具调用（跑在线程池里；async handler 丢给后台 loop 跑完再交回来）。
 
@@ -207,18 +243,18 @@ def _run(tool_obj, rid, kwargs, lock, session, state):
     except BaseException as e:  # 含 sys.exit()：工具怎么炸都不该带走宿主
         _emit({"id": rid, "error": "%s: %s" % (type(e).__name__, e)}, lock)
         return
-    if not isinstance(out, str):
-        _emit(
-            {
-                "id": rid,
-                "error": "工具 %s 必须返回 str，拿到 %s" % (tool_obj.name, type(out).__name__),
-            },
-            lock,
-        )
+    try:
+        body, header, state_out = _normalize_result(out)
+    except TypeError as e:  # 返回形状不对：当成工具错误交给模型，别带崩宿主
+        _emit({"id": rid, "error": "工具 %s: %s" % (tool_obj.name, e)}, lock)
         return
-    reply = {"id": rid, "text": out}
-    if proxy is not None:
-        # 声明了 S = 认领了 state：整份交回（没改也交，覆盖是幂等的）
+    reply = {"id": rid, "text": body}
+    if header is not None:
+        reply["header"] = header
+    # `state` 的优先级：**返回值里给的赢**（那是作者显式声明的最终值）；没给就看 `S.state`
+    if state_out is not None:
+        reply["state"] = state_out
+    elif proxy is not None:
         reply["state"] = proxy.state
     _emit(reply, lock)
 
