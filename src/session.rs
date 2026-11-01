@@ -4,7 +4,7 @@
 //! 两半，分开只会让每次调用在两模块之间穿 7 个参数（其中 4 个还是 `self` 的字段）。
 //! 一次性模式改走 `Session::ephemeral()`（不落盘、压缩事件只在内存）。
 //!
-//! **持久化契约**：一个会话 = **一个目录** `~/.pie/sessions/chat-<unix 秒>-<微秒>/`
+//! **持久化契约**：一个会话 = **一个目录** `~/.pie/sessions/chat-<YYYYMMDD-HHMMSS>_<微秒>/`
 //!
 //!   - `meta.json`：usage / windows / cwd / title / 压缩流水 / `state`（工具的小状态）；
 //!   - `messages.jsonl`：一行一条消息，**没有 `__meta__` 首行**；
@@ -15,7 +15,9 @@
 //!   - resume 按 `messages.jsonl` 的 mtime 选最新、「同 cwd 优先」（读 `meta.json` 的 `cwd`）；
 //!     子会话（`parent` 非空）不参与；未知字段 serde 直接忽略。
 //!
-//! 目录名用 `chat-<unix 秒>-<微秒>`：没有日期库，Unix 时间戳一样能做到「可排序 + 微秒级不撞车」。
+//! 目录名用 `chat-<本地时间 YYYYMMDD-HHMMSS>_<微秒>`（`config::fmt_local_stamp`）：看得懂时间，
+//! 又仍然「可排序 + 微秒级不撞车」。排序与「最新会话」一律看 `messages.jsonl` 的 mtime，
+//! 名字只负责不重复（所以本地时区/DST 挪一下也不影响任何行为）。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -1864,10 +1866,12 @@ fn resolve_dir(sessions: &Path, id: Option<&str>) -> PathBuf {
     }
 }
 
-/// `<unix 秒>-<微秒 6 位>`：可排序、同秒不撞车。
+/// `<本地时间 YYYYMMDD-HHMMSS>_<微秒 6 位>`：看得懂时间、仍可字典序排、同一秒内不撞车。
 fn timestamp() -> String {
     let now = config::now();
-    format!("{}-{:06}", now.as_secs(), now.subsec_micros())
+    // `fmt_local_stamp` 吃 `i64`（unix 秒，1970 前为负）；`now()` 给的 `u64` 在 5840 亿年后才溢出。
+    let stamp = config::fmt_local_stamp(now.as_secs() as i64);
+    format!("{stamp}_{:06}", now.subsec_micros())
 }
 
 /// 目录里最新的会话；`cwd` 匹配的优先。
@@ -2944,6 +2948,26 @@ mod tests {
             loaded.messages[0].content_text().contains("df.head()"),
             "载入后那节要能重建：{}",
             loaded.messages[0].content_text()
+        );
+    }
+
+    /// 默认会话目录名：`chat-<本地时间 YYYYMMDD-HHMMSS>_<微秒 6 位>`（可读 + 可字典序排 + 不撞名）。
+    #[test]
+    fn new_session_dir_is_named_with_a_local_timestamp() {
+        let sessions = std::path::Path::new("/tmp/pie-sessions");
+        let dir = resolve_dir(sessions, None);
+        assert_eq!(dir.parent(), Some(sessions));
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        let stamp = name.strip_prefix("chat-").expect("前缀 chat-");
+        let (time, micros) = stamp.split_once('_').expect("下划线分开时间与微秒");
+        let (date, clock) = time.split_once('-').expect("日期与时间用 - 分开");
+        assert_eq!((date.len(), clock.len(), micros.len()), (8, 6, 6), "{name}");
+        assert!(
+            date.chars()
+                .chain(clock.chars())
+                .chain(micros.chars())
+                .all(|c| c.is_ascii_digit()),
+            "全是数字，不能带负号/字母：{name}"
         );
     }
 

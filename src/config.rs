@@ -557,7 +557,7 @@ pub struct SetupReport {
 ///
 /// 这一处三个一队（[`Storage::store`] 的命名约定：`<前缀>-<hash>[.扩展名]`）：
 ///   - [`hash_id`]：**内容 → hash**（起名用）；
-///   - [`name_of`]：**路径 → 文件名主干**（= id，如 `img-<hash>` / `chat-<秒>-<微秒>`）；
+///   - [`name_of`]：**路径 → 文件名主干**（= id，如 `img-<hash>` / `chat-20261031-103045_123456`）；
 ///   - [`hash_of`]：**路径 → hash 段**（主干里最后一段，metadata 只想要 hash 时用）。
 pub fn hash_id(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -566,7 +566,7 @@ pub fn hash_id(data: &[u8]) -> String {
 }
 
 /// 从落盘路径取回**文件名主干**（= id，[`Storage::store`] 命名的正解）：
-/// `img-<hash>` / `<前缀>-<hash>` / `chat-<秒>-<微秒>`（扩展名不算）。
+/// `img-<hash>` / `<前缀>-<hash>` / `chat-<YYYYMMDD-HHMMSS>_<微秒>`（扩展名不算）。
 ///
 /// ⚠ 别拿它当 [`hash_of`] 用：主干是整个 id（带 `img-` 那截前缀），`hash_of` 才只取 hash 段。
 /// 消费方：图片副本的 id（`session.rs`，与 `Session.files` / `state.repl.images` 的键同形）、
@@ -646,12 +646,13 @@ pub fn now() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-/// unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`（`pie sessions` / `files list` 的时间列）。
+/// unix 秒 → 本地时间的日历字段 `(年, 月, 日, 时, 分, 秒)`。
 ///
-/// 只给人看、不参与任何判断；换算就两步——先加本地时区偏移，再把 unix 秒拆成年月日时分。
-/// （这两步原本拆成 `civil` / `local_utc_offset` 两个私有函数，消费方只有这里 → 按「别给单一消费者
-/// 造私有辅助函数」合并了进来；日历换算那几行的来历见下面的注释。）
-pub fn fmt_local(secs: i64) -> String {
+/// 两个消费者：[`fmt_local`]（给人看的 `YYYY-MM-DD HH:MM`）与 [`fmt_local_stamp`]（会话目录名的
+/// 紧凑戳 `YYYYMMDD-HHMMSS`）—— 所以它自己不是「单一消费者的私有辅助」。
+///
+/// 换算就两步——先加本地时区偏移，再把 unix 秒拆成年月日时分秒（日历换算的来历见下面注释）。
+fn local_fields(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     /// 本地时区相对 UTC 的偏移（秒，含夏令时）——**不给 UTC 时区**。
     ///
     /// 用 `localtime_r`（POSIX，线程安全）拿到带 DST 的 `struct tm`，取 `tm_gmtoff`；
@@ -692,12 +693,33 @@ pub fn fmt_local(secs: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
-        tod / 3600,
-        (tod % 3600) / 60
+    (
+        if m <= 2 { y + 1 } else { y },
+        m as u32,
+        d as u32,
+        (tod / 3600) as u32,
+        ((tod % 3600) / 60) as u32,
+        (tod % 60) as u32,
     )
+}
+
+/// unix 秒 → 本地时间 `YYYY-MM-DD HH:MM`（`pie sessions` / `files list` 的时间列）。
+///
+/// 只给人看、不参与任何判断；换算全在 [`local_fields`]（秒那截这里不用）。
+pub fn fmt_local(secs: i64) -> String {
+    let (y, m, d, hh, mm, _ss) = local_fields(secs);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// unix 秒 → **紧凑本地时间戳** `YYYYMMDD-HHMMSS`（会话目录名那段：`chat-20261031-103045_123456`）。
+///
+/// 与 [`fmt_local`] 同一份换算，只是不要分隔符、要带秒；时区不变时字典序等于时间序。
+/// ⚠ 名字里的秒只用来「让人看得懂」：**唯一性靠后面那截微秒**，**排序与「最新会话」一律看
+/// `messages.jsonl` 的 mtime**（`session::latest_in`）—— 所以 DST 回拨 / 改时区导致的名字
+/// 顺序抖动不影响任何行为。
+pub fn fmt_local_stamp(secs: i64) -> String {
+    let (y, m, d, hh, mm, ss) = local_fields(secs);
+    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
 }
 
 /// 千分位（`1234567` → `1,234,567`）：Rust 的 format 没有千分位语法，只能自己加。
@@ -1508,6 +1530,36 @@ mod tests {
         set_tz("CST-8"); // POSIX 串里的符号与 `date +%z` 相反：`CST-8` = UTC+8
         assert_eq!(fmt_local(0), "1970-01-01 08:00");
         assert_eq!(fmt_local(1_700_000_000), "2023-11-15 06:13");
+
+        match old {
+            Some(v) => set_env("TZ", v),
+            None => unset_env("TZ"),
+        }
+        unsafe { tzset() };
+    }
+
+    /// 会话目录名那段的时间戳（`YYYYMMDD-HHMMSS`）：跟 [`fmt_local`] 同一份换算，只是带秒、无分隔符。
+    #[cfg(unix)]
+    #[test]
+    fn fmt_local_stamp_matches_known_instants() {
+        unsafe extern "C" {
+            fn tzset();
+        }
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("TZ");
+        let set_tz = |tz: &str| {
+            set_env("TZ", tz);
+            // SAFETY: 只动 libc 的时区缓存；`ENV_LOCK` 保证没有别的用例同时读它
+            unsafe { tzset() };
+        };
+
+        set_tz("UTC0");
+        assert_eq!(fmt_local_stamp(0), "19700101-000000");
+        assert_eq!(fmt_local_stamp(1_700_000_000), "20231114-221320"); // 与 fmt_local 的 :13 同一时刻，这里带秒
+        assert_eq!(fmt_local_stamp(-1), "19691231-235959"); // 负值（1970 前）也对
+        set_tz("CST-8"); // UTC+8
+        assert_eq!(fmt_local_stamp(1_700_000_000), "20231115-061320");
 
         match old {
             Some(v) => set_env("TZ", v),
