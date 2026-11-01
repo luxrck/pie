@@ -24,7 +24,7 @@ pie [OPTIONS] [TASK]... [COMMAND]
 
 | 命令 | 作用 |
 | --- | --- |
-| `pie setup` | 补齐**数据根**（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`；`PIE_HOME` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并把 `repl` 要的 IPython 装进去）；已存在不动，没装 uv 只告警 |
+| `pie setup` | 补齐**数据根**（`PIE_HOME` → `<cwd>/.pie` → `~/.pie`；`PIE_HOME` 指定的目录不存在就建出来）下缺的默认件：配置 + 全局记忆 + **默认 Python 环境**（`uv` 建 `<数据根>/envs/base`，并装上默认依赖 `ipython` / `httpx2` / `matplotlib`）；已存在不动、缺哪个装哪个，没装 uv 只告警 |
 | `pie sessions [-l N] [--all] [--json]` | 列出历史会话（默认 20 个） |
 | `pie files list [--all]` / `rm <id> [--all]` | 列出本地副本（`--all` 列云端上传件）/ 删一张图（`--all` 连云端那份一起删） |
 | `pie files upload <路径> [--mime <类型>]` | 把一个文件传到 Files API、打印 `file_id`（运维用：不写会话记录，`read` 读图那条路上传时自动完成） |
@@ -75,7 +75,8 @@ df.plot()                              # 图直接回到界面（见下）
   （`__meta__.repl_blocks`）—— 丢的是**体积**（工具输出），留的是**结构**（代码 + 结论）。
 - **中断不丢状态**：`Esc` 取消给解释器发 `SIGINT`（命名空间保住），停不住才 `SIGKILL`；输出超限与 `bash` 同款（落盘 + 指针）。
 - **解释器从哪来**：`[tools.repl] _python` → `[python] interpreter` → `~/.pie/envs/base/bin/python`（`pie setup` 用 uv 建好、
-  连 IPython 一起装上）→ `python3`。所以只跑过 `pie setup` 的话，`repl` 开箱就能用（系统 python3 通常没有 IPython）。
+  连 IPython / httpx2 / matplotlib 一起装上）→ `python3`。所以只跑过 `pie setup` 的话，`repl` 开箱就能用
+  （系统 python3 通常没有 IPython，画图也没有 matplotlib）。
 
 什么时候该用它：分几段写、边看边改（探查数据 / 调参数 / 试算法）；任务里有**贵的准备**；要**画图**。
 反过来，一次性命令（grep / 看目录 / 构建 / 测试）用 `bash` 更直接 —— `bash` 每次都是新进程。
@@ -88,15 +89,15 @@ df.plot()                              # 图直接回到界面（见下）
 启动时起一个长活宿主进程读清单，把工具注册进**同一张**工具表 —— 模型看不出它和内置工具有什么区别。
 
 ⚠ **前提：那个解释器里装着 Python 绑定 `pie`**（工具就是用它写的 → 只有一份实现，不会与绑定分叉）。
-`pie setup` 建的 `envs/base` 里只有 IPython，所以自己装一下（它不在 PyPI 上，别 `pip install pie`）：
+`pie setup` 建的 `envs/base` 里只有默认那三样（`ipython` / `httpx2` / `matplotlib`），所以自己装一下（它不在 PyPI 上，别 `pip install pie`）：
 
 ```bash
 cd bindings/pie-py && VIRTUAL_ENV=~/.pie/envs/base .venv/bin/maturin develop   # 用开发 venv 的 maturin 瞄准 base
-# 或先出 wheel 再装：maturin build --out dist → uv pip install --python ~/.pie/envs/base/bin/python dist/pie-*.whl
+# 或先出 wheel 再装：maturin build --release --out dist → uv pip install --python ~/.pie/envs/base/bin/python dist/pie-*.whl
 ```
 
 上例里 `~/.pie/envs/base` 的实际路径跟着数据根走（`PIE_HOME` 一改就是 `<PIE_HOME>/envs/base`）。
-⚠ 它是**没开 abi3** 的扩展（按解释器版本编的）：base 是 3.13 就只要 `cp313` 那份，以后改了 Rust 要重跑同一条命令刷新。
+⚠ 它是 **abi3 扩展**（`pyo3/abi3-py39`）：装一次就 3.9+ 通用，换 Python 版本不必重装；以后改了 Rust 要重跑同一条命令刷新。
 
 ```python
 # ~/.pie/plugins/word_count.py
@@ -267,6 +268,61 @@ await pie.allm("异步的那份")                      # 同一语义，跑在�
 `pie.llm(...)` / `pie.allm(...)` 不是另一套 HTTP，而是 `pie.LlmClient.complete` 的最短写法：同样有**重试**、
 同样释放 GIL、出错同样抛 `pie.LlmError`（带 `.status`）；`config=None` 就读 `~/.pie/config.toml`，
 `model=` / `max_tokens=` 是按次覆盖。要 `usage` / `tool_calls` 用 `LlmClient.complete`，要工具循环 / 流式用 `Session`。
+
+## 构建
+
+### 可执行文件 `pie`
+
+`x86_64-unknown-linux-gnu`（本机默认架构）：
+
+```bash
+cargo build --release                 # → target/release/pie
+```
+
+`aarch64-unknown-linux-gnu`（交叉编译，用 zig 当 cc，不必装 aarch64 工具链）：
+
+```bash
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+# → target/aarch64-unknown-linux-gnu/release/pie
+```
+
+- 前置：`cargo install cargo-zigbuild`、`zig` 在 `PATH` 里（`uv pip install ziglang` 也行）、
+  `rustup target add aarch64-unknown-linux-gnu`。
+- 想压低 glibc 基线就在三元组后面加点号版本（两个架构同理）：
+  `--target aarch64-unknown-linux-gnu.2.17` / `--target x86_64-unknown-linux-gnu.2.17`
+  （本机默认基线由构建机决定，交叉产物默认 `manylinux_2_17` 一类老基线）。
+- 源码在 9p 盘（WSL 的 `/mnt/...`）上时建议把产物放大盘：`CARGO_TARGET_DIR=$HOME/.cache/pie-target`。
+- 目标机是 **HarmonyOS / OpenHarmony** 不是这条路（那里用 NDK clang + `build-std`，配在 `.cargo/config.toml`）：
+  `cargo build -r --target aarch64-unknown-linux-ohos`。
+
+### Python 绑定（`bindings/pie-py`）
+
+它是 **abi3 扩展**（`pyo3/abi3-py39`）→ **一条 wheel 覆盖 3.9+ 的所有 Python 版本**，产物名固定
+`pie-<版本>-cp39-abi3-<平台>.whl`，不必按解释器版本各出一份。
+
+```bash
+cd bindings/pie-py
+
+# 本机架构（x86_64-unknown-linux-gnu）
+.venv/bin/maturin build --release --out dist
+
+# aarch64-unknown-linux-gnu：交叉编译交给 zig
+.venv/bin/maturin build --release --zig --target aarch64-unknown-linux-gnu --out dist-aarch64
+
+# 顺带压 glibc 基线（可选，默认基线由构建机决定）
+.venv/bin/maturin build --release --zig --target aarch64-unknown-linux-gnu \
+    --compatibility manylinux2014 --out dist-aarch64
+```
+
+开发态装进 `pie setup` 建的那个环境（改过 Rust 就要重跑刷新 `.so`）：
+
+```bash
+VIRTUAL_ENV=~/.pie/envs/base .venv/bin/maturin develop
+```
+
+- abi3 下 `-i` / `--interpreter` 已经**不必给**（它只用来定 ABI 校验用的解释器，产物名不变）。
+- 输出的 wheel 装法：`uv pip install --python ~/.pie/envs/base/bin/python dist/pie-*.whl`。
+- `cargo build` 直接编 cdylib 会报一堆 Python 符号 undefined —— 一律走 `maturin`。
 
 ## 更多
 
