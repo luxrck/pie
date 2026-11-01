@@ -463,9 +463,19 @@ impl Storage {
     /// 确保默认 Python 环境 `envs/base` 可用（`pie setup` 调）：没有 uv 或建不成就**回一句告警文案**
     /// （`Err`），setup 不该因此失败。
     ///
-    /// 幂等：venv 已在就不建；`repl` 靠的 IPython 已在就不装（用户自己的依赖自己
-    /// `uv pip install --python <环境>/bin/python …` 装进这个环境 —— `repl` 与 Python 工具都能 import）。
+    /// 幂等：venv 已在就不建；默认那三样（`IPython` / `httpx2` / `matplotlib`）都在就不装
+    /// （用户自己的依赖自己 `uv pip install --python <环境>/bin/python …` 装进这个环境 ——
+    /// `repl` 与 Python 工具都能 import）。
     pub fn ensure_base_env(&self) -> Result<String, String> {
+        // 默认依赖只这三样，缺哪样装哪样（理由分别是 `repl` 的本体、Python 工具的 HTTP 客户端、`repl` 的画图回传）：
+        //   IPython    —— `repl` 跑的就是它（系统 python3 通常没有）；
+        //   httpx2     —— Python 写的工具发 HTTP 就用它（httpx 已停维护，`examples/web_search.py` 用它）；
+        //   matplotlib —— `repl` 里画的 figure 能随结果回传、界面直接显示。
+        const PACKAGES: [(&str, &str); 3] = [
+            ("IPython", "ipython"),
+            ("httpx2", "httpx2"),
+            ("matplotlib", "matplotlib"),
+        ];
         let python = self.base_env_python();
         let uv_ok = std::process::Command::new("uv")
             .arg("--version")
@@ -497,34 +507,53 @@ impl Storage {
             }
         }
 
-        // IPython 是 `repl` 的运行时依赖（系统 python3 通常没有）——装好它，repl 开箱可用。
-        let has_ipython = std::process::Command::new(&python)
-            .args(["-c", "import IPython"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // 探一次就知道缺哪几样（`uv pip install` 对已满足的是 no-op，探不出来就全装，不亏）。
+        let modules: Vec<&str> = PACKAGES.iter().map(|(module, _)| *module).collect();
+        let probe = format!(
+            "import importlib.util as u\nprint(' '.join(m for m in {modules:?} if u.find_spec(m) is None))"
+        );
+        let missing: Vec<&str> = match std::process::Command::new(&python)
+            .arg("-c")
+            .arg(&probe)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let absent = String::from_utf8_lossy(&out.stdout);
+                let absent = absent.trim();
+                PACKAGES
+                    .iter()
+                    .filter(|(module, _)| absent.split_whitespace().any(|m| m == *module))
+                    .map(|(_, pip)| *pip)
+                    .collect()
+            }
+            _ => PACKAGES.iter().map(|(_, pip)| *pip).collect(),
+        };
         let label = if existed { "已存在" } else { "已创建" };
-        if has_ipython {
-            return Ok(format!("{label}  {}", self.base_env().display()));
+        if missing.is_empty() {
+            return Ok(format!(
+                "{label}（ipython / httpx2 / matplotlib 都在）  {}",
+                self.base_env().display()
+            ));
         }
         let out = std::process::Command::new("uv")
             .args(["pip", "install", "--python"])
             .arg(&python)
-            .arg("ipython")
+            .args(&missing)
             .output()
             .map_err(|e| format!("跑 `uv pip install` 失败: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "{label} {}，但装 IPython 失败（`repl` 要它）：{}\n  自己补：uv pip install --python {} ipython",
+                "{label} {}，但装 {} 失败（`repl` / Python 工具要它们）：{}\n  自己补：uv pip install --python {} {}",
                 self.base_env().display(),
+                missing.join(" / "),
                 String::from_utf8_lossy(&out.stderr).trim(),
-                python.display()
+                python.display(),
+                missing.join(" ")
             ));
         }
         Ok(format!(
-            "{label} + 已装 IPython  {}",
+            "{label} + 已装 {}  {}",
+            missing.join(" / "),
             self.base_env().display()
         ))
     }
